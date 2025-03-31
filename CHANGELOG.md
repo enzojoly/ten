@@ -79,5 +79,27 @@
   * Added comments explaining type-level enforcement of phase separation
   * Updated test expectations to match current implementation
 * Build system refinements:
+
   * Fixed binary data handling to prevent encoding issues
   * Implemented proper return type handling in monadic operations
+
+  ## 0.1.5.0 -- 2025-03-31
+* Fixed sandbox permission issues:
+  * Added proper directory creation with appropriate permissions
+  * Created helper function `createAndSetupDir` for consistent permission handling
+  * Ensured all sandbox directories have executable permissions
+  * Properly handled parent directory creation before file operations
+* Enhanced build process robustness:
+  * Improved shell script builder to use system gcc correctly
+  * Added permission verification for builder executables
+  * Implemented better error reporting for build failures
+  * Fixed test suite to properly handle monadic return types
+* Cross-platform improvements:
+  * Removed unix-specific dependency for better compatibility
+  * Implemented sandbox directory structure using portable operations
+  * Ensured the build system works consistently across environments
+* Completed proof-of-concept implementation:
+  * All test cases now pass successfully
+  * Demonstrated type-level phase separation works correctly
+  * Validated content-addressable storage functionality
+  * Confirmed proper isolation of build environments

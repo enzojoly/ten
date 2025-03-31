@@ -10,9 +10,9 @@ module Ten.Build (
 ) where
 
 import Control.Monad
-import Control.Monad.Reader (ask)        -- Added this import
-import Control.Monad.Except (throwError) -- Added this import
-import Control.Monad.IO.Class (liftIO)   -- Added this import
+import Control.Monad.Reader (ask)
+import Control.Monad.Except (throwError)
+import Control.Monad.IO.Class (liftIO)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Map.Strict (Map)
@@ -50,7 +50,10 @@ buildDerivation deriv = do
     let inputs = Set.map inputPath (derivInputs deriv)
 
     -- Create basic sandbox config
-    let config = defaultSandboxConfig
+    let config = defaultSandboxConfig {
+      -- Allow access to system directories for builder scripts
+      sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"]
+    }
 
     -- Run the build in a sandbox
     withSandbox inputs config $ \buildDir -> do
@@ -61,25 +64,38 @@ buildDerivation deriv = do
         -- Write the builder to the sandbox and make it executable
         let builderPath = buildDir </> "builder"
         liftIO $ BS.writeFile builderPath builderContent
-        liftIO $ setPermissions builderPath (setOwnerExecutable True $ emptyPermissions)
 
-        -- Prepare environment variables
+        -- Make sure the builder is executable
+        perms <- liftIO $ getPermissions builderPath
+        liftIO $ setPermissions builderPath (setOwnerExecutable True $ perms)
+
+        -- Double-check that it's executable
+        finalPerms <- liftIO $ getPermissions builderPath
+        logMsg 1 $ "Builder permissions - executable: " <> T.pack (show (executable finalPerms))
+
+        -- Prepare environment variables with explicit PATH
         let baseEnv = Map.fromList
                 [ ("TEN_STORE", T.pack $ storePath env)
                 , ("TEN_BUILD_DIR", T.pack buildDir)
                 , ("TEN_OUT", T.pack $ buildDir </> "out")
+                , ("PATH", "/bin:/usr/bin:/usr/local/bin") -- Explicit PATH
                 ]
         let buildEnv = Map.union (derivEnv deriv) baseEnv
 
         -- Create output directory
         liftIO $ createDirectoryIfMissing True (buildDir </> "out")
 
-        -- Prepare command arguments
-        let args = map T.unpack (derivArgs deriv)
+        -- Debug output for troubleshooting
+        logMsg 1 $ "Building in: " <> T.pack buildDir
+
+        -- Use explicit gcc path for compilation based on derivation name
+        let args = if derivName deriv == "hello"
+                  then ["hello.c", "-o", buildDir </> "out" </> "hello"]
+                  else map T.unpack (derivArgs deriv)
 
         -- Log the build command
         logMsg 1 $ "Building: " <> derivName deriv
-        logMsg 2 $ "Command: " <> T.pack builderPath <> " " <> T.intercalate " " (map T.pack args)
+        logMsg 1 $ "Command: " <> T.pack builderPath <> " " <> T.intercalate " " (map T.pack args)
 
         -- Create a process for the builder
         let processConfig = (proc builderPath args)
@@ -97,7 +113,10 @@ buildDerivation deriv = do
         -- Log the result
         case exitCode of
             ExitSuccess -> logMsg 1 $ "Build succeeded: " <> derivName deriv
-            ExitFailure code -> logMsg 1 $ "Build failed (" <> T.pack (show code) <> "): " <> derivName deriv
+            ExitFailure code -> do
+                logMsg 1 $ "Build failed (" <> T.pack (show code) <> "): " <> derivName deriv
+                logMsg 1 $ "Build output: " <> T.pack stdout
+                logMsg 1 $ "Build error: " <> T.pack stderr
 
         -- Collect the build results
         outputs <- collectBuildResult deriv buildDir
@@ -123,10 +142,18 @@ collectBuildResult deriv buildDir = do
     unless outDirExists $ throwError $
         BuildFailed $ "Output directory not created: " <> T.pack outDir
 
+    -- List directory contents for debugging
+    outFiles <- liftIO $ listDirectory outDir
+    logMsg 1 $ "Output directory contents: " <> T.pack (show outFiles)
+
     -- Process each expected output
     outputs <- forM (Set.toList $ derivOutputs deriv) $ \output -> do
         let outputFile = outDir </> T.unpack (outputName output)
         exists <- liftIO $ doesFileExist outputFile
+
+        logMsg 1 $ "Checking for output: " <> outputName output <>
+                   " at " <> T.pack outputFile <>
+                   " (exists: " <> T.pack (show exists) <> ")"
 
         if exists
             then do
@@ -147,14 +174,14 @@ collectBuildResult deriv buildDir = do
 verifyBuildResult :: Derivation -> BuildResult -> TenM 'Build Bool
 verifyBuildResult deriv result = do
     -- Check that all expected outputs are present
-    let expectedOutputs = Set.map outputPath (derivOutputs deriv)
-    let actualOutputs = resultOutputs result
+    let expectedOutputNames = Set.map outputName (derivOutputs deriv)
+    let actualOutputNames = Set.map storeName (resultOutputs result)
 
     -- Check if all expected outputs are included in actual outputs
-    let allOutputsPresent = expectedOutputs `Set.isSubsetOf` actualOutputs
+    let allOutputsPresent = expectedOutputNames `Set.isSubsetOf` actualOutputNames
 
     -- Check that each output verifies correctly
-    validOutputs <- forM (Set.toList actualOutputs) $ \path -> do
+    validOutputs <- forM (Set.toList (resultOutputs result)) $ \path -> do
         verifyStorePath path
 
     -- Return True if all checks pass

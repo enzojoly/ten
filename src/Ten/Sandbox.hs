@@ -59,15 +59,21 @@ withSandbox inputs config action = do
 
     -- Create a temporary sandbox directory
     let sandboxFunc sandboxDir = do
-            -- Create the basic structure
-            liftIO $ createDirectoryIfMissing True (sandboxDir </> "tmp")
-            liftIO $ createDirectoryIfMissing True (sandboxDir </> "build")
+            -- Create the basic directory structure with proper permissions
+            liftIO $ createAndSetupDir sandboxDir
+            liftIO $ createAndSetupDir (sandboxDir </> "tmp")
+            liftIO $ createAndSetupDir (sandboxDir </> "build")
+            liftIO $ createAndSetupDir (sandboxDir </> "out")
+            liftIO $ createAndSetupDir (sandboxDir </> "store")
 
             -- Map all inputs into the sandbox
             mapM_ (setupInput sandboxDir) (Set.toList inputs)
 
             -- Add read-only bind mounts from config
             mapM_ (setupBindMount sandboxDir) (Map.toList $ sandboxReadOnlyBindMounts config)
+
+            -- Set up system paths for gcc if needed
+            mapM_ (setupSystemPath sandboxDir) (Set.toList $ sandboxExtraPaths config)
 
             -- Log sandbox creation
             logMsg 1 $ "Created sandbox at: " <> T.pack sandboxDir
@@ -76,7 +82,7 @@ withSandbox inputs config action = do
             addProof $ BuildProof
 
             -- Run the action inside the sandbox
-            let buildDir = sandboxDir </> "build"
+            let buildDir = sandboxDir
             result <- action buildDir
 
             -- Log sandbox cleanup
@@ -87,6 +93,15 @@ withSandbox inputs config action = do
     -- Create the temporary directory and ensure cleanup
     liftIO (withSystemTempDirectory "ten-sandbox" (runSandboxed env state sandboxFunc))
         >>= either throwError return
+
+-- | Helper to create a directory and set proper permissions
+createAndSetupDir :: FilePath -> IO ()
+createAndSetupDir dir = do
+    createDirectoryIfMissing True dir
+    perms <- getPermissions dir
+    setPermissions dir (setOwnerExecutable True $
+                       setOwnerWritable True $
+                       setOwnerReadable True $ perms)
 
 -- | Helper to run a sandbox action with the Ten monad context
 runSandboxed :: BuildEnv -> BuildState -> (FilePath -> TenM 'Build a) -> FilePath -> IO (Either BuildError a)
@@ -103,30 +118,84 @@ setupInput sandboxDir input = do
 
     -- Determine source and destination paths
     let sourcePath = storePathToFilePath input env
-    let destPath = sandboxDir </> "store" </> T.unpack (storeHash input) ++ "-" ++ T.unpack (storeName input)
 
-    -- Create parent directory
-    liftIO $ createDirectoryIfMissing True (takeDirectory destPath)
+    -- Create two links:
+    -- 1. One with the full store path format
+    let storeDest = sandboxDir </> "store" </> T.unpack (storeHash input) ++ "-" ++ T.unpack (storeName input)
+    -- 2. One with just the name (what the builder expects to find)
+    let nameDest = sandboxDir </> T.unpack (storeName input)
 
-    -- Create a hard link (or copy if cross-device)
-    result <- liftIO $ E.try $ createFileLink sourcePath destPath
-    case result of
+    -- Create the files with appropriate permissions
+    result1 <- liftIO $ E.try $ createFileLink sourcePath storeDest
+    case result1 of
         Left (_ :: E.SomeException) -> do
             -- Fallback to copying if linking fails
-            liftIO $ copyFile sourcePath destPath
-            logMsg 2 $ "Copied input to sandbox: " <> T.pack destPath
+            liftIO $ copyFile sourcePath storeDest
+            perms <- liftIO $ getPermissions storeDest
+            liftIO $ setPermissions storeDest (setOwnerReadable True $ perms)
+            logMsg 2 $ "Copied input to sandbox store: " <> T.pack storeDest
         Right () ->
-            logMsg 2 $ "Linked input to sandbox: " <> T.pack destPath
+            logMsg 2 $ "Linked input to sandbox store: " <> T.pack storeDest
+
+    -- Then create the simple name link (THIS IS THE KEY PART)
+    result2 <- liftIO $ E.try $ createFileLink sourcePath nameDest
+    case result2 of
+        Left (_ :: E.SomeException) -> do
+            -- Fallback to copying if linking fails
+            liftIO $ copyFile sourcePath nameDest
+            perms <- liftIO $ getPermissions nameDest
+            liftIO $ setPermissions nameDest (setOwnerReadable True $ perms)
+            logMsg 2 $ "Copied input to sandbox: " <> T.pack nameDest
+        Right () ->
+            logMsg 2 $ "Linked input to sandbox: " <> T.pack nameDest
 
 -- | Set up a bind mount in the sandbox
 setupBindMount :: FilePath -> (FilePath, FilePath) -> TenM 'Build ()
 setupBindMount sandboxDir (source, dest) = do
     let fullDest = sandboxDir </> dest
 
-    -- Create parent directory
-    liftIO $ createDirectoryIfMissing True (takeDirectory fullDest)
+    -- Create parent directory with appropriate permissions
+    liftIO $ createAndSetupDir (takeDirectory fullDest)
 
     -- In a real implementation, this would use mount --bind
     -- For now, we simulate with symlinks for portability
     liftIO $ createFileLink source fullDest
     logMsg 2 $ "Bind mounted (simulated): " <> T.pack source <> " -> " <> T.pack fullDest
+
+-- | Helper to make system paths available in the sandbox
+setupSystemPath :: FilePath -> FilePath -> TenM 'Build ()
+setupSystemPath sandboxDir systemPath = do
+    -- Skip if path doesn't exist
+    pathExists <- liftIO $ doesPathExist systemPath
+    unless pathExists $ return ()
+
+    -- Create parent dirs if needed
+    let sandboxPath = sandboxDir </> makeRelative "/" systemPath
+    liftIO $ createAndSetupDir (takeDirectory sandboxPath)
+
+    -- Skip if it's already a link or file
+    destExists <- liftIO $ doesPathExist sandboxPath
+    when destExists $ return ()
+
+    -- Check if the source is a directory
+    isDir <- liftIO $ doesDirectoryExist systemPath
+
+    -- Link the system path into the sandbox
+    if isDir
+        then do
+            -- For directories, create the directory and set permissions
+            liftIO $ createAndSetupDir sandboxPath
+            logMsg 2 $ "Created directory in sandbox: " <> T.pack sandboxPath
+        else do
+            -- For files, create a link and ensure it's accessible
+            result <- liftIO $ E.try $ createFileLink systemPath sandboxPath
+            case result of
+                Left (_ :: E.SomeException) -> do
+                    -- Fallback to copying for files
+                    liftIO $ copyFile systemPath sandboxPath
+                    perms <- liftIO $ getPermissions sandboxPath
+                    liftIO $ setPermissions sandboxPath (setOwnerExecutable True $
+                                                       setOwnerReadable True $ perms)
+                    logMsg 2 $ "Copied file to sandbox: " <> T.pack sandboxPath
+                Right () ->
+                    logMsg 2 $ "Linked file to sandbox: " <> T.pack systemPath
