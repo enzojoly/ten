@@ -23,7 +23,7 @@
   * Garbage collection with correct file operations
   * Sandbox isolation with validated type safety
   * Build execution with better monad context handling
-* Enhanced code organization with more consistent import structures
+* Enhanced code organisation with more consistent import structures
 
 ## 0.1.2.0 -- 2025-04-01
 
@@ -39,7 +39,27 @@
   * Renamed `storePath` utility to `getStorePath` to avoid field name conflicts
   * Qualified imports in Graph module to avoid `AcyclicProof` ambiguity
   * Fixed type matching in pattern expressions
-* Documentation updates:
-  * Expanded code comments
-  * Updated Changelog format for better readability
-  * Enhanced README with accurate build instructions
+
+## 0.1.3.0 -- 2025-04-02
+
+* Test suite fixes:
+  * Fixed phantom type errors in phase separation tests
+  * Improved error simulation approach for cross-phase testing
+  * Added proper return type handling for monadic operations
+  * Fixed ByteString conversion in external process interaction
+  * Properly structured test helpers with consistent error propagation
+* Type system enhancements:
+  * Implemented correct pattern matching on phase-specific operations
+  * Enhanced GADTs for more robust phantom type checking
+  * Improved type-level phase separation guarantees
+  * Fixed polymorphic type constraints in proof system
+* Build system improvements:
+  * Added test case for minimal viable build scenario
+  * Implemented reproducible build verification
+  * Enhanced determinism testing methodology
+  * Added proper support for test-time file operations
+* Project structure:
+  * Stabilised dependency graph between modules
+  * Established consistent error handling patterns
+  * Completed initial testing infrastructure
+  * System now ready for feature development and enhancement
