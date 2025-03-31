@@ -15,6 +15,9 @@ module Ten.Graph (
 ) where
 
 import Control.Monad
+import Control.Monad.Except (throwError)
+import Control.Monad.Reader (ask)
+import Control.Monad.IO.Class (liftIO)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -23,7 +26,10 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.List (foldl')
 
-import Ten.Core
+-- Use qualified import for Ten.Core to avoid name collisions
+import qualified Ten.Core as Core
+-- Still import specific names from Ten.Core that don't cause collisions
+import Ten.Core (TenM, Phase(..), BuildError(..), StorePath(..))
 import Ten.Derivation
 import Ten.Store
 
@@ -75,16 +81,16 @@ createBuildGraph :: Set StorePath -> Set Derivation -> TenM 'Eval BuildGraph
 createBuildGraph requestedOutputs derivations = do
     -- Start with an empty graph
     let graph = emptyGraph
-    
+
     -- Add all derivations to the graph
     graph' <- foldM addDerivation graph (Set.toList derivations)
-    
+
     -- Add requested outputs as roots
     let graph'' = graph' { graphRoots = Set.map outputNodeId requestedOutputs }
-    
+
     -- Validate the graph
     proof <- validateGraph graph''
-    
+
     -- Return the validated graph
     return $ graph'' { graphProof = Just proof }
 
@@ -96,15 +102,15 @@ addDerivation graph deriv = do
     let graph' = graph
             { graphNodes = Map.insert nodeId (DerivationNode deriv) (graphNodes graph)
             }
-    
+
     -- Add input nodes and edges
     let inputs = derivInputs deriv
     graph'' <- foldM addInputEdge graph' (Set.toList inputs)
-    
+
     -- Add output nodes and edges
     let outputs = derivOutputs deriv
     graph''' <- foldM (addOutputEdge deriv) graph'' (Set.toList outputs)
-    
+
     return graph'''
 
 -- | Add an input edge to the graph
@@ -113,17 +119,17 @@ addInputEdge graph input = do
     -- Get the node IDs
     let inputId = pathNodeId (inputPath input)
     let derivId = derivNodeId deriv  -- Need to recover the derivation here
-    
+
     -- Add the input node if it doesn't exist
     let graph' = if Map.member inputId (graphNodes graph)
                    then graph
                    else graph
                         { graphNodes = Map.insert inputId (InputNode (inputPath input)) (graphNodes graph)
                         }
-    
+
     -- Add the edge: derivation depends on input
     let edges' = Map.insertWith Set.union derivId (Set.singleton inputId) (graphEdges graph')
-    
+
     return $ graph' { graphEdges = edges' }
   where
     -- This is a placeholder - in a real implementation, we would have the
@@ -136,15 +142,15 @@ addOutputEdge deriv graph output = do
     -- Get the node IDs
     let outputId = outputNodeId (outputPath output)
     let derivId = derivNodeId deriv
-    
+
     -- Add the output node
     let graph' = graph
             { graphNodes = Map.insert outputId (OutputNode (outputPath output) deriv) (graphNodes graph)
             }
-    
+
     -- Add the edge: output depends on derivation
     let edges' = Map.insertWith Set.union outputId (Set.singleton derivId) (graphEdges graph')
-    
+
     return $ graph' { graphEdges = edges' }
 
 -- | Validate a build graph
@@ -154,15 +160,15 @@ validateGraph graph = do
     hasCycles <- detectCycles graph
     when hasCycles $
         throwError $ GraphError "Dependency cycle detected in build graph"
-    
+
     -- Check for completeness (all dependencies are present)
     isComplete <- checkCompleteness graph
     unless isComplete $
         throwError $ GraphError "Build graph is missing some dependencies"
-    
-    -- Add acyclic proof
-    addProof AcyclicProof
-    
+
+    -- Add acyclic proof - Use qualified name from Ten.Core
+    Core.addProof Core.AcyclicProof
+
     -- Return the appropriate proof
     return ValidProof
 
@@ -183,15 +189,15 @@ checkCompleteness _ = do
 -- | Topologically sort the graph (return build order)
 topologicalSort :: BuildGraph -> TenM 'Eval [BuildNode]
 topologicalSort graph = do
-    -- Verify the graph is acyclic
+    -- Verify the graph is acyclic - Use qualified references
     case graphProof graph of
         Just AcyclicProof -> pure ()
         Just ValidProof -> pure ()
         _ -> validateGraph graph >> pure ()
-    
+
     -- Simple implementation - this should be replaced with a real topological sort
     let nodes = Map.elems (graphNodes graph)
-    
+
     -- In a real implementation, we would use a standard topological sort algorithm
     return nodes
 
@@ -200,7 +206,7 @@ findAffected :: BuildGraph -> Set StorePath -> TenM p (Set Text)
 findAffected graph changedPaths = do
     -- Convert paths to node IDs
     let changedIds = Set.map pathNodeId changedPaths
-    
+
     -- In a real implementation, we would traverse the graph to find all nodes
     -- that depend on the changed paths
     return changedIds

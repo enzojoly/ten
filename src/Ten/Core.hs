@@ -30,6 +30,10 @@ import System.Exit
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
 
+-- Add standalone deriving instances for Phase
+deriving instance Show Phase
+deriving instance Eq Phase
+
 -- | Core error types
 data BuildError
     = EvalError Text           -- Errors during evaluation phase

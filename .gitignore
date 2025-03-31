@@ -25,3 +25,4 @@ cabal.project.local~
 # Custom Ten store paths
 /tmp/ten-build/
 /tmp/ten-store/
+output

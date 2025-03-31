@@ -14,6 +14,9 @@ module Ten.Derivation (
 ) where
 
 import Control.Monad
+import Control.Monad.Reader (ask)
+import Control.Monad.State (modify)
+import Control.Monad.Except (throwError)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -25,7 +28,7 @@ import qualified Data.ByteString as BS
 import System.FilePath
 
 import Ten.Core
-import Ten.Hash
+import qualified Ten.Hash as Hash
 import Ten.Store
 
 -- | Input to a derivation
@@ -54,18 +57,18 @@ data Derivation = Derivation
 mkDerivation :: Text -> StorePath -> [Text] -> Set DerivationInput -> Set Text -> Map Text Text -> TenM 'Eval Derivation
 mkDerivation name builder args inputs outputNames env = do
     -- Generate output paths based on the derivation hash
-    let derivHash = hashDerivation name (map T.pack $ show builder : map T.unpack args) (Map.toList env)
-    let hashText = showHash derivHash
-    
+    let derivHash = Hash.hashDerivation name (map T.pack $ show builder : map T.unpack args) (Map.toList env)
+    let hashText = Hash.showHash derivHash
+
     -- Create output specifications with predicted paths
     let outputs = Set.map (\outName -> DerivationOutput
                               { outputName = outName
                               , outputPath = StorePath hashText outName
                               }) outputNames
-    
+
     -- Record that this is a valid derivation
     addProof TypeProof
-    
+
     return Derivation
         { derivName = name
         , derivBuilder = builder
@@ -81,21 +84,21 @@ instantiateDerivation deriv = do
     -- Verify inputs exist
     forM_ (derivInputs deriv) $ \input -> do
         exists <- storePathExists (inputPath input)
-        unless exists $ throwError $ 
+        unless exists $ throwError $
             BuildFailed $ "Input does not exist: " <> T.pack (show $ inputPath input)
-    
+
     -- Record inputs in build state
     let inputPaths = Set.map inputPath (derivInputs deriv)
     modify $ \s -> s { buildInputs = Set.union inputPaths (buildInputs s) }
-    
+
     -- Verify builder exists
     builderExists <- storePathExists (derivBuilder deriv)
     unless builderExists $ throwError $
         BuildFailed $ "Builder does not exist: " <> T.pack (show $ derivBuilder deriv)
-    
+
     -- Add input proof
     addProof InputProof
-    
+
     logMsg 1 $ "Instantiated derivation: " <> derivName deriv
 
 -- | Serialize a derivation to a ByteString
@@ -114,5 +117,5 @@ deserializeDerivation :: BS.ByteString -> Either Text Derivation
 deserializeDerivation _ = Left "Deserialization not implemented yet"
 
 -- | Compute a deterministic hash for a derivation
-hashDerivation :: Derivation -> Hash
-hashDerivation deriv = hashByteString $ serializeDerivation deriv
+hashDerivation :: Derivation -> Hash.Hash
+hashDerivation deriv = Hash.hashByteString $ serializeDerivation deriv
