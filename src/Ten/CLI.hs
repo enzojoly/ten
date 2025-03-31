@@ -10,6 +10,9 @@ module Ten.CLI (
 ) where
 
 import Control.Monad
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ask)
+import Control.Monad.Except (throwError)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -20,7 +23,8 @@ import System.FilePath
 import System.Environment
 import System.Exit
 
-import Ten.Core
+import qualified Ten.Core as Core  -- Use qualified import to avoid name clashes
+import Ten.Core (BuildEnv(..), BuildError(..), TenM) -- Import specific non-conflicting names
 import Ten.Build
 import Ten.Store
 import Ten.GC
@@ -54,9 +58,9 @@ defaultOptions = Options
 -- | Parse command line arguments
 parseArgs :: [String] -> Either String (Command, Options)
 parseArgs [] = Right (Help, defaultOptions)
-parseArgs (cmd:args) = 
+parseArgs (cmd:args) =
     case cmd of
-        "build" -> 
+        "build" ->
             case args of
                 (file:rest) -> parseOptions rest (Build file)
                 [] -> Left "build: missing file argument"
@@ -78,15 +82,15 @@ parseOptions :: [String] -> Command -> Either String (Command, Options)
 parseOptions args cmd = go args (cmd, defaultOptions)
   where
     go [] result = Right result
-    go ("--verbose":rest) (c, opts) = 
+    go ("--verbose":rest) (c, opts) =
         go rest (c, opts { optVerbosity = min 3 (optVerbosity opts + 1) })
-    go ("--quiet":rest) (c, opts) = 
+    go ("--quiet":rest) (c, opts) =
         go rest (c, opts { optVerbosity = max 0 (optVerbosity opts - 1) })
     go ("--store":path:rest) (c, opts) =
         go rest (c, opts { optStorePath = path })
     go ("--keep-failed":rest) (c, opts) =
         go rest (c, opts { optKeepFailed = True })
-    go (unknown:_) _ = 
+    go (unknown:_) _ =
         Left $ "unknown option: " ++ unknown
 
 -- | Run a command with the given options
@@ -94,7 +98,7 @@ runCommand :: Command -> Options -> IO ()
 runCommand cmd options = do
     -- Create the store directory if it doesn't exist
     createDirectoryIfMissing True (optStorePath options)
-    
+
     -- Create the build environment
     let env = BuildEnv
             { workDir = "/tmp/ten-build"
@@ -102,7 +106,7 @@ runCommand cmd options = do
             , verbosity = optVerbosity options
             , allowedPaths = Set.empty
             }
-    
+
     -- Execute the command
     result <- case cmd of
         Build file -> buildDerivationFile env file
@@ -111,13 +115,13 @@ runCommand cmd options = do
         Info path -> showPathInfo env path
         ListRoots -> showRoots env
         Help -> showHelp >> return (Right ())
-    
+
     -- Handle the result
     case result of
         Left err -> do
             TIO.putStrLn $ "Error: " <> T.pack (show err)
             exitFailure
-        Right _ -> 
+        Right _ ->
             exitSuccess
 
 -- | Build a derivation file
@@ -125,32 +129,34 @@ buildDerivationFile :: BuildEnv -> FilePath -> IO (Either BuildError ())
 buildDerivationFile env file = do
     -- Check if the file exists
     exists <- doesFileExist file
-    unless exists $ return $ Left $ InputNotFound file
-    
-    -- In a real implementation, we would:
-    -- 1. Parse the derivation file
-    -- 2. Instantiate the derivation
-    -- 3. Build it
-    -- For now, we just print a message
-    
-    putStrLn $ "Building derivation: " ++ file
-    return $ Right ()
+    -- Fixed: Use if/then/else instead of unless
+    if not exists
+        then return $ Left $ InputNotFound file
+        else do
+            -- In a real implementation, we would:
+            -- 1. Parse the derivation file
+            -- 2. Instantiate the derivation
+            -- 3. Build it
+            -- For now, we just print a message
+            putStrLn $ "Building derivation: " ++ file
+            return $ Right ()
 
 -- | Evaluate a Ten expression file
 evalExpressionFile :: BuildEnv -> FilePath -> IO (Either BuildError ())
 evalExpressionFile env file = do
     -- Check if the file exists
     exists <- doesFileExist file
-    unless exists $ return $ Left $ InputNotFound file
-    
-    -- In a real implementation, we would:
-    -- 1. Parse the Ten expression file
-    -- 2. Evaluate it to produce a derivation
-    -- 3. Instantiate the derivation
-    -- For now, we just print a message
-    
-    putStrLn $ "Evaluating expression: " ++ file
-    return $ Right ()
+    -- Fixed: Use if/then/else instead of unless
+    if not exists
+        then return $ Left $ InputNotFound file
+        else do
+            -- In a real implementation, we would:
+            -- 1. Parse the Ten expression file
+            -- 2. Evaluate it to produce a derivation
+            -- 3. Instantiate the derivation
+            -- For now, we just print a message
+            putStrLn $ "Evaluating expression: " ++ file
+            return $ Right ()
 
 -- | Run garbage collection
 runGC :: BuildEnv -> IO (Either BuildError ())
@@ -160,7 +166,7 @@ runGC env = do
     -- 2. Build the reachability graph
     -- 3. Delete unreachable paths
     -- For now, we just print a message
-    
+
     putStrLn "Running garbage collection"
     return $ Right ()
 
@@ -172,7 +178,7 @@ showPathInfo env path = do
     -- 2. Check if it exists in the store
     -- 3. Display information about it
     -- For now, we just print a message
-    
+
     putStrLn $ "Path info: " ++ path
     return $ Right ()
 
@@ -183,7 +189,7 @@ showRoots env = do
     -- 1. List all roots
     -- 2. Display information about each
     -- For now, we just print a message
-    
+
     putStrLn "Listing GC roots"
     return $ Right ()
 

@@ -13,57 +13,61 @@ module Ten (
     evalTen,
     buildTen,
     initBuildEnv,
-    
+
     -- Re-exports from Store
     addToStore,
     ensureInStore,
     readFromStore,
     verifyStorePath,
     storePathExists,
-    
+
     -- Re-exports from Derivation
     Derivation(..),
     DerivationInput(..),
     DerivationOutput(..),
     mkDerivation,
     instantiateDerivation,
-    
+
     -- Re-exports from Build
     BuildResult(..),
     buildDerivation,
-    
+
     -- Re-exports from Sandbox
     SandboxConfig(..),
     defaultSandboxConfig,
     withSandbox,
-    
+
     -- Re-exports from Graph
     BuildGraph(..),
     BuildNode(..),
     createBuildGraph,
     validateGraph,
     topologicalSort,
-    
+
     -- Re-exports from GC
     GCRoot(..),
     GCStats(..),
     addRoot,
     removeRoot,
     collectGarbage,
-    
+
     -- Basic utilities
-    storePath,
+    getStorePath,  -- Renamed from storePath to avoid name clash
     evalFile,
     buildFile,
     buildExpression
 ) where
 
 import Control.Monad
+import Control.Monad.Reader (ask)
+import Control.Monad.Except (throwError)
+import Control.Monad.IO.Class (liftIO)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import qualified Data.ByteString as BS
 import System.FilePath
+import System.Environment (getEnv)
 
 import Ten.Core
 import Ten.Store
@@ -72,11 +76,11 @@ import Ten.Build
 import Ten.Sandbox
 import Ten.Graph
 import Ten.GC
-import Ten.Hash
+import qualified Ten.Hash as Hash
 
 -- | Get a standard store path
-storePath :: FilePath -> IO FilePath
-storePath override
+getStorePath :: FilePath -> IO FilePath  -- Renamed from storePath
+getStorePath override
     | not (null override) = return override
     | otherwise = do
         home <- getEnv "HOME"
@@ -85,7 +89,7 @@ storePath override
 -- | Evaluate a Ten expression file
 evalFile :: FilePath -> IO (Either BuildError Derivation)
 evalFile file = do
-    store <- storePath ""
+    store <- getStorePath ""  -- Updated to use the renamed function
     let env = initBuildEnv "/tmp/ten-build" store
     content <- TIO.readFile file
     result <- evalTen (evalExpression content) env
@@ -96,7 +100,7 @@ evalFile file = do
 -- | Build a derivation file
 buildFile :: FilePath -> IO (Either BuildError BuildResult)
 buildFile file = do
-    store <- storePath ""
+    store <- getStorePath ""  -- Updated to use the renamed function
     let env = initBuildEnv "/tmp/ten-build" store
     content <- BS.readFile file
     -- In a real implementation, we would parse the derivation file
@@ -106,9 +110,9 @@ buildFile file = do
 -- | Build a Ten expression
 buildExpression :: Text -> IO (Either BuildError BuildResult)
 buildExpression expr = do
-    store <- storePath ""
+    store <- getStorePath ""  -- Updated to use the renamed function
     let env = initBuildEnv "/tmp/ten-build" store
-    
+
     -- Step 1: Evaluate the expression to get a derivation
     evalResult <- evalTen (evalExpression expr) env
     case evalResult of
@@ -127,5 +131,5 @@ evalExpression expr = do
     -- 1. Parse the expression into an AST
     -- 2. Interpret the AST to produce a derivation
     -- For now, we just create a dummy derivation
-    
+
     throwError $ EvalError "Expression evaluation not implemented"

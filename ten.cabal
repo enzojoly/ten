@@ -72,3 +72,11 @@ test-suite ten-test
                      , ten
                      , hspec >=2.11
                      , QuickCheck >=2.14
+                     , bytestring >=0.11.4
+                     , containers >=0.7
+                     , text >=2.0
+                     , directory >=1.3.7
+                     , filepath >=1.4.100
+                     , process >=1.6.17
+                     , mtl >=2.3
+                     , time >=1.12
