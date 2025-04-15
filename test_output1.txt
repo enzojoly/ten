@@ -1,0 +1,131 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (test:ten-test) (first run)
+Preprocessing test suite 'ten-test' for ten-0.1.0.0...
+Building test suite 'ten-test' for ten-0.1.0.0...
+Running 1 test suites...
+Test suite ten-test: RUNNING...
+
+Ten Build System Core Properties
+  Content-addressed storage
+    computes consistent hashes for identical content [✔]
+    computes different hashes for different content [✔]
+Adding to store: 48ab47cb11b2b3fad94e3d0f7b4e40a70d14ae16fbe439d1432ac0add107bb53-test-file
+    correctly adds and retrieves content from the store [✔]
+Adding to store: 488fa3242b183eb7d75bb68d96bb65b587e10ad290b02477a2212386ce782f06-verify-file
+    verifies content hash matches path hash [✔]
+  Build phase separation
+    enforces eval-phase-only operations [✔]
+Adding to store: 02512903e85d7eb1f18f39e576ab4b2a93e0d65cc499e63c5bd450e5327aae12-hello.c
+    enforces build-phase-only operations [✔]
+    fails when build operations are attempted in eval phase [✔]
+  Proof system
+    generates and validates type proofs [✔]
+    generates and validates acyclic proofs [✔]
+    generates and validates build proofs [✔]
+    composes proofs correctly [✔]
+  Deterministic builds
+Adding to store: 285b0911f1f30f29d38f45891b7d74698059bcdef9ab199a2b1b893a30b19ae3-determinism.txt
+    produces identical outputs for identical inputs [✔]
+  Build isolation
+Adding to store: 93ab980e4b52b24f42ecb905f40020479481cdc2e4d6e756362ebf71dd48aac8-sandbox-test.txt
+Created sandbox at: /tmp/ten-sandbox-dc6f19421b224d05
+Cleaning up sandbox: /tmp/ten-sandbox-dc6f19421b224d05
+    correctly isolates builds in sandboxes [✔]
+Created sandbox at: /tmp/ten-sandbox-c4805cb03ea76129
+root:x:0:0::/root:/usr/bin/bash
+alpm:x:982:982:Arch Linux Package Management:/:/usr/bin/nologin
+bin:x:1:1::/:/usr/bin/nologin
+daemon:x:2:2::/:/usr/bin/nologin
+mail:x:8:12::/var/spool/mail:/usr/bin/nologin
+ftp:x:14:11::/srv/ftp:/usr/bin/nologin
+http:x:33:33::/srv/http:/usr/bin/nologin
+nobody:x:65534:65534:Kernel Overflow User:/:/usr/bin/nologin
+dbus:x:81:81:System Message Bus:/:/usr/bin/nologin
+git:x:981:981:git daemon user:/:/usr/bin/git-shell
+polkitd:x:102:102:User for polkitd:/:/usr/bin/nologin
+uuidd:x:980:980:UUID generator helper daemon:/var/lib/libuuid:/usr/bin/nologin
+enzo:x:1000:1000::/home/enzo:/bin/zsh
+ntp:x:87:87:Network Time Protocol:/var/lib/ntp:/bin/false
+avahi:x:979:979:Avahi mDNS/DNS-SD daemon:/:/usr/bin/nologin
+mpd:x:45:45::/var/lib/mpd:/usr/bin/nologin
+nixbld01:x:977:978:Nix builder 01:/:/usr/bin/nologin
+nixbld02:x:976:978:Nix builder 02:/:/usr/bin/nologin
+nixbld03:x:975:978:Nix builder 03:/:/usr/bin/nologin
+nixbld04:x:974:978:Nix builder 04:/:/usr/bin/nologin
+nixbld05:x:973:978:Nix builder 05:/:/usr/bin/nologin
+nixbld06:x:972:978:Nix builder 06:/:/usr/bin/nologin
+nixbld07:x:971:978:Nix builder 07:/:/usr/bin/nologin
+nixbld08:x:970:978:Nix builder 08:/:/usr/bin/nologin
+nixbld09:x:969:978:Nix builder 09:/:/usr/bin/nologin
+nixbld10:x:968:978:Nix builder 10:/:/usr/bin/nologin
+
+Cleaning up sandbox: /tmp/ten-sandbox-c4805cb03ea76129
+    prevents access to unauthorized paths [✔]
+  Dependency management
+    correctly builds dependency graphs [✔]
+    validates graph acyclicity [✔]
+  Garbage collection
+Adding to store: 2b268ce70e5dcf76b22f9d33999d604ae7e1c0150ff1e231863ff9c371187cb2-gc-test1.txt
+Adding to store: 3dbcfd07f5b23f44774a484a41e180d4ecc0c84f3aba95aefb4d7e90b3fbed65-gc-test2.txt
+Adding to store: b878e00a02356ddd6984ad1510ee1611366bb41f1c9a9a13a1b1f4cab0373ba7-gc-root.txt
+Added GC root: test-root -> b878e00a02356ddd6984ad1510ee1611366bb41f1c9a9a13a1b1f4cab0373ba7
+    correctly identifies and collects unreachable paths [✔]
+Adding to store: dcbc6ae6c4e36b146332d1d0c8e62349e3e662556b7b44a7675422b87eea40ee-gc-preserve.txt
+Added GC root: preserve-root -> dcbc6ae6c4e36b146332d1d0c8e62349e3e662556b7b44a7675422b87eea40ee
+    preserves reachable paths [✔]
+  C compilation example
+Adding to store: 02512903e85d7eb1f18f39e576ab4b2a93e0d65cc499e63c5bd450e5327aae12-hello.c
+Adding to store: 4d10567fa1351fc6a80aeaa040c824851fba09598d54c72b5b8c1adad59dd8c5-build-hello
+Instantiated derivation: hello
+Created sandbox at: /tmp/ten-sandbox-eb07d31361174cd1
+Builder permissions - executable: True
+Building in: /tmp/ten-sandbox-eb07d31361174cd1
+Building: hello
+Command: /tmp/ten-sandbox-eb07d31361174cd1/builder hello.c -o /tmp/ten-sandbox-eb07d31361174cd1/out/hello
+Build succeeded: hello
+Output directory contents: ["hello"]
+Checking for output: hello at /tmp/ten-sandbox-eb07d31361174cd1/out/hello (exists: True)
+Adding to store: 6fe8895db9d638e449c5f326584c95e6b80b1cf72681ca6d4f70da5629e6fa79-hello
+Cleaning up sandbox: /tmp/ten-sandbox-eb07d31361174cd1
+    successfully builds hello.c [✔]
+Instantiated derivation: hello
+Created sandbox at: /tmp/ten-sandbox-6bcfc57401a28b19
+Builder permissions - executable: True
+Building in: /tmp/ten-sandbox-6bcfc57401a28b19
+Building: hello
+Command: /tmp/ten-sandbox-6bcfc57401a28b19/builder hello.c -o /tmp/ten-sandbox-6bcfc57401a28b19/out/hello
+Build succeeded: hello
+Output directory contents: ["hello"]
+Checking for output: hello at /tmp/ten-sandbox-6bcfc57401a28b19/out/hello (exists: True)
+Cleaning up sandbox: /tmp/ten-sandbox-6bcfc57401a28b19
+    produces a verified executable output [✔]
+    fails gracefully with missing input [✔]
+Instantiated derivation: hello
+Created sandbox at: /tmp/ten-sandbox-3a239b25e8324c74
+Builder permissions - executable: True
+Building in: /tmp/ten-sandbox-3a239b25e8324c74
+Building: hello
+Command: /tmp/ten-sandbox-3a239b25e8324c74/builder hello.c -o /tmp/ten-sandbox-3a239b25e8324c74/out/hello
+Build succeeded: hello
+Output directory contents: ["hello"]
+Checking for output: hello at /tmp/ten-sandbox-3a239b25e8324c74/out/hello (exists: True)
+Cleaning up sandbox: /tmp/ten-sandbox-3a239b25e8324c74
+Instantiated derivation: hello
+Created sandbox at: /tmp/ten-sandbox-6e3df51e35c68062
+Builder permissions - executable: True
+Building in: /tmp/ten-sandbox-6e3df51e35c68062
+Building: hello
+Command: /tmp/ten-sandbox-6e3df51e35c68062/builder hello.c -o /tmp/ten-sandbox-6e3df51e35c68062/out/hello
+Build succeeded: hello
+Output directory contents: ["hello"]
+Checking for output: hello at /tmp/ten-sandbox-6e3df51e35c68062/out/hello (exists: True)
+Cleaning up sandbox: /tmp/ten-sandbox-6e3df51e35c68062
+    reproduces identical build results [✔]
+
+Finished in 0.2371 seconds
+22 examples, 0 failures
+Test suite ten-test: PASS
+Test suite logged to:
+/home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/t/ten-test/test/ten-0.1.0.0-ten-test.log
+1 of 1 test suites (1 of 1 test cases) passed.
