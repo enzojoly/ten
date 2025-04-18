@@ -7,13 +7,84 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
-module Ten.Core where
+module Ten.Core (
+    -- Core types
+    Phase(..),
+    TenM(..),
+    BuildEnv(..),
+    BuildState(..),
+    BuildError(..),
+    BuildId(..),
+    BuildStatus(..),
+    BuildStrategy(..),
+    RunMode(..),
+    DaemonConfig(..),
+    UserCredentials(..),
+    UserId(..),
+    AuthToken(..),
 
+    -- Return-Continuation types
+    PhaseTransition(..),
+    transitionPhase,
+
+    -- Store types
+    StorePath(..),
+    storePathToFilePath,
+
+    -- Core derivation types
+    Derivation(..),
+    DerivationInput(..),
+    DerivationOutput(..),
+    derivationEquals,
+    derivationPathsEqual,
+
+    -- Graph types
+    BuildGraph(..),
+
+    -- Proof system
+    Proof(..),
+    addProof,
+
+    -- Environment/state handling
+    initBuildEnv,
+    initClientEnv,
+    initDaemonEnv,
+    initBuildState,
+
+    -- Monad operations
+    runTen,
+    evalTen,
+    buildTen,
+    logMsg,
+    assertTen,
+
+    -- Type class constraints
+    EvalPhase(..),
+    BuildPhase(..),
+
+    -- Build chain handling
+    newBuildId,
+    setCurrentBuildId,
+    addToDerivationChain,
+    isInDerivationChain,
+
+    -- STM operations
+    atomicallyTen,
+
+    -- Daemon operations
+    withDaemon,
+    isDaemonMode,
+    isClientMode
+) where
+
+import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.Except
 import Control.Monad.State
+import Control.Monad.IO.Class
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Map.Strict (Map)
@@ -26,31 +97,80 @@ import System.Directory
 import System.FilePath
 import System.Process
 import System.Exit
+import Data.Unique (Unique, newUnique)
+import Network.Socket (Socket)
+import System.IO (Handle)
+import Data.Maybe (isJust)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
+    deriving (Show, Eq)
 
--- Add standalone deriving instances for Phase
-deriving instance Show Phase
-deriving instance Eq Phase
+-- | Build identifier type
+newtype BuildId = BuildId Unique
+    deriving (Eq, Ord)
+
+instance Show BuildId where
+    show (BuildId u) = "build-" ++ show u
 
 -- | Core error types
 data BuildError
-    = EvalError Text           -- Errors during evaluation phase
-    | BuildFailed Text         -- Errors during build phase
-    | StoreError Text          -- Errors interacting with the store
-    | SandboxError Text        -- Errors in sandbox creation/management
-    | InputNotFound FilePath   -- Input file missing
-    | HashError Text           -- Error computing hash
-    | GraphError Text          -- Error in dependency graph
-    | ResourceError Text       -- Error with system resources
+    = EvalError Text                     -- Errors during evaluation phase
+    | BuildFailed Text                   -- Errors during build phase
+    | StoreError Text                    -- Errors interacting with the store
+    | SandboxError Text                  -- Errors in sandbox creation/management
+    | InputNotFound FilePath             -- Input file missing
+    | HashError Text                     -- Error computing hash
+    | GraphError Text                    -- Error in dependency graph
+    | ResourceError Text                 -- Error with system resources
+    | DaemonError Text                   -- Errors in daemon communication
+    | AuthError Text                     -- Authentication/Authorization errors
+    | CyclicDependency Text              -- Cyclic dependency detected
+    | SerializationError Text            -- Error serializing/deserializing data
+    | RecursionLimit Text                -- Too many recursive derivations
+    | NetworkError Text                  -- Network-related errors
+    | ParseError Text                    -- Parsing errors
     deriving (Show, Eq)
 
 -- | Store path representing a content-addressed location
 data StorePath = StorePath
-    { storeHash :: Text      -- Hash part of the path
-    , storeName :: Text      -- Human-readable name component
+    { storeHash :: Text                  -- Hash part of the path
+    , storeName :: Text                  -- Human-readable name component
     } deriving (Show, Eq, Ord)
+
+-- | Input to a derivation
+data DerivationInput = DerivationInput
+    { inputPath :: StorePath             -- Path in the store
+    , inputName :: Text                  -- Name to expose this input as
+    } deriving (Show, Eq, Ord)
+
+-- | Expected output from a derivation
+data DerivationOutput = DerivationOutput
+    { outputName :: Text                 -- Name of the output
+    , outputPath :: StorePath            -- Where it will be stored
+    } deriving (Show, Eq, Ord)
+
+-- | A derivation is a pure description of a build
+data Derivation = Derivation
+    { derivName :: Text                      -- Human-readable name
+    , derivHash :: Text                      -- Deterministic hash of derivation
+    , derivBuilder :: StorePath              -- Path to the builder executable
+    , derivArgs :: [Text]                    -- Arguments to the builder
+    , derivInputs :: Set DerivationInput     -- Input dependencies
+    , derivOutputs :: Set DerivationOutput   -- Expected outputs
+    , derivEnv :: Map Text Text              -- Environment variables
+    , derivSystem :: Text                    -- Target system (e.g., "x86_64-linux")
+    , derivStrategy :: BuildStrategy         -- How to build this derivation
+    , derivMeta :: Map Text Text             -- Metadata for derivation
+    } deriving (Show, Eq)
+
+-- | Compare two derivations for equality
+derivationEquals :: Derivation -> Derivation -> Bool
+derivationEquals d1 d2 = derivHash d1 == derivHash d2
+
+-- | Compare StorePaths for equality
+derivationPathsEqual :: StorePath -> StorePath -> Bool
+derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == storeName p2
 
 -- | Proof of a property, parameterized by phase
 data Proof (p :: Phase) where
@@ -64,6 +184,10 @@ data Proof (p :: Phase) where
     BuildProof     :: Proof 'Build
     OutputProof    :: Proof 'Build
 
+    -- Proofs for Return-Continuation
+    ReturnProof    :: Proof 'Build
+    RecursionProof :: Proof 'Build
+
     -- Composite proofs
     ComposeProof   :: Proof p -> Proof p -> Proof p
 
@@ -71,20 +195,96 @@ data Proof (p :: Phase) where
 deriving instance Show (Proof p)
 deriving instance Eq (Proof p)
 
+-- | Phase transition type for Return-Continuation
+data PhaseTransition p q where
+    EvalToBuild :: PhaseTransition 'Eval 'Build
+    BuildToEval :: PhaseTransition 'Build 'Eval
+
+deriving instance Show (PhaseTransition p q)
+deriving instance Eq (PhaseTransition p q)
+
+-- | Daemon connection type
+data DaemonConnection = DaemonConnection
+    { daemonSocket :: Socket
+    , daemonUserId :: UserId
+    , daemonToken  :: AuthToken
+    }
+
+-- | User identifier
+newtype UserId = UserId Text
+    deriving (Show, Eq, Ord)
+
+-- | Authentication token
+newtype AuthToken = AuthToken Text
+    deriving (Show, Eq)
+
+-- | Running mode for Ten
+data RunMode
+    = StandaloneMode                     -- Direct execution without daemon
+    | ClientMode DaemonConnection        -- Connect to existing daemon
+    | DaemonMode                         -- Running as daemon process
+    deriving (Show, Eq)
+
+-- | Build status for tracking builds
+data BuildStatus
+    = BuildPending
+    | BuildRunning Float                 -- Progress percentage (0.0-1.0)
+    | BuildRecursing BuildId             -- Switched to a new derivation
+    | BuildCompleted
+    | BuildFailed'
+    deriving (Show, Eq)
+
+-- | Build strategy
+data BuildStrategy
+    = ApplicativeStrategy                -- Static dependencies, can parallelize
+    | MonadicStrategy                    -- Dynamic dependencies or Return-Continuation
+    deriving (Show, Eq)
+
+-- | Daemon configuration
+data DaemonConfig = DaemonConfig
+    { daemonSocketPath :: FilePath       -- Path to daemon socket
+    , daemonStorePath :: FilePath        -- Path to store
+    , daemonStateFile :: FilePath        -- Path to state file
+    , daemonLogLevel :: Int              -- Log verbosity level
+    , daemonGcInterval :: Maybe Int      -- Garbage collection interval in seconds
+    , daemonUser :: Maybe Text           -- User to run as
+    , daemonAllowedUsers :: Set Text     -- Users allowed to connect
+    } deriving (Show, Eq)
+
+-- | User credentials for daemon authentication
+data UserCredentials = UserCredentials
+    { username :: Text
+    , token :: Text
+    } deriving (Show, Eq)
+
+-- | Build graph for dependency tracking
+data BuildGraph = BuildGraph
+    { graphNodes :: Map Text Derivation      -- Map of derivation hash to derivation
+    , graphEdges :: Map Text (Set Text)      -- Map of node hash to dependency hashes
+    , graphRoots :: Set Text                 -- Root nodes (outputs requested)
+    } deriving (Show, Eq)
+
 -- | Environment for build operations
 data BuildEnv = BuildEnv
-    { workDir :: FilePath       -- Temporary build directory
-    , storePath :: FilePath     -- Root of content-addressed store
-    , verbosity :: Int          -- Logging verbosity level
-    , allowedPaths :: Set FilePath -- Paths accessible during build
+    { workDir :: FilePath                -- Temporary build directory
+    , storePath :: FilePath              -- Root of content-addressed store
+    , verbosity :: Int                   -- Logging verbosity level
+    , allowedPaths :: Set FilePath       -- Paths accessible during build
+    , runMode :: RunMode                 -- Current running mode
+    , userName :: Maybe Text             -- Current user name (for daemon mode)
+    , buildStrategy :: BuildStrategy     -- How to build derivations
+    , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
     } deriving (Show, Eq)
 
 -- | State carried through build operations
 data BuildState = BuildState
-    { currentPhase :: Phase       -- Current execution phase
-    , buildProofs :: [Proof 'Build] -- Accumulated proofs
-    , buildInputs :: Set StorePath  -- Input paths for current build
-    , buildOutputs :: Set StorePath -- Output paths for current build
+    { currentPhase :: Phase              -- Current execution phase
+    , buildProofs :: [Proof 'Build]      -- Accumulated proofs
+    , buildInputs :: Set StorePath       -- Input paths for current build
+    , buildOutputs :: Set StorePath      -- Output paths for current build
+    , currentBuildId :: Maybe BuildId    -- Current build identifier
+    , buildChain :: [Derivation]         -- Chain of return-continuation derivations
+    , recursionDepth :: Int              -- Tracks recursion depth for cycles
     } deriving (Show)
 
 -- | The core monad for all Ten operations
@@ -107,6 +307,23 @@ initBuildEnv wd sp = BuildEnv
     , storePath = sp
     , verbosity = 1
     , allowedPaths = Set.empty
+    , runMode = StandaloneMode
+    , userName = Nothing
+    , buildStrategy = MonadicStrategy
+    , maxRecursionDepth = 100
+    }
+
+-- | Initialize client build environment
+initClientEnv :: FilePath -> FilePath -> DaemonConnection -> BuildEnv
+initClientEnv wd sp conn = (initBuildEnv wd sp)
+    { runMode = ClientMode conn
+    }
+
+-- | Initialize daemon build environment
+initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
+initDaemonEnv wd sp user = (initBuildEnv wd sp)
+    { runMode = DaemonMode
+    , userName = user
     }
 
 -- | Initialize build state for a given phase
@@ -116,6 +333,9 @@ initBuildState phase = BuildState
     , buildProofs = []
     , buildInputs = Set.empty
     , buildOutputs = Set.empty
+    , currentBuildId = Nothing
+    , buildChain = []
+    , recursionDepth = 0
     }
 
 -- | Execute a Ten monad in the given environment and state
@@ -134,6 +354,58 @@ buildTen m env = runTen m env (initBuildState Build)
 storePathToFilePath :: StorePath -> BuildEnv -> FilePath
 storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
 
+-- | Safely transition between phases
+transitionPhase :: PhaseTransition p q -> TenM p a -> TenM q a
+transitionPhase trans action =
+    case trans of
+        EvalToBuild -> TenM $ do
+            env <- ask
+            state <- get
+            -- Run action in eval phase
+            liftIO $ do
+                result <- runTen action env state
+                case result of
+                    Left err -> return $ Left err
+                    Right (val, newState) -> do
+                        -- Transition to build phase
+                        let buildState = newState { currentPhase = Build }
+                        return $ Right (val, buildState)
+        BuildToEval -> TenM $ do
+            env <- ask
+            state <- get
+            -- Run action in build phase
+            liftIO $ do
+                result <- runTen action env state
+                case result of
+                    Left err -> return $ Left err
+                    Right (val, newState) -> do
+                        -- Transition to eval phase
+                        let evalState = newState { currentPhase = Eval }
+                        return $ Right (val, evalState)
+
+-- | Generate a new unique build ID
+newBuildId :: TenM p BuildId
+newBuildId = liftIO $ BuildId <$> newUnique
+
+-- | Set the current build ID
+setCurrentBuildId :: BuildId -> TenM p ()
+setCurrentBuildId bid = modify $ \s -> s { currentBuildId = Just bid }
+
+-- | Add a derivation to the build chain
+addToDerivationChain :: Derivation -> TenM p ()
+addToDerivationChain drv = do
+    depth <- gets recursionDepth
+    maxDepth <- asks maxRecursionDepth
+    when (depth >= maxDepth) $
+        throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show maxDepth)
+    modify $ \s -> s { buildChain = drv : buildChain s, recursionDepth = depth + 1 }
+
+-- | Check if a derivation is in the build chain (cycle detection)
+isInDerivationChain :: Derivation -> TenM p Bool
+isInDerivationChain drv = do
+    chain <- gets buildChain
+    return $ any (derivationEquals drv) chain
+
 -- | Logging function
 logMsg :: Int -> Text -> TenM p ()
 logMsg level msg = do
@@ -145,6 +417,8 @@ addProof :: Proof p -> TenM p ()
 addProof proof = modify $ \s ->
     case proof of
         p@(BuildProof {}) -> s { buildProofs = p : buildProofs s }
+        p@(ReturnProof {}) -> s { buildProofs = p : buildProofs s }
+        p@(RecursionProof {}) -> s { buildProofs = p : buildProofs s }
         _ -> s  -- Only track build proofs in state for now
 
 -- | Assert that a condition holds, or throw an error
@@ -166,3 +440,31 @@ class BuildPhase (p :: Phase) where
 -- Only actual build phase can run build operations
 instance BuildPhase 'Build where
     buildOnly = id
+
+-- | Run an STM transaction from Ten monad
+atomicallyTen :: STM a -> TenM p a
+atomicallyTen = liftIO . atomically
+
+-- | Execute a build operation using the daemon (if in client mode)
+withDaemon :: (DaemonConnection -> IO (Either BuildError a)) -> TenM p a
+withDaemon f = do
+    mode <- asks runMode
+    case mode of
+        ClientMode conn -> do
+            result <- liftIO $ f conn
+            case result of
+                Left err -> throwError err
+                Right val -> return val
+        _ -> throwError $ DaemonError "Operation requires daemon connection"
+
+-- | Check if running in daemon mode
+isDaemonMode :: TenM p Bool
+isDaemonMode = (== DaemonMode) <$> asks runMode
+
+-- | Check if connected to daemon
+isClientMode :: TenM p Bool
+isClientMode = do
+    mode <- asks runMode
+    case mode of
+        ClientMode _ -> return True
+        _ -> return False
