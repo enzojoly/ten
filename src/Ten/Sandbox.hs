@@ -33,7 +33,7 @@ module Ten.Sandbox (
     prepareSandboxEnvironment,
 
     -- Privilege management
-    dropPrivileges,
+    dropSandboxPrivileges,
     regainPrivileges,
     withDroppedPrivileges,
     runBuilderAsUser
@@ -41,9 +41,10 @@ module Ten.Sandbox (
 
 import Control.Monad
 import Control.Monad.Reader (ask)
-import Control.Monad.State (get)
-import Control.Monad.Except (throwError)
+import Control.Monad.State (get, gets)
+import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
+import Data.List (isPrefixOf)
 import Control.Exception (bracket, try, tryJust, throwIO, catch, finally, SomeException, IOException)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -58,7 +59,7 @@ import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
-import System.Posix.Types (ProcessID)
+import System.Posix.Types (ProcessID, UserID, GroupID)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO
@@ -72,6 +73,12 @@ import System.IO (hPutStrLn, stderr, hClose)
 
 import Ten.Core
 import qualified Ten.Store as Store
+
+-- Custom RLimit structure for FFI compatibility since System.Posix.Resource doesn't export it
+data RLimit = RLimit
+    { rlim_cur :: CULong  -- Current limit (soft limit)
+    , rlim_max :: CULong  -- Maximum limit (hard limit)
+    }
 
 -- Foreign function imports for Linux-specific system calls
 
@@ -105,10 +112,10 @@ foreign import ccall unsafe "sys/capability.h cap_free"
 
 -- Process resource limits
 foreign import ccall unsafe "resource.h getrlimit"
-    c_getrlimit :: CInt -> Ptr Resource.RLimit -> IO CInt
+    c_getrlimit :: CInt -> Ptr RLimit -> IO CInt
 
 foreign import ccall unsafe "resource.h setrlimit"
-    c_setrlimit :: CInt -> Ptr Resource.RLimit -> IO CInt
+    c_setrlimit :: CInt -> Ptr RLimit -> IO CInt
 
 -- Chroot operation
 foreign import ccall unsafe "unistd.h chroot"
@@ -740,8 +747,8 @@ prepareSandboxEnvironment env sandboxDir extraEnv =
         ]
 
 -- | Drop privileges to run as unprivileged user
-dropPrivileges :: String -> String -> IO ()
-dropPrivileges userName groupName = do
+dropSandboxPrivileges :: String -> String -> IO ()
+dropSandboxPrivileges userName groupName = do
     -- Get the current (effective) user ID
     euid <- User.getEffectiveUserID
 
@@ -774,17 +781,17 @@ dropPrivileges userName groupName = do
         -- This is a simplified version - a full implementation would use libcap
         hPutStrLn stderr "Dropping capabilities"
 
-    -- Set restrictive resource limits for the unprivileged user
-    setResourceLimits :: IO ()
-    setResourceLimits = do
-        -- Set core dump limit to 0
-        Resource.setResourceLimit Resource.ResourceCoreFileSize (Resource.ResourceLimit 0)
+-- Set restrictive resource limits for the unprivileged user
+setResourceLimits :: IO ()
+setResourceLimits = do
+    -- Set core dump limit to 0
+    Resource.setResourceLimit Resource.ResourceCoreFileSize (Resource.ResourceLimits 0 0)
 
-        -- Set a reasonable file size limit (1GB)
-        Resource.setResourceLimit Resource.ResourceFileSize (Resource.ResourceLimit (1024*1024*1024))
+    -- Set a reasonable file size limit (1GB)
+    Resource.setResourceLimit Resource.ResourceFileSize (Resource.ResourceLimits (1024*1024*1024) (1024*1024*1024))
 
-        -- Set reasonable number of open files
-        Resource.setResourceLimit Resource.ResourceOpenFiles (Resource.ResourceLimit 1024)
+    -- Set reasonable number of open files
+    Resource.setResourceLimit Resource.ResourceOpenFiles (Resource.ResourceLimits 1024 1024)
 
 -- | Regain privileges (back to root)
 regainPrivileges :: IO ()
@@ -818,14 +825,14 @@ withDroppedPrivileges user group action =
                     egid <- User.getEffectiveGroupID
 
                     -- Drop privileges
-                    dropPrivileges user group
+                    dropSandboxPrivileges user group
 
                     -- Return the original IDs for restoration
                     return $ Just (euid, egid)
                 else
                     -- Not running as root, nothing to do
                     return Nothing)
-        (\case
+ (\case
             Just (euid, egid) -> do
                 -- Restore original privileges
                 -- If we can't, just log a warning
@@ -833,7 +840,7 @@ withDroppedPrivileges user group action =
                     User.setEffectiveGroupID egid
                     User.setEffectiveUserID euid) :: IO (Either SomeException ())
             Nothing ->
-                return ())
+                return (Right ()) :: IO (Either SomeException ()))
         (\_ -> action)
 
 -- | Run a builder process as an unprivileged user
@@ -864,7 +871,7 @@ runBuilderAsUser program args user group env = do
         readCreateProcessWithExitCode process ""
 
 -- | Helper to set ownership of a file or directory
-setOwnerAndGroup :: FilePath -> User.UserID -> User.GroupID -> IO ()
+setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
 setOwnerAndGroup path uid gid = do
     -- Check if path exists
     exists <- doesPathExist path

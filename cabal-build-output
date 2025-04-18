@@ -1,0 +1,52 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[ 6 of 17] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o )
+
+src/Ten/Sandbox.hs:394:17: error: [GHC-83865]
+    • Couldn't match type ‘TenM p0’ with ‘IO’
+      Expected: IO ()
+        Actual: TenM p0 ()
+    • In a stmt of a 'do' block:
+        logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
+      In the second argument of ‘($)’, namely
+        ‘do unmountAllBindMounts sandboxDir
+            logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath’
+      In a stmt of a 'do' block:
+        liftIO
+          $ do unmountAllBindMounts sandboxDir
+               logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
+    |
+394 |                 logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:566:56: error: [GHC-83865]
+    • Couldn't match type ‘Text’ with ‘[Char]’
+      Expected: String
+        Actual: Text
+    • In the first argument of ‘T.pack’, namely ‘(storeHash input)’
+      In the first argument of ‘(<>)’, namely ‘T.pack (storeHash input)’
+      In the second argument of ‘(<>)’, namely
+        ‘T.pack (storeHash input) <> "-" <> T.pack (storeName input)’
+    |
+566 |         logMsg 3 $ "Made input available: " <> T.pack (storeHash input) <> "-" <> T.pack (storeName input)
+    |                                                        ^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:566:91: error: [GHC-83865]
+    • Couldn't match type ‘Text’ with ‘[Char]’
+      Expected: String
+        Actual: Text
+    • In the first argument of ‘T.pack’, namely ‘(storeName input)’
+      In the second argument of ‘(<>)’, namely ‘T.pack (storeName input)’
+      In the second argument of ‘(<>)’, namely
+        ‘"-" <> T.pack (storeName input)’
+    |
+566 |         logMsg 3 $ "Made input available: " <> T.pack (storeHash input) <> "-" <> T.pack (storeName input)
+    |                                                                                           ^^^^^^^^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+

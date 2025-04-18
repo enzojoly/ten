@@ -113,7 +113,7 @@ import System.Posix.User (getUserEntryForName, getGroupEntryForName,
                          userID, groupID)
 import System.Posix.Types (UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
-import Control.Exception (bracket, try, SomeException)
+import Control.Exception (bracket, try, SomeException, Exception)
 import System.Environment (lookupEnv)
 import System.Posix.Types (ProcessID)
 
@@ -146,6 +146,8 @@ data BuildError
     | NetworkError Text                  -- Network-related errors
     | ParseError Text                    -- Parsing errors
     deriving (Show, Eq)
+
+instance Exception BuildError
 
 -- | Store path representing a content-addressed location
 data StorePath = StorePath
