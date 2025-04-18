@@ -92,6 +92,7 @@ import System.FilePath (takeDirectory)
 import System.IO (withFile, IOMode(..), hClose, stderr, hPutStrLn)
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.Files (setFileMode)
+import System.Posix.Types (UserID, GroupID)
 import System.Posix.User (
     getUserEntryForName, getGroupEntryForName,
     getAllGroupEntries, getAllUserEntries,
@@ -369,10 +370,20 @@ tokenExpired TokenInfo{..} = do
 -- | Get information about a system user
 getSystemUserInfo :: Text -> IO (Maybe UserEntry)
 getSystemUserInfo username = do
-    result <- try $ getUserEntryForName (T.unpack username)
-    case result of
+    -- First get the user entry
+    userResult <- try $ getUserEntryForName (T.unpack username)
+    case userResult of
         Left (_ :: SomeException) -> return Nothing
-        Right entry -> return $ Just (userID entry, userName entry, groupID entry)
+        Right userEntry -> do
+            -- Then get the primary group for this user
+            let groupName = userName userEntry  -- Simplified: using username as group name
+            groupResult <- try $ getGroupEntryForName groupName
+            case groupResult of
+                Left (_ :: SomeException) ->
+                    -- Fallback to a default group if needed
+                    return $ Just (userID userEntry, userName userEntry, 0)
+                Right groupEntry ->
+                    return $ Just (userID userEntry, userName userEntry, groupID groupEntry)
 
 -- | Check if a system user exists
 systemUserExists :: Text -> IO Bool
@@ -420,7 +431,7 @@ loadAuthFile path = do
             -- Load the database from file
             content <- BS.readFile path
             case Aeson.eitherDecodeStrict content of
-                Left err -> throwIO $ AuthError $ "Failed to parse auth file: " <> T.pack err
+                Left err -> throwIO $ AuthFileError $ "Failed to parse auth file: " <> T.pack err
                 Right db -> return db
 
 -- | Save the authentication database
@@ -465,7 +476,7 @@ authenticateUser config db username password clientInfo = do
                 then do
                     -- Create a new user based on the system user
                     createUserFromSystem db username clientInfo
-                else throwIO $ AuthError InvalidCredentials
+                else throwIO InvalidCredentials
 
     -- Authenticate the user
     now <- getCurrentTime
@@ -476,8 +487,8 @@ authenticateUser config db username password clientInfo = do
             sysUser <- case uiSystemUser user of
                 Just sysName -> do
                     exists <- systemUserExists sysName
-                    if exists then return sysName else throwIO $ AuthError InvalidCredentials
-                Nothing -> throwIO $ AuthError InvalidCredentials
+                    if exists then return sysName else throwIO InvalidCredentials
+                Nothing -> throwIO InvalidCredentials
 
             -- Create a token with appropriate permissions
             tokenInfo <- createToken user clientInfo (Just 86400)  -- 24 hour token
@@ -498,7 +509,7 @@ authenticateUser config db username password clientInfo = do
         -- If a password is set, validate it
         Just passwordHash -> do
             unless (verifyPassword password passwordHash) $
-                throwIO $ AuthError InvalidCredentials
+                throwIO InvalidCredentials
 
             -- Create a token with appropriate permissions
             tokenInfo <- createToken user clientInfo (Just 86400)  -- 24 hour token
@@ -569,20 +580,20 @@ refreshToken :: AuthDb -> AuthToken -> IO (AuthDb, AuthToken)
 refreshToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
-        Nothing -> throwIO $ AuthError TokenNotFound
+        Nothing -> throwIO TokenNotFound
         Just username -> do
             -- Check if the user exists
             case Map.lookup username (adUsers db) of
-                Nothing -> throwIO $ AuthError UserNotFound
+                Nothing -> throwIO UserNotFound
                 Just user -> do
                     -- Check if the token exists for this user
                     case Map.lookup token (uiTokens user) of
-                        Nothing -> throwIO $ AuthError TokenNotFound
+                        Nothing -> throwIO TokenNotFound
                         Just tokenInfo -> do
                             -- Check if the token has expired
                             expired <- tokenExpired tokenInfo
                             if expired
-                                then throwIO $ AuthError TokenExpired
+                                then throwIO TokenExpired
                                 else do
                                     -- Create a new token with the same permissions and expiry
                                     now <- getCurrentTime
@@ -652,7 +663,7 @@ listUserTokens :: AuthDb -> Text -> IO [TokenInfo]
 listUserTokens db username = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
-        Nothing -> throwIO $ AuthError UserNotFound
+        Nothing -> throwIO UserNotFound
         Just user -> return $ Map.elems (uiTokens user)
 
 -- | Get user information
@@ -660,7 +671,7 @@ getUserInfo :: AuthDb -> Text -> IO UserInfo
 getUserInfo db username = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
-        Nothing -> throwIO $ AuthError UserNotFound
+        Nothing -> throwIO UserNotFound
         Just user -> return user
 
 -- | Add a new user
@@ -725,7 +736,7 @@ changeUserPassword :: AuthDb -> Text -> Text -> IO AuthDb
 changeUserPassword db username newPassword = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
-        Nothing -> throwIO $ AuthError UserNotFound
+        Nothing -> throwIO UserNotFound
         Just user -> do
             -- Hash the new password
             passwordHash <- hashPassword newPassword
