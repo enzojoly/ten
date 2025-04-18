@@ -93,15 +93,18 @@ import System.IO (withFile, IOMode(..), hClose, stderr, hPutStrLn)
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.Files (setFileMode)
 import System.Posix.User (
-    UserEntry(..), GroupEntry(..),
     getUserEntryForName, getGroupEntryForName,
     getAllGroupEntries, getAllUserEntries,
     getRealUserID, getEffectiveUserID,
-    getUserEntryForID)
+    getUserEntryForID, userID, groupID,
+    userName, homeDirectory)
 import System.Random (randomIO, randomRIO)
 
 -- Import Ten modules
 import Ten.Core (UserId(..), AuthToken(..), BuildError(..))
+
+-- Type alias for UserEntry since we can't import the constructor directly
+type UserEntry = (UserID, String, GroupID)
 
 -- | Authentication errors
 data AuthError
@@ -369,7 +372,7 @@ getSystemUserInfo username = do
     result <- try $ getUserEntryForName (T.unpack username)
     case result of
         Left (_ :: SomeException) -> return Nothing
-        Right entry -> return $ Just entry
+        Right entry -> return $ Just (userID entry, userName entry, groupID entry)
 
 -- | Check if a system user exists
 systemUserExists :: Text -> IO Bool
@@ -523,7 +526,7 @@ createUserFromSystem db username clientInfo = do
     sysUserEntry <- getSystemUserInfo username
     case sysUserEntry of
         Nothing -> throwIO $ AuthError $ "System user not found: " <> username
-        Just entry -> do
+        Just (uid, name, _) -> do
             now <- getCurrentTime
             let userId = UserId $ "sys_" <> username
 
