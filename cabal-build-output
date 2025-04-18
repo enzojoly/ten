@@ -1,0 +1,77 @@
+Resolving dependencies...
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Configuring library for ten-0.1.0.0...
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+
+<no location info>: warning: [GHC-32850] [-Wmissing-home-modules]
+    These modules are needed for compilation but not listed in your .cabal file's other-modules for ‘ten-0.1.0.0-inplace’ :
+        Ten.Daemon.Auth
+        Ten.Daemon.Client
+        Ten.Daemon.Config
+        Ten.Daemon.Core
+        Ten.Daemon.Protocol
+        Ten.Daemon.Server
+        Ten.Daemon.State
+[ 1 of 17] Compiling Ten.Core         ( src/Ten/Core.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Core.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Core.dyn_o )
+
+src/Ten/Core.hs:82:1: error: [GHC-87110]
+    Could not load module ‘Control.Concurrent.STM’.
+    It is a member of the hidden package ‘stm-2.5.2.1’.
+    Perhaps you need to add ‘stm’ to the build-depends in your .cabal file.
+    Use -v to see a list of the files searched for.
+   |
+82 | import Control.Concurrent.STM
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:101:1: error: [GHC-87110]
+    Could not find module ‘Network.Socket’.
+    Use -v to see a list of the files searched for.
+    |
+101 | import Network.Socket (Socket)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[ 4 of 17] Compiling Ten.Hash         ( src/Ten/Hash.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Hash.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Hash.dyn_o )
+
+src/Ten/Hash.hs:29:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Crypto.Hash.Algorithms’ is redundant
+      except perhaps to import instances from ‘Crypto.Hash.Algorithms’
+    To import instances alone, use: import Crypto.Hash.Algorithms()
+   |
+29 | import qualified Crypto.Hash.Algorithms as Crypto
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:32:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString.Char8’ is redundant
+      except perhaps to import instances from ‘Data.ByteString.Char8’
+    To import instances alone, use: import Data.ByteString.Char8()
+   |
+32 | import qualified Data.ByteString.Char8 as BS8
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:37:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.List’ is redundant
+      except perhaps to import instances from ‘Data.List’
+    To import instances alone, use: import Data.List()
+   |
+37 | import Data.List (intercalate)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:43:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Monad.IO.Class’ is redundant
+      except perhaps to import instances from ‘Control.Monad.IO.Class’
+    To import instances alone, use: import Control.Monad.IO.Class()
+   |
+43 | import Control.Monad.IO.Class (liftIO)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:120:1: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: ‘hashFileIO’
+    |
+120 | hashFileIO path = do
+    | ^^^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten from ten-0.1.0.0).
+

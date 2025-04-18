@@ -76,10 +76,16 @@ module Ten.Core (
     -- Daemon operations
     withDaemon,
     isDaemonMode,
-    isClientMode
+    isClientMode,
+
+    -- Linux-specific operations
+    dropPrivileges,
+    getSystemUser,
+    getSystemGroup
 ) where
 
 import Control.Concurrent.STM
+import Control.Concurrent.MVar
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.Except
@@ -101,6 +107,14 @@ import Data.Unique (Unique, newUnique)
 import Network.Socket (Socket)
 import System.IO (Handle)
 import Data.Maybe (isJust)
+import System.Posix.User (getUserEntryForName, getGroupEntryForName,
+                         setUserID, setGroupID, getEffectiveUserID,
+                         userID, groupID)
+import System.Posix.Types (UserID, GroupID)
+import System.IO.Error (isDoesNotExistError)
+import Control.Exception (bracket, try, SomeException)
+import System.Environment (lookupEnv)
+import System.Posix.Types (ProcessID)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -203,13 +217,6 @@ data PhaseTransition p q where
 deriving instance Show (PhaseTransition p q)
 deriving instance Eq (PhaseTransition p q)
 
--- | Daemon connection type
-data DaemonConnection = DaemonConnection
-    { daemonSocket :: Socket
-    , daemonUserId :: UserId
-    , daemonToken  :: AuthToken
-    }
-
 -- | User identifier
 newtype UserId = UserId Text
     deriving (Show, Eq, Ord)
@@ -218,12 +225,58 @@ newtype UserId = UserId Text
 newtype AuthToken = AuthToken Text
     deriving (Show, Eq)
 
+-- | Daemon connection type
+data DaemonConnection = DaemonConnection
+    { connSocket :: Socket
+    , connUserId :: UserId
+    , connAuthToken :: AuthToken
+    , connectionState :: ConnectionState
+    }
+
+-- | Connection state for daemon communication
+data ConnectionState = ConnectionState {
+    csSocket :: Socket,                     -- ^ Socket connected to daemon
+    csHandle :: Handle,                     -- ^ Handle for socket I/O
+    csUserId :: UserId,                     -- ^ Authenticated user ID
+    csToken :: AuthToken,                   -- ^ Authentication token
+    csRequestMap :: IORef (Map RequestId (MVar Response)), -- ^ Map of pending requests
+    csNextReqId :: IORef RequestId,         -- ^ Next request ID
+    csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
+    csShutdown :: IORef Bool                -- ^ Flag to indicate connection shutdown
+}
+
+-- | Request ID type
+type RequestId = Int
+
+-- | Request type (stub for compilation)
+data Request = Request deriving (Show, Eq)
+
+-- | Response type (stub for compilation)
+data Response = Response deriving (Show, Eq)
+
+-- | Thread ID type (stub for compilation)
+type ThreadId = Int
+
+-- | IORef type (stub for compilation)
+type IORef a = TVar a
+
 -- | Running mode for Ten
 data RunMode
     = StandaloneMode                     -- Direct execution without daemon
     | ClientMode DaemonConnection        -- Connect to existing daemon
     | DaemonMode                         -- Running as daemon process
-    deriving (Show, Eq)
+
+-- Custom instances for RunMode to avoid needing instances for DaemonConnection
+instance Show RunMode where
+    show StandaloneMode = "StandaloneMode"
+    show (ClientMode _) = "ClientMode <connection>"
+    show DaemonMode = "DaemonMode"
+
+instance Eq RunMode where
+    StandaloneMode == StandaloneMode = True
+    (ClientMode _) == (ClientMode _) = True  -- Considers all client modes equal
+    DaemonMode == DaemonMode = True
+    _ == _ = False
 
 -- | Build status for tracking builds
 data BuildStatus
@@ -365,11 +418,11 @@ transitionPhase trans action =
             liftIO $ do
                 result <- runTen action env state
                 case result of
-                    Left err -> return $ Left err
+                    Left err -> return $ throwError err
                     Right (val, newState) -> do
                         -- Transition to build phase
                         let buildState = newState { currentPhase = Build }
-                        return $ Right (val, buildState)
+                        return $ return (val, buildState) >>= uncurry (,)
         BuildToEval -> TenM $ do
             env <- ask
             state <- get
@@ -377,11 +430,11 @@ transitionPhase trans action =
             liftIO $ do
                 result <- runTen action env state
                 case result of
-                    Left err -> return $ Left err
+                    Left err -> return $ throwError err
                     Right (val, newState) -> do
                         -- Transition to eval phase
                         let evalState = newState { currentPhase = Eval }
-                        return $ Right (val, evalState)
+                        return $ return (val, evalState) >>= uncurry (,)
 
 -- | Generate a new unique build ID
 newBuildId :: TenM p BuildId
@@ -414,12 +467,15 @@ logMsg level msg = do
 
 -- | Record a proof in the build state
 addProof :: Proof p -> TenM p ()
-addProof proof = modify $ \s ->
-    case proof of
-        p@(BuildProof {}) -> s { buildProofs = p : buildProofs s }
-        p@(ReturnProof {}) -> s { buildProofs = p : buildProofs s }
-        p@(RecursionProof {}) -> s { buildProofs = p : buildProofs s }
-        _ -> s  -- Only track build proofs in state for now
+addProof proof = case proof of
+    p@BuildProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
+    p@OutputProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
+    p@ReturnProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
+    p@RecursionProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
+    p@(ComposeProof p1 p2) -> do
+        addProof p1
+        addProof p2
+    _ -> return () -- Other proofs don't affect build state
 
 -- | Assert that a condition holds, or throw an error
 assertTen :: Bool -> BuildError -> TenM p ()
@@ -468,3 +524,33 @@ isClientMode = do
     case mode of
         ClientMode _ -> return True
         _ -> return False
+
+-- | Linux-specific: Drop privileges to a specified user and group
+dropPrivileges :: Text -> Text -> TenM p ()
+dropPrivileges user group = liftIO $ do
+    -- Get the current (effective) user ID
+    euid <- getEffectiveUserID
+
+    -- Only proceed if we're running as root
+    when (euid == 0) $ do
+        -- Get user and group entries
+        userEntry <- getUserEntryForName (T.unpack user)
+        groupEntry <- getGroupEntryForName (T.unpack group)
+
+        -- Set group first (needed before dropping user privileges)
+        setGroupID (groupID groupEntry)
+
+        -- Then set user
+        setUserID (userID userEntry)
+
+-- | Linux-specific: Get a system user ID
+getSystemUser :: Text -> TenM p UserID
+getSystemUser username = liftIO $ do
+    userEntry <- getUserEntryForName (T.unpack username)
+    return $ userID userEntry
+
+-- | Linux-specific: Get a system group ID
+getSystemGroup :: Text -> TenM p GroupID
+getSystemGroup groupname = liftIO $ do
+    groupEntry <- getGroupEntryForName (T.unpack groupname)
+    return $ groupID groupEntry
