@@ -103,3 +103,109 @@
   * Demonstrated type-level phase separation works correctly
   * Validated content-addressable storage functionality
   * Confirmed proper isolation of build environments
+
+## 0.1.6.0 -- 2025-04-18
+
+### New Daemon Architecture
+
+* Added a dedicated daemon process (`ten-daemon`) for background operation
+* Implemented client-server architecture with socket-based communication
+* Seamless integration between standalone and daemon operation modes
+* Added support for Unix domain sockets with future TCP socket capability
+* Created proper daemonisation with robust process management
+
+### Authentication and Security
+
+* Comprehensive user authentication system with token-based auth
+* Permission system with five levels (none, basic, standard, advanced, admin)
+* Specific permission controls for different operations (build, GC, etc.)
+* System user integration for simplified authentication
+* Token management with creation, verification, and expiration handling
+* Privilege dropping when running as root for enhanced security
+* Configurable access control for daemon connections
+
+### Daemon Communication Protocol
+
+* Well-defined binary protocol with proper message framing
+* Protocol versioning for forward compatibility
+* Comprehensive request and response types for all operations
+* Proper error handling and status reporting
+* Efficient serialisation and deserialisation of messages
+
+### Configuration System
+
+* Multiple configuration sources (file, environment, command-line)
+* XDG-compliant configuration paths for user environments
+* System-wide configuration for daemon installations
+* Extensive configuration options for all daemon aspects
+* Proper validation of configuration values
+
+### State Management
+
+* Persistent daemon state with journal and recovery
+* Build tracking and queuing system for high load situations
+* Advanced path locking for concurrent store access
+* Coordinated garbage collection with locking
+* Reachability tracking for store paths
+
+### Build Improvements
+
+* Parallel builds with dependency tracking
+* Build status monitoring and reporting
+* Build cancellation support
+* Return-continuation support for multi-stage builds
+* Resource usage tracking and limits
+
+### Command-line Integration
+
+* New daemon subcommands in the main CLI:
+  * `start` - Start the daemon process
+  * `stop` - Stop the daemon process
+  * `restart` - Restart the daemon process
+  * `status` - Check daemon status
+  * `config` - Show/edit daemon configuration
+* Seamless fallback to standalone mode when daemon unavailable
+* Automatic daemon starting when needed
+
+### Background Services
+
+* Periodic garbage collection with configurable intervals
+* State persistence for crash recovery
+* Maintenance tasks for store optimisation
+* Build queue management and scheduling
+
+### Store Enhancements
+
+* Concurrent store access with proper locking
+* Advanced garbage collection coordination
+* Path reachability tracking
+* Store integrity verification and repair
+* Enhanced store query capabilities
+
+### Improved Logging
+
+* Configurable log levels (quiet, normal, verbose, debug)
+* Log file rotation and management
+* Structured logging for machine consumption
+* Build-specific log capture and retrieval
+
+### System Integration
+
+* Proper signal handling (SIGTERM, SIGHUP, SIGUSR1)
+* PID file management for system monitoring
+* Resource usage reporting
+* System user integration
+
+### Performance Improvements
+
+* Background worker threads for non-blocking operations
+* Connection pooling for client requests
+* Efficient resource utilisation
+* Memory usage optimisation for large builds
+
+### Documentation
+
+* Extensive daemon configuration documentation
+* Command-line help for all daemon operations
+* Protocol specification for client implementations
+* Security considerations and best practices
