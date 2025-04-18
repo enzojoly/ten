@@ -30,6 +30,8 @@ module Ten.Daemon.Auth (
     permissionToText,
     textToPermission,
     permissionLevelToText,
+    textToPermissionLevel,
+    defaultPermissions,
 
     -- System user integration
     getSystemUserInfo,
@@ -48,19 +50,22 @@ module Ten.Daemon.Auth (
     loadAuthFile,
     saveAuthFile,
     migrateAuthFile,
+    AuthDb(..),
+    UserInfo(..),
+    PasswordHash(..),
 
     -- Authentication errors
     AuthError(..)
 ) where
 
-import Control.Concurrent.MVar
-import Control.Exception (catch, throwIO, try, bracket, SomeException, Exception)
-import Control.Monad (void, when, unless, forM)
-import Crypto.Hash (hash, Digest, SHA256, SHA512, PBKDF2, hmac, HMAC)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (catch, throwIO, try, bracket, SomeException, Exception, finally)
+import Control.Monad (void, when, unless, forM, forM_)
+import Crypto.Hash (hash, digestFromByteString, Digest, SHA256, SHA512)
 import qualified Crypto.Hash as Crypto
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
 import qualified Crypto.Random as CryptoRandom
-import Data.Aeson ((.:), (.=))
+import Data.Aeson ((.:), (.=), eitherDecode, encode)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteArray as BA
@@ -78,14 +83,15 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime, diffUTCTime)
-import Data.Time.Format (formatTime, defaultTimeLocale)
+import Data.Time.Format (formatTime, defaultTimeLocale, parseTimeM)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
-import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile)
+import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, getPermissions, setPermissions)
 import System.FilePath (takeDirectory)
-import System.IO (withFile, IOMode(..), hClose)
+import System.IO (withFile, IOMode(..), hClose, stderr, hPutStrLn)
 import System.IO.Error (isDoesNotExistError)
+import System.Posix.Files (setFileMode)
 import System.Posix.User (
     UserEntry(..), GroupEntry(..),
     getUserEntryForName, getGroupEntryForName,
@@ -96,7 +102,6 @@ import System.Random (randomIO, randomRIO)
 
 -- Import Ten modules
 import Ten.Core (UserId(..), AuthToken(..), BuildError(..))
-import Ten.Daemon.Config (DaemonConfig(..))
 
 -- | Authentication errors
 data AuthError
@@ -273,6 +278,7 @@ hashPassword password = do
     now <- getCurrentTime
 
     -- Use 100,000 iterations (can be adjusted based on security requirements)
+    -- NIST SP 800-132 recommends at least 10,000 iterations
     let iterations = 100000
     let hash = pbkdf2Hash (TE.encodeUtf8 password) salt iterations 64
 
@@ -292,17 +298,24 @@ pbkdf2Hash password salt iterations keyLen =
         password
         salt
 
--- | Generate a random token
+-- | Generate a random token with high entropy
 generateToken :: IO Text
 generateToken = do
+    -- Generate UUIDs for randomness
     uuid1 <- UUID.toString <$> UUID.nextRandom
     uuid2 <- UUID.toString <$> UUID.nextRandom
-    timestamp <- formatTime defaultTimeLocale "%Y%m%d%H%M%S" <$> getCurrentTime
-    random <- T.pack . show <$> (randomIO :: IO Int)
 
-    -- Create a unique token combining UUIDs, timestamp, and random number
-    let tokenInput = T.pack uuid1 <> T.pack uuid2 <> T.pack timestamp <> random
+    -- Add timestamp for uniqueness
+    timestamp <- formatTime defaultTimeLocale "%Y%m%d%H%M%S%q" <$> getCurrentTime
+
+    -- Add more cryptographic randomness (32 bytes = 256 bits of entropy)
+    randomBytes <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
+
+    -- Combine all sources of randomness and hash
+    let tokenInput = T.pack uuid1 <> T.pack uuid2 <> T.pack timestamp <> TE.decodeUtf8 (Base64.encode randomBytes)
     let tokenHash = hashText tokenInput
+
+    -- Return prefixed token
     return $ "ten_" <> encodeBase64 tokenHash
 
 -- | Generate a Base64-encoded hash of text
@@ -417,8 +430,14 @@ saveAuthFile path db = do
     let tempPath = path <> ".tmp"
     BS.writeFile tempPath (LBS.toStrict $ Aeson.encode db)
 
+    -- Set appropriate permissions (600 - owner read/write only)
+    setFileMode tempPath 0o600
+
     -- Atomically replace the original file
     renameFile tempPath path
+
+    -- Ensure proper permissions on the final file
+    setFileMode path 0o600
 
 -- | Migrate an authentication file to a new format
 migrateAuthFile :: FilePath -> FilePath -> IO ()
@@ -430,7 +449,7 @@ migrateAuthFile oldPath newPath = do
     saveAuthFile newPath oldDb
 
 -- | Authenticate a user and generate a token
-authenticateUser :: DaemonConfig -> AuthDb -> Text -> Text -> Text -> IO (AuthDb, UserId, AuthToken)
+authenticateUser :: Map Text Text -> AuthDb -> Text -> Text -> Text -> IO (AuthDb, UserId, AuthToken)
 authenticateUser config db username password clientInfo = do
     -- Check if the user exists
     user <- case Map.lookup username (adUsers db) of
@@ -438,7 +457,8 @@ authenticateUser config db username password clientInfo = do
         Nothing -> do
             -- If not, check if it's a system user
             isSysUser <- systemUserExists username
-            if isSysUser && Set.null (daemonAllowedUsers config) || username `Set.member` (daemonAllowedUsers config)
+            let allowedUsers = maybe Set.empty Set.fromList (Map.lookup "allowedUsers" config >>= parseUserList)
+            if isSysUser && (Set.null allowedUsers || username `Set.member` allowedUsers)
                 then do
                     -- Create a new user based on the system user
                     createUserFromSystem db username clientInfo
@@ -492,6 +512,9 @@ authenticateUser config db username password clientInfo = do
                 }
 
             return (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo))
+  where
+    parseUserList :: Text -> Maybe [Text]
+    parseUserList txt = Just $ map T.strip $ T.split (==',') txt
 
 -- | Create a new user from a system user
 createUserFromSystem :: AuthDb -> Text -> Text -> IO UserInfo
@@ -558,13 +581,21 @@ refreshToken db (AuthToken token) = do
                             if expired
                                 then throwIO $ AuthError TokenExpired
                                 else do
-                                    -- Create a new token with the same permissions
+                                    -- Create a new token with the same permissions and expiry
                                     now <- getCurrentTime
+                                    let oldExpiry = tiExpires tokenInfo
+                                    let expirySeconds = case oldExpiry of
+                                            Nothing -> Nothing
+                                            Just expiry -> Just $ floor $ diffUTCTime expiry now
+
                                     newToken <- generateToken
                                     let newTokenInfo = tokenInfo {
                                             tiToken = newToken,
                                             tiCreated = now,
-                                            tiLastUsed = now
+                                            tiLastUsed = now,
+                                            tiExpires = case expirySeconds of
+                                                Nothing -> Nothing
+                                                Just seconds -> Just $ addUTCTime (fromIntegral seconds) now
                                         }
 
                                     -- Update the database
@@ -837,7 +868,7 @@ instance Aeson.FromJSON AuthDb where
 
         return AuthDb{..}
 
--- Utility functions
+-- | Helper functions
 
 -- | Repeat an action n times
 replicateM :: Int -> IO a -> IO [a]
@@ -847,11 +878,3 @@ replicateM n action
         x <- action
         xs <- replicateM (n-1) action
         return (x:xs)
-
--- | Modify an IORef and return a value
-modifyIORef' :: IORef a -> (a -> (a, b)) -> IO b
-modifyIORef' ref f = atomicModifyIORef' ref f
-
--- | Execute an action with a resource and clean up after
-withMVar :: MVar a -> (a -> IO b) -> IO b
-withMVar = Control.Concurrent.MVar.withMVar

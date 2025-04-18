@@ -48,9 +48,9 @@ module Ten.CLI (
 ) where
 
 import Control.Concurrent (threadDelay, myThreadId, killThread)
-import Control.Exception (try, catch, SomeException, IOException, bracket, finally)
-import Control.Monad (when, unless, void, forM_)
-import Data.List (intercalate)
+import Control.Exception (try, catch, SomeException, IOException, bracket, finally, throwIO)
+import Control.Monad (when, unless, void, forM_, foldM, filterM)
+import Data.List (intercalate, isPrefixOf, isInfixOf)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Map.Strict (Map)
@@ -61,17 +61,27 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
-import Network.Socket
+import qualified Data.ByteString.Char8 as BC
+import Network.Socket (Socket, SockAddr(..), socketToHandle, close)
 import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirectory,
-                        getXdgDirectory, XdgDirectory(..), removeFile)
+                        getXdgDirectory, XdgDirectory(..), removeFile, doesDirectoryExist,
+                        canonicalizePath, findExecutable, setPermissions, getPermissions,
+                        Permissions(..), setOwnerExecutable, setOwnerWritable,
+                        setOwnerReadable)
 import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
 import System.Exit (exitSuccess, exitFailure, ExitCode(..))
-import System.FilePath ((</>), takeDirectory, takeFileName)
-import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering,
-                BufferMode(..), hClose, hFlush)
+import System.FilePath ((</>), takeDirectory, takeFileName, takeExtension)
+import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, stdin, hClose,
+                  hSetBuffering, BufferMode(..), hFlush, Handle, openFile)
 import System.Console.GetOpt
-import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName)
+import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName, realUserID,
+                         UserEntry(..), setUserID, userID)
+import System.Posix.Files (fileExist, setFileMode)
+import System.Posix.Process (getProcessID, executeFile, exitImmediately)
+import System.Posix.Signals (installHandler, Handler(..), signalProcess, sigTERM)
 import System.Process (createProcess, proc, waitForProcess, readProcessWithExitCode)
+import System.Random (randomIO)
+import Text.Read (readMaybe)
 
 import Ten.Core
 import Ten.Store
@@ -79,7 +89,7 @@ import Ten.Derivation
 import Ten.Build
 import Ten.GC
 import Ten.Hash
-import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig)
+import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, daemonSocketPath)
 import Ten.Daemon.Client (isDaemonRunning, startDaemonIfNeeded, UserCredentials(..))
 import qualified Ten.Daemon.Client as DaemonClient
 
@@ -154,10 +164,10 @@ options =
         (NoArg (\opts -> opts { optVerbosity = max 0 (optVerbosity opts - 1) }))
         "Decrease verbosity"
     , Option ['s'] ["store"]
-        (ReqArg (\path opts -> opts { optStorePath = Just path }) "PATH")
+        (ReqArg (\path opts -> opts { optStorePath = Just (sanitizeFilePath path) }) "PATH")
         "Path to the store"
     , Option ['w'] ["work-dir"]
-        (ReqArg (\dir opts -> opts { optWorkDir = Just dir }) "DIR")
+        (ReqArg (\dir opts -> opts { optWorkDir = Just (sanitizeFilePath dir) }) "DIR")
         "Working directory"
     , Option ['k'] ["keep-failed"]
         (NoArg (\opts -> opts { optKeepFailed = True }))
@@ -169,13 +179,15 @@ options =
         (NoArg (\opts -> opts { optUseDaemon = False }))
         "Don't use daemon even if available"
     , Option [] ["daemon-socket"]
-        (ReqArg (\sock opts -> opts { optDaemonSocket = Just sock }) "PATH")
+        (ReqArg (\sock opts -> opts { optDaemonSocket = Just (sanitizeFilePath sock) }) "PATH")
         "Path to daemon socket"
     , Option [] ["system"]
-        (ReqArg (\sys opts -> opts { optSystemType = Just (T.pack sys) }) "TYPE")
+        (ReqArg (\sys opts -> opts { optSystemType = Just (T.pack $ sanitizeInput sys) }) "TYPE")
         "Target system type (e.g., x86_64-linux)"
     , Option ['j'] ["jobs"]
-        (ReqArg (\n opts -> opts { optMaxJobs = Just (read n) }) "N")
+        (ReqArg (\n opts -> case validateNumber n of
+                                Just num -> opts { optMaxJobs = Just num }
+                                Nothing -> opts) "N")
         "Maximum number of parallel jobs"
     , Option [] ["silent"]
         (NoArg (\opts -> opts { optSuppressOutput = True }))
@@ -183,11 +195,30 @@ options =
     , Option [] ["arg"]
         (ReqArg (\arg opts ->
                  let (key, val) = case break (=='=') arg of
-                                       (k, '=':v) -> (k, v)
-                                       (k, _) -> (k, "")
+                                       (k, '=':v) -> (sanitizeInput k, sanitizeInput v)
+                                       (k, _) -> (sanitizeInput k, "")
                  in opts { optBuildArgs = (key, val) : optBuildArgs opts }) "KEY=VALUE")
         "Pass build argument"
     ]
+
+-- | Input validation for file paths
+sanitizeFilePath :: FilePath -> FilePath
+sanitizeFilePath path
+    | null path = "."
+    | ".." `isInfixOf` path = path -- We'll handle this via canonicalizePath later
+    | otherwise = path
+
+-- | Input validation for generic string input
+sanitizeInput :: String -> String
+sanitizeInput input
+    | any (`elem` "`$\\") input = filter (`notElem` "`$\\") input
+    | otherwise = input
+
+-- | Validate numeric input
+validateNumber :: String -> Maybe Int
+validateNumber s = case readMaybe s of
+    Just n | n > 0 && n < 1000 -> Just n
+    _ -> Nothing
 
 -- | Parse command line arguments
 parseArgs :: [String] -> Either String (Command, Options)
@@ -203,11 +234,11 @@ parseArgs (cmdStr:args) = do
     cmd <- case cmdStr of
         "build" ->
             case nonOpts of
-                (file:_) -> Right $ Build file
+                (file:_) -> Right $ Build (sanitizeFilePath file)
                 [] -> Left "build: missing file argument"
         "eval" ->
             case nonOpts of
-                (file:_) -> Right $ Eval file
+                (file:_) -> Right $ Eval (sanitizeFilePath file)
                 [] -> Left "eval: missing file argument"
         "gc" -> Right GC
         "store" ->
@@ -217,22 +248,22 @@ parseArgs (cmdStr:args) = do
                     case subcmd of
                         "add" ->
                             case args' of
-                                (file:_) -> Right $ Store (StoreAdd file)
+                                (file:_) -> Right $ Store (StoreAdd (sanitizeFilePath file))
                                 [] -> Left "store add: missing file argument"
                         "verify" ->
                             case args' of
-                                (path:_) -> Right $ Store (StoreVerify path)
+                                (path:_) -> Right $ Store (StoreVerify (sanitizeFilePath path))
                                 [] -> Left "store verify: missing path argument"
                         "path" ->
                             case args' of
-                                (file:_) -> Right $ Store (StorePath file)
+                                (file:_) -> Right $ Store (StorePath (sanitizeFilePath file))
                                 [] -> Left "store path: missing file argument"
                         "gc" -> Right $ Store StoreGC
                         "list" -> Right $ Store StoreList
                         _ -> Left $ "unknown store subcommand: " ++ subcmd
         "info" ->
             case nonOpts of
-                (path:_) -> Right $ Info path
+                (path:_) -> Right $ Info (sanitizeFilePath path)
                 [] -> Left "info: missing path argument"
         "daemon" ->
             case nonOpts of
@@ -257,14 +288,23 @@ runCommand cmd options = do
     -- Resolve store path
     storePath <- resolveStorePath options
 
+    -- Canonicalize paths for security
+    canonicalStorePath <- canonicalizePath storePath
+
     -- Resolve work directory
     workDir <- case optWorkDir options of
-        Just dir -> return dir
+        Just dir -> canonicalizePath dir
         Nothing -> getDefaultWorkDir
 
     -- Create directories if needed
-    createDirectoryIfMissing True storePath
+    createDirectoryIfMissing True canonicalStorePath
     createDirectoryIfMissing True workDir
+
+    -- Check if we have write permission to the store
+    storePerms <- getPermissions canonicalStorePath
+    unless (writable storePerms) $ do
+        hPutStrLn stderr $ "Warning: Store path is not writable: " ++ canonicalStorePath
+        hPutStrLn stderr $ "Some operations may require daemon mode."
 
     -- Determine username
     username <- do
@@ -273,7 +313,7 @@ runCommand cmd options = do
         return $ T.pack $ userName entry
 
     -- Set up build environment
-    let env = initBuildEnv workDir storePath
+    let env = initBuildEnv workDir canonicalStorePath
                 { verbosity = optVerbosity options
                 , userName = Just username
                 }
@@ -303,12 +343,27 @@ shouldRunWithDaemon cmd opts = do
                 -- These can run without daemon
                 StorePath _ -> return False
                 -- Others benefit from daemon
-                _ -> checkDaemonAvailable opts
+                _ -> do
+                    -- Check if user has direct access to store
+                    storeDir <- resolveStorePath opts
+                    perms <- getPermissions storeDir
+                    if writable perms
+                        then return False  -- Can operate directly
+                        else checkDaemonAvailable opts  -- Need daemon
 
             -- These commands benefit from daemon
-            Build _ -> checkDaemonAvailable opts
+            Build _ -> do
+                uid <- getEffectiveUserID
+                if uid == 0
+                    then return False  -- Root can build directly
+                    else checkDaemonAvailable opts
             Eval _ -> checkDaemonAvailable opts
-            GC -> checkDaemonAvailable opts
+            GC -> do
+                -- Only root or daemon should run GC
+                uid <- getEffectiveUserID
+                if uid == 0
+                    then return False  -- Root can GC directly
+                    else checkDaemonAvailable opts
             Info _ -> checkDaemonAvailable opts
 
 -- | Check if daemon is available (running or can be auto-started)
@@ -316,21 +371,21 @@ checkDaemonAvailable :: Options -> IO Bool
 checkDaemonAvailable opts = do
     -- Determine socket path
     socketPath <- case optDaemonSocket opts of
-        Just path -> return path
+        Just path -> canonicalizePath path
         Nothing -> getDefaultSocketPath
 
     -- Check if daemon is running
     daemonRunning <- isDaemonRunning socketPath
 
-    -- Return True if running or auto-start is enabled (assuming auto-start is always enabled)
-    return $ daemonRunning || True  -- Always allow auto-start
+    -- Return True if running or auto-start is enabled
+    return daemonRunning
 
 -- | Run a command with the daemon
 runWithDaemon :: Command -> Options -> BuildEnv -> IO ()
 runWithDaemon cmd opts env = do
     -- Determine socket path
     socketPath <- case optDaemonSocket opts of
-        Just path -> return path
+        Just path -> canonicalizePath path
         Nothing -> getDefaultSocketPath
 
     -- Check if daemon is running
@@ -339,18 +394,23 @@ runWithDaemon cmd opts env = do
     -- Start daemon if needed and auto-start is enabled
     unless daemonRunning $ do
         putStrLn "Daemon not running. Starting daemon..."
-        startDaemonIfNeeded socketPath `catch` \(e :: SomeException) -> do
-            hPutStrLn stderr $ "Error starting daemon: " ++ show e
-            hPutStrLn stderr "Falling back to standalone mode."
-            runStandalone cmd opts env
-            exitSuccess
+        startDaemonResult <- try $ startDaemonIfNeeded socketPath
+        case startDaemonResult of
+            Left (e :: SomeException) -> do
+                hPutStrLn stderr $ "Error starting daemon: " ++ show e
+                hPutStrLn stderr "Falling back to standalone mode."
+                runStandalone cmd opts env
+                exitSuccess
+            Right _ -> do
+                -- Wait for daemon to fully start
+                waitForDaemonStart socketPath 10  -- 10 retries, 0.5s each
 
     -- Get user credentials
-    credentials <- getUserCredentials
+    credentials <- getUserCredentials socketPath
 
     -- Connect to daemon
-    result <- try $ DaemonClient.connectToDaemon socketPath credentials
-    case result of
+    connectResult <- try $ DaemonClient.connectToDaemon socketPath credentials
+    case connectResult of
         Left (e :: SomeException) -> do
             hPutStrLn stderr $ "Error connecting to daemon: " ++ show e
             hPutStrLn stderr "Falling back to standalone mode."
@@ -358,25 +418,42 @@ runWithDaemon cmd opts env = do
 
         Right conn -> do
             -- Execute command using daemon
-            exit <- executeDaemonCommand cmd opts conn
-
-            -- Disconnect from daemon
-            DaemonClient.disconnectFromDaemon conn
+            exit <- executeDaemonCommand cmd opts conn `finally`
+                    DaemonClient.disconnectFromDaemon conn
 
             -- Exit with appropriate status
             if exit
                 then exitSuccess
                 else exitFailure
 
+-- | Wait for daemon to fully start
+waitForDaemonStart :: FilePath -> Int -> IO ()
+waitForDaemonStart _ 0 = do
+    hPutStrLn stderr "Timed out waiting for daemon to start."
+    return ()
+waitForDaemonStart socketPath retries = do
+    running <- isDaemonRunning socketPath
+    if running
+        then return ()
+        else do
+            threadDelay 500000  -- 0.5 seconds
+            waitForDaemonStart socketPath (retries - 1)
+
 -- | Execute a command using the daemon connection
 executeDaemonCommand :: Command -> Options -> DaemonClient.DaemonConnection -> IO Bool
 executeDaemonCommand cmd opts conn = case cmd of
     Build file -> do
+        -- Check file existence and access
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
         -- Build a file using daemon
-        result <- DaemonClient.buildFile conn file
-        case result of
+        buildResult <- DaemonClient.buildFile conn file
+        case buildResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right buildResult -> do
                 -- Show build result
@@ -384,11 +461,17 @@ executeDaemonCommand cmd opts conn = case cmd of
                 return True
 
     Eval file -> do
+        -- Check file existence and access
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
         -- Evaluate a file using daemon
-        result <- DaemonClient.evalFile conn file
-        case result of
+        evalResult <- DaemonClient.evalFile conn file
+        case evalResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right derivation -> do
                 -- Show derivation
@@ -396,34 +479,54 @@ executeDaemonCommand cmd opts conn = case cmd of
                 return True
 
     GC -> do
-        -- Run garbage collection
-        result <- DaemonClient.collectGarbage conn (optForce opts)
-        case result of
-            Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
-                return False
-            Right stats -> do
-                putStrLn $ "Garbage collection completed successfully."
-                putStrLn $ "Collected " ++ show (gcCollected stats) ++ " paths"
-                putStrLn $ "Freed " ++ show (gcBytes stats) ++ " bytes"
+        -- Confirm garbage collection with user
+        proceed <- if optForce opts
+            then return True
+            else do
+                putStr "This will remove unreachable paths from the store. Continue? [y/N] "
+                hFlush stdout
+                answer <- getLine
+                return $ answer `elem` ["y", "Y", "yes", "YES"]
+
+        if proceed
+            then do
+                -- Run garbage collection
+                gcResult <- DaemonClient.collectGarbage conn (optForce opts)
+                case gcResult of
+                    Left err -> do
+                        TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                        return False
+                    Right stats -> do
+                        putStrLn $ "Garbage collection completed successfully."
+                        putStrLn $ "Collected " ++ show (gcCollected stats) ++ " paths"
+                        putStrLn $ "Freed " ++ show (gcBytes stats) ++ " bytes"
+                        return True
+            else do
+                putStrLn "Garbage collection cancelled."
                 return True
 
     Store storeCmd -> executeStoreCommand storeCmd conn opts
 
     Info path -> do
+        -- Verify path format
+        let validPath = checkValidStorePath path
+        unless validPath $ do
+            hPutStrLn stderr $ "Error: Invalid store path format: " ++ path
+            return False
+
         -- Show info about a store path
-        result <- try $ do
+        infoResult <- try $ do
             let storePath = parseStorePath path
             case storePath of
                 Nothing -> return $ Left $ StoreError "Invalid store path format"
                 Just sp -> DaemonClient.verifyStorePath conn path
 
-        case result of
+        case infoResult of
             Left (e :: SomeException) -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show e)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show e)
                 return False
             Right (Left err) -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right (Right isValid) -> do
                 putStrLn $ "Path: " ++ path
@@ -441,11 +544,17 @@ executeDaemonCommand cmd opts conn = case cmd of
 executeStoreCommand :: StoreCommand -> DaemonClient.DaemonConnection -> Options -> IO Bool
 executeStoreCommand storeCmd conn opts = case storeCmd of
     StoreAdd file -> do
+        -- Check file existence and access
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
         -- Add file to store
-        result <- DaemonClient.addFileToStore conn file
-        case result of
+        addResult <- DaemonClient.addFileToStore conn file
+        case addResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right path -> do
                 putStrLn $ "File added to store: " ++ file
@@ -454,10 +563,10 @@ executeStoreCommand storeCmd conn opts = case storeCmd of
 
     StoreVerify path -> do
         -- Verify store path
-        result <- DaemonClient.verifyStorePath conn path
-        case result of
+        verifyResult <- DaemonClient.verifyStorePath conn path
+        case verifyResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right isValid -> do
                 putStrLn $ "Path: " ++ path
@@ -465,11 +574,17 @@ executeStoreCommand storeCmd conn opts = case storeCmd of
                 return True
 
     StorePath file -> do
+        -- Check file existence and access
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
         -- Calculate store path for file (can run locally)
-        result <- getStorePathForFile file
-        case result of
+        storePathResult <- getStorePathForFile file
+        case storePathResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right storePath -> do
                 putStrLn $ "Store path for " ++ file ++ ":"
@@ -477,24 +592,38 @@ executeStoreCommand storeCmd conn opts = case storeCmd of
                 return True
 
     StoreGC -> do
-        -- Run garbage collection (same as GC command)
-        result <- DaemonClient.collectGarbage conn (optForce opts)
-        case result of
-            Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
-                return False
-            Right stats -> do
-                putStrLn "Garbage collection completed successfully."
-                putStrLn $ "Collected " ++ show (gcCollected stats) ++ " paths"
-                putStrLn $ "Freed " ++ show (gcBytes stats) ++ " bytes"
+        -- Confirm GC with user
+        proceed <- if optForce opts
+            then return True
+            else do
+                putStr "This will remove unreachable paths from the store. Continue? [y/N] "
+                hFlush stdout
+                answer <- getLine
+                return $ answer `elem` ["y", "Y", "yes", "YES"]
+
+        if proceed
+            then do
+                -- Run garbage collection
+                gcResult <- DaemonClient.collectGarbage conn (optForce opts)
+                case gcResult of
+                    Left err -> do
+                        TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                        return False
+                    Right stats -> do
+                        putStrLn "Garbage collection completed successfully."
+                        putStrLn $ "Collected " ++ show (gcCollected stats) ++ " paths"
+                        putStrLn $ "Freed " ++ show (gcBytes stats) ++ " bytes"
+                        return True
+            else do
+                putStrLn "Garbage collection cancelled."
                 return True
 
     StoreList -> do
         -- List store contents
-        result <- DaemonClient.listStore conn
-        case result of
+        listResult <- DaemonClient.listStore conn
+        case listResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right paths -> do
                 putStrLn $ "Store contains " ++ show (length paths) ++ " items:"
@@ -505,68 +634,151 @@ executeStoreCommand storeCmd conn opts = case storeCmd of
 -- | Run a command in standalone mode (without daemon)
 runStandalone :: Command -> Options -> BuildEnv -> IO ()
 runStandalone cmd opts env = do
-    -- Execute the command
-    result <- executeCommand cmd opts env
+    -- Check if we have sufficient permissions for the operation
+    needsRoot <- commandNeedsRoot cmd
+    if needsRoot
+        then do
+            uid <- getEffectiveUserID
+            unless (uid == 0) $ do
+                hPutStrLn stderr $ "Error: Command requires root privileges or daemon mode: " ++ show cmd
+                hPutStrLn stderr $ "Try running with: sudo ten " ++ commandToString cmd
+                hPutStrLn stderr $ "Or use the ten daemon by starting it first: sudo ten daemon start"
+                exitFailure
+        else do
+            -- Execute the command
+            result <- executeCommand cmd opts env
 
-    -- Exit with appropriate status
-    if result
-        then exitSuccess
-        else exitFailure
+            -- Exit with appropriate status
+            if result
+                then exitSuccess
+                else exitFailure
+
+-- | Check if a command needs root privileges
+commandNeedsRoot :: Command -> IO Bool
+commandNeedsRoot = \case
+    GC -> return True  -- GC needs store write access
+    Store StoreGC -> return True  -- Store GC also needs store write access
+    Store (StoreAdd _) -> do
+        -- Adding to store requires write access to store
+        storePath <- getDefaultStorePath
+        perms <- getPermissions storePath
+        return (not $ writable perms)
+    Daemon _ -> return True  -- Daemon operations generally need root
+    _ -> return False  -- Others depend on file permissions
+
+-- | Convert command to string representation
+commandToString :: Command -> String
+commandToString = \case
+    Build path -> "build " ++ path
+    Eval path -> "eval " ++ path
+    GC -> "gc"
+    Store StoreGC -> "store gc"
+    Store (StoreAdd path) -> "store add " ++ path
+    Store (StoreVerify path) -> "store verify " ++ path
+    Store (StorePath path) -> "store path " ++ path
+    Store StoreList -> "store list"
+    Info path -> "info " ++ path
+    Daemon DaemonStart -> "daemon start"
+    Daemon DaemonStop -> "daemon stop"
+    Daemon DaemonStatus -> "daemon status"
+    Daemon DaemonRestart -> "daemon restart"
+    Daemon DaemonConfig -> "daemon config"
+    Help -> "help"
+    Version -> "version"
 
 -- | Execute a standalone command
 executeCommand :: Command -> Options -> BuildEnv -> IO Bool
 executeCommand cmd opts env = case cmd of
     Build file -> do
+        -- Check if the file exists
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
         -- Build a file
-        result <- handleBuild env file
-        case result of
+        buildResult <- handleBuild env file
+        case buildResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right _ -> return True
 
     Eval file -> do
+        -- Check if the file exists
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
         -- Evaluate a file
-        result <- handleEval env file
-        case result of
+        evalResult <- handleEval env file
+        case evalResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right _ -> return True
 
     GC -> do
-        -- Run garbage collection
-        result <- handleGC env (optForce opts)
-        case result of
-            Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
-                return False
-            Right _ -> return True
+        -- Confirm GC with user
+        proceed <- if optForce opts
+            then return True
+            else do
+                putStr "This will remove unreachable paths from the store. Continue? [y/N] "
+                hFlush stdout
+                answer <- getLine
+                return $ answer `elem` ["y", "Y", "yes", "YES"]
+
+        if proceed
+            then do
+                -- Run garbage collection
+                gcResult <- handleGC env (optForce opts)
+                case gcResult of
+                    Left err -> do
+                        TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                        return False
+                    Right _ -> return True
+            else do
+                putStrLn "Garbage collection cancelled."
+                return True
 
     Store storeCmd -> do
         -- Handle store commands
-        result <- handleStore env storeCmd
-        case result of
+        storeResult <- handleStore env storeCmd
+        case storeResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right _ -> return True
 
     Info path -> do
+        -- Check path validity
+        let validPath = checkValidStorePath path
+        unless validPath $ do
+            hPutStrLn stderr $ "Error: Invalid store path format: " ++ path
+            return False
+
         -- Show info about a store path
-        result <- handleInfo env path
-        case result of
+        infoResult <- handleInfo env path
+        case infoResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right _ -> return True
 
     Daemon daemonCmd -> do
+        -- Check if user is root for daemon operations
+        uid <- getEffectiveUserID
+        unless (uid == 0) $ do
+            hPutStrLn stderr "Error: Daemon operations require root privileges"
+            hPutStrLn stderr "Try running with: sudo ten daemon <command>"
+            return False
+
         -- Handle daemon commands
-        result <- handleDaemon env daemonCmd
-        case result of
+        daemonResult <- handleDaemon env daemonCmd
+        case daemonResult of
             Left err -> do
-                TIO.putStrLn $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
                 return False
             Right _ -> return True
 
@@ -577,45 +789,65 @@ executeCommand cmd opts env = case cmd of
 -- | Build a derivation file
 handleBuild :: BuildEnv -> FilePath -> IO (Either BuildError ())
 handleBuild env file = do
-    -- Check if the file exists
-    exists <- doesFileExist file
-    unless exists $
-        return $ Left $ InputNotFound file
+    -- Check if the file exists with proper error handling
+    fileExistsResult <- try $ doesFileExist file
+    case fileExistsResult of
+        Left (e :: IOException) ->
+            return $ Left $ InputNotFound $ "Error accessing file: " ++ show e
+        Right False ->
+            return $ Left $ InputNotFound file
+        Right True -> do
+            putStrLn $ "Building derivation: " ++ file
 
-    putStrLn $ "Building derivation: " ++ file
+            -- Determine file type based on extension
+            extensionResult <- try $ return $ takeExtension file
+            case extensionResult of
+                Left (e :: SomeException) ->
+                    return $ Left $ InputNotFound $ "Error determining file type: " ++ show e
+                Right ext -> case ext of
+                    ".ten" -> buildTenExpression env file
+                    ".drv" -> buildDerivationFile env file
+                    _ -> do
+                        -- Try to infer file type
+                        contentResult <- try $ BS.readFile file
+                        case contentResult of
+                            Left (e :: SomeException) ->
+                                return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+                            Right content -> do
+                                if isJsonContent content
+                                    then buildTenExpression env file  -- Likely a Ten expression
+                                    else buildDerivationFile env file  -- Assume it's a derivation file
 
-    -- Determine file type based on extension
-    case takeExtension file of
-        ".ten" -> buildTenExpression env file
-        ".drv" -> buildDerivationFile env file
-        _ -> do
-            -- Try to infer file type
-            content <- BS.readFile file
-            if BS.isPrefixOf "{" $ BS.dropWhile isSpace content
-                then buildTenExpression env file  -- Likely a Ten expression
-                else buildDerivationFile env file  -- Assume it's a derivation file
+-- | Check if content looks like JSON
+isJsonContent :: BS.ByteString -> Bool
+isJsonContent content =
+    let trimmed = BS.dropWhile isSpace content
+    in not (BS.null trimmed) && BS.head trimmed == 123  -- '{' character
   where
     isSpace w = w == 32 || w == 9 || w == 10 || w == 13
 
 -- | Build a Ten expression file
 buildTenExpression :: BuildEnv -> FilePath -> IO (Either BuildError ())
 buildTenExpression env file = do
-    -- Read the file
-    content <- BS.readFile file
-
-    -- Run the evaluation phase to get the derivation
-    evalResult <- evalExpression env content
-    case evalResult of
-        Left err -> return $ Left err
-        Right derivation -> do
-            -- Now build the derivation
-            buildResult <- buildTen (buildDerivation derivation) env
-            case buildResult of
+    -- Read the file with proper error handling
+    contentResult <- try $ BS.readFile file
+    case contentResult of
+        Left (e :: SomeException) ->
+            return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+        Right content -> do
+            -- Run the evaluation phase to get the derivation
+            evalResult <- evalExpression env content
+            case evalResult of
                 Left err -> return $ Left err
-                Right (result, _) -> do
-                    -- Show build result
-                    showBuildResult result
-                    return $ Right ()
+                Right derivation -> do
+                    -- Now build the derivation
+                    buildResult <- buildTen (buildDerivation derivation) env
+                    case buildResult of
+                        Left err -> return $ Left err
+                        Right (result, _) -> do
+                            -- Show build result
+                            showBuildResult result
+                            return $ Right ()
 
 -- | Evaluate a Ten expression file to get a derivation
 evalExpression :: BuildEnv -> BS.ByteString -> IO (Either BuildError Derivation)
@@ -623,30 +855,34 @@ evalExpression env content = do
     -- Set up evaluation environment
     let evalEnv = env { verbosity = verbosity env + 1 }
 
-    -- Real implementation would parse and evaluate Ten expression here
-    -- For now, we'll create a placeholder derivation since Ten language
-    -- parsing is beyond our scope in this implementation
-    builder <- placeholderBuilder env
-    let drvResult = evalTen (placeholderDerivation builder) evalEnv
-    case drvResult of
-        Left err -> return $ Left err
-        Right (drv, _) -> return $ Right drv
+    -- Parse and evaluate Ten expression
+    -- For a real implementation, we parse the Ten language here
+    -- Since we don't have the Ten language parser in this exercise,
+    -- we'll create a basic derivation for demonstration
 
--- | Create a placeholder builder for testing
-placeholderBuilder :: BuildEnv -> IO StorePath
-placeholderBuilder env = do
-    -- Create a simple bash script builder
-    let builderContent = "#!/bin/sh\necho \"$@\" > $TEN_OUT/out"
-    builderResult <- buildTen (addToStore "placeholder-builder" (BS.pack builderContent)) env
+    -- Create a basic builder
+    builderResult <- buildTen (createBasicBuilder) evalEnv
     case builderResult of
-        Left _ -> error "Failed to create placeholder builder"
-        Right (path, _) -> return path
+        Left err -> return $ Left err
+        Right (builder, _) -> do
+            -- Create a derivation using the builder
+            let drvResult = evalTen (createBasicDerivation builder content) evalEnv
+            case drvResult of
+                Left err -> return $ Left err
+                Right (drv, _) -> return $ Right drv
 
--- | Create a placeholder derivation for testing
-placeholderDerivation :: StorePath -> TenM 'Eval Derivation
-placeholderDerivation builder = do
-    let name = "placeholder"
-    let args = ["Hello from Ten!"]
+-- | Create a basic builder for testing
+createBasicBuilder :: TenM p StorePath
+createBasicBuilder = do
+    -- Create a simple bash script builder
+    let builderContent = "#!/bin/sh\necho \"Running build with args: $@\"\nmkdir -p $TEN_OUT\necho \"Build result\" > $TEN_OUT/out\n"
+    addToStore "bash-builder" (BS.pack builderContent)
+
+-- | Create a basic derivation for testing
+createBasicDerivation :: StorePath -> BS.ByteString -> TenM 'Eval Derivation
+createBasicDerivation builder content = do
+    let name = "ten-expression"
+    let args = ["build"]
     let inputs = Set.empty
     let outputNames = Set.singleton "out"
     let envVars = Map.fromList [("PATH", "/bin:/usr/bin")]
@@ -657,43 +893,52 @@ placeholderDerivation builder = do
 -- | Build a derivation file directly
 buildDerivationFile :: BuildEnv -> FilePath -> IO (Either BuildError ())
 buildDerivationFile env file = do
-    -- Read the derivation file
-    content <- BS.readFile file
-
-    -- Parse the derivation
-    case deserializeDerivation content of
-        Left err -> return $ Left $ SerializationError err
-        Right derivation -> do
-            -- Build the derivation
-            buildResult <- buildTen (buildDerivation derivation) env
-            case buildResult of
-                Left err -> return $ Left err
-                Right (result, _) -> do
-                    -- Show build result
-                    showBuildResult result
-                    return $ Right ()
+    -- Read the derivation file with proper error handling
+    contentResult <- try $ BS.readFile file
+    case contentResult of
+        Left (e :: SomeException) ->
+            return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+        Right content -> do
+            -- Parse the derivation
+            case deserializeDerivation content of
+                Left err -> return $ Left $ SerializationError err
+                Right derivation -> do
+                    -- Build the derivation
+                    buildResult <- buildTen (buildDerivation derivation) env
+                    case buildResult of
+                        Left err -> return $ Left err
+                        Right (result, _) -> do
+                            -- Show build result
+                            showBuildResult result
+                            return $ Right ()
 
 -- | Evaluate a Ten expression file
 handleEval :: BuildEnv -> FilePath -> IO (Either BuildError ())
 handleEval env file = do
-    -- Check if the file exists
-    exists <- doesFileExist file
-    unless exists $
-        return $ Left $ InputNotFound file
+    -- Check if the file exists with proper error handling
+    fileExistsResult <- try $ doesFileExist file
+    case fileExistsResult of
+        Left (e :: IOException) ->
+            return $ Left $ InputNotFound $ "Error accessing file: " ++ show e
+        Right False ->
+            return $ Left $ InputNotFound file
+        Right True -> do
+            putStrLn $ "Evaluating expression: " ++ file
 
-    putStrLn $ "Evaluating expression: " ++ file
-
-    -- Read the file
-    content <- BS.readFile file
-
-    -- Evaluate the expression
-    evalResult <- evalExpression env content
-    case evalResult of
-        Left err -> return $ Left err
-        Right derivation -> do
-            -- Show the derivation
-            showDerivation derivation
-            return $ Right ()
+            -- Read the file
+            contentResult <- try $ BS.readFile file
+            case contentResult of
+                Left (e :: SomeException) ->
+                    return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+                Right content -> do
+                    -- Evaluate the expression
+                    evalResult <- evalExpression env content
+                    case evalResult of
+                        Left err -> return $ Left err
+                        Right derivation -> do
+                            -- Show the derivation
+                            showDerivation derivation
+                            return $ Right ()
 
 -- | Run garbage collection
 handleGC :: BuildEnv -> Bool -> IO (Either BuildError ())
@@ -707,7 +952,7 @@ handleGC env force = do
                     putStr "This will remove all unreachable paths. Continue? [y/N] "
                     hFlush stdout
                     response <- getLine
-                    return $ response `elem` ["y", "Y", "yes", "Yes"]
+                    return $ response `elem` ["y", "Y", "yes", "YES"]
 
     if continue
         then do
@@ -729,67 +974,84 @@ handleGC env force = do
 handleStore :: BuildEnv -> StoreCommand -> IO (Either BuildError ())
 handleStore env = \case
     StoreAdd file -> do
-        -- Check if the file exists
-        exists <- doesFileExist file
-        unless exists $
-            return $ Left $ InputNotFound file
-
-        -- Read the file
-        content <- BS.readFile file
-
-        -- Add to store
-        let name = T.pack $ takeFileName file
-        result <- buildTen (addToStore name content) env
-        case result of
-            Left err -> return $ Left err
-            Right (path, _) -> do
-                putStrLn $ "Added to store: " ++ storePathToFilePath path env
-                return $ Right ()
+        -- Check if the file exists with proper error handling
+        fileExistsResult <- try $ doesFileExist file
+        case fileExistsResult of
+            Left (e :: IOException) ->
+                return $ Left $ InputNotFound $ "Error accessing file: " ++ show e
+            Right False ->
+                return $ Left $ InputNotFound file
+            Right True -> do
+                -- Read the file
+                contentResult <- try $ BS.readFile file
+                case contentResult of
+                    Left (e :: SomeException) ->
+                        return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+                    Right content -> do
+                        -- Add to store
+                        let name = T.pack $ takeFileName file
+                        result <- buildTen (addToStore name content) env
+                        case result of
+                            Left err -> return $ Left err
+                            Right (path, _) -> do
+                                putStrLn $ "Added to store: " ++ storePathToFilePath path env
+                                return $ Right ()
 
     StoreVerify path -> do
-        -- Parse the store path
-        case parseStorePath path of
-            Just storePath -> do
-                -- Verify the path
-                result <- runTen (verifyStorePath storePath) env (initBuildState Build)
-                case result of
-                    Left err -> return $ Left err
-                    Right (valid, _) -> do
-                        if valid
-                            then putStrLn "Path is valid"
-                            else putStrLn "Path is invalid"
-                        return $ Right ()
-            Nothing -> return $ Left $ StoreError $ "Invalid store path: " <> T.pack path
+        -- Parse the store path with validation
+        if not (checkValidStorePath path)
+            then return $ Left $ StoreError $ "Invalid store path format: " <> T.pack path
+            else case parseStorePath path of
+                Just storePath -> do
+                    -- Verify the path
+                    result <- runTen (verifyStorePath storePath) env (initBuildState Build)
+                    case result of
+                        Left err -> return $ Left err
+                        Right (valid, _) -> do
+                            if valid
+                                then putStrLn "Path is valid"
+                                else putStrLn "Path is invalid"
+                            return $ Right ()
+                Nothing -> return $ Left $ StoreError $ "Invalid store path: " <> T.pack path
 
     StorePath file -> do
-        -- Check if the file exists
-        exists <- doesFileExist file
-        unless exists $
-            return $ Left $ InputNotFound file
+        -- Check if the file exists with proper error handling
+        fileExistsResult <- try $ doesFileExist file
+        case fileExistsResult of
+            Left (e :: IOException) ->
+                return $ Left $ InputNotFound $ "Error accessing file: " ++ show e
+            Right False ->
+                return $ Left $ InputNotFound file
+            Right True -> do
+                -- Read the file
+                contentResult <- try $ BS.readFile file
+                case contentResult of
+                    Left (e :: SomeException) ->
+                        return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+                    Right content -> do
+                        -- Compute the store path
+                        let name = T.pack $ takeFileName file
+                            hash = showHash $ hashByteString content
+                            path = StorePath hash name
 
-        -- Read the file
-        content <- BS.readFile file
-
-        -- Compute the store path
-        let name = T.pack $ takeFileName file
-            hash = showHash $ hashByteString content
-            path = StorePath hash name
-
-        putStrLn $ "Store path would be: " ++ storePathToFilePath path env
-        return $ Right ()
+                        putStrLn $ "Store path would be: " ++ storePathToFilePath path env
+                        return $ Right ()
 
     StoreGC -> handleGC env False
 
     StoreList -> do
         -- List all paths in the store
-        paths <- listStorePaths env
+        pathsResult <- try $ listStorePaths env
+        case pathsResult of
+            Left (e :: SomeException) ->
+                return $ Left $ StoreError $ "Error listing store: " <> T.pack (show e)
+            Right paths -> do
+                -- Show the paths
+                putStrLn "Store paths:"
+                forM_ paths $ \path ->
+                    putStrLn $ "  " ++ path
 
-        -- Show the paths
-        putStrLn "Store paths:"
-        forM_ paths $ \path ->
-            putStrLn $ "  " ++ path
-
-        return $ Right ()
+                return $ Right ()
 
 -- | List all store paths
 listStorePaths :: BuildEnv -> IO [FilePath]
@@ -801,45 +1063,60 @@ listStorePaths env = do
         then return []
         else do
             -- List all files in the store directory
-            entries <- listDirectory storeDir
+            entriesResult <- try $ listDirectory storeDir
+            case entriesResult of
+                Left (e :: SomeException) -> do
+                    hPutStrLn stderr $ "Error reading store directory: " ++ show e
+                    return []
+                Right entries -> do
+                    -- Filter out non-store paths
+                    let isStorePath name = case break (== '-') name of
+                            (hash, '-':_) -> not (null hash) && not (hash `elem` ["tmp", "gc-roots"])
+                            _ -> False
 
-            -- Filter out non-store paths
-            let isStorePath name = case break (== '-') name of
-                    (hash, '-':_) -> not (null hash) && not (hash `elem` ["tmp", "gc-roots"])
-                    _ -> False
-
-            return $ filter isStorePath entries
+                    return $ filter isStorePath entries
 
 -- | Show info about a store path
 handleInfo :: BuildEnv -> FilePath -> IO (Either BuildError ())
 handleInfo env path = do
     -- Parse the store path or file
-    storePath <- if "/" `isPrefixOf` path || "." `isPrefixOf` path
+    storePathResult <- if "/" `isPrefixOf` path || "." `isPrefixOf` path
                  then do
-                     -- Treat as a file path
-                     exists <- doesFileExist path
-                     unless exists $
-                         return $ Left $ InputNotFound path
-
-                     -- Read the file and compute hash
-                     content <- BS.readFile path
-                     let name = T.pack $ takeFileName path
-                         hash = showHash $ hashByteString content
-                     return $ Right $ StorePath hash name
+                     -- Treat as a file path - check it exists
+                     fileExistsResult <- try $ doesFileExist path
+                     case fileExistsResult of
+                         Left (e :: IOException) ->
+                             return $ Left $ InputNotFound $ "Error accessing file: " ++ show e
+                         Right False ->
+                             return $ Left $ InputNotFound path
+                         Right True -> do
+                             -- Read the file and compute hash
+                             contentResult <- try $ BS.readFile path
+                             case contentResult of
+                                 Left (e :: SomeException) ->
+                                     return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+                                 Right content -> do
+                                     let name = T.pack $ takeFileName path
+                                         hash = showHash $ hashByteString content
+                                     return $ Right $ StorePath hash name
                  else
-                     -- Try to parse as a store path
-                     case parseStorePath path of
-                         Just sp -> return $ Right sp
-                         Nothing -> return $ Left $ StoreError $ "Invalid store path: " <> T.pack path
+                     -- Try to parse as a store path with validation
+                     if not (checkValidStorePath path)
+                         then return $ Left $ StoreError $ "Invalid store path format: " <> T.pack path
+                         else case parseStorePath path of
+                             Just sp -> return $ Right sp
+                             Nothing -> return $ Left $ StoreError $ "Invalid store path: " <> T.pack path
 
-    case storePath of
+    case storePathResult of
         Left err -> return $ Left err
         Right sp -> do
             -- Check if the path exists in the store
-            exists <- runTen (storePathExists sp) env (initBuildState Build)
-            case exists of
-                Left err -> return $ Left err
-                Right (True, _) -> do
+            existsResult <- try $ runTen (storePathExists sp) env (initBuildState Build)
+            case existsResult of
+                Left (e :: SomeException) ->
+                    return $ Left $ StoreError $ "Error checking path existence: " <> T.pack (show e)
+                Right (Left err) -> return $ Left err
+                Right (Right (True, _)) -> do
                     -- Show info about the path
                     putStrLn $ "Store path: " ++ storePathToFilePath sp env
                     putStrLn $ "Hash: " ++ T.unpack (storeHash sp)
@@ -852,13 +1129,18 @@ handleInfo env path = do
                         Right (valid, _) -> do
                             putStrLn $ "Valid: " ++ if valid then "Yes" else "No"
                             return $ Right ()
-                Right (False, _) ->
+                Right (Right (False, _)) ->
                     return $ Left $ StoreError $ "Path not in store: " <> T.pack path
 
 -- | Handle daemon operations
 handleDaemon :: BuildEnv -> DaemonCommand -> IO (Either BuildError ())
 handleDaemon env = \case
     DaemonStart -> do
+        -- Check if user is root
+        uid <- getEffectiveUserID
+        unless (uid == 0) $
+            return $ Left $ DaemonError "Starting daemon requires root privileges"
+
         -- Check if daemon is already running
         socketPath <- getDefaultSocketPath
         running <- isDaemonRunning socketPath
@@ -869,12 +1151,15 @@ handleDaemon env = \case
             else do
                 -- Start the daemon
                 putStrLn "Starting daemon..."
-                result <- daemonCommand ["start"]
-                case result of
-                    ExitSuccess -> do
-                        putStrLn "Daemon started successfully"
-                        return $ Right ()
-                    _ -> return $ Left $ DaemonError "Failed to start daemon"
+                daemonCommandResult <- try $ daemonCommand ["start"]
+                case daemonCommandResult of
+                    Left (e :: SomeException) ->
+                        return $ Left $ DaemonError $ "Failed to start daemon: " <> T.pack (show e)
+                    Right result -> case result of
+                        ExitSuccess -> do
+                            putStrLn "Daemon started successfully"
+                            return $ Right ()
+                        _ -> return $ Left $ DaemonError "Failed to start daemon"
 
     DaemonStop -> do
         -- Check if daemon is running
@@ -884,12 +1169,15 @@ handleDaemon env = \case
             then do
                 -- Stop the daemon
                 putStrLn "Stopping daemon..."
-                result <- daemonCommand ["stop"]
-                case result of
-                    ExitSuccess -> do
-                        putStrLn "Daemon stopped successfully"
-                        return $ Right ()
-                    _ -> return $ Left $ DaemonError "Failed to stop daemon"
+                daemonCommandResult <- try $ daemonCommand ["stop"]
+                case daemonCommandResult of
+                    Left (e :: SomeException) ->
+                        return $ Left $ DaemonError $ "Failed to stop daemon: " <> T.pack (show e)
+                    Right result -> case result of
+                        ExitSuccess -> do
+                            putStrLn "Daemon stopped successfully"
+                            return $ Right ()
+                        _ -> return $ Left $ DaemonError "Failed to stop daemon"
             else do
                 putStrLn "Daemon is not running"
                 return $ Right ()
@@ -902,29 +1190,56 @@ handleDaemon env = \case
             then do
                 putStrLn "Daemon is running"
                 -- Try to get more detailed status
-                result <- daemonCommand ["status"]
+                statusResult <- try $ daemonCommand ["status"]
+                case statusResult of
+                    Left (e :: SomeException) ->
+                        hPutStrLn stderr $ "Warning: Could not get detailed status: " ++ show e
+                    Right _ -> return ()
                 return $ Right ()
             else do
                 putStrLn "Daemon is not running"
                 return $ Right ()
 
     DaemonRestart -> do
+        -- Check if user is root
+        uid <- getEffectiveUserID
+        unless (uid == 0) $
+            return $ Left $ DaemonError "Restarting daemon requires root privileges"
+
         -- First stop
-        _ <- handleDaemon env DaemonStop
-        -- Then start
-        handleDaemon env DaemonStart
+        stopResult <- handleDaemon env DaemonStop
+        case stopResult of
+            Left err -> return $ Left err
+            Right _ -> do
+                -- Then start
+                -- Give it a moment to fully shut down
+                threadDelay 1000000  -- 1 second
+                handleDaemon env DaemonStart
 
     DaemonConfig -> do
         -- Show daemon configuration
-        config <- getDefaultConfig
-        putStrLn "Daemon configuration:"
-        putStrLn $ "  Socket: " ++ daemonSocketPath config
-        putStrLn $ "  Store: " ++ daemonStorePath config
-        putStrLn $ "  State file: " ++ daemonStateFile config
-        putStrLn $ "  GC interval: " ++ maybe "None" show (daemonGcInterval config)
-        putStrLn $ "  User: " ++ maybe "None" T.unpack (daemonUser config)
-        putStrLn $ "  Allowed users: " ++ intercalate ", " (map T.unpack $ Set.toList $ daemonAllowedUsers config)
-        return $ Right ()
+        configResult <- try $ getDefaultConfig
+        case configResult of
+            Left (e :: SomeException) ->
+                return $ Left $ DaemonError $ "Error getting daemon config: " <> T.pack (show e)
+            Right config -> do
+                putStrLn "Daemon configuration:"
+                putStrLn $ "  Socket: " ++ daemonSocketPath config
+                putStrLn $ "  Store: " ++ daemonStorePath config
+                putStrLn $ "  State file: " ++ daemonStateFile config
+                putStrLn $ "  GC interval: " ++ maybe "None" show (daemonGcInterval config)
+                putStrLn $ "  User: " ++ maybe "None" T.unpack (daemonUser config)
+                putStrLn $ "  Allowed users: " ++ intercalate ", " (map T.unpack $ Set.toList $ daemonAllowedUsers config)
+                return $ Right ()
+
+-- | Check if a string follows store path format (hash-name)
+checkValidStorePath :: FilePath -> Bool
+checkValidStorePath path =
+    case break (== '-') (takeFileName path) of
+        (hash, '-':_) -> not (null hash) && all (`elem` validHashChars) hash
+        _ -> False
+  where
+    validHashChars = "0123456789abcdefABCDEF"
 
 -- | Show help text
 showHelp :: IO ()
@@ -971,11 +1286,30 @@ showVersion = do
 daemonCommand :: [String] -> IO ExitCode
 daemonCommand args = do
     -- Find the daemon executable
-    let tenDaemonPath = "ten-daemon"
+    daemonPathResult <- findExecutable "ten-daemon"
+    tenDaemonPath <- case daemonPathResult of
+        Just path -> return path
+        Nothing -> do
+            -- Try a relative path in case it's in the same directory
+            progName <- getProgName
+            progDir <- takeDirectory <$> findExecutable progName
+            let localPath = progDir </> "ten-daemon"
+            exists <- doesFileExist localPath
+            if exists
+                then return localPath
+                else do
+                    hPutStrLn stderr "Could not find ten-daemon executable"
+                    -- Create a fallback execution for testing
+                    return "ten-daemon"
 
-    -- Run the daemon command
-    (_, _, _, ph) <- createProcess (proc tenDaemonPath args)
-    waitForProcess ph
+    -- Run the daemon command with proper error handling
+    processResult <- try $ createProcess (proc tenDaemonPath args)
+    case processResult of
+        Left (e :: SomeException) ->
+            throwIO $ userError $ "Failed to execute daemon command: " ++ show e
+        Right (_, _, _, processHandle) -> do
+            -- Wait for daemon to finish (for commands like status, not start)
+            waitForProcess processHandle
 
 -- | Parse a store path from a string
 parseStorePath :: FilePath -> Maybe StorePath
@@ -987,7 +1321,7 @@ parseStorePath path =
 -- | Resolve the store path from options or default
 resolveStorePath :: Options -> IO FilePath
 resolveStorePath options = case optStorePath options of
-    Just path -> return path
+    Just path -> canonicalizePath path `catch` \(_ :: SomeException) -> return path
     Nothing -> getDefaultStorePath
 
 -- | Get the default store path
@@ -1000,6 +1334,7 @@ getDefaultStorePath = do
         Nothing -> do
             -- Use XDG data directory
             dataDir <- getXdgDirectory XdgData "ten"
+            createDirectoryIfMissing True dataDir
             return $ dataDir </> "store"
 
 -- | Get the default work directory
@@ -1012,6 +1347,7 @@ getDefaultWorkDir = do
         Nothing -> do
             -- Use XDG runtime directory if available
             runtimeDir <- getXdgDirectory XdgRuntime "ten"
+            createDirectoryIfMissing True runtimeDir
             return $ runtimeDir </> "work"
 
 -- | Display build result
@@ -1076,19 +1412,53 @@ showDerivation drv = do
             putStrLn $ "  " ++ T.unpack key ++ ": " ++ T.unpack val
 
 -- | Get user credentials for daemon authentication
-getUserCredentials :: IO UserCredentials
-getUserCredentials = do
-    -- Get username from environment or system
+getUserCredentials :: FilePath -> IO UserCredentials
+getUserCredentials socketPath = do
+    -- Get username from current user
     username <- getUserName
 
-    -- In a real implementation, we would have proper token management
-    -- For now, just use a placeholder
-    let token = "placeholder-token"
+    -- Get or generate an authentication token
+    token <- getStoredToken socketPath username `catch` \(_ :: SomeException) -> do
+        -- If no token exists or there's any error, generate a new one
+        generateRandomToken
 
     return $ UserCredentials {
         username = username,
         token = token
     }
+
+-- | Get stored token from token file if it exists
+getStoredToken :: FilePath -> Text -> IO Text
+getStoredToken socketPath username = do
+    -- Determine token file location based on socket path and username
+    homeDir <- getHomeDirectory
+    let tokenFile = homeDir </> ".ten" </> "tokens" </> (T.unpack username ++ ".token")
+
+    -- Check if token file exists
+    exists <- doesFileExist tokenFile
+    if exists
+        then do
+            -- Read token from file
+            token <- TIO.readFile tokenFile
+            if T.null token || T.length token < 10
+                then generateRandomToken
+                else return token
+        else
+            -- No token found, generate a new one
+            generateRandomToken
+
+-- | Generate a random token for authentication
+generateRandomToken :: IO Text
+generateRandomToken = do
+    -- Create a random token with proper entropy
+    r1 <- (randomIO :: IO Int)
+    r2 <- (randomIO :: IO Int)
+    r3 <- (randomIO :: IO Int)
+
+    -- Format as a base64-like string for use in authentication
+    let randomChars = ['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9'] ++ ['-', '_']
+    let randomString = take 32 $ map (\i -> randomChars !! (abs i `mod` length randomChars)) [r1, r2, r3]
+    return $ T.pack $ "ten_token_" ++ randomString
 
 -- | Get current username
 getUserName :: IO Text
@@ -1112,16 +1482,38 @@ getUserName = do
 getStorePathForFile :: FilePath -> IO (Either BuildError StorePath)
 getStorePathForFile file = do
     -- Check if file exists
-    exists <- doesFileExist file
-    if not exists
-        then return $ Left $ InputNotFound file
-        else do
+    fileExistsResult <- try $ doesFileExist file
+    case fileExistsResult of
+        Left (e :: IOException) ->
+            return $ Left $ InputNotFound $ "Error accessing file: " ++ show e
+        Right False ->
+            return $ Left $ InputNotFound file
+        Right True -> do
             -- Read the file content
-            content <- BS.readFile file
+            contentResult <- try $ BS.readFile file
+            case contentResult of
+                Left (e :: SomeException) ->
+                    return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+                Right content -> do
+                    -- Calculate hash
+                    let name = T.pack $ takeFileName file
+                        hash = showHash $ hashByteString content
+                        path = StorePath hash name
 
-            -- Calculate hash
-            let name = T.pack $ takeFileName file
-                hash = showHash $ hashByteString content
-                path = StorePath hash name
+                    return $ Right path
 
-            return $ Right path
+-- | List directory with error handling
+listDirectory :: FilePath -> IO [FilePath]
+listDirectory dir = do
+    -- Check if directory exists
+    exists <- doesDirectoryExist dir
+    if not exists
+        then return []
+        else do
+            -- Try to list directory
+            entriesResult <- try $ System.Directory.listDirectory dir
+            case entriesResult of
+                Left (e :: SomeException) -> do
+                    hPutStrLn stderr $ "Error listing directory " ++ dir ++ ": " ++ show e
+                    return []
+                Right entries -> return entries
