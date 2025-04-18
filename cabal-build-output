@@ -25,26 +25,6 @@ src/Ten/Daemon/Auth.hs:59:65: error: [GHC-61689]
 59 | import Crypto.Hash (hash, Digest, SHA256, SHA512, PBKDF2, hmac, HMAC)
    |                                                                 ^^^^
 
-src/Ten/Daemon/Auth.hs:66:1: error: [GHC-87110]
-    Could not load module ‘Data.ByteArray’.
-    It is a member of the hidden package ‘memory-0.18.0’.
-    Perhaps you need to add ‘memory’ to the build-depends in your .cabal file.
-    Use -v to see a list of the files searched for.
-   |
-66 | import qualified Data.ByteArray as BA
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-src/Ten/Daemon/Auth.hs:68:1: error: [GHC-61948]
-    Could not find module ‘Data.ByteString.Base64’.
-    Perhaps you meant
-      Data.ByteString.Lazy (from bytestring-0.12.1.0)
-      Data.ByteString.Unsafe (from bytestring-0.12.1.0)
-      Data.ByteString.Char8 (from bytestring-0.12.1.0)
-    Use -v to see a list of the files searched for.
-   |
-68 | import qualified Data.ByteString.Base64 as Base64
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
 src/Ten/Daemon/Auth.hs:90:5: error: [GHC-61689]
     Module ‘System.Posix.User’ does not export ‘UserEntry(..)’.
     Suggested fix: Perhaps use data constructor ‘UserEntry’
@@ -58,115 +38,32 @@ src/Ten/Daemon/Auth.hs:90:20: error: [GHC-61689]
    |
 90 |     UserEntry(..), GroupEntry(..),
    |                    ^^^^^^^^^^^^^^
-
-src/Ten/Daemon/Auth.hs:95:1: error: [GHC-87110]
-    Could not load module ‘System.Random’.
-    It is a member of the hidden package ‘random-1.3.1’.
-    Perhaps you need to add ‘random’ to the build-depends in your .cabal file.
-    Use -v to see a list of the files searched for.
-   |
-95 | import System.Random (randomIO, randomRIO)
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 [ 6 of 17] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o )
 
-src/Ten/Sandbox.hs:243:13: error: [GHC-87543]
-    Ambiguous occurrence ‘setOwnerAndGroup’.
-    It could refer to
-       either ‘System.Posix.Files.setOwnerAndGroup’,
-              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
-           or ‘Ten.Sandbox.setOwnerAndGroup’,
-              defined at src/Ten/Sandbox.hs:568:1.
-    |
-243 |             setOwnerAndGroup sandboxDir ownerId groupId
-    |             ^^^^^^^^^^^^^^^^
-
-src/Ten/Sandbox.hs:244:13: error: [GHC-87543]
-    Ambiguous occurrence ‘setOwnerAndGroup’.
-    It could refer to
-       either ‘System.Posix.Files.setOwnerAndGroup’,
-              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
-           or ‘Ten.Sandbox.setOwnerAndGroup’,
-              defined at src/Ten/Sandbox.hs:568:1.
-    |
-244 |             setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
-    |             ^^^^^^^^^^^^^^^^
-
-src/Ten/Sandbox.hs:245:13: error: [GHC-87543]
-    Ambiguous occurrence ‘setOwnerAndGroup’.
-    It could refer to
-       either ‘System.Posix.Files.setOwnerAndGroup’,
-              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
-           or ‘Ten.Sandbox.setOwnerAndGroup’,
-              defined at src/Ten/Sandbox.hs:568:1.
-    |
-245 |             setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
-    |             ^^^^^^^^^^^^^^^^
-
-src/Ten/Sandbox.hs:249:17: error: [GHC-87543]
-    Ambiguous occurrence ‘setOwnerAndGroup’.
-    It could refer to
-       either ‘System.Posix.Files.setOwnerAndGroup’,
-              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
-           or ‘Ten.Sandbox.setOwnerAndGroup’,
-              defined at src/Ten/Sandbox.hs:568:1.
-    |
-249 |                 setOwnerAndGroup returnDir ownerId groupId
-    |                 ^^^^^^^^^^^^^^^^
-
-src/Ten/Sandbox.hs:343:26: error: [GHC-87543]
-    Ambiguous occurrence ‘storePathToFilePath’.
-    It could refer to
-       either ‘Ten.Core.storePathToFilePath’,
-              imported from ‘Ten.Core’ at src/Ten/Sandbox.hs:68:1-15,
-           or ‘Ten.Store.storePathToFilePath’,
-              imported from ‘Ten.Store’ at src/Ten/Sandbox.hs:69:1-16.
-    |
-343 |         let sourcePath = storePathToFilePath input env
-    |                          ^^^^^^^^^^^^^^^^^^^
-
-src/Ten/Sandbox.hs:479:97: error: [GHC-76037]
-    Not in scope: type constructor or class ‘ProcessConfig’
-    |
-479 | sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> ProcessConfig () () ()
-    |                                                                                                 ^^^^^^^^^^^^^
-
-src/Ten/Sandbox.hs:546:10: error: [GHC-87543]
+src/Ten/Sandbox.hs:549:10: error: [GHC-87543]
     Ambiguous occurrence ‘dropPrivileges’.
     It could refer to
        either ‘Ten.Core.dropPrivileges’,
               imported from ‘Ten.Core’ at src/Ten/Sandbox.hs:68:1-15,
            or ‘Ten.Sandbox.dropPrivileges’,
-              defined at src/Ten/Sandbox.hs:509:1.
+              defined at src/Ten/Sandbox.hs:512:1.
     |
-546 |         (dropPrivileges user group)
+549 |         (dropPrivileges user group)
     |          ^^^^^^^^^^^^^^
 
-src/Ten/Sandbox.hs:567:33: error: [GHC-76037]
-    Not in scope: type constructor or class ‘UserID’
-    Suggested fix:
-      Perhaps use one of these:
-        ‘UserId’ (imported from Ten.Core),
-        data constructor ‘UserId’ (imported from Ten.Core)
+src/Ten/Sandbox.hs:570:34: error: [GHC-76037]
+    Not in scope: type constructor or class ‘User.UserID’
+    NB: the module ‘System.Posix.User’ does not export ‘UserID’.
     |
-567 | setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
-    |                                 ^^^^^^
+570 | setOwnerAndGroup' :: FilePath -> User.UserID -> User.GroupID -> IO ()
+    |                                  ^^^^^^^^^^^
 
-src/Ten/Sandbox.hs:567:43: error: [GHC-76037]
-    Not in scope: type constructor or class ‘GroupID’
+src/Ten/Sandbox.hs:570:49: error: [GHC-76037]
+    Not in scope: type constructor or class ‘User.GroupID’
+    NB: the module ‘System.Posix.User’ does not export ‘GroupID’.
     |
-567 | setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
-    |                                           ^^^^^^^
-
-src/Ten/Sandbox.hs:573:9: error: [GHC-87543]
-    Ambiguous occurrence ‘setOwnerAndGroup’.
-    It could refer to
-       either ‘System.Posix.Files.setOwnerAndGroup’,
-              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
-           or ‘Ten.Sandbox.setOwnerAndGroup’,
-              defined at src/Ten/Sandbox.hs:568:1.
-    |
-573 |         setOwnerAndGroup path uid gid
-    |         ^^^^^^^^^^^^^^^^
+570 | setOwnerAndGroup' :: FilePath -> User.UserID -> User.GroupID -> IO ()
+    |                                                 ^^^^^^^^^^^^
 Error: [Cabal-7125]
 Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
 
