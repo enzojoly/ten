@@ -53,12 +53,12 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import System.Directory
 import System.FilePath
-import System.Process
+import System.Process (createProcess, proc, readCreateProcessWithExitCode, CreateProcess(..), StdStream(..))
 import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
-import System.Posix.Files
+import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus)
-import System.Posix.User
+import qualified System.Posix.User as User
 import Foreign.C.Error (throwErrno, throwErrnoIfMinus1_, getErrno)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt(..))
@@ -66,7 +66,7 @@ import System.IO.Error (IOError)
 import System.IO (hPutStrLn, stderr)
 
 import Ten.Core
-import Ten.Store
+import qualified Ten.Store as Store
 
 -- Foreign function imports for Linux-specific calls
 foreign import ccall unsafe "sys/mount.h mount"
@@ -137,7 +137,7 @@ withSandbox inputs config action = do
 
     -- Check if running as root (daemon mode)
     isRoot <- liftIO $ do
-        uid <- getRealUserID
+        uid <- User.getRealUserID
         return (uid == 0)
 
     -- Need root for proper sandbox isolation
@@ -227,26 +227,26 @@ setupSandbox sandboxDir config = do
 
         -- Set POSIX permissions for unprivileged access
         -- Owner: rwx, Group: rwx, Other: r-x
-        setFileMode sandboxDir 0o775
-        setFileMode (sandboxDir </> "out") 0o775
+        Posix.setFileMode sandboxDir 0o775
+        Posix.setFileMode (sandboxDir </> "out") 0o775
 
         -- If we're running as root, set ownership for unprivileged builder
-        uid <- getRealUserID
+        uid <- User.getRealUserID
         when (uid == 0) $ do
             -- Get the user/group IDs for the sandbox user/group
-            userEntry <- getUserEntryForName (sandboxUser config)
-            groupEntry <- getGroupEntryForName (sandboxGroup config)
-            let ownerId = userID userEntry
-            let groupId = groupID groupEntry
+            userEntry <- User.getUserEntryForName (sandboxUser config)
+            groupEntry <- User.getGroupEntryForName (sandboxGroup config)
+            let ownerId = User.userID userEntry
+            let groupId = User.groupID groupEntry
 
             -- Set ownership of key directories
-            setOwnerAndGroup sandboxDir ownerId groupId
-            setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
-            setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
+            Posix.setOwnerAndGroup sandboxDir ownerId groupId
+            Posix.setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
+            Posix.setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
 
             when (sandboxReturnSupport config) $ do
                 let returnDir = takeDirectory $ returnDerivationPath sandboxDir
-                setOwnerAndGroup returnDir ownerId groupId
+                Posix.setOwnerAndGroup returnDir ownerId groupId
 
     -- Add sandbox proof
     addProof BuildProof
@@ -285,7 +285,7 @@ createAndSetupDir dir = do
                         setOwnerReadable True $ perms)
 
     -- Set Unix permissions directly - rwxrwxr-x for proper unprivileged access
-    setFileMode dir 0o775
+    Posix.setFileMode dir 0o775
 
 -- | Helper to run a sandbox action with the Ten monad context
 runSandboxed :: BuildEnv -> BuildState -> (FilePath -> TenM 'Build a) -> FilePath -> IO (Either BuildError a)
@@ -340,7 +340,7 @@ makeInputsAvailable sandboxDir inputs = do
     -- Process each input
     forM_ (Set.toList inputs) $ \input -> do
         -- Get source path
-        let sourcePath = storePathToFilePath input env
+        let sourcePath = Store.storePathToFilePath input env
 
         -- Create two paths:
         -- 1. One with the full store path format
@@ -364,8 +364,8 @@ makeInputsAvailable sandboxDir inputs = do
                 writeFile nameDest ""
 
                 -- Make sure they are writable for the bind mount
-                setFileMode storeDest 0o664
-                setFileMode nameDest 0o664
+                Posix.setFileMode storeDest 0o664
+                Posix.setFileMode nameDest 0o664
 
             -- Mount the input (read-only)
             bindMountReadOnly sourcePath storeDest
@@ -406,7 +406,7 @@ makeSystemPathAvailable sandboxDir systemPath = do
             -- Create empty file
             liftIO $ writeFile sandboxPath ""
             -- Set proper permissions
-            liftIO $ setFileMode sandboxPath 0o664
+            liftIO $ Posix.setFileMode sandboxPath 0o664
             -- Mount file (read-only)
             liftIO $ bindMountReadOnly systemPath sandboxPath
             logMsg 3 $ "System file mounted: " <> T.pack systemPath
@@ -475,8 +475,11 @@ unmountAllBindMounts dir = do
     -- In a real implementation, we would scan /proc/mounts to find
     -- all mounts related to this sandbox
 
+-- | Process configuration for sandbox
+data ProcessConfig i o e = CreateProcess
+
 -- | Prepare process configuration for a command run in the sandbox
-sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> ProcessConfig () () ()
+sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> CreateProcess
 sandboxedProcessConfig sandboxDir programPath args envVars config =
     -- In a real implementation, this would set up the proper namespaces,
     -- cgroups, and other isolation mechanisms.
@@ -508,22 +511,22 @@ prepareSandboxEnvironment env sandboxDir extraEnv =
 dropPrivileges :: String -> String -> IO ()
 dropPrivileges userName groupName = do
     -- Get the current (effective) user ID - should be root
-    euid <- getEffectiveUserID
+    euid <- User.getEffectiveUserID
 
     -- Only proceed if we're running as root
     when (euid == 0) $ do
         -- Get user and group info
-        userEntry <- getUserEntryForName userName
-        groupEntry <- getGroupEntryForName groupName
+        userEntry <- User.getUserEntryForName userName
+        groupEntry <- User.getGroupEntryForName groupName
 
         -- Set the group ID first (must be done before dropping user privileges)
-        setGroupID (groupID groupEntry)
+        User.setGroupID (User.groupID groupEntry)
 
         -- Then set the user ID
-        setUserID (userID userEntry)
+        User.setUserID (User.userID userEntry)
 
         -- Verify the change
-        newEuid <- getEffectiveUserID
+        newEuid <- User.getEffectiveUserID
         when (newEuid == 0) $
             error "Failed to drop privileges - still running as root"
 
@@ -532,10 +535,10 @@ regainPrivileges :: IO ()
 regainPrivileges = do
     -- Set effective user ID back to 0 (root)
     -- This only works if the real UID is root
-    setEffectiveUserID 0
+    User.setEffectiveUserID 0
 
     -- Verify
-    euid <- getEffectiveUserID
+    euid <- User.getEffectiveUserID
     when (euid /= 0) $
         error "Failed to regain privileges - not running as root"
 
@@ -551,26 +554,26 @@ withDroppedPrivileges user group action =
 runBuilderAsUser :: FilePath -> [String] -> String -> String -> Map Text Text -> IO (ExitCode, String, String)
 runBuilderAsUser program args user group env = do
     -- Get current UID to check if we're root
-    uid <- getRealUserID
+    uid <- User.getRealUserID
 
     if uid == 0
         then do
             -- We're root, so use privilege dropping
             withDroppedPrivileges user group $ do
                 -- Execute the builder as the unprivileged user
-                readProcessWithExitCode program args ""
+                readCreateProcessWithExitCode (proc program args) ""
         else do
             -- Not running as root, just execute directly
-            readProcessWithExitCode program args ""
+            readCreateProcessWithExitCode (proc program args) ""
 
 -- | Helper to set ownership of a file or directory
-setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
-setOwnerAndGroup path uid gid = do
+setOwnerAndGroup' :: FilePath -> User.UserID -> User.GroupID -> IO ()
+setOwnerAndGroup' path uid gid = do
     -- Check if path exists
     exists <- doesPathExist path
     when exists $ do
         -- Set ownership
-        setOwnerAndGroup path uid gid
+        Posix.setOwnerAndGroup path uid gid
 
 -- | Bitwise OR for CInt flags
 (.|.) :: CInt -> CInt -> CInt

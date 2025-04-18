@@ -1,77 +1,172 @@
-Resolving dependencies...
 Build profile: -w ghc-9.8.2 -O1
 In order, the following will be built (use -v for more details):
  - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
  - ten-0.1.0.0 (exe:ten) (first run)
-Configuring library for ten-0.1.0.0...
 Preprocessing library for ten-0.1.0.0...
 Building library for ten-0.1.0.0...
+[ 3 of 17] Compiling Ten.Daemon.Auth  ( src/Ten/Daemon/Auth.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Auth.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Auth.dyn_o )
 
-<no location info>: warning: [GHC-32850] [-Wmissing-home-modules]
-    These modules are needed for compilation but not listed in your .cabal file's other-modules for ‘ten-0.1.0.0-inplace’ :
-        Ten.Daemon.Auth
-        Ten.Daemon.Client
-        Ten.Daemon.Config
-        Ten.Daemon.Core
-        Ten.Daemon.Protocol
-        Ten.Daemon.Server
-        Ten.Daemon.State
-[ 1 of 17] Compiling Ten.Core         ( src/Ten/Core.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Core.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Core.dyn_o )
+src/Ten/Daemon/Auth.hs:59:51: error: [GHC-61689]
+    Module ‘Crypto.Hash’ does not export ‘PBKDF2’.
+   |
+59 | import Crypto.Hash (hash, Digest, SHA256, SHA512, PBKDF2, hmac, HMAC)
+   |                                                   ^^^^^^
 
-src/Ten/Core.hs:82:1: error: [GHC-87110]
-    Could not load module ‘Control.Concurrent.STM’.
-    It is a member of the hidden package ‘stm-2.5.2.1’.
-    Perhaps you need to add ‘stm’ to the build-depends in your .cabal file.
+src/Ten/Daemon/Auth.hs:59:59: error: [GHC-61689]
+    Module ‘Crypto.Hash’ does not export ‘hmac’.
+   |
+59 | import Crypto.Hash (hash, Digest, SHA256, SHA512, PBKDF2, hmac, HMAC)
+   |                                                           ^^^^
+
+src/Ten/Daemon/Auth.hs:59:65: error: [GHC-61689]
+    Module ‘Crypto.Hash’ does not export ‘HMAC’.
+   |
+59 | import Crypto.Hash (hash, Digest, SHA256, SHA512, PBKDF2, hmac, HMAC)
+   |                                                                 ^^^^
+
+src/Ten/Daemon/Auth.hs:66:1: error: [GHC-87110]
+    Could not load module ‘Data.ByteArray’.
+    It is a member of the hidden package ‘memory-0.18.0’.
+    Perhaps you need to add ‘memory’ to the build-depends in your .cabal file.
     Use -v to see a list of the files searched for.
    |
-82 | import Control.Concurrent.STM
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+66 | import qualified Data.ByteArray as BA
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-src/Ten/Core.hs:101:1: error: [GHC-87110]
-    Could not find module ‘Network.Socket’.
+src/Ten/Daemon/Auth.hs:68:1: error: [GHC-61948]
+    Could not find module ‘Data.ByteString.Base64’.
+    Perhaps you meant
+      Data.ByteString.Lazy (from bytestring-0.12.1.0)
+      Data.ByteString.Unsafe (from bytestring-0.12.1.0)
+      Data.ByteString.Char8 (from bytestring-0.12.1.0)
     Use -v to see a list of the files searched for.
-    |
-101 | import Network.Socket (Socket)
-    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-[ 4 of 17] Compiling Ten.Hash         ( src/Ten/Hash.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Hash.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Hash.dyn_o )
-
-src/Ten/Hash.hs:29:1: warning: [GHC-66111] [-Wunused-imports]
-    The qualified import of ‘Crypto.Hash.Algorithms’ is redundant
-      except perhaps to import instances from ‘Crypto.Hash.Algorithms’
-    To import instances alone, use: import Crypto.Hash.Algorithms()
    |
-29 | import qualified Crypto.Hash.Algorithms as Crypto
+68 | import qualified Data.ByteString.Base64 as Base64
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-src/Ten/Hash.hs:32:1: warning: [GHC-66111] [-Wunused-imports]
-    The qualified import of ‘Data.ByteString.Char8’ is redundant
-      except perhaps to import instances from ‘Data.ByteString.Char8’
-    To import instances alone, use: import Data.ByteString.Char8()
+src/Ten/Daemon/Auth.hs:90:5: error: [GHC-61689]
+    Module ‘System.Posix.User’ does not export ‘UserEntry(..)’.
+    Suggested fix: Perhaps use data constructor ‘UserEntry’
    |
-32 | import qualified Data.ByteString.Char8 as BS8
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+90 |     UserEntry(..), GroupEntry(..),
+   |     ^^^^^^^^^^^^^
 
-src/Ten/Hash.hs:37:1: warning: [GHC-66111] [-Wunused-imports]
-    The import of ‘Data.List’ is redundant
-      except perhaps to import instances from ‘Data.List’
-    To import instances alone, use: import Data.List()
+src/Ten/Daemon/Auth.hs:90:20: error: [GHC-61689]
+    Module ‘System.Posix.User’ does not export ‘GroupEntry(..)’.
+    Suggested fix: Perhaps use data constructor ‘GroupEntry’
    |
-37 | import Data.List (intercalate)
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+90 |     UserEntry(..), GroupEntry(..),
+   |                    ^^^^^^^^^^^^^^
 
-src/Ten/Hash.hs:43:1: warning: [GHC-66111] [-Wunused-imports]
-    The import of ‘Control.Monad.IO.Class’ is redundant
-      except perhaps to import instances from ‘Control.Monad.IO.Class’
-    To import instances alone, use: import Control.Monad.IO.Class()
+src/Ten/Daemon/Auth.hs:95:1: error: [GHC-87110]
+    Could not load module ‘System.Random’.
+    It is a member of the hidden package ‘random-1.3.1’.
+    Perhaps you need to add ‘random’ to the build-depends in your .cabal file.
+    Use -v to see a list of the files searched for.
    |
-43 | import Control.Monad.IO.Class (liftIO)
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+95 | import System.Random (randomIO, randomRIO)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[ 6 of 17] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o )
 
-src/Ten/Hash.hs:120:1: warning: [GHC-40910] [-Wunused-top-binds]
-    Defined but not used: ‘hashFileIO’
+src/Ten/Sandbox.hs:243:13: error: [GHC-87543]
+    Ambiguous occurrence ‘setOwnerAndGroup’.
+    It could refer to
+       either ‘System.Posix.Files.setOwnerAndGroup’,
+              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
+           or ‘Ten.Sandbox.setOwnerAndGroup’,
+              defined at src/Ten/Sandbox.hs:568:1.
     |
-120 | hashFileIO path = do
-    | ^^^^^^^^^^
+243 |             setOwnerAndGroup sandboxDir ownerId groupId
+    |             ^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:244:13: error: [GHC-87543]
+    Ambiguous occurrence ‘setOwnerAndGroup’.
+    It could refer to
+       either ‘System.Posix.Files.setOwnerAndGroup’,
+              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
+           or ‘Ten.Sandbox.setOwnerAndGroup’,
+              defined at src/Ten/Sandbox.hs:568:1.
+    |
+244 |             setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
+    |             ^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:245:13: error: [GHC-87543]
+    Ambiguous occurrence ‘setOwnerAndGroup’.
+    It could refer to
+       either ‘System.Posix.Files.setOwnerAndGroup’,
+              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
+           or ‘Ten.Sandbox.setOwnerAndGroup’,
+              defined at src/Ten/Sandbox.hs:568:1.
+    |
+245 |             setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
+    |             ^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:249:17: error: [GHC-87543]
+    Ambiguous occurrence ‘setOwnerAndGroup’.
+    It could refer to
+       either ‘System.Posix.Files.setOwnerAndGroup’,
+              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
+           or ‘Ten.Sandbox.setOwnerAndGroup’,
+              defined at src/Ten/Sandbox.hs:568:1.
+    |
+249 |                 setOwnerAndGroup returnDir ownerId groupId
+    |                 ^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:343:26: error: [GHC-87543]
+    Ambiguous occurrence ‘storePathToFilePath’.
+    It could refer to
+       either ‘Ten.Core.storePathToFilePath’,
+              imported from ‘Ten.Core’ at src/Ten/Sandbox.hs:68:1-15,
+           or ‘Ten.Store.storePathToFilePath’,
+              imported from ‘Ten.Store’ at src/Ten/Sandbox.hs:69:1-16.
+    |
+343 |         let sourcePath = storePathToFilePath input env
+    |                          ^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:479:97: error: [GHC-76037]
+    Not in scope: type constructor or class ‘ProcessConfig’
+    |
+479 | sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> ProcessConfig () () ()
+    |                                                                                                 ^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:546:10: error: [GHC-87543]
+    Ambiguous occurrence ‘dropPrivileges’.
+    It could refer to
+       either ‘Ten.Core.dropPrivileges’,
+              imported from ‘Ten.Core’ at src/Ten/Sandbox.hs:68:1-15,
+           or ‘Ten.Sandbox.dropPrivileges’,
+              defined at src/Ten/Sandbox.hs:509:1.
+    |
+546 |         (dropPrivileges user group)
+    |          ^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:567:33: error: [GHC-76037]
+    Not in scope: type constructor or class ‘UserID’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘UserId’ (imported from Ten.Core),
+        data constructor ‘UserId’ (imported from Ten.Core)
+    |
+567 | setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
+    |                                 ^^^^^^
+
+src/Ten/Sandbox.hs:567:43: error: [GHC-76037]
+    Not in scope: type constructor or class ‘GroupID’
+    |
+567 | setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
+    |                                           ^^^^^^^
+
+src/Ten/Sandbox.hs:573:9: error: [GHC-87543]
+    Ambiguous occurrence ‘setOwnerAndGroup’.
+    It could refer to
+       either ‘System.Posix.Files.setOwnerAndGroup’,
+              imported from ‘System.Posix.Files’ at src/Ten/Sandbox.hs:59:1-25,
+           or ‘Ten.Sandbox.setOwnerAndGroup’,
+              defined at src/Ten/Sandbox.hs:568:1.
+    |
+573 |         setOwnerAndGroup path uid gid
+    |         ^^^^^^^^^^^^^^^^
 Error: [Cabal-7125]
-Failed to build ten-0.1.0.0 (which is required by exe:ten from ten-0.1.0.0).
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
 

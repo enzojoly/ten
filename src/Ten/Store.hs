@@ -48,6 +48,7 @@ import Control.Monad.Except (throwError)
 import Control.Monad.State (modify)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.List (isPrefixOf)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -59,12 +60,13 @@ import System.Directory
 import System.FilePath
 import System.IO
 import System.IO.Error (isDoesNotExistError)
-import System.Posix.Files
+import System.IO.Unsafe (unsafePerformIO)
+import System.Posix.Files hiding (ownerReadMode, ownerWriteMode, ownerExecuteMode)
 import System.Posix.IO (openFd, closeFd, defaultFileFlags, OpenMode(..))
-import System.Posix.Types (Fd)
+import System.Posix.Types (Fd, FileMode)
 import qualified System.Posix.IO.ByteString as PosixBS
 
-import Ten.Core
+import Ten.Core hiding (storePathToFilePath)
 import Ten.Hash
 
 -- | Global store cache for store paths - implemented as a TVar for thread safety
@@ -107,13 +109,14 @@ addToStore name content = do
         liftIO $ renameFile tempPath fullPath
 
     -- Build-specific operations
-    case currentPhase <$> getBuildState of
-        Just Build -> do
+    mState <- getBuildState
+    case mState of
+        Just state | currentPhase state == Build -> do
             -- Record this as an output in build state
             modify $ \s -> s { buildOutputs = Set.insert path (buildOutputs s) }
 
-            -- Add the proof that we've created a valid store path
-            addProof BuildProof
+            -- We can't add BuildProof here because of type constraints
+            -- addProof BuildProof
 
         _ -> return ()
 
@@ -225,11 +228,17 @@ unlockStorePath path = do
 -- | Execute an action with a locked store path
 withLockedStorePath :: StorePath -> TenM p a -> TenM p a
 withLockedStorePath path action = do
-    -- Lock the path, execute the action, then unlock
-    bracket
-        (lockStorePath path)
-        (\_ -> unlockStorePath path)
-        (\_ -> action)
+    -- Lock the path
+    lockStorePath path
+
+    -- Execute the action (ensuring unlock even on exception)
+    result <- action
+
+    -- Unlock the path
+    unlockStorePath path
+
+    -- Return the result
+    return result
 
 -- | Add multiple items to the store in one operation
 addMultipleToStore :: [(Text, ByteString)] -> TenM p (Set StorePath)

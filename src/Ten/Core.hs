@@ -93,6 +93,7 @@ import Control.Monad.State
 import Control.Monad.IO.Class
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.Unique (Unique, newUnique, hashUnique)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -125,7 +126,7 @@ newtype BuildId = BuildId Unique
     deriving (Eq, Ord)
 
 instance Show BuildId where
-    show (BuildId u) = "build-" ++ show u
+    show (BuildId u) = "build-" ++ show (hashUnique u)
 
 -- | Core error types
 data BuildError
@@ -409,32 +410,30 @@ storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++
 
 -- | Safely transition between phases
 transitionPhase :: PhaseTransition p q -> TenM p a -> TenM q a
-transitionPhase trans action =
+transitionPhase trans action = TenM $ do
+    env <- ask
+    state <- get
+
     case trans of
-        EvalToBuild -> TenM $ do
-            env <- ask
-            state <- get
-            -- Run action in eval phase
-            liftIO $ do
-                result <- runTen action env state
-                case result of
-                    Left err -> return $ throwError err
-                    Right (val, newState) -> do
-                        -- Transition to build phase
-                        let buildState = newState { currentPhase = Build }
-                        return $ return (val, buildState) >>= uncurry (,)
-        BuildToEval -> TenM $ do
-            env <- ask
-            state <- get
-            -- Run action in build phase
-            liftIO $ do
-                result <- runTen action env state
-                case result of
-                    Left err -> return $ throwError err
-                    Right (val, newState) -> do
-                        -- Transition to eval phase
-                        let evalState = newState { currentPhase = Eval }
-                        return $ return (val, evalState) >>= uncurry (,)
+        EvalToBuild -> do
+            -- Run action in eval phase with original state
+            result <- liftIO $ runTen action env state
+            case result of
+                Left err -> throwError err
+                Right (val, newState) -> do
+                    -- Update state with build phase
+                    put newState { currentPhase = Build }
+                    return val
+
+        BuildToEval -> do
+            -- Run action in build phase with original state
+            result <- liftIO $ runTen action env state
+            case result of
+                Left err -> throwError err
+                Right (val, newState) -> do
+                    -- Update state with eval phase
+                    put newState { currentPhase = Eval }
+                    return val
 
 -- | Generate a new unique build ID
 newBuildId :: TenM p BuildId

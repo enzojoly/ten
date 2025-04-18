@@ -49,7 +49,7 @@ import qualified Data.Text.IO as TIO
 import System.Console.GetOpt (OptDescr(..), ArgDescr(..), ArgOrder(..), getOpt)
 import System.Directory (doesFileExist, getHomeDirectory, createDirectoryIfMissing, getXdgDirectory, XdgDirectory(..))
 import System.Environment (getEnv, lookupEnv)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName)
 import qualified System.IO.Error as IOE
 
@@ -99,6 +99,10 @@ data DaemonConfig = DaemonConfig {
     daemonAutoStart     :: Bool,          -- ^ Auto-start daemon when client connects if not running
     daemonRestrictive   :: Bool           -- ^ Use more restrictive sandbox settings
 } deriving (Show, Eq)
+
+-- | Load daemon configuration from a file (alias for loadConfigFromFile)
+loadDaemonConfig :: FilePath -> IO (Either String DaemonConfig)
+loadDaemonConfig = loadConfigFromFile
 
 -- | Default daemon configuration
 defaultDaemonConfig :: DaemonConfig
@@ -189,11 +193,6 @@ getDefaultConfig = do
     mapM_ (createDirectoryIfMissing True) dirsToCreate
 
     return config
-  where
-    takeDirectory path =
-        case break (== '/') (reverse path) of
-            (_, []) -> "."
-            (_, (_:rest)) -> reverse rest
 
 -- | Get the default socket path based on current user
 getDefaultSocketPath :: IO FilePath
