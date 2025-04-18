@@ -63,6 +63,8 @@ import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Aeson.Encoding as Aeson
+import qualified Data.Vector as Vector
+import qualified Data.HashMap.Strict as HashMap
 import System.FilePath
 import System.Directory (doesFileExist)
 import System.IO (withFile, IOMode(..))
@@ -398,7 +400,7 @@ derivationFromJSON = Aeson.parseEither $ \o -> do
 
     parseInputs :: Aeson.Value -> Aeson.Parser [DerivationInput]
     parseInputs = Aeson.withArray "Inputs" $ \arr ->
-        mapM parseInput (Aeson.toList arr)
+        mapM parseInput (Vector.toList arr)
 
     parseInput :: Aeson.Value -> Aeson.Parser DerivationInput
     parseInput = Aeson.withObject "DerivationInput" $ \o -> do
@@ -409,7 +411,7 @@ derivationFromJSON = Aeson.parseEither $ \o -> do
 
     parseOutputs :: Aeson.Value -> Aeson.Parser [DerivationOutput]
     parseOutputs = Aeson.withArray "Outputs" $ \arr ->
-        mapM parseOutput (Aeson.toList arr)
+        mapM parseOutput (Vector.toList arr)
 
     parseOutput :: Aeson.Value -> Aeson.Parser DerivationOutput
     parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
@@ -420,7 +422,7 @@ derivationFromJSON = Aeson.parseEither $ \o -> do
 
     parseEnv :: Aeson.Value -> Map Text Text
     parseEnv (Aeson.Object obj) = Map.fromList $
-        map (\(k, Aeson.String v) -> (k, v)) $ Aeson.toList obj
+        map (\(k, Aeson.String v) -> (k, v)) $ HashMap.toList obj
     parseEnv _ = Map.empty
 
 -- | Hash a derivation's inputs for dependency tracking

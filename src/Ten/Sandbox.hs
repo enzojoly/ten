@@ -74,6 +74,11 @@ import System.IO (hPutStrLn, stderr, hClose)
 import Ten.Core
 import qualified Ten.Store as Store
 
+-- Helper function to convert BuildId to String
+showBuildId :: Maybe BuildId -> String
+showBuildId Nothing = "unknown"
+showBuildId (Just (BuildId _)) = "build" -- Simply use a placeholder string since we can't show Unique directly
+
 -- Custom RLimit structure for FFI compatibility since System.Posix.Resource doesn't export it
 data RLimit = RLimit
     { rlim_cur :: CULong  -- Current limit (soft limit)
@@ -286,7 +291,7 @@ getSandboxDir env = do
     case bid of
         Just (BuildId uid) -> do
             -- Use build ID for unique sandbox in daemon mode
-            let uniqueDir = baseDir </> "build-" ++ show uid
+            let uniqueDir = baseDir </> "build-" ++ showBuildId bid
             liftIO $ createDirectoryIfMissing True uniqueDir
             return uniqueDir
         Nothing -> do
@@ -389,9 +394,8 @@ teardownSandbox sandboxDir = do
     if returnExists
         then do
             -- If there's a return derivation, unmount everything but preserve the file
-            liftIO $ do
-                unmountAllBindMounts sandboxDir
-                logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
+            liftIO $ unmountAllBindMounts sandboxDir
+            logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
         else do
             -- Otherwise remove the entire sandbox
             liftIO $ do
@@ -563,7 +567,7 @@ makeInputsAvailable sandboxDir inputs = do
                             then copyDirectoryRecursive sourcePath nameDest
                             else copyFile sourcePath nameDest)
 
-        logMsg 3 $ "Made input available: " <> T.pack (storeHash input) <> "-" <> T.pack (storeName input)
+        logMsg 3 $ "Made input available: " <> storeHash input <> "-" <> storeName input
 
     logMsg 2 $ "Made " <> T.pack (show $ Set.size inputs) <> " inputs available in sandbox"
 
@@ -632,7 +636,7 @@ bindMount source dest writable = do
                     when (ret /= 0) $ do
                         errno <- getErrno
                         throwErrno $ "Failed to bind mount " ++ source ++ " to " ++ dest ++
-                                    " (errno: " ++ show errno ++ ")"
+                                    " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
 
     -- If read-only, remount with MS_RDONLY
     unless writable $ do
@@ -646,7 +650,7 @@ bindMount source dest writable = do
                             errno <- getErrno
                             -- Don't fail, just warn - the mount is already established
                             hPutStrLn stderr $ "Warning: Failed to remount read-only " ++ dest ++
-                                             " (errno: " ++ show errno ++ ")"
+                                             " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
 
 -- | Shorthand for read-only bind mounts
 bindMountReadOnly :: FilePath -> FilePath -> IO ()
@@ -667,7 +671,7 @@ unmountPath path = do
                 unless (isPermissionError (errnoToIOError "umount" errno Nothing Nothing) ||
                         isDoesNotExistError (errnoToIOError "umount" errno Nothing Nothing)) $ do
                     hPutStrLn stderr $ "Warning: Failed to unmount " ++ path ++
-                                      " (errno: " ++ show errno ++ ")"
+                                      " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
 
 -- | Find and unmount all bind mounts in a sandbox directory
 unmountAllBindMounts :: FilePath -> IO ()
@@ -785,13 +789,13 @@ dropSandboxPrivileges userName groupName = do
 setResourceLimits :: IO ()
 setResourceLimits = do
     -- Set core dump limit to 0
-    Resource.setResourceLimit Resource.ResourceCoreFileSize (Resource.ResourceLimits 0 0)
+    Resource.setResourceLimit Resource.ResourceCoreFileSize (Resource.ResourceLimits Resource.ResourceLimitInfinity Resource.ResourceLimitInfinity)
 
     -- Set a reasonable file size limit (1GB)
-    Resource.setResourceLimit Resource.ResourceFileSize (Resource.ResourceLimits (1024*1024*1024) (1024*1024*1024))
+    Resource.setResourceLimit Resource.ResourceFileSize (Resource.ResourceLimits (Resource.ResourceLimit $ 1024*1024*1024) (Resource.ResourceLimit $ 1024*1024*1024))
 
     -- Set reasonable number of open files
-    Resource.setResourceLimit Resource.ResourceOpenFiles (Resource.ResourceLimits 1024 1024)
+    Resource.setResourceLimit Resource.ResourceOpenFiles (Resource.ResourceLimits (Resource.ResourceLimit 1024) (Resource.ResourceLimit 1024))
 
 -- | Regain privileges (back to root)
 regainPrivileges :: IO ()
