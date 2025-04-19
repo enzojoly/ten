@@ -61,7 +61,7 @@ import qualified Data.Text as T
 import qualified Data.List as List
 import Data.Maybe (isJust, fromJust, catMaybes)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.:), (.=))  -- Add this import for JSON operators
+import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Vector as Vector
@@ -547,8 +547,8 @@ deserializeGraph json =
     parseEdgeEntry _ = Left "Edge entry must be an array"
 
     parseRoots :: Aeson.Value -> Either Text (Set Text)
-    parseRoots (Aeson.Array arr) = do
-        rootsList <- parseTextArray arr
+    parseRoots val@(Aeson.Array _) = do
+        rootsList <- parseTextArray val
         return $ Set.fromList rootsList
     parseRoots _ = Left "Roots field must be an array"
 

@@ -176,7 +176,7 @@ instance Aeson.ToJSON AuthResult where
 
 instance Aeson.FromJSON AuthResult where
     parseJSON = Aeson.withObject "AuthResult" $ \v -> do
-        status <- v .: "status"
+        status <- v .: "status" :: Aeson.Parser Text
         case status of
             "accepted" -> do
                 uid <- v .: "userId"
@@ -265,7 +265,7 @@ instance Aeson.ToJSON BuildStatusUpdate where
 
 instance Aeson.FromJSON BuildStatusUpdate where
     parseJSON = Aeson.withObject "BuildStatusUpdate" $ \v -> do
-        buildIdStr <- v .: "buildId"
+        buildIdStr <- v .: "buildId" :: Aeson.Parser Text
         let buildId = read buildIdStr  -- Will throw if invalid
         statusObj <- v .: "status"
         buildStatus <- parseStatus statusObj
@@ -276,14 +276,14 @@ instance Aeson.FromJSON BuildStatusUpdate where
         return BuildStatusUpdate{..}
       where
         parseStatus obj = Aeson.withObject "BuildStatus" (\o -> do
-            statusType <- o .: "type"
+            statusType <- o .: "type" :: Aeson.Parser Text
             case statusType of
                 "pending" -> return BuildPending
                 "running" -> do
                     progress <- o .: "progress"
                     return $ BuildRunning progress
                 "recursing" -> do
-                    innerIdStr <- o .: "innerBuildId"
+                    innerIdStr <- o .: "innerBuildId" :: Aeson.Parser Text
                     return $ BuildRecursing (read innerIdStr)
                 "completed" -> return BuildCompleted
                 "failed" -> return BuildFailed'
@@ -452,7 +452,7 @@ instance Aeson.ToJSON DaemonRequest where
 
 instance Aeson.FromJSON DaemonRequest where
     parseJSON = Aeson.withObject "DaemonRequest" $ \v -> do
-        requestType <- v .: "type"
+        requestType <- v .: "type" :: Aeson.Parser Text
         case requestType of
             "auth" -> do
                 ver <- v .: "version"
@@ -473,15 +473,15 @@ instance Aeson.FromJSON DaemonRequest where
                 return $ BuildFile path info
 
             "cancel-build" -> do
-                buildIdStr <- v .: "buildId"
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 return $ CancelBuild (read buildIdStr)
 
             "query-build-status" -> do
-                buildIdStr <- v .: "buildId"
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 return $ QueryBuildStatus (read buildIdStr)
 
             "query-build-output" -> do
-                buildIdStr <- v .: "buildId"
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 return $ QueryBuildOutput (read buildIdStr)
 
             "list-builds" -> do
@@ -576,7 +576,7 @@ data DaemonResponse
     | BuildStatusResponse BuildStatusUpdate
     | BuildFinished BuildId (Either BuildError (Set StorePath))
     | BuildOutputResponse BuildId Text  -- Build log
-    | BuildListResponse [(BuildId, BuildStatus, Float)]  -- BuildId, status, progress (changed from Double to Float)
+    | BuildListResponse [(BuildId, BuildStatus, Float)]  -- BuildId, status, progress
 
     -- Store responses
     | PathInfoResponse StorePath Bool Text  -- StorePath, exists, info
@@ -813,14 +813,14 @@ instance Aeson.ToJSON DaemonResponse where
 
 instance Aeson.FromJSON DaemonResponse where
     parseJSON = Aeson.withObject "DaemonResponse" $ \v -> do
-        responseType <- v .: "type"
+        responseType <- v .: "type" :: Aeson.Parser Text
         case responseType of
             "auth" -> do
                 result <- v .: "result"
                 return $ AuthResponse result
 
             "build-started" -> do
-                buildIdStr <- v .: "buildId"
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 return $ BuildStarted (read buildIdStr)
 
             "build-status" -> do
@@ -828,7 +828,7 @@ instance Aeson.FromJSON DaemonResponse where
                 return $ BuildStatusResponse update
 
             "build-finished" -> do
-                buildIdStr <- v .: "buildId"
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 resultObj <- v .: "result"
                 success <- resultObj .: "success"
                 result <- if success
@@ -842,20 +842,20 @@ instance Aeson.FromJSON DaemonResponse where
                 return $ BuildFinished (read buildIdStr) result
 
             "build-output" -> do
-                buildIdStr <- v .: "buildId"
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 output <- v .: "output"
                 return $ BuildOutputResponse (read buildIdStr) output
 
             "build-list" -> do
                 buildsJson <- v .: "builds"
                 builds <- mapM (\obj -> do
-                    idStr <- obj .: "id"
-                    statusStr <- obj .: "status"
-                    progress <- obj .: "progress"
+                    idStr <- obj .: "id" :: Aeson.Parser Text
+                    statusStr <- obj .: "status" :: Aeson.Parser Text
+                    progress <- obj .: "progress" :: Aeson.Parser Float
                     let status = case statusStr of
                             "pending" -> BuildPending
                             "running" -> BuildRunning progress
-                            "recursing" -> BuildRecursing (BuildId undefined)  -- Can't reconstruct inner ID
+                            "recursing" -> BuildRecursing (BuildIdFromInt 0)  -- Temporary ID, will be replaced
                             "completed" -> BuildCompleted
                             "failed" -> BuildFailed'
                             _ -> BuildPending  -- Default
