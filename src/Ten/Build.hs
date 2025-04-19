@@ -52,6 +52,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
@@ -62,10 +63,11 @@ import System.Process
 import System.Exit
 import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile)
 import System.Posix.Files (setFileMode, getFileStatus, fileMode)
-import System.Posix.User (getUserEntryForName, UserEntry(..), getGroupEntryForName, GroupEntry(..))
+import qualified System.Posix.User as User
 import System.Posix.Process (ProcessStatus(..), getProcessStatus)
 import System.Posix.Signals (signalProcess, sigKILL)
-import System.Posix.Types (ProcessID, FileMode)
+import System.Posix.Types (ProcessID, FileMode, UserID, GroupID)
+import System.Posix.IO (createPipe, fdToHandle)
 import System.Timeout (timeout)
 import System.Random (randomRIO)
 import Control.Concurrent.Async (async, Async, wait, cancel, waitCatch)
@@ -129,7 +131,7 @@ buildApplicativeStrategy deriv = do
             logMsg 2 $ "Building " <> T.pack (show $ length missingDeps) <> " dependencies first"
 
             -- Create a map of dependency derivations
-            depDerivs <- liftIO $ atomically $ newTVar Map.empty
+            depDerivs <- liftIO $ atomically $ newTVarIO Map.empty
 
             -- Find the derivations for each missing dependency
             deps <- findDependencyDerivations missingDeps
@@ -280,8 +282,8 @@ buildWithSandbox deriv config = do
             if uid == 0
                 then do
                     -- Try to use the specified user, fallback to nobody
-                    catch (getUserEntryForName (sandboxUser config)) $ \(_ :: SomeException) ->
-                        getUserEntryForName "nobody"
+                    catch (User.getUserEntryForName (sandboxUser config)) $ \(_ :: SomeException) ->
+                        User.getUserEntryForName "nobody"
                 else
                     -- Not running as root, use current user
                     User.getUserEntryForID uid
@@ -292,17 +294,17 @@ buildWithSandbox deriv config = do
             if uid == 0
                 then do
                     -- Try to use the specified group, fallback to nogroup
-                    catch (getGroupEntryForName (sandboxGroup config)) $ \(_ :: SomeException) ->
-                        getGroupEntryForName "nogroup"
+                    catch (User.getGroupEntryForName (sandboxGroup config)) $ \(_ :: SomeException) ->
+                        User.getGroupEntryForName "nogroup"
                 else
                     -- Not running as root, use current user's primary group
-                    User.getGroupEntryForID (userGroupID builderUser)
+                    User.getGroupEntryForID (User.userGroupID builderUser)
 
         -- Log the build command
         logMsg 1 $ "Building: " <> derivName deriv
         logMsg 2 $ "Command: " <> T.pack execPath <> " " <>
                    T.intercalate " " (map T.pack $ map T.unpack $ derivArgs deriv)
-        logMsg 3 $ "Running as: " <> T.pack (userName builderUser) <> ":" <> T.pack (groupName builderGroup)
+        logMsg 3 $ "Running as: " <> T.pack (User.userName builderUser) <> ":" <> T.pack (User.groupName builderGroup)
 
         -- Run the builder with proper privilege handling
         buildResult <- runBuilder execPath (map T.unpack $ derivArgs deriv) buildDir buildEnv builderUser builderGroup
@@ -350,7 +352,7 @@ buildWithSandbox deriv config = do
                             }
 
 -- | Run a builder process with proper privilege handling
-runBuilder :: FilePath -> [String] -> FilePath -> Map Text Text -> UserEntry -> GroupEntry
+runBuilder :: FilePath -> [String] -> FilePath -> Map Text Text -> User.UserEntry -> User.GroupEntry
            -> TenM 'Build (Either Text (ExitCode, String, String))
 runBuilder program args buildDir envVars userEntry groupEntry = do
     -- Verify that the program exists and is executable
@@ -375,7 +377,7 @@ runBuilder program args buildDir envVars userEntry groupEntry = do
     -- Determine if we need to drop privileges
     needDropPrivs <- liftIO $ do
         uid <- User.getRealUserID
-        return $ uid == 0 && userName userEntry /= "root"
+        return $ uid == 0 && User.userName userEntry /= "root"
 
     -- Start the builder process with proper privilege handling
     (mPid, result) <- liftIO $ mask $ \restore -> do
@@ -396,8 +398,8 @@ runBuilder program args buildDir envVars userEntry groupEntry = do
             -- Drop privileges if needed
             when needDropPrivs $ do
                 -- Set group first, then user
-                User.setGroupID (groupID groupEntry)
-                User.setUserID (userID userEntry)
+                User.setGroupID (User.groupID groupEntry)
+                User.setUserID (User.userID userEntry)
 
             -- Change to build directory
             setCurrentDirectory buildDir

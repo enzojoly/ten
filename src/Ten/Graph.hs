@@ -25,7 +25,7 @@ module Ten.Graph (
 
     -- Recursive derivation handling
     detectRecursionCycle,
-    addToDerivationChain,
+    Ten.Core.addToDerivationChain,
 
     -- Graph queries
     findAffected,

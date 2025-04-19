@@ -31,7 +31,9 @@ module Ten.Core (
 
     -- Store types
     StorePath(..),
-    storePathToFilePath,
+
+    -- Re-exports from Ten.Store (removed redundant local definitions)
+    -- storePathToFilePath is now imported from Ten.Store
 
     -- Core derivation types
     Derivation(..),
@@ -456,10 +458,6 @@ evalTen m env = runTen m env (initBuildState Eval)
 -- | Execute a build-phase computation
 buildTen :: TenM 'Build a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 buildTen m env = runTen m env (initBuildState Build)
-
--- | Convert a store path to a filesystem path
-storePathToFilePath :: StorePath -> BuildEnv -> FilePath
-storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
 
 -- | Safely transition between phases
 transitionPhase :: PhaseTransition p q -> TenM p a -> TenM q a

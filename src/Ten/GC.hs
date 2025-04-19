@@ -49,14 +49,14 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.ByteString as BS
-import System.Directory
+import System.Directory hiding (getFileSize) -- Avoid ambiguity
 import System.FilePath
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.Files
 import System.IO (hPutStrLn, stderr)
 
-import Ten.Core
-import Ten.Store
+import Ten.Core hiding (storePathToFilePath) -- Import Core but not the conflicting function
+import qualified Ten.Store as Store          -- Use qualified import for Store
 import Ten.Hash
 import Ten.Derivation
 import Ten.Graph
@@ -109,7 +109,7 @@ addRoot path name permanent = do
     let rootFile = rootsDir </> (T.unpack $ storeHash path <> "-" <> name)
 
     -- Write a symlink to the actual path
-    let targetPath = storePathToFilePath path env
+    let targetPath = Store.storePathToFilePath path env
     liftIO $ createSymbolicLink targetPath rootFile
 
     logMsg 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
@@ -175,7 +175,7 @@ collectGarbageWithStats env = do
     let deletablePaths = Set.difference allStorePaths protectedPaths
 
     -- Get total size of deletable paths
-    totalSize <- liftIO $ sum <$> mapM (getFileSize . (storeDir </>)) (Set.toList deletablePaths)
+    totalSize <- liftIO $ sum <$> mapM (getFileSizeIO . (storeDir </>)) (Set.toList deletablePaths)
 
     -- Delete unreachable paths
     deleted <- liftIO $ do
@@ -401,18 +401,15 @@ parseStorePath path =
         (hash, '-':name) -> Just $ StorePath (T.pack hash) (T.pack name)
         _ -> Nothing
 
--- | Helper to get the size of a file
-getFileSize :: FilePath -> IO Integer
-getFileSize path = do
+-- | Helper to get the size of a file - renamed to avoid ambiguity
+getFileSizeIO :: FilePath -> IO Integer
+getFileSizeIO path = do
     exists <- doesFileExist path
     if exists
-        then getFileSize' path
+        then do
+            info <- getFileStatus path
+            return $ fromIntegral $ fileSize info
         else return 0
-  where
-    getFileSize' :: FilePath -> IO Integer
-    getFileSize' p = do
-        info <- getFileStatus p
-        return $ fromIntegral $ fileSize info
 
 -- | Verify the store integrity
 verifyStore :: TenM p Bool
@@ -488,7 +485,7 @@ repairStore = do
                     then return (validCount + 1, invalidCount, totalSize)
                     else do
                         -- Remove invalid path and add to size
-                        size <- liftIO $ getFileSize fullPath
+                        size <- liftIO $ getFileSizeIO fullPath
                         liftIO $ removeFile fullPath
                         return (validCount, invalidCount + 1, totalSize + size)
 
@@ -507,9 +504,9 @@ onException action handler = do
             throwError err
         Right (val, _) -> return val
 
--- | STM version of throwError
+-- | STM version of throwError - fixed implementation to avoid recursion
 throwSTM :: BuildError -> STM a
-throwSTM err = throwSTM $ err
+throwSTM err = Control.Concurrent.STM.throwSTM $ toException err
 
 -- | Helper functions for STM
 catMaybes :: [Maybe a] -> [a]
