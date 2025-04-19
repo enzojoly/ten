@@ -1,0 +1,514 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[ 8 of 17] Compiling Ten.Graph        ( src/Ten/Graph.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Graph.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Graph.dyn_o )
+
+src/Ten/Graph.hs:116:7: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+116 |     { graphNodes = Map.empty
+    |       ^^^^^^^^^^
+
+src/Ten/Graph.hs:117:7: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+117 |     , graphEdges = Map.empty
+    |       ^^^^^^^^^^
+
+src/Ten/Graph.hs:118:7: error: [GHC-87543]
+    Ambiguous occurrence ‘graphRoots’.
+    It could refer to
+       either the field ‘graphRoots’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphRoots’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:109:7.
+    |
+118 |     , graphRoots = Set.empty
+    |       ^^^^^^^^^^
+
+src/Ten/Graph.hs:144:28: error: [GHC-56428]
+    Ambiguous record field ‘graphRoots’.
+    It could refer to any of the following:
+      • record field ‘graphRoots’ of ‘Ten.Core.BuildGraph’,
+        imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35
+      • record field ‘graphRoots’ of ‘BuildGraph’,
+        defined at src/Ten/Graph.hs:109:7
+    Suggested fix: Perhaps you intended to use DisambiguateRecordFields
+    |
+144 |     let graph'' = graph' { graphRoots = Set.map outputNodeId requestedOutputs }
+    |                            ^^^^^^^^^^
+
+src/Ten/Graph.hs:155:13: error: [GHC-56428]
+    Ambiguous record field ‘graphNodes’.
+    It could refer to any of the following:
+      • record field ‘graphNodes’ of ‘Ten.Core.BuildGraph’,
+        imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35
+      • record field ‘graphNodes’ of ‘BuildGraph’,
+        defined at src/Ten/Graph.hs:107:7
+    Suggested fix: Perhaps you intended to use DisambiguateRecordFields
+    |
+155 |     graph { graphNodes = Map.insert nodeId node (graphNodes graph) }
+    |             ^^^^^^^^^^
+
+src/Ten/Graph.hs:155:50: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+155 |     graph { graphNodes = Map.insert nodeId node (graphNodes graph) }
+    |                                                  ^^^^^^^^^^
+
+src/Ten/Graph.hs:161:61: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+161 |         currentDeps = Map.findWithDefault Set.empty fromId (graphEdges graph)
+    |                                                             ^^^^^^^^^^
+
+src/Ten/Graph.hs:164:17: error: [GHC-56428]
+    Ambiguous record field ‘graphEdges’.
+    It could refer to any of the following:
+      • record field ‘graphEdges’ of ‘Ten.Core.BuildGraph’,
+        imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35
+      • record field ‘graphEdges’ of ‘BuildGraph’,
+        defined at src/Ten/Graph.hs:108:7
+    Suggested fix: Perhaps you intended to use DisambiguateRecordFields
+    |
+164 |         graph { graphEdges = Map.insert fromId newDeps (graphEdges graph) }
+    |                 ^^^^^^^^^^
+
+src/Ten/Graph.hs:164:57: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+164 |         graph { graphEdges = Map.insert fromId newDeps (graphEdges graph) }
+    |                                                         ^^^^^^^^^^
+
+src/Ten/Graph.hs:180:41: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+180 |         let g' = if Map.member inputId (graphNodes g)
+    |                                         ^^^^^^^^^^
+
+src/Ten/Graph.hs:224:73: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+224 |     result <- foldM checkNode (False, Set.empty, Set.empty) (Map.keys $ graphNodes graph)
+    |                                                                         ^^^^^^^^^^
+
+src/Ten/Graph.hs:244:54: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+244 |     let deps = Map.findWithDefault Set.empty nodeId (graphEdges graph)
+    |                                                      ^^^^^^^^^^
+
+src/Ten/Graph.hs:262:34: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+262 |     let allNodes = Map.keysSet $ graphNodes graph
+    |                                  ^^^^^^^^^^
+
+src/Ten/Graph.hs:263:44: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+263 |     let allDeps = Set.unions $ Map.elems $ graphEdges graph
+    |                                            ^^^^^^^^^^
+
+src/Ten/Graph.hs:271:14: error: [GHC-87543]
+    Ambiguous occurrence ‘AcyclicProof’.
+    It could refer to
+       either ‘Ten.Core.AcyclicProof’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or ‘Ten.Graph.AcyclicProof’, defined at src/Ten/Graph.hs:100:7.
+    |
+271 |         Just AcyclicProof -> pure ()
+    |              ^^^^^^^^^^^^
+
+src/Ten/Graph.hs:279:30: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+279 |     let nodeIds = Map.keys $ graphNodes graph
+    |                              ^^^^^^^^^^
+
+src/Ten/Graph.hs:283:61: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+283 |     return $ catMaybes $ map (\nodeId -> Map.lookup nodeId (graphNodes graph)) sorted
+    |                                                             ^^^^^^^^^^
+
+src/Ten/Graph.hs:293:62: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+293 |             let deps = Map.findWithDefault Set.empty nodeId (graphEdges graph)
+    |                                                              ^^^^^^^^^^
+
+src/Ten/Graph.hs:302:43: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+302 |     Map.findWithDefault Set.empty nodeId (graphEdges graph)
+    |                                           ^^^^^^^^^^
+
+src/Ten/Graph.hs:336:56: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+336 |     let reverseEdges = Map.filter (Set.member nodeId) (graphEdges graph)
+    |                                                        ^^^^^^^^^^
+
+src/Ten/Graph.hs:357:51: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+357 |     Map.foldl' (\acc node -> f acc node) initial (graphNodes graph)
+    |                                                   ^^^^^^^^^^
+
+src/Ten/Graph.hs:362:13: error: [GHC-56428]
+    Ambiguous record field ‘graphNodes’.
+    It could refer to any of the following:
+      • record field ‘graphNodes’ of ‘Ten.Core.BuildGraph’,
+        imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35
+      • record field ‘graphNodes’ of ‘BuildGraph’,
+        defined at src/Ten/Graph.hs:107:7
+    Suggested fix: Perhaps you intended to use DisambiguateRecordFields
+    |
+362 |     graph { graphNodes = Map.map f (graphNodes graph) }
+    |             ^^^^^^^^^^
+
+src/Ten/Graph.hs:362:37: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+362 |     graph { graphNodes = Map.map f (graphNodes graph) }
+    |                                     ^^^^^^^^^^
+
+src/Ten/Graph.hs:371:72: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+371 |     let newNodes = Map.filterWithKey (\k _ -> k `Set.member` closure) (graphNodes graph)
+    |                                                                        ^^^^^^^^^^
+
+src/Ten/Graph.hs:372:72: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+372 |     let newEdges = Map.filterWithKey (\k _ -> k `Set.member` closure) (graphEdges graph)
+    |                                                                        ^^^^^^^^^^
+
+src/Ten/Graph.hs:376:11: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+376 |         { graphNodes = newNodes
+    |           ^^^^^^^^^^
+
+src/Ten/Graph.hs:377:11: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+377 |         , graphEdges = newEdges
+    |           ^^^^^^^^^^
+
+src/Ten/Graph.hs:378:11: error: [GHC-87543]
+    Ambiguous occurrence ‘graphRoots’.
+    It could refer to
+       either the field ‘graphRoots’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphRoots’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:109:7.
+    |
+378 |         , graphRoots = newRoots
+    |           ^^^^^^^^^^
+
+src/Ten/Graph.hs:396:64: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+396 |             neighbors = Map.findWithDefault Set.empty current (graphEdges graph)
+    |                                                                ^^^^^^^^^^
+
+src/Ten/Graph.hs:421:64: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+421 |             neighbors = Map.findWithDefault Set.empty current (graphEdges graph)
+    |                                                                ^^^^^^^^^^
+
+src/Ten/Graph.hs:448:34: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+448 |     [ "nodes" .= serializeNodes (graphNodes graph)
+    |                                  ^^^^^^^^^^
+
+src/Ten/Graph.hs:449:34: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+449 |     , "edges" .= serializeEdges (graphEdges graph)
+    |                                  ^^^^^^^^^^
+
+src/Ten/Graph.hs:450:30: error: [GHC-87543]
+    Ambiguous occurrence ‘graphRoots’.
+    It could refer to
+       either the field ‘graphRoots’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphRoots’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:109:7.
+    |
+450 |     , "roots" .= Set.toList (graphRoots graph)
+    |                              ^^^^^^^^^^
+
+src/Ten/Graph.hs:507:23: error: [GHC-87543]
+    Ambiguous occurrence ‘graphNodes’.
+    It could refer to
+       either the field ‘graphNodes’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphNodes’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:107:7.
+    |
+507 |                     { graphNodes = nodes
+    |                       ^^^^^^^^^^
+
+src/Ten/Graph.hs:508:23: error: [GHC-87543]
+    Ambiguous occurrence ‘graphEdges’.
+    It could refer to
+       either the field ‘graphEdges’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphEdges’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:108:7.
+    |
+508 |                     , graphEdges = edges
+    |                       ^^^^^^^^^^
+
+src/Ten/Graph.hs:509:23: error: [GHC-87543]
+    Ambiguous occurrence ‘graphRoots’.
+    It could refer to
+       either the field ‘graphRoots’ of record ‘Ten.Core.BuildGraph’,
+              imported from ‘Ten.Core’ at src/Ten/Graph.hs:79:1-35,
+           or the field ‘graphRoots’ of record ‘BuildGraph’,
+              defined at src/Ten/Graph.hs:109:7.
+    |
+509 |                     , graphRoots = roots
+    |                       ^^^^^^^^^^
+[10 of 17] Compiling Ten.Daemon.Protocol ( src/Ten/Daemon/Protocol.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Protocol.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Protocol.dyn_o )
+
+src/Ten/Daemon/Protocol.hs:864:44: error: [GHC-83865]
+    • Couldn't match type ‘Float’ with ‘Double’
+      Expected: [(BuildId, BuildStatus, Double)]
+        Actual: [(BuildId, BuildStatus, Float)]
+    • In the first argument of ‘BuildListResponse’, namely ‘builds’
+      In the second argument of ‘($)’, namely ‘BuildListResponse builds’
+      In a stmt of a 'do' block: return $ BuildListResponse builds
+    |
+864 |                 return $ BuildListResponse builds
+    |                                            ^^^^^^
+
+src/Ten/Daemon/Protocol.hs:1136:63: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’
+                  with actual type ‘[Text] -> Map Text Text -> Ten.Hash.Hash’
+    • Probable cause: ‘hashDerivation’ is applied to too few arguments
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+      In the first argument of ‘(++)’, namely
+        ‘T.unpack (T.take 40 (hashDerivation drv))’
+     |
+1136 |         T.pack $ "Build derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                               ^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Protocol.hs:1136:78: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’ with actual type ‘Derivation’
+    • In the first argument of ‘hashDerivation’, namely ‘drv’
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+     |
+1136 |         T.pack $ "Build derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                                              ^^^
+
+src/Ten/Daemon/Protocol.hs:1195:70: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’
+                  with actual type ‘[Text] -> Map Text Text -> Ten.Hash.Hash’
+    • Probable cause: ‘hashDerivation’ is applied to too few arguments
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+      In the first argument of ‘(++)’, namely
+        ‘T.unpack (T.take 40 (hashDerivation drv))’
+     |
+1195 |         T.pack $ "Compute build graph for: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                                      ^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Protocol.hs:1195:85: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’ with actual type ‘Derivation’
+    • In the first argument of ‘hashDerivation’, namely ‘drv’
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+     |
+1195 |         T.pack $ "Compute build graph for: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                                                     ^^^
+
+src/Ten/Daemon/Protocol.hs:1198:62: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’
+                  with actual type ‘[Text] -> Map Text Text -> Ten.Hash.Hash’
+    • Probable cause: ‘hashDerivation’ is applied to too few arguments
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+      In the first argument of ‘(++)’, namely
+        ‘T.unpack (T.take 40 (hashDerivation drv))’
+     |
+1198 |         T.pack $ "Join derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                              ^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Protocol.hs:1198:77: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’ with actual type ‘Derivation’
+    • In the first argument of ‘hashDerivation’, namely ‘drv’
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+     |
+1198 |         T.pack $ "Join derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                                             ^^^
+
+src/Ten/Daemon/Protocol.hs:1278:64: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’
+                  with actual type ‘[Text] -> Map Text Text -> Ten.Hash.Hash’
+    • Probable cause: ‘hashDerivation’ is applied to too few arguments
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+      In the first argument of ‘(++)’, namely
+        ‘T.unpack (T.take 40 (hashDerivation drv))’
+     |
+1278 |         T.pack $ "Joined derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                                ^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Protocol.hs:1278:79: error: [GHC-83865]
+    • Couldn't match expected type ‘Text’ with actual type ‘Derivation’
+    • In the first argument of ‘hashDerivation’, namely ‘drv’
+      In the second argument of ‘T.take’, namely ‘(hashDerivation drv)’
+      In the first argument of ‘T.unpack’, namely
+        ‘(T.take 40 (hashDerivation drv))’
+     |
+1278 |         T.pack $ "Joined derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+     |                                                                               ^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+

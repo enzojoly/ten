@@ -30,7 +30,7 @@ module Ten.Derivation (
     derivationFromJSON,
 
     -- Hashing and identity
-    hashDerivation,
+    Ten.Hash.hashDerivation,
     hashDerivationInputs,
 
     -- Build strategy analysis
@@ -39,8 +39,8 @@ module Ten.Derivation (
     -- Derivation chain handling
     DerivationChain,
     newDerivationChain,
-    addToDerivationChain,
-    isInDerivationChain,
+    Ten.Core.addToDerivationChain,
+    Ten.Core.isInDerivationChain,
     derivationChainLength
 ) where
 
@@ -56,6 +56,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.List as List
 import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
@@ -68,7 +69,8 @@ import qualified Data.Aeson.KeyMap as Aeson.KeyMap
 import qualified Data.Vector as Vector
 import qualified Data.HashMap.Strict as HashMap
 import System.FilePath
-import System.Directory (doesFileExist, setPermissions)
+import System.Directory (doesFileExist)
+import qualified System.Posix.Files as Posix
 import System.IO (withFile, IOMode(..))
 import System.Process
 import System.Exit
@@ -86,13 +88,11 @@ data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
 newDerivationChain :: Derivation -> DerivationChain
 newDerivationChain drv = DerivationChain [derivHash drv]
 
--- | Extend a derivation chain with a new derivation
-addToDerivationChain :: DerivationChain -> Derivation -> DerivationChain
-addToDerivationChain (DerivationChain hashes) drv = DerivationChain (derivHash drv : hashes)
-
 -- | Check if a derivation is in a chain (cycle detection)
-isInDerivationChain :: DerivationChain -> Derivation -> Bool
-isInDerivationChain (DerivationChain hashes) drv = derivHash drv `elem` hashes
+detectRecursionCycle :: [Derivation] -> TenM p Bool
+detectRecursionCycle derivations =
+    -- Check if any derivation appears more than once in the chain
+    return $ length (List.nubBy derivationEquals derivations) < length derivations
 
 -- | Get chain length
 derivationChainLength :: DerivationChain -> Int
@@ -217,16 +217,12 @@ instantiateDerivation deriv = do
         throwError $ CyclicDependency $ "Cyclic derivation detected: " <> derivName deriv
 
     -- Add to build chain
-    addToDerivationChain' deriv
+    addToDerivationChain deriv
 
     -- Add input proof
     addProof InputProof
 
     logMsg 1 $ "Instantiated derivation: " <> derivName deriv
-
--- | Add to derivation chain (internal)
-addToDerivationChain' :: Derivation -> TenM 'Build ()
-addToDerivationChain' drv = modify $ \s -> s { buildChain = drv : buildChain s }
 
 -- | The monadic join operation for Return-Continuation
 joinDerivation :: Derivation -> TenM 'Build Derivation
@@ -255,7 +251,7 @@ buildToGetInnerDerivation drv = do
         -- Write the builder to the sandbox
         let builderPath = sandboxDir </> "builder"
         liftIO $ BS.writeFile builderPath builderContent
-        liftIO $ setFileMode builderPath 0o755
+        liftIO $ Posix.setFileMode builderPath 0o755
 
         -- Prepare environment variables
         let buildEnv = prepareSandboxEnvironment env sandboxDir (derivEnv drv)
@@ -353,7 +349,10 @@ deserializeDerivation bs =
 
 -- | Convert JSON to Derivation
 derivationFromJSON :: Aeson.Value -> Either Text Derivation
-derivationFromJSON = Aeson.parseEither parseDerivation
+derivationFromJSON v =
+    case Aeson.parseEither parseDerivation v of
+        Left err -> Left $ T.pack err
+        Right drv -> Right drv
   where
     parseDerivation = Aeson.withObject "Derivation" $ \o -> do
         name <- o .: "name"
@@ -364,7 +363,7 @@ derivationFromJSON = Aeson.parseEither parseDerivation
         outputsJSON <- o .: "outputs"
         envObj <- o .: "env"
         system <- o .: "system"
-        strategyText <- o .: "strategy"
+        strategyText <- o .: "strategy" :: Aeson.Parser Text
         metaObj <- o .: "meta"
 
         -- Parse nested objects
@@ -375,8 +374,8 @@ derivationFromJSON = Aeson.parseEither parseDerivation
         outputs <- parseOutputs outputsJSON
 
         -- Parse maps
-        let env = parseEnv envObj
-        let meta = parseEnv metaObj
+        env <- parseEnvMap envObj
+        meta <- parseEnvMap metaObj
 
         -- Parse strategy
         let strategy = case strategyText of
@@ -424,9 +423,9 @@ derivationFromJSON = Aeson.parseEither parseDerivation
         path <- parseStorePath pathObj
         return $ DerivationOutput name path
 
-    parseEnv :: Aeson.Value -> Map Text Text
-    parseEnv = Aeson.withObject "Environment" $ \obj ->
-        Map.fromList $ map convertKeyValue $ Aeson.KeyMap.toList obj
+    parseEnvMap :: Aeson.Value -> Aeson.Parser (Map Text Text)
+    parseEnvMap = Aeson.withObject "Environment" $ \obj ->
+        return $ Map.fromList $ map convertKeyValue $ Aeson.KeyMap.toList obj
       where
         convertKeyValue (k, Aeson.String v) = (Aeson.toText k, v)
         convertKeyValue _ = ("", "") -- Fallback for non-string values
@@ -438,13 +437,8 @@ hashDerivationInputs drv =
         map (\input -> storeHash $ inputPath input) $
         Set.toList $ derivInputs drv
 
--- | Hash a derivation (consistent with its derivHash)
-hashDerivation :: Derivation -> Text
-hashDerivation drv = derivHash drv
-
 -- | Set the file mode (permissions) for a file
 setFileMode :: FilePath -> Int -> IO ()
 setFileMode path mode = do
-    -- Convert to proper FileMode type and set
-    let fileMode' = fromIntegral mode
-    setPermissions path fileMode'
+    -- Use Posix.setFileMode which accepts a numeric mode
+    Posix.setFileMode path (fromIntegral mode)

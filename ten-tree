@@ -1,0 +1,95 @@
+ten
+├── app
+│   ├── Main.hs
+│   └── TenDaemon.hs
+├── cabal-build-output
+├── CHANGELOG.md
+├── dist-newstyle
+│   ├── build
+│   │   └── x86_64-linux
+│   │       └── ghc-9.8.2
+│   │           └── ten-0.1.0.0
+│   │               ├── build
+│   │               │   ├── autogen
+│   │               │   │   ├── cabal_macros.h
+│   │               │   │   ├── PackageInfo_ten.hs
+│   │               │   │   └── Paths_ten.hs
+│   │               │   └── Ten
+│   │               │       ├── Core.dyn_hi
+│   │               │       ├── Core.dyn_o
+│   │               │       ├── Core.hi
+│   │               │       ├── Core.o
+│   │               │       ├── Daemon
+│   │               │       │   ├── Auth.dyn_hi
+│   │               │       │   ├── Auth.dyn_o
+│   │               │       │   ├── Auth.hi
+│   │               │       │   ├── Auth.o
+│   │               │       │   ├── Config.dyn_hi
+│   │               │       │   ├── Config.dyn_o
+│   │               │       │   ├── Config.hi
+│   │               │       │   └── Config.o
+│   │               │       ├── Derivation.dyn_hi
+│   │               │       ├── Derivation.dyn_o
+│   │               │       ├── Derivation.hi
+│   │               │       ├── Derivation.o
+│   │               │       ├── Hash.dyn_hi
+│   │               │       ├── Hash.dyn_o
+│   │               │       ├── Hash.hi
+│   │               │       ├── Hash.o
+│   │               │       ├── Sandbox.dyn_hi
+│   │               │       ├── Sandbox.dyn_o
+│   │               │       ├── Sandbox.hi
+│   │               │       ├── Sandbox.o
+│   │               │       ├── Store.dyn_hi
+│   │               │       ├── Store.dyn_o
+│   │               │       ├── Store.hi
+│   │               │       └── Store.o
+│   │               ├── cache
+│   │               │   └── config
+│   │               ├── package.conf.inplace
+│   │               │   ├── package.cache
+│   │               │   └── package.cache.lock
+│   │               └── setup-config
+│   ├── cache
+│   │   ├── compiler
+│   │   ├── config
+│   │   ├── elaborated-plan
+│   │   ├── improved-plan
+│   │   ├── plan.json
+│   │   ├── solver-plan
+│   │   ├── source-hashes
+│   │   └── up-to-date
+│   ├── packagedb
+│   │   └── ghc-9.8.2
+│   │       ├── package.cache
+│   │       └── package.cache.lock
+│   └── tmp
+├── README.md
+├── src
+│   ├── Ten
+│   │   ├── Build.hs
+│   │   ├── CLI.hs
+│   │   ├── Core.hs
+│   │   ├── Daemon
+│   │   │   ├── Auth.hs
+│   │   │   ├── Client.hs
+│   │   │   ├── Config.hs
+│   │   │   ├── Core.hs
+│   │   │   ├── Protocol.hs
+│   │   │   ├── Server.hs
+│   │   │   └── State.hs
+│   │   ├── Derivation.hs
+│   │   ├── GC.hs
+│   │   ├── Graph.hs
+│   │   ├── Hash.hs
+│   │   ├── Sandbox.hs
+│   │   └── Store.hs
+│   └── Ten.hs
+├── ten.cabal
+├── test
+│   ├── hello.c
+│   └── Spec.hs
+├── 典
+└── 天
+
+21 directories, 72 files

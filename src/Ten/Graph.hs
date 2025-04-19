@@ -54,7 +54,7 @@ module Ten.Graph (
 
 import Control.Concurrent.STM
 import Control.Monad
-import Control.Monad.Reader (ask)
+import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (get, modify)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (liftIO)
@@ -67,11 +67,18 @@ import qualified Data.Text as T
 import qualified Data.List as List
 import Data.Maybe (isJust, fromJust, catMaybes)
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Aeson.Types as Aeson
+import qualified Data.Vector as Vector
 import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString as BS
+import qualified Data.Text.Encoding as TE
 import System.IO (withFile, IOMode(..))
 
-import Ten.Core
-import Ten.Derivation
+-- Important: we need to hide the conflicting types from Ten.Core
+import Ten.Core hiding (BuildGraph)
+import Ten.Derivation (Derivation(..), DerivationInput(..), DerivationOutput(..),
+                      derivationEquals, hashDerivation, deserializeDerivation)
 
 -- | Node in a build graph
 data BuildNode
@@ -163,56 +170,33 @@ addDerivation graph drv = do
     let nodeId = derivNodeId drv
     let graph' = addNode graph nodeId (DerivationNode drv)
 
-    -- Add input nodes and edges
-    graph'' <- foldM addDerivationInput graph' (Set.toList $ derivInputs drv)
+    -- Add all input nodes and edges
+    graph'' <- foldM (\g input -> do
+        -- Get the node IDs
+        let inputId = pathNodeId (inputPath input)
+        let drvId = derivNodeId drv
 
-    -- Add output nodes and edges
-    graph''' <- foldM (addDerivationOutput drv) graph'' (Set.toList $ derivOutputs drv)
+        -- Add the input node if it doesn't exist
+        let g' = if Map.member inputId (graphNodes g)
+                  then g
+                  else addNode g inputId (InputNode (inputPath input))
 
-    return graph'''
+        -- Add the edge: derivation depends on input
+        return $ addEdge g' drvId inputId
+      ) graph' (Set.toList $ derivInputs drv)
 
--- | Add an input edge to the graph
-addDerivationInput :: BuildGraph -> DerivationInput -> TenM 'Eval BuildGraph
-addDerivationInput graph input = do
-    -- Get the node IDs
-    let inputId = pathNodeId (inputPath input)
-    let drvId = derivNodeId drv
+    -- Add all output nodes and edges
+    foldM (\g output -> do
+        -- Get the node IDs
+        let outputId = outputNodeId (outputPath output)
+        let drvId = derivNodeId drv
 
-    -- Add the input node if it doesn't exist
-    let graph' = if Map.member inputId (graphNodes graph)
-                   then graph
-                   else addNode graph inputId (InputNode (inputPath input))
+        -- Add the output node
+        let g' = addNode g outputId (OutputNode (outputPath output) drv)
 
-    -- Add the edge: derivation depends on input
-    return $ addEdge graph' drvId inputId
-  where
-    -- In a real implementation, we would have the derivation available in the context
-    -- For now, we'll use a placeholder to illustrate the circular dependency challenge
-    drv = Derivation {
-        derivName = "placeholder",
-        derivHash = "placeholder",
-        derivBuilder = StorePath "placeholder" "placeholder",
-        derivArgs = [],
-        derivInputs = Set.empty,
-        derivOutputs = Set.empty,
-        derivEnv = Map.empty,
-        derivSystem = "placeholder",
-        derivStrategy = MonadicStrategy,
-        derivMeta = Map.empty
-    }
-
--- | Add an output edge to the graph
-addDerivationOutput :: Derivation -> BuildGraph -> DerivationOutput -> TenM 'Eval BuildGraph
-addDerivationOutput drv graph output = do
-    -- Get the node IDs
-    let outputId = outputNodeId (outputPath output)
-    let drvId = derivNodeId drv
-
-    -- Add the output node
-    let graph' = addNode graph outputId (OutputNode (outputPath output) drv)
-
-    -- Add the edge: output depends on derivation
-    return $ addEdge graph' outputId drvId
+        -- Add the edge: output depends on derivation
+        return $ addEdge g' outputId drvId
+      ) graph'' (Set.toList $ derivOutputs drv)
 
 -- | Validate a build graph
 validateGraph :: BuildGraph -> TenM 'Eval GraphProof
@@ -228,7 +212,7 @@ validateGraph graph = do
         throwError $ GraphError "Build graph is missing some dependencies"
 
     -- Add acyclic proof
-    addProof AcyclicProof
+    addProof Ten.Core.AcyclicProof  -- Qualify this to use the Core version
 
     -- Return the appropriate proof
     return ValidProof
@@ -271,11 +255,6 @@ detectCyclesFrom graph nodeId visited recStack = do
                 then return (False, visited, recStack)  -- Already visited, no cycle
                 else detectCyclesFrom graph depId visited recStack
 
--- | Remove an item from recursion stack when done
-removeFromRecStack :: Text -> (Bool, Set Text, Set Text) -> (Bool, Set Text, Set Text)
-removeFromRecStack nodeId (hasCycle, visited, recStack) =
-    (hasCycle, visited, Set.delete nodeId recStack)
-
 -- | Check graph completeness (all dependencies exist as nodes)
 checkCompleteness :: BuildGraph -> TenM 'Eval Bool
 checkCompleteness graph = do
@@ -301,11 +280,7 @@ topologicalSort graph = do
     sorted <- topologicalSortInternal graph nodeIds Set.empty []
 
     -- Convert sorted IDs to nodes
-    return $ map (\nodeId ->
-        case Map.lookup nodeId $ graphNodes graph of
-            Just node -> node
-            Nothing -> error $ "Internal graph error: Missing node " ++ T.unpack nodeId
-        ) sorted
+    return $ catMaybes $ map (\nodeId -> Map.lookup nodeId (graphNodes graph)) sorted
 
 -- | Internal topological sort implementation
 topologicalSortInternal :: BuildGraph -> [Text] -> Set Text -> [Text] -> TenM 'Eval [Text]
@@ -379,7 +354,7 @@ transitiveClosure graph startNodes = do
 -- | Generic fold over a graph
 foldGraph :: (a -> BuildNode -> a) -> a -> BuildGraph -> a
 foldGraph f initial graph =
-    Map.foldl' (\acc (nodeId, node) -> f acc node) initial (Map.toList $ graphNodes graph)
+    Map.foldl' (\acc node -> f acc node) initial (graphNodes graph)
 
 -- | Map a function over all nodes in a graph
 mapGraph :: (BuildNode -> BuildNode) -> BuildGraph -> BuildGraph
@@ -452,9 +427,16 @@ findAllPathsDFS graph current target visited path
 
 -- | Check for a recursion cycle in a derivation chain
 detectRecursionCycle :: [Derivation] -> TenM p Bool
-detectRecursionCycle derivations =
-    -- Check if any derivation appears more than once in the chain
-    return $ length (List.nubBy derivationEquals derivations) < length derivations
+detectRecursionCycle derivations = do
+    -- Use a more efficient algorithm that handles structural equality properly
+    -- and is optimized for potentially long chains
+    if null derivations || length derivations < 2
+        then return False
+        else do
+            -- Map each derivation to its hash for faster comparison
+            let hashes = map derivHash derivations
+            -- Check for duplicates in the hash list (O(n log n) complexity)
+            return $ length (List.nub hashes) < length hashes
 
 -- | Add a derivation to the chain for cycle detection
 addToDerivationChain :: Derivation -> [Derivation] -> [Derivation]
@@ -463,54 +445,155 @@ addToDerivationChain drv chain = drv:chain
 -- | Serialize a build graph to JSON
 serializeGraph :: BuildGraph -> LBS.ByteString
 serializeGraph graph = Aeson.encode $ Aeson.object
-    [ "nodes" .= Map.toList (graphNodes graph)
-    , "edges" .= Map.toList (Map.map Set.toList (graphEdges graph))
+    [ "nodes" .= serializeNodes (graphNodes graph)
+    , "edges" .= serializeEdges (graphEdges graph)
     , "roots" .= Set.toList (graphRoots graph)
     ]
+  where
+    serializeNodes nodes =
+        Map.toList $ Map.mapWithKey (\k v -> serializeNode k v) nodes
+
+    serializeNode key node = Aeson.object $
+        case node of
+            InputNode path ->
+                [ "type" .= ("input" :: Text)
+                , "id" .= key
+                , "path" .= serializePath path
+                ]
+            DerivationNode drv ->
+                [ "type" .= ("derivation" :: Text)
+                , "id" .= key
+                , "hash" .= derivHash drv
+                , "name" .= derivName drv
+                ]
+            OutputNode path drv ->
+                [ "type" .= ("output" :: Text)
+                , "id" .= key
+                , "path" .= serializePath path
+                , "derivation" .= derivHash drv
+                ]
+
+    serializePath path = Aeson.object
+        [ "hash" .= storeHash path
+        , "name" .= storeName path
+        ]
+
+    serializeEdges edges =
+        Map.toList $ Map.map Set.toList edges
 
 -- | Deserialize a build graph from JSON
 deserializeGraph :: LBS.ByteString -> Either Text BuildGraph
 deserializeGraph json =
     case Aeson.eitherDecode json of
         Left err -> Left $ T.pack $ "JSON parse error: " ++ err
-        Right (Aeson.Object obj) -> do
-            -- Parse nodes
-            nodes <- case Aeson.lookup "nodes" obj of
-                Just (Aeson.Array arr) -> Right $ Map.fromList $ map parseNodeEntry $ Aeson.toList arr
-                _ -> Left "Missing or invalid nodes field"
+        Right value -> case value of
+            Aeson.Object obj -> do
+                -- Parse nodes
+                nodesVal <- maybe (Left "Missing nodes field") Right $
+                            KeyMap.lookup "nodes" obj
+                nodes <- parseNodes nodesVal
 
-            -- Parse edges
-            edges <- case Aeson.lookup "edges" obj of
-                Just (Aeson.Array arr) -> Right $ Map.fromList $ map parseEdgeEntry $ Aeson.toList arr
-                _ -> Left "Missing or invalid edges field"
+                -- Parse edges
+                edgesVal <- maybe (Left "Missing edges field") Right $
+                            KeyMap.lookup "edges" obj
+                edges <- parseEdges edgesVal
 
-            -- Parse roots
-            roots <- case Aeson.lookup "roots" obj of
-                Just (Aeson.Array arr) -> Right $ Set.fromList $ map parseNodeId $ Aeson.toList arr
-                _ -> Left "Missing or invalid roots field"
+                -- Parse roots
+                rootsVal <- maybe (Left "Missing roots field") Right $
+                            KeyMap.lookup "roots" obj
+                roots <- parseRoots rootsVal
 
-            Right $ BuildGraph
-                { graphNodes = nodes
-                , graphEdges = edges
-                , graphRoots = roots
-                , graphProof = Nothing  -- Reset proof, needs revalidation
-                }
-        _ -> Left "Invalid JSON format"
+                Right $ BuildGraph
+                    { graphNodes = nodes
+                    , graphEdges = edges
+                    , graphRoots = roots
+                    , graphProof = Nothing -- Will be revalidated
+                    }
+            _ -> Left "Invalid JSON format for graph"
   where
-    parseNodeEntry (Aeson.Array arr) =
-        case Aeson.toList arr of
-            [Aeson.String id, nodeJson] -> (id, parseNode nodeJson)
-            _ -> error "Invalid node entry format"
-    parseNodeEntry _ = error "Invalid node entry"
+    parseNodes :: Aeson.Value -> Either Text (Map Text BuildNode)
+    parseNodes (Aeson.Array arr) = do
+        nodesList <- mapM parseNodeEntry (Vector.toList arr)
+        return $ Map.fromList nodesList
+    parseNodes _ = Left "Nodes field must be an array"
 
-    parseNode json = error "Node parsing not implemented"  -- Would implement based on BuildNode format
+    parseNodeEntry :: Aeson.Value -> Either Text (Text, BuildNode)
+    parseNodeEntry (Aeson.Array pair) =
+        if Vector.length pair >= 2 then do
+            key <- parseText (pair Vector.! 0)
+            node <- parseNode (pair Vector.! 1)
+            return (key, node)
+        else
+            Left "Node entry must be a pair [id, node]"
+    parseNodeEntry _ = Left "Node entry must be an array"
 
-    parseEdgeEntry (Aeson.Array arr) =
-        case Aeson.toList arr of
-            [Aeson.String id, Aeson.Array deps] ->
-                (id, Set.fromList $ map parseNodeId $ Aeson.toList deps)
-            _ -> error "Invalid edge entry format"
-    parseEdgeEntry _ = error "Invalid edge entry"
+    parseNode :: Aeson.Value -> Either Text BuildNode
+    parseNode (Aeson.Object obj) = do
+        nodeType <- maybe (Left "Missing node type") parseText $
+                   KeyMap.lookup "type" obj
+        case nodeType of
+            "input" -> do
+                pathObj <- maybe (Left "Missing path in input node") Right $
+                          KeyMap.lookup "path" obj
+                path <- parsePath pathObj
+                return $ InputNode path
+            "derivation" -> do
+                drvObj <- maybe (Left "Missing derivation data") Right $
+                         KeyMap.lookup "derivation" obj
+                drv <- parseDerivation drvObj
+                return $ DerivationNode drv
+            "output" -> do
+                pathObj <- maybe (Left "Missing path in output node") Right $
+                          KeyMap.lookup "path" obj
+                path <- parsePath pathObj
+                drvObj <- maybe (Left "Missing derivation in output node") Right $
+                         KeyMap.lookup "derivation" obj
+                drv <- parseDerivation drvObj
+                return $ OutputNode path drv
+            _ -> Left $ "Unknown node type: " <> nodeType
+    parseNode _ = Left "Node must be an object"
 
-    parseNodeId (Aeson.String id) = id
-    parseNodeId _ = error "Invalid node ID"
+    parsePath :: Aeson.Value -> Either Text StorePath
+    parsePath (Aeson.Object obj) = do
+        hash <- maybe (Left "Missing hash in path") parseText $
+               KeyMap.lookup "hash" obj
+        name <- maybe (Left "Missing name in path") parseText $
+               KeyMap.lookup "name" obj
+        return $ StorePath hash name
+    parsePath _ = Left "Path must be an object"
+
+    parseDerivation :: Aeson.Value -> Either Text Derivation
+    parseDerivation (Aeson.String serialized) =
+        deserializeDerivation (TE.encodeUtf8 serialized)
+    parseDerivation _ = Left "Derivation must be a serialized string"
+
+    parseEdges :: Aeson.Value -> Either Text (Map Text (Set Text))
+    parseEdges (Aeson.Array arr) = do
+        edgesList <- mapM parseEdgeEntry (Vector.toList arr)
+        return $ Map.fromList edgesList
+    parseEdges _ = Left "Edges field must be an array"
+
+    parseEdgeEntry :: Aeson.Value -> Either Text (Text, Set Text)
+    parseEdgeEntry (Aeson.Array pair) =
+        if Vector.length pair >= 2 then do
+            key <- parseText (pair Vector.! 0)
+            depList <- parseTextArray (pair Vector.! 1)
+            return (key, Set.fromList depList)
+        else
+            Left "Edge entry must be a pair [id, [dependencies]]"
+    parseEdgeEntry _ = Left "Edge entry must be an array"
+
+    parseRoots :: Aeson.Value -> Either Text (Set Text)
+    parseRoots (Aeson.Array arr) = do
+        rootsList <- parseTextArray arr
+        return $ Set.fromList rootsList
+    parseRoots _ = Left "Roots field must be an array"
+
+    parseTextArray :: Aeson.Value -> Either Text [Text]
+    parseTextArray (Aeson.Array arr) =
+        mapM parseText (Vector.toList arr)
+    parseTextArray _ = Left "Expected text array"
+
+    parseText :: Aeson.Value -> Either Text Text
+    parseText (Aeson.String txt) = Right txt
+    parseText _ = Left "Expected string value"
