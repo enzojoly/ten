@@ -51,11 +51,10 @@ module Ten.Daemon.Client (
 ) where
 
 import Control.Concurrent (forkIO, ThreadId, threadDelay, myThreadId, killThread)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, newMVar, takeMVar, putMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, newMVar, readMVar)
 import Control.Concurrent.STM (atomically, TVar, newTVarIO, readTVar, writeTVar, TQueue, newTQueueIO, writeTQueue, readTQueue)
 import Control.Exception (catch, finally, bracketOnError, bracket, throwIO, SomeException, try)
 import Control.Monad (void, when, forever, unless)
-import Data.Aeson (encode, decode, (.=), (.:))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
@@ -77,14 +76,17 @@ import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirecto
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
-import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr)
-import System.Process (createProcess, proc, waitForProcess)
+import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr, hGet, BufferMode(..), hSetBuffering)
+import System.Process (createProcess, proc, waitForProcess, CreateProcess(..), StdStream(..))
 import System.Timeout (timeout)
 
-import Ten.Core
-import Ten.Daemon.Protocol
-import Ten.Daemon.Auth
+import Ten.Core hiding (UserCredentials) -- Import Core, but not UserCredentials
+import qualified Ten.Daemon.Protocol as Protocol -- Import Protocol qualified
+import Ten.Daemon.Auth (authenticateUser) -- Import Auth functions directly
 import Ten.Daemon.Config (getDefaultSocketPath)
+
+-- | Re-export UserCredentials from Protocol
+type UserCredentials = Protocol.UserCredentials
 
 -- | Connection state for daemon communication
 data ConnectionState = ConnectionState {
@@ -92,14 +94,22 @@ data ConnectionState = ConnectionState {
     csHandle :: Handle,                     -- ^ Handle for socket I/O
     csUserId :: UserId,                     -- ^ Authenticated user ID
     csToken :: AuthToken,                   -- ^ Authentication token
-    csRequestMap :: IORef (Map RequestId (MVar Response)), -- ^ Map of pending requests
-    csNextReqId :: IORef RequestId,         -- ^ Next request ID
+    csRequestMap :: IORef (Map Int (MVar Protocol.Response)), -- ^ Map of pending requests
+    csNextReqId :: IORef Int,               -- ^ Next request ID
     csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
     csShutdown :: IORef Bool                -- ^ Flag to indicate connection shutdown
 }
 
+-- | Daemon connection type
+data DaemonConnection = DaemonConnection {
+    connSocket :: Socket,
+    connUserId :: UserId,
+    connAuthToken :: AuthToken,
+    connState :: ConnectionState
+}
+
 -- | Connect to the Ten daemon
-connectToDaemon :: FilePath -> UserCredentials -> IO DaemonConnection
+connectToDaemon :: FilePath -> Protocol.UserCredentials -> IO DaemonConnection
 connectToDaemon socketPath credentials = do
     -- Check if daemon is running
     running <- isDaemonRunning socketPath
@@ -119,45 +129,51 @@ connectToDaemon socketPath credentials = do
     shutdownFlag <- newIORef False
 
     -- Authenticate with the daemon
-    let authReq = AuthRequest {
-            authUser = username credentials,
-            authToken = token credentials
+    let authReq = Protocol.AuthRequest {
+            Protocol.version = Protocol.currentProtocolVersion,
+            Protocol.credentials = credentials
         }
 
     -- Send auth request
-    BS.hPut handle $ encodeMessage $ AuthRequestMsg authReq
+    BS.hPut handle $ Protocol.serializeMessage $ Protocol.AuthRequestMsg authReq
     hFlush handle
 
     -- Read auth response
     respBS <- readMessageWithTimeout handle 5000000 -- 5 seconds timeout
-    case decodeMessage respBS of
-        Just (AuthResponseMsg authResp) ->
-            case authResp of
-                AuthSuccess userId authToken -> do
-                    -- Start background thread to read responses
-                    readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
+    case Protocol.deserializeMessage respBS of
+        Left err -> do
+            hClose handle
+            close sock
+            throwIO $ AuthError $ "Authentication failed: " <> err
 
-                    -- Create connection state
-                    let connState = ConnectionState {
-                            csSocket = sock,
-                            csHandle = handle,
-                            csUserId = userId,
-                            csToken = authToken,
-                            csRequestMap = requestMap,
-                            csNextReqId = nextReqId,
-                            csReaderThread = readerThread,
-                            csShutdown = shutdownFlag
-                        }
+        Right (Protocol.AuthResponseMsg (Protocol.AuthAccepted userId authToken)) -> do
+            -- Set up handle buffering
+            hSetBuffering handle NoBuffering
 
-                    -- Return connection object
-                    return $ DaemonConnection sock userId authToken connState
+            -- Start background thread to read responses
+            readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
 
-                AuthFailure reason -> do
-                    hClose handle
-                    close sock
-                    throwIO $ AuthError $ "Authentication failed: " <> reason
+            -- Create connection state
+            let connState = ConnectionState {
+                    csSocket = sock,
+                    csHandle = handle,
+                    csUserId = userId,
+                    csToken = authToken,
+                    csRequestMap = requestMap,
+                    csNextReqId = nextReqId,
+                    csReaderThread = readerThread,
+                    csShutdown = shutdownFlag
+                }
 
-        _ -> do
+            -- Return connection object
+            return $ DaemonConnection sock userId authToken connState
+
+        Right (Protocol.AuthResponseMsg (Protocol.AuthRejected reason)) -> do
+            hClose handle
+            close sock
+            throwIO $ AuthError $ "Authentication failed: " <> reason
+
+        Right _ -> do
             hClose handle
             close sock
             throwIO $ DaemonError "Invalid authentication response from daemon"
@@ -166,7 +182,7 @@ connectToDaemon socketPath credentials = do
 disconnectFromDaemon :: DaemonConnection -> IO ()
 disconnectFromDaemon conn = do
     -- Extract connection state
-    let connState = connectionState conn
+    let connState = connState conn
 
     -- Signal reader thread to shut down
     writeIORef (csShutdown connState) True
@@ -204,7 +220,7 @@ isDaemonRunning socketPath = do
                     return True
 
 -- | Execute an action with a daemon connection
-withDaemonConnection :: FilePath -> UserCredentials -> (DaemonConnection -> IO a) -> IO a
+withDaemonConnection :: FilePath -> Protocol.UserCredentials -> (DaemonConnection -> IO a) -> IO a
 withDaemonConnection socketPath credentials action =
     bracket
         (connectToDaemon socketPath credentials)
@@ -231,10 +247,10 @@ createSocketAndConnect socketPath = do
         )
 
 -- | Send a request to the daemon
-sendRequest :: DaemonConnection -> Request -> IO RequestId
+sendRequest :: DaemonConnection -> Protocol.Request -> IO Int
 sendRequest conn request = do
     -- Extract connection state
-    let connState = connectionState conn
+    let connState = connState conn
 
     -- Generate request ID
     reqId <- atomicModifyIORef' (csNextReqId connState) (\id -> (id + 1, id))
@@ -246,20 +262,21 @@ sendRequest conn request = do
     atomicModifyIORef' (csRequestMap connState) (\m -> (Map.insert reqId respVar m, ()))
 
     -- Create message with request ID
-    let msg = RequestMsg reqId request
+    let msg = Protocol.RequestMsg reqId request
 
     -- Send message
-    BS.hPut (csHandle connState) $ encodeMessage msg
+    let serialized = Protocol.serializeMessage msg
+    BS.hPut (csHandle connState) serialized
     hFlush (csHandle connState)
 
     -- Return request ID for tracking
     return reqId
 
 -- | Receive a response for a specific request
-receiveResponse :: DaemonConnection -> RequestId -> Int -> IO (Maybe Response)
+receiveResponse :: DaemonConnection -> Int -> Int -> IO (Maybe Protocol.Response)
 receiveResponse conn reqId timeoutMicros = do
     -- Extract connection state
-    let connState = connectionState conn
+    let connState = connState conn
 
     -- Get response MVar
     respVarMap <- readIORef (csRequestMap connState)
@@ -279,7 +296,7 @@ receiveResponse conn reqId timeoutMicros = do
             return result
 
 -- | Send a request and wait for response (synchronous)
-sendRequestSync :: DaemonConnection -> Request -> Int -> IO (Either BuildError Response)
+sendRequestSync :: DaemonConnection -> Protocol.Request -> Int -> IO (Either BuildError Protocol.Response)
 sendRequestSync conn request timeoutMicros = do
     -- Send request
     reqId <- sendRequest conn request
@@ -290,16 +307,14 @@ sendRequestSync conn request timeoutMicros = do
         Nothing ->
             return $ Left $ DaemonError "Timeout waiting for daemon response"
 
-        Just response ->
-            case response of
-                ErrorResponse err ->
-                    return $ Left err
+        Just (Protocol.ErrorResponse err) ->
+            return $ Left err
 
-                _ ->
-                    return $ Right response
+        Just response ->
+            return $ Right response
 
 -- | Background thread to read and dispatch responses
-responseReaderThread :: Handle -> IORef (Map RequestId (MVar Response)) -> IORef Bool -> IO ()
+responseReaderThread :: Handle -> IORef (Map Int (MVar Protocol.Response)) -> IORef Bool -> IO ()
 responseReaderThread handle requestMap shutdownFlag = do
     let loop = do
             -- Check if we should shut down
@@ -314,8 +329,12 @@ responseReaderThread handle requestMap shutdownFlag = do
 
                     Right msgBS -> do
                         -- Process message if valid
-                        case decodeMessage msgBS of
-                            Just (ResponseMsg reqId response) -> do
+                        case Protocol.deserializeMessage msgBS of
+                            Left _ ->
+                                -- Parsing error, continue loop
+                                loop
+
+                            Right (Protocol.ResponseMsg reqId response) -> do
                                 -- Look up request
                                 reqMap <- readIORef requestMap
                                 case Map.lookup reqId reqMap of
@@ -328,8 +347,8 @@ responseReaderThread handle requestMap shutdownFlag = do
                                         putMVar respVar response
                                         loop
 
-                            _ ->
-                                -- Invalid message format, continue
+                            Right _ ->
+                                -- Other message type, ignore
                                 loop
 
     -- Start the loop
@@ -368,17 +387,16 @@ readMessage handle = do
 
     return msgBytes
 
--- | Encode a message with length prefix
-encodeMessage :: Message -> BS.ByteString
-encodeMessage msg =
-    let msgBS = LBS.toStrict $ Aeson.encode msg
-        len = fromIntegral $ BS.length msgBS
-        header = LBS.toStrict $ toLazyByteString $ word32BE len
-    in header <> msgBS
+-- | Encode a request for transmission
+encodeRequest :: Protocol.Request -> BS.ByteString
+encodeRequest req = Protocol.serializeRequest req
 
--- | Decode a message from bytes
-decodeMessage :: BS.ByteString -> Maybe Message
-decodeMessage bs = Aeson.decode $ LBS.fromStrict bs
+-- | Decode a response from bytes
+decodeResponse :: BS.ByteString -> Either Text Protocol.Response
+decodeResponse bs =
+    case Protocol.deserializeResponse bs of
+        Left err -> Left err
+        Right resp -> Right resp
 
 -- | Start the daemon if it's not running
 startDaemonIfNeeded :: FilePath -> IO ()
@@ -455,16 +473,16 @@ buildFile conn file = do
     content <- BS.readFile file
 
     -- Create build request
-    let request = BuildRequest {
-            buildFilePath = T.pack file,
-            buildFileContent = Just content,
-            buildOptions = defaultBuildOptions
+    let request = Protocol.BuildFileRequest {
+            Protocol.filePath = T.pack file,
+            Protocol.fileContent = content,
+            Protocol.buildOptions = Protocol.defaultBuildOptions
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
     case response of
-        Right (BuildResponse result) ->
+        Right (Protocol.BuildResponse result) ->
             return $ Right result
 
         Right _ ->
@@ -480,16 +498,16 @@ evalFile conn file = do
     content <- BS.readFile file
 
     -- Create eval request
-    let request = EvalRequest {
-            evalFilePath = T.pack file,
-            evalFileContent = Just content,
-            evalOptions = defaultEvalOptions
+    let request = Protocol.EvalFileRequest {
+            Protocol.evalFilePath = T.pack file,
+            Protocol.evalContent = content,
+            Protocol.evalOptions = Protocol.defaultEvalOptions
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     case response of
-        Right (EvalResponse derivation) ->
+        Right (Protocol.EvalResponse derivation) ->
             return $ Right derivation
 
         Right _ ->
@@ -502,15 +520,15 @@ evalFile conn file = do
 buildDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError BuildResult)
 buildDerivation conn derivation = do
     -- Create build derivation request
-    let request = BuildDerivationRequest {
-            buildDerivation = derivation,
-            buildDerivOptions = defaultBuildOptions
+    let request = Protocol.BuildDerivationRequest {
+            Protocol.derivation = derivation,
+            Protocol.buildOptions = Protocol.defaultBuildOptions
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
     case response of
-        Right (BuildResponse result) ->
+        Right (Protocol.BuildResponse result) ->
             return $ Right result
 
         Right _ ->
@@ -523,14 +541,14 @@ buildDerivation conn derivation = do
 cancelBuild :: DaemonConnection -> BuildId -> IO (Either BuildError ())
 cancelBuild conn buildId = do
     -- Create cancel build request
-    let request = CancelBuildRequest {
-            cancelBuildId = buildId
+    let request = Protocol.CancelBuildRequest {
+            Protocol.buildId = buildId
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (CancelBuildResponse success) ->
+        Right (Protocol.CancelBuildResponse success) ->
             if success
                 then return $ Right ()
                 else return $ Left $ BuildFailed "Failed to cancel build"
@@ -545,14 +563,14 @@ cancelBuild conn buildId = do
 getBuildStatus :: DaemonConnection -> BuildId -> IO (Either BuildError BuildStatus)
 getBuildStatus conn buildId = do
     -- Create build status request
-    let request = BuildStatusRequest {
-            statusBuildId = buildId
+    let request = Protocol.BuildStatusRequest {
+            Protocol.statusBuildId = buildId
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (BuildStatusResponse status) ->
+        Right (Protocol.BuildStatusResponse status) ->
             return $ Right status
 
         Right _ ->
@@ -562,22 +580,22 @@ getBuildStatus conn buildId = do
             return $ Left err
 
 -- | Add a file to the store
-addFileToStore :: DaemonConnection -> FilePath -> IO (Either BuildError ())
+addFileToStore :: DaemonConnection -> FilePath -> IO (Either BuildError StorePath)
 addFileToStore conn file = do
     -- Read file content
     content <- BS.readFile file
 
     -- Create store add request
-    let request = StoreAddRequest {
-            storeAddPath = T.pack file,
-            storeAddContent = content
+    let request = Protocol.StoreAddRequest {
+            Protocol.name = T.pack (takeFileName file),
+            Protocol.content = content
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     case response of
-        Right (StoreAddResponse _) ->
-            return $ Right ()
+        Right (Protocol.StoreAddResponse path) ->
+            return $ Right path
 
         Right _ ->
             return $ Left $ DaemonError "Invalid response type for store add request"
@@ -589,14 +607,14 @@ addFileToStore conn file = do
 verifyStorePath :: DaemonConnection -> FilePath -> IO (Either BuildError Bool)
 verifyStorePath conn path = do
     -- Create verify request
-    let request = StoreVerifyRequest {
-            storeVerifyPath = T.pack path
+    let request = Protocol.StoreVerifyRequest {
+            Protocol.storePath = T.pack path
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (StoreVerifyResponse isValid) ->
+        Right (Protocol.StoreVerifyResponse isValid) ->
             return $ Right isValid
 
         Right _ ->
@@ -612,15 +630,15 @@ getStorePathForFile conn file = do
     content <- BS.readFile file
 
     -- Create path request
-    let request = StorePathRequest {
-            storePathForFile = T.pack file,
-            storePathContent = content
+    let request = Protocol.StorePathRequest {
+            Protocol.filePath = T.pack file,
+            Protocol.content = content
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (StorePathResponse path) ->
+        Right (Protocol.StorePathResponse path) ->
             return $ Right path
 
         Right _ ->
@@ -630,16 +648,16 @@ getStorePathForFile conn file = do
             return $ Left err
 
 -- | List store contents
-listStore :: DaemonConnection -> IO (Either BuildError ())
+listStore :: DaemonConnection -> IO (Either BuildError [StorePath])
 listStore conn = do
     -- Create list request
-    let request = StoreListRequest
+    let request = Protocol.StoreListRequest
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (StoreListResponse _) ->
-            return $ Right ()
+        Right (Protocol.StoreListResponse paths) ->
+            return $ Right paths
 
         Right _ ->
             return $ Left $ DaemonError "Invalid response type for store list request"
@@ -648,18 +666,18 @@ listStore conn = do
             return $ Left err
 
 -- | Run garbage collection
-collectGarbage :: DaemonConnection -> Bool -> IO (Either BuildError ())
+collectGarbage :: DaemonConnection -> Bool -> IO (Either BuildError GCStats)
 collectGarbage conn force = do
     -- Create GC request
-    let request = GCRequest {
-            gcForce = force
+    let request = Protocol.GCRequest {
+            Protocol.force = force
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
     case response of
-        Right (GCResponse _) ->
-            return $ Right ()
+        Right (Protocol.GCResponse stats) ->
+            return $ Right stats
 
         Right _ ->
             return $ Left $ DaemonError "Invalid response type for GC request"
@@ -671,12 +689,12 @@ collectGarbage conn force = do
 shutdownDaemon :: DaemonConnection -> IO (Either BuildError ())
 shutdownDaemon conn = do
     -- Create shutdown request
-    let request = ShutdownRequest
+    let request = Protocol.ShutdownRequest
 
     -- Send request and expect connection to close
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (ShutdownResponse) ->
+        Right Protocol.ShutdownResponse ->
             return $ Right ()
 
         Right _ ->
@@ -686,15 +704,15 @@ shutdownDaemon conn = do
             return $ Left err
 
 -- | Get daemon status
-getDaemonStatus :: DaemonConnection -> IO (Either BuildError DaemonStatus)
+getDaemonStatus :: DaemonConnection -> IO (Either BuildError Protocol.DaemonStatus)
 getDaemonStatus conn = do
     -- Create status request
-    let request = StatusRequest
+    let request = Protocol.StatusRequest
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (StatusResponse status) ->
+        Right (Protocol.StatusResponse status) ->
             return $ Right status
 
         Right _ ->
@@ -704,16 +722,16 @@ getDaemonStatus conn = do
             return $ Left err
 
 -- | Get daemon configuration
-getDaemonConfig :: DaemonConnection -> IO (Either BuildError ())
+getDaemonConfig :: DaemonConnection -> IO (Either BuildError Protocol.DaemonConfig)
 getDaemonConfig conn = do
     -- Create config request
-    let request = ConfigRequest
+    let request = Protocol.ConfigRequest
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (ConfigResponse _) ->
-            return $ Right ()
+        Right (Protocol.ConfigResponse config) ->
+            return $ Right config
 
         Right _ ->
             return $ Left $ DaemonError "Invalid response type for config request"
@@ -721,32 +739,9 @@ getDaemonConfig conn = do
         Left err ->
             return $ Left err
 
--- | Default build options
-defaultBuildOptions :: BuildOptions
-defaultBuildOptions = BuildOptions {
-    buildKeepFailed = False,
-    buildVerbosity = 1,
-    buildMaxJobs = Nothing,
-    buildTimeout = Nothing,
-    buildSystemType = Nothing,
-    buildArgs = Map.empty
-}
-
--- | Default evaluation options
-defaultEvalOptions :: EvalOptions
-defaultEvalOptions = EvalOptions {
-    evalVerbosity = 1,
-    evalSystemType = Nothing,
-    evalArgs = Map.empty
-}
-
--- | Get the connection state from a connection
-connectionState :: DaemonConnection -> ConnectionState
-connectionState (DaemonConnection _ _ _ state) = state
-
--- Bitwise operations for message length encoding/decoding
+-- | Bitwise operations for message length encoding/decoding
 shiftL :: Int -> Int -> Int
 shiftL x n = x * (2 ^ n)
 
 (.|.) :: Int -> Int -> Int
-(.|.) = (Prelude.||)
+(.|.) = (Prelude.+)
