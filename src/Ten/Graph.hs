@@ -75,8 +75,7 @@ import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as TE
 import System.IO (withFile, IOMode(..))
 
--- Important: we need to hide the conflicting types from Ten.Core
-import Ten.Core hiding (BuildGraph)
+import Ten.Core
 import Ten.Derivation (Derivation(..), DerivationInput(..), DerivationOutput(..),
                       derivationEquals, hashDerivation, deserializeDerivation)
 
@@ -97,7 +96,7 @@ data GraphError
 
 -- | Proof about a build graph
 data GraphProof
-    = AcyclicProof      -- Graph has no cycles
+    = GraphAcyclicProof      -- Graph has no cycles
     | CompleteProof     -- Graph contains all dependencies
     | ValidProof        -- Graph is both acyclic and complete
     deriving (Show, Eq)
@@ -212,7 +211,7 @@ validateGraph graph = do
         throwError $ GraphError "Build graph is missing some dependencies"
 
     -- Add acyclic proof
-    addProof Ten.Core.AcyclicProof  -- Qualify this to use the Core version
+    addProof AcyclicProof
 
     -- Return the appropriate proof
     return ValidProof
@@ -268,7 +267,7 @@ topologicalSort :: BuildGraph -> TenM 'Eval [BuildNode]
 topologicalSort graph = do
     -- Verify the graph is acyclic
     case graphProof graph of
-        Just AcyclicProof -> pure ()
+        Just GraphAcyclicProof -> pure ()
         Just ValidProof -> pure ()
         _ -> do
             hasCycles <- detectCycles graph
@@ -372,7 +371,7 @@ getSubgraph graph nodeIds = do
     let newEdges = Map.filterWithKey (\k _ -> k `Set.member` closure) (graphEdges graph)
     let newRoots = Set.intersection nodeIds closure
 
-    return $ BuildGraph
+    return BuildGraph
         { graphNodes = newNodes
         , graphEdges = newEdges
         , graphRoots = newRoots
