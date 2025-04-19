@@ -59,15 +59,15 @@ import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
 import Data.Time (getCurrentTime, diffUTCTime)
 import System.Directory
 import System.FilePath
-import System.Process
+import qualified System.Process as Process
 import System.Exit
-import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile)
+import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile, hDuplicateTo)
 import System.Posix.Files (setFileMode, getFileStatus, fileMode)
 import qualified System.Posix.User as User
-import System.Posix.Process (ProcessStatus(..), getProcessStatus)
+import System.Posix.Process (ProcessStatus(..), getProcessStatus, forkProcess, executeFile)
 import System.Posix.Signals (signalProcess, sigKILL)
 import System.Posix.Types (ProcessID, FileMode, UserID, GroupID)
-import System.Posix.IO (createPipe, fdToHandle)
+import qualified System.Posix.IO as PosixIO
 import System.Timeout (timeout)
 import System.Random (randomRIO)
 import Control.Concurrent.Async (async, Async, wait, cancel, waitCatch)
@@ -368,8 +368,8 @@ runBuilder program args buildDir envVars userEntry groupEntry = do
         return $ Left $ "Builder program is not executable: " <> T.pack program
 
     -- Create pipes for stdout and stderr
-    (stdoutRead, stdoutWrite) <- liftIO createPipe
-    (stderrRead, stderrWrite) <- liftIO createPipe
+    (stdoutRead, stdoutWrite) <- liftIO $ createPipe
+    (stderrRead, stderrWrite) <- liftIO $ createPipe
 
     -- Convert environment variables
     let envList = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList envVars
@@ -649,7 +649,7 @@ buildDependenciesConcurrently derivations = do
 
     -- Create a semaphore to limit concurrency
     maxConcurrent <- asks (\e -> fromMaybe 4 (maxConcurrentBuilds e))
-    sem <- liftIO $ newQSem maxConcurrent
+    sem <- liftIO $ Ten.Build.newQSem maxConcurrent
 
     -- Track all build threads
     threads <- liftIO $ newTVarIO []
@@ -659,7 +659,7 @@ buildDependenciesConcurrently derivations = do
         let hash = T.unpack $ derivHash drv
         thread <- mask $ \restore -> forkIO $ do
             -- Acquire semaphore
-            bracket (waitQSem sem) (\_ -> signalQSem sem) $ \_ -> restore $ do
+            bracket (Ten.Build.waitQSem sem) (\_ -> Ten.Build.signalQSem sem) $ \_ -> restore $ do
                 -- Run the build in a separate thread
                 result <- runTen (buildDerivation drv) env state
                 -- Store the result
@@ -755,9 +755,9 @@ getBuildStatus buildId = do
 -- | Utility function to create a pipe
 createPipe :: IO (Handle, Handle)
 createPipe = do
-    (readFd, writeFd) <- System.Posix.IO.createPipe
-    readHandle <- System.Posix.IO.fdToHandle readFd
-    writeHandle <- System.Posix.IO.fdToHandle writeFd
+    (readFd, writeFd) <- PosixIO.createPipe
+    readHandle <- PosixIO.fdToHandle readFd
+    writeHandle <- PosixIO.fdToHandle writeFd
     return (readHandle, writeHandle)
 
 -- | Semaphore implementation for controlling concurrency

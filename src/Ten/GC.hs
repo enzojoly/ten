@@ -144,7 +144,7 @@ collectGarbage = do
     -- Get the GC lock to prevent concurrent GCs
     liftIO $ atomically $ do
         -- Try to take the global GC lock
-        takeTMVar globalGCLock `orElse` throwSTM (ResourceError "Another garbage collection is in progress")
+        takeTMVar globalGCLock `orElse` gcThrowErrorSTM (ResourceError "Another garbage collection is in progress")
 
     -- Ensure we release the lock even if an error occurs
     collectGarbageWithStats env `onException`
@@ -505,8 +505,8 @@ onException action handler = do
         Right (val, _) -> return val
 
 -- | STM version of throwError - fixed implementation to avoid recursion
-throwSTM :: BuildError -> STM a
-throwSTM err = Control.Concurrent.STM.throwSTM $ toException err
+gcThrowErrorSTM :: BuildError -> STM a
+gcThrowErrorSTM err = Control.Concurrent.STM.throwSTM $ toException err
 
 -- | Helper functions for STM
 catMaybes :: [Maybe a] -> [a]

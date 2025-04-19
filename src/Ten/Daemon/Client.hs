@@ -76,7 +76,7 @@ import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirecto
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
-import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr, hGet, BufferMode(..), hSetBuffering)
+import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr, BufferMode(..), hSetBuffering)
 import System.Process (createProcess, proc, waitForProcess, CreateProcess(..), StdStream(..))
 import System.Timeout (timeout)
 
