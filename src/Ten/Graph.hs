@@ -5,12 +5,6 @@
 {-# LANGUAGE LambdaCase #-}
 
 module Ten.Graph (
-    -- Core graph types
-    BuildGraph(..),
-    BuildNode(..),
-    GraphError(..),
-    GraphProof(..),
-
     -- Graph construction
     createBuildGraph,
     addNode,
@@ -67,6 +61,7 @@ import qualified Data.Text as T
 import qualified Data.List as List
 import Data.Maybe (isJust, fromJust, catMaybes)
 import qualified Data.Aeson as Aeson
+import Data.Aeson ((.:), (.=))  -- Add this import for JSON operators
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Vector as Vector
@@ -76,47 +71,7 @@ import qualified Data.Text.Encoding as TE
 import System.IO (withFile, IOMode(..))
 
 import Ten.Core
-import Ten.Derivation (Derivation(..), DerivationInput(..), DerivationOutput(..),
-                      derivationEquals, hashDerivation, deserializeDerivation)
-
--- | Node in a build graph
-data BuildNode
-    = InputNode StorePath                  -- An input that doesn't need to be built
-    | DerivationNode Derivation            -- A derivation that needs to be built
-    | OutputNode StorePath Derivation      -- An output produced by a derivation
-    deriving (Show, Eq)
-
--- | Graph errors
-data GraphError
-    = CycleError [Text]                    -- A cycle was detected (node IDs)
-    | MissingNodeError Text                -- A referenced node doesn't exist
-    | InconsistentGraphError Text          -- Graph is in an inconsistent state
-    | DeserializationError Text            -- Couldn't deserialize graph
-    deriving (Show, Eq)
-
--- | Proof about a build graph
-data GraphProof
-    = AcyclicProof      -- Graph has no cycles
-    | CompleteProof     -- Graph contains all dependencies
-    | ValidProof        -- Graph is both acyclic and complete
-    deriving (Show, Eq)
-
--- | A build graph representing the dependency relationships
-data BuildGraph = BuildGraph
-    { graphNodes :: Map Text BuildNode     -- Nodes indexed by ID
-    , graphEdges :: Map Text (Set Text)    -- Edges from node -> dependencies
-    , graphRoots :: Set Text               -- Root nodes (outputs requested)
-    , graphProof :: Maybe GraphProof       -- Proof about this graph
-    } deriving (Show, Eq)
-
--- | Empty build graph
-emptyGraph :: BuildGraph
-emptyGraph = BuildGraph
-    { graphNodes = Map.empty
-    , graphEdges = Map.empty
-    , graphRoots = Set.empty
-    , graphProof = Nothing
-    }
+import Ten.Derivation (hashDerivation, deserializeDerivation)
 
 -- | Create a unique ID for a store path
 pathNodeId :: StorePath -> Text
@@ -129,6 +84,15 @@ derivNodeId drv = "drv:" <> derivHash drv
 -- | Create a unique ID for an output
 outputNodeId :: StorePath -> Text
 outputNodeId path = "out:" <> storeHash path <> ":" <> storeName path
+
+-- | Empty build graph
+emptyGraph :: BuildGraph
+emptyGraph = BuildGraph
+    { graphNodes = Map.empty
+    , graphEdges = Map.empty
+    , graphRoots = Set.empty
+    , graphProof = Nothing
+    }
 
 -- | Create a build graph from a set of derivations
 createBuildGraph :: Set StorePath -> Set Derivation -> TenM 'Eval BuildGraph
@@ -267,7 +231,7 @@ topologicalSort :: BuildGraph -> TenM 'Eval [BuildNode]
 topologicalSort graph = do
     -- Verify the graph is acyclic
     case graphProof graph of
-        Just AcyclicProof -> pure ()
+        Just AcyclicGraphProof -> pure ()
         Just ValidProof -> pure ()
         _ -> do
             hasCycles <- detectCycles graph

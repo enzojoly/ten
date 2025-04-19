@@ -42,6 +42,9 @@ module Ten.Core (
 
     -- Graph types
     BuildGraph(..),
+    BuildNode(..),
+    GraphError(..),
+    GraphProof(..),
 
     -- Proof system
     Proof(..),
@@ -189,11 +192,41 @@ derivationEquals d1 d2 = derivHash d1 == derivHash d2
 derivationPathsEqual :: StorePath -> StorePath -> Bool
 derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == storeName p2
 
+-- | Node in a build graph
+data BuildNode
+    = InputNode StorePath                  -- An input that doesn't need to be built
+    | DerivationNode Derivation            -- A derivation that needs to be built
+    | OutputNode StorePath Derivation      -- An output produced by a derivation
+    deriving (Show, Eq)
+
+-- | Graph errors
+data GraphError
+    = CycleError [Text]                    -- A cycle was detected (node IDs)
+    | MissingNodeError Text                -- A referenced node doesn't exist
+    | InconsistentGraphError Text          -- Graph is in an inconsistent state
+    | DeserializationError Text            -- Couldn't deserialize graph
+    deriving (Show, Eq)
+
+-- | Proof about a build graph
+data GraphProof
+    = AcyclicGraphProof      -- Graph has no cycles
+    | CompleteProof     -- Graph contains all dependencies
+    | ValidProof        -- Graph is both acyclic and complete
+    deriving (Show, Eq)
+
+-- | A build graph representing the dependency relationships
+data BuildGraph = BuildGraph
+    { graphNodes :: Map Text BuildNode     -- Nodes indexed by ID
+    , graphEdges :: Map Text (Set Text)    -- Edges from node -> dependencies
+    , graphRoots :: Set Text               -- Root nodes (outputs requested)
+    , graphProof :: Maybe GraphProof       -- Proof about this graph
+    } deriving (Show, Eq)
+
 -- | Proof of a property, parameterized by phase
 data Proof (p :: Phase) where
     -- Proofs for evaluation phase
     TypeProof      :: Proof 'Eval
-    AcyclicProof   :: Proof 'Eval
+    AcyclicProof   :: Proof 'Eval  -- Now references the GraphProof concept
     EvalCompleteProof :: Proof 'Eval
 
     -- Proofs for build phase
@@ -311,13 +344,6 @@ data DaemonConfig = DaemonConfig
 data UserCredentials = UserCredentials
     { username :: Text
     , token :: Text
-    } deriving (Show, Eq)
-
--- | Build graph for dependency tracking
-data BuildGraph = BuildGraph
-    { graphNodes :: Map Text Derivation      -- Map of derivation hash to derivation
-    , graphEdges :: Map Text (Set Text)      -- Map of node hash to dependency hashes
-    , graphRoots :: Set Text                 -- Root nodes (outputs requested)
     } deriving (Show, Eq)
 
 -- | Environment for build operations
