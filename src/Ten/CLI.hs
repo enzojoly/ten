@@ -11,6 +11,7 @@ module Ten.CLI (
     defaultOptions,
     StoreCommand(..),
     DaemonCommand(..),
+    DerivationCommand(..),
 
     -- Command parsing
     parseArgs,
@@ -28,6 +29,7 @@ module Ten.CLI (
     handleStore,
     handleInfo,
     handleDaemon,
+    handleDerivation,
     handleHelp,
     handleVersion,
 
@@ -89,6 +91,8 @@ import Ten.Derivation
 import Ten.Build
 import Ten.GC
 import Ten.Hash
+import Ten.DB.Core
+import Ten.DB.Derivations
 import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, daemonSocketPath)
 import Ten.Daemon.Client (isDaemonRunning, startDaemonIfNeeded, UserCredentials(..))
 import qualified Ten.Daemon.Client as DaemonClient
@@ -99,6 +103,7 @@ data Command
     | Eval FilePath                      -- Evaluate a Ten expression file
     | GC                                 -- Garbage collection
     | Store StoreCommand                 -- Store operations
+    | Derivation DerivationCommand       -- Derivation operations
     | Info FilePath                      -- Show info about a store path
     | Daemon DaemonCommand               -- Daemon operations
     | Help                               -- Show help
@@ -112,6 +117,15 @@ data StoreCommand
     | StorePath FilePath                 -- Convert a path to a store path
     | StoreGC                            -- Run garbage collection
     | StoreList                          -- List store contents
+    deriving (Show, Eq)
+
+-- | Derivation subcommands
+data DerivationCommand
+    = DerivationInfo FilePath            -- Show info about a derivation
+    | QueryDeriver FilePath              -- Find which derivation produced an output
+    | StoreDerivation FilePath           -- Store a derivation file
+    | RegisterDerivation FilePath        -- Register a derivation in the database
+    | ListDerivations                    -- List registered derivations
     deriving (Show, Eq)
 
 -- | Daemon subcommands
@@ -261,6 +275,29 @@ parseArgs (cmdStr:args) = do
                         "gc" -> Right $ Store StoreGC
                         "list" -> Right $ Store StoreList
                         _ -> Left $ "unknown store subcommand: " ++ subcmd
+        "derivation" ->
+            case nonOpts of
+                [] -> Left "derivation: missing subcommand"
+                (subcmd:args') ->
+                    case subcmd of
+                        "info" ->
+                            case args' of
+                                (path:_) -> Right $ Derivation (DerivationInfo (sanitizeFilePath path))
+                                [] -> Left "derivation info: missing path argument"
+                        "query-deriver" ->
+                            case args' of
+                                (path:_) -> Right $ Derivation (QueryDeriver (sanitizeFilePath path))
+                                [] -> Left "derivation query-deriver: missing path argument"
+                        "store" ->
+                            case args' of
+                                (file:_) -> Right $ Derivation (StoreDerivation (sanitizeFilePath file))
+                                [] -> Left "derivation store: missing file argument"
+                        "register" ->
+                            case args' of
+                                (file:_) -> Right $ Derivation (RegisterDerivation (sanitizeFilePath file))
+                                [] -> Left "derivation register: missing file argument"
+                        "list" -> Right $ Derivation ListDerivations
+                        _ -> Left $ "unknown derivation subcommand: " ++ subcmd
         "info" ->
             case nonOpts of
                 (path:_) -> Right $ Info (sanitizeFilePath path)
@@ -343,6 +380,19 @@ shouldRunWithDaemon cmd opts = do
                 -- These can run without daemon
                 StorePath _ -> return False
                 -- Others benefit from daemon
+                _ -> do
+                    -- Check if user has direct access to store
+                    storeDir <- resolveStorePath opts
+                    perms <- getPermissions storeDir
+                    if writable perms
+                        then return False  -- Can operate directly
+                        else checkDaemonAvailable opts  -- Need daemon
+
+            -- Derivation operations often need daemon
+            Derivation derivCmds -> case derivCmds of
+                -- These can run without daemon
+                DerivationInfo _ -> return False
+                -- Others may benefit from daemon
                 _ -> do
                     -- Check if user has direct access to store
                     storeDir <- resolveStorePath opts
@@ -507,6 +557,8 @@ executeDaemonCommand cmd opts conn = case cmd of
 
     Store storeCmd -> executeStoreCommand storeCmd conn opts
 
+    Derivation derivCmd -> executeDerivationCommand derivCmd conn opts
+
     Info path -> do
         -- Verify path format
         let validPath = checkValidStorePath path
@@ -631,6 +683,108 @@ executeStoreCommand storeCmd conn opts = case storeCmd of
                     putStrLn $ "  " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
                 return True
 
+-- | Execute a derivation command using the daemon
+executeDerivationCommand :: DerivationCommand -> DaemonClient.DaemonConnection -> Options -> IO Bool
+executeDerivationCommand derivCmd conn opts = case derivCmd of
+    DerivationInfo path -> do
+        -- Check if it's a valid store path
+        let validPath = checkValidStorePath path
+        unless validPath $ do
+            hPutStrLn stderr $ "Error: Invalid store path format: " ++ path
+            return False
+
+        -- Query derivation info
+        derivInfoResult <- DaemonClient.getDerivationInfo conn path
+        case derivInfoResult of
+            Left err -> do
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                return False
+            Right drv -> do
+                -- Display derivation information
+                showDerivation drv
+                return True
+
+    QueryDeriver outputPath -> do
+        -- Check if it's a valid store path
+        let validPath = checkValidStorePath outputPath
+        unless validPath $ do
+            hPutStrLn stderr $ "Error: Invalid store path format: " ++ outputPath
+            return False
+
+        -- Query which derivation produced this output
+        derivResult <- DaemonClient.queryDeriver conn outputPath
+        case derivResult of
+            Left err -> do
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                return False
+            Right drvInfo -> do
+                -- Display the derivation info
+                putStrLn $ "Output: " ++ outputPath
+                putStrLn $ "Produced by derivation: " ++ T.unpack (drvInfoPath drvInfo)
+                putStrLn $ "Derivation hash: " ++ T.unpack (drvInfoHash drvInfo)
+                return True
+
+    StoreDerivation file -> do
+        -- Check file existence
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
+        -- Store the derivation file
+        storeResult <- DaemonClient.storeDerivationFile conn file
+        case storeResult of
+            Left err -> do
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                return False
+            Right path -> do
+                putStrLn $ "Derivation stored at: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+                return True
+
+    RegisterDerivation file -> do
+        -- Check file existence
+        fileExists <- doesFileExist file
+        unless fileExists $ do
+            hPutStrLn stderr $ "Error: File not found: " ++ file
+            return False
+
+        -- Register the derivation file
+        registerResult <- DaemonClient.registerDerivation conn file
+        case registerResult of
+            Left err -> do
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                return False
+            Right (path, outputs) -> do
+                putStrLn $ "Derivation registered at: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+                putStrLn "Outputs:"
+                forM_ outputs $ \output ->
+                    putStrLn $ "  " ++ T.unpack (storeHash output) ++ "-" ++ T.unpack (storeName output)
+                return True
+
+    ListDerivations -> do
+        -- List all registered derivations
+        listResult <- DaemonClient.listDerivations conn
+        case listResult of
+            Left err -> do
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                return False
+            Right drvs -> do
+                putStrLn $ "Found " ++ show (length drvs) ++ " registered derivations:"
+                forM_ drvs $ \drv -> do
+                    putStrLn $ T.unpack (drvInfoPath drv) ++ " (" ++ T.unpack (drvInfoHash drv) ++ ")"
+                return True
+
+-- | Add derivation info getter to DaemonClient
+drvInfoPath :: DerivInfoResult -> Text
+drvInfoPath = fst
+
+-- | Add derivation info hash getter to DaemonClient
+drvInfoHash :: DerivInfoResult -> Text
+drvInfoHash = snd
+
+-- | Derivation info result type
+type DerivInfoResult = (Text, Text)
+
 -- | Run a command in standalone mode (without daemon)
 runStandalone :: Command -> Options -> BuildEnv -> IO ()
 runStandalone cmd opts env = do
@@ -664,6 +818,11 @@ commandNeedsRoot = \case
         perms <- getPermissions storePath
         return (not $ writable perms)
     Daemon _ -> return True  -- Daemon operations generally need root
+    Derivation (RegisterDerivation _) -> do
+        -- Registering derivations needs DB access
+        storePath <- getDefaultStorePath
+        perms <- getPermissions storePath
+        return (not $ writable perms)
     _ -> return False  -- Others depend on file permissions
 
 -- | Convert command to string representation
@@ -677,6 +836,11 @@ commandToString = \case
     Store (StoreVerify path) -> "store verify " ++ path
     Store (StorePath path) -> "store path " ++ path
     Store StoreList -> "store list"
+    Derivation (DerivationInfo path) -> "derivation info " ++ path
+    Derivation (QueryDeriver path) -> "derivation query-deriver " ++ path
+    Derivation (StoreDerivation path) -> "derivation store " ++ path
+    Derivation (RegisterDerivation path) -> "derivation register " ++ path
+    Derivation ListDerivations -> "derivation list"
     Info path -> "info " ++ path
     Daemon DaemonStart -> "daemon start"
     Daemon DaemonStop -> "daemon stop"
@@ -751,6 +915,15 @@ executeCommand cmd opts env = case cmd of
                 return False
             Right _ -> return True
 
+    Derivation derivCmd -> do
+        -- Handle derivation commands
+        derivResult <- handleDerivation env derivCmd
+        case derivResult of
+            Left err -> do
+                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                return False
+            Right _ -> return True
+
     Info path -> do
         -- Check path validity
         let validPath = checkValidStorePath path
@@ -785,6 +958,143 @@ executeCommand cmd opts env = case cmd of
     Help -> showHelp >> return True
 
     Version -> showVersion >> return True
+
+-- | Handle derivation commands
+handleDerivation :: BuildEnv -> DerivationCommand -> IO (Either BuildError ())
+handleDerivation env = \case
+    DerivationInfo path -> do
+        -- Check path validity
+        let validPath = checkValidStorePath path
+        unless validPath $
+            return $ Left $ StoreError $ "Invalid store path format: " <> T.pack path
+
+        -- Get the store path
+        let storePath = case parseStorePath path of
+                Just sp -> sp
+                Nothing -> error "Invalid store path format"
+
+        -- Try to retrieve the derivation from store
+        retrieveResult <- try $ runTen (retrieveDerivation storePath) env (initBuildState Build)
+
+        case retrieveResult of
+            Left (e :: SomeException) ->
+                return $ Left $ StoreError $ "Failed to retrieve derivation: " <> T.pack (show e)
+            Right (Left err) ->
+                return $ Left err
+            Right (Right (Nothing, _)) ->
+                return $ Left $ StoreError $ "Derivation not found: " <> T.pack path
+            Right (Right (Just drv, _)) -> do
+                -- Show the derivation
+                showDerivation drv
+                return $ Right ()
+
+    QueryDeriver outputPath -> do
+        -- Check path validity
+        let validPath = checkValidStorePath outputPath
+        unless validPath $
+            return $ Left $ StoreError $ "Invalid store path format: " <> T.pack outputPath
+
+        -- Get the store path
+        let storePath = case parseStorePath outputPath of
+                Just sp -> sp
+                Nothing -> error "Invalid store path format"
+
+        -- Query the database for the derivation that produced this output
+        db <- initDatabase (defaultDBPath (storePath env)) 5000
+
+        derivResult <- try $ getDerivationForOutput db storePath
+        closeDatabase db
+
+        case derivResult of
+            Left (e :: SomeException) ->
+                return $ Left $ StoreError $ "Database query failed: " <> T.pack (show e)
+            Right Nothing -> do
+                putStrLn $ "No derivation found for output: " ++ outputPath
+                return $ Right ()
+            Right (Just derivInfo) -> do
+                putStrLn $ "Output: " ++ outputPath
+                putStrLn $ "Produced by derivation: " ++ T.unpack (storePathToText (derivInfoStorePath derivInfo))
+                putStrLn $ "Derivation hash: " ++ T.unpack (derivInfoHash derivInfo)
+                return $ Right ()
+
+    StoreDerivation file -> do
+        -- Check file existence
+        fileExists <- doesFileExist file
+        unless fileExists $
+            return $ Left $ InputNotFound file
+
+        -- Read the file content
+        content <- try $ BS.readFile file
+        case content of
+            Left (e :: SomeException) ->
+                return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+            Right bytes -> do
+                -- Deserialize the derivation
+                case deserializeDerivation bytes of
+                    Left err ->
+                        return $ Left $ SerializationError err
+                    Right drv -> do
+                        -- Store the derivation
+                        storeResult <- try $ runTen (storeDerivation drv) env (initBuildState Build)
+
+                        case storeResult of
+                            Left (e :: SomeException) ->
+                                return $ Left $ StoreError $ "Failed to store derivation: " <> T.pack (show e)
+                            Right (Left err) ->
+                                return $ Left err
+                            Right (Right (path, _)) -> do
+                                putStrLn $ "Derivation stored at: " ++ storePathToFilePath path env
+                                return $ Right ()
+
+    RegisterDerivation file -> do
+        -- Check file existence
+        fileExists <- doesFileExist file
+        unless fileExists $
+            return $ Left $ InputNotFound file
+
+        -- Read the file content
+        content <- try $ BS.readFile file
+        case content of
+            Left (e :: SomeException) ->
+                return $ Left $ InputNotFound $ "Error reading file: " ++ show e
+            Right bytes -> do
+                -- Deserialize the derivation
+                case deserializeDerivation bytes of
+                    Left err ->
+                        return $ Left $ SerializationError err
+                    Right drv -> do
+                        -- Store the derivation
+                        storeResult <- try $ runTen (storeDerivationFile drv) env (initBuildState Build)
+
+                        case storeResult of
+                            Left (e :: SomeException) ->
+                                return $ Left $ StoreError $ "Failed to register derivation: " <> T.pack (show e)
+                            Right (Left err) ->
+                                return $ Left err
+                            Right (Right (path, _)) -> do
+                                putStrLn $ "Derivation registered at: " ++ storePathToFilePath path env
+                                putStrLn "Outputs:"
+                                forM_ (Set.toList $ derivationOutputPaths drv) $ \output ->
+                                    putStrLn $ "  " ++ storePathToFilePath output env
+                                return $ Right ()
+
+    ListDerivations -> do
+        -- Open database
+        db <- initDatabase (defaultDBPath (storePath env)) 5000
+
+        -- Query all registered derivations
+        derivsResult <- try $ listRegisteredDerivations db
+        closeDatabase db
+
+        case derivsResult of
+            Left (e :: SomeException) ->
+                return $ Left $ StoreError $ "Database query failed: " <> T.pack (show e)
+            Right drvs -> do
+                putStrLn $ "Found " ++ show (length drvs) ++ " registered derivations:"
+                forM_ drvs $ \drv ->
+                    putStrLn $ storePathToFilePath (derivInfoStorePath drv) env ++
+                               " (" ++ T.unpack (derivInfoHash drv) ++ ")"
+                return $ Right ()
 
 -- | Build a derivation file
 handleBuild :: BuildEnv -> FilePath -> IO (Either BuildError ())
@@ -840,14 +1150,19 @@ buildTenExpression env file = do
             case evalResult of
                 Left err -> return $ Left err
                 Right derivation -> do
-                    -- Now build the derivation
-                    buildResult <- buildTen (buildDerivation derivation) env
-                    case buildResult of
+                    -- Store the derivation in the store
+                    storeResult <- runTen (storeDerivationFile derivation) env (initBuildState Build)
+                    case storeResult of
                         Left err -> return $ Left err
-                        Right (result, _) -> do
-                            -- Show build result
-                            showBuildResult result
-                            return $ Right ()
+                        Right _ -> do
+                            -- Now build the derivation
+                            buildResult <- buildTen (buildDerivation derivation) env
+                            case buildResult of
+                                Left err -> return $ Left err
+                                Right (result, _) -> do
+                                    -- Show build result
+                                    showBuildResult result
+                                    return $ Right ()
 
 -- | Evaluate a Ten expression file to get a derivation
 evalExpression :: BuildEnv -> BS.ByteString -> IO (Either BuildError Derivation)
@@ -903,14 +1218,19 @@ buildDerivationFile env file = do
             case deserializeDerivation content of
                 Left err -> return $ Left $ SerializationError err
                 Right derivation -> do
-                    -- Build the derivation
-                    buildResult <- buildTen (buildDerivation derivation) env
-                    case buildResult of
+                    -- Store the derivation in the store
+                    storeResult <- runTen (storeDerivationFile derivation) env (initBuildState Build)
+                    case storeResult of
                         Left err -> return $ Left err
-                        Right (result, _) -> do
-                            -- Show build result
-                            showBuildResult result
-                            return $ Right ()
+                        Right _ -> do
+                            -- Build the derivation
+                            buildResult <- buildTen (buildDerivation derivation) env
+                            case buildResult of
+                                Left err -> return $ Left err
+                                Right (result, _) -> do
+                                    -- Show build result
+                                    showBuildResult result
+                                    return $ Right ()
 
 -- | Evaluate a Ten expression file
 handleEval :: BuildEnv -> FilePath -> IO (Either BuildError ())
@@ -936,9 +1256,14 @@ handleEval env file = do
                     case evalResult of
                         Left err -> return $ Left err
                         Right derivation -> do
-                            -- Show the derivation
-                            showDerivation derivation
-                            return $ Right ()
+                            -- Store the derivation
+                            storeResult <- runTen (storeDerivationFile derivation) env (initBuildState Build)
+                            case storeResult of
+                                Left err -> return $ Left err
+                                Right _ -> do
+                                    -- Show the derivation
+                                    showDerivation derivation
+                                    return $ Right ()
 
 -- | Run garbage collection
 handleGC :: BuildEnv -> Bool -> IO (Either BuildError ())
@@ -967,7 +1292,7 @@ handleGC env force = do
                     putStrLn $ "Freed " ++ show (gcBytes stats) ++ " bytes"
                     return $ Right ()
         else do
-            putStrLn "Garbage collection cancelled"
+            putStrLn "Garbage collection cancelled."
             return $ Right ()
 
 -- | Handle store operations
@@ -1117,18 +1442,52 @@ handleInfo env path = do
                     return $ Left $ StoreError $ "Error checking path existence: " <> T.pack (show e)
                 Right (Left err) -> return $ Left err
                 Right (Right (True, _)) -> do
-                    -- Show info about the path
-                    putStrLn $ "Store path: " ++ storePathToFilePath sp env
-                    putStrLn $ "Hash: " ++ T.unpack (storeHash sp)
-                    putStrLn $ "Name: " ++ T.unpack (storeName sp)
+                    -- Check if this is a derivation file
+                    let isDrv = ".drv" `T.isSuffixOf` storeName sp
 
-                    -- Verify the path
-                    verifyResult <- runTen (verifyStorePath sp) env (initBuildState Build)
-                    case verifyResult of
-                        Left err -> return $ Left err
-                        Right (valid, _) -> do
-                            putStrLn $ "Valid: " ++ if valid then "Yes" else "No"
-                            return $ Right ()
+                    if isDrv then do
+                        -- Show derivation info
+                        drvResult <- try $ runTen (retrieveDerivation sp) env (initBuildState Build)
+                        case drvResult of
+                            Left (e :: SomeException) ->
+                                return $ Left $ StoreError $ "Error retrieving derivation: " <> T.pack (show e)
+                            Right (Left err) ->
+                                return $ Left err
+                            Right (Right (Nothing, _)) ->
+                                return $ Left $ StoreError $ "Derivation not found: " <> T.pack path
+                            Right (Right (Just drv, _)) -> do
+                                -- Show the derivation
+                                putStrLn "Derivation file:"
+                                showDerivation drv
+                                return $ Right ()
+                    else do
+                        -- Check if this is an output of some derivation
+                        db <- initDatabase (defaultDBPath (storePath env)) 5000
+                        derivResult <- try $ getDerivationForOutput db sp
+                        closeDatabase db
+
+                        -- Show info about the path
+                        putStrLn $ "Store path: " ++ storePathToFilePath sp env
+                        putStrLn $ "Hash: " ++ T.unpack (storeHash sp)
+                        putStrLn $ "Name: " ++ T.unpack (storeName sp)
+
+                        -- Show deriver info if available
+                        case derivResult of
+                            Left (e :: SomeException) ->
+                                putStrLn $ "Could not query database: " ++ show e
+                            Right Nothing ->
+                                putStrLn "Not an output of any known derivation"
+                            Right (Just derivInfo) ->
+                                putStrLn $ "Output of derivation: " ++
+                                          storePathToFilePath (derivInfoStorePath derivInfo) env
+
+                        -- Verify the path
+                        verifyResult <- runTen (verifyStorePath sp) env (initBuildState Build)
+                        case verifyResult of
+                            Left err -> return $ Left err
+                            Right (valid, _) -> do
+                                putStrLn $ "Valid: " ++ if valid then "Yes" else "No"
+                                return $ Right ()
                 Right (Right (False, _)) ->
                     return $ Left $ StoreError $ "Path not in store: " <> T.pack path
 
@@ -1253,6 +1612,7 @@ showHelp = do
     putStrLn "  eval FILE           Evaluate a Ten expression file"
     putStrLn "  gc                  Run garbage collection"
     putStrLn "  store SUBCOMMAND    Store operations"
+    putStrLn "  derivation SUBCOMMAND  Derivation operations"
     putStrLn "  info PATH           Show information about a store path"
     putStrLn "  daemon SUBCOMMAND   Daemon operations"
     putStrLn "  help                Show this help"
@@ -1264,6 +1624,13 @@ showHelp = do
     putStrLn "  path FILE           Convert a file to a store path"
     putStrLn "  gc                  Run garbage collection"
     putStrLn "  list                List store contents"
+    putStrLn ""
+    putStrLn "Derivation subcommands:"
+    putStrLn "  info PATH           Show information about a derivation"
+    putStrLn "  query-deriver PATH  Find which derivation produced an output"
+    putStrLn "  store FILE          Store a derivation file"
+    putStrLn "  register FILE       Register a derivation in the database"
+    putStrLn "  list                List registered derivations"
     putStrLn ""
     putStrLn "Daemon subcommands:"
     putStrLn "  start               Start the daemon"
@@ -1517,3 +1884,7 @@ listDirectory dir = do
                     hPutStrLn stderr $ "Error listing directory " ++ dir ++ ": " ++ show e
                     return []
                 Right entries -> return entries
+
+-- | Convert StorePath to Text for database operations
+storePathToText :: StorePath -> Text
+storePathToText (StorePath hash name) = hash <> "-" <> name

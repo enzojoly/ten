@@ -32,8 +32,9 @@ module Ten.Core (
     -- Store types
     StorePath(..),
 
-    -- Re-exports from Ten.Store (removed redundant local definitions)
-    -- storePathToFilePath is now imported from Ten.Store
+    -- Database paths
+    defaultDBPath,
+    ensureDBDirectories,
 
     -- Core derivation types
     Derivation(..),
@@ -118,7 +119,7 @@ import System.Posix.User (getUserEntryForName, getGroupEntryForName,
                          userID, groupID)
 import System.Posix.Types (UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
-import Control.Exception (bracket, try, SomeException, Exception)
+import Control.Exception (bracket, try, catch, throwIO, SomeException, Exception, ErrorCall(..))
 import System.Environment (lookupEnv)
 import System.Posix.Types (ProcessID)
 import Text.Read (readPrec)
@@ -175,6 +176,7 @@ data BuildError
     | RecursionLimit Text                -- Too many recursive derivations
     | NetworkError Text                  -- Network-related errors
     | ParseError Text                    -- Parsing errors
+    | DBError Text                       -- Database-related errors
     deriving (Show, Eq)
 
 instance Exception BuildError
@@ -383,6 +385,7 @@ data BuildEnv = BuildEnv
     , userName :: Maybe Text             -- Current user name (for daemon mode)
     , buildStrategy :: BuildStrategy     -- How to build derivations
     , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
+    , maxConcurrentBuilds :: Maybe Int   -- Maximum concurrent builds
     } deriving (Show, Eq)
 
 -- | State carried through build operations
@@ -409,6 +412,17 @@ newtype TenM (p :: Phase) a = TenM
         , MonadIO
         )
 
+-- | Get the default path for the Ten database
+defaultDBPath :: FilePath -> FilePath
+defaultDBPath store = takeDirectory store </> "var/ten/db/ten.db"
+
+-- | Ensure database directories exist
+ensureDBDirectories :: FilePath -> IO ()
+ensureDBDirectories storeDir = do
+    let dbDir = takeDirectory (defaultDBPath storeDir)
+    createDirectoryIfMissing True dbDir
+    return ()
+
 -- | Initialize the build environment
 initBuildEnv :: FilePath -> FilePath -> BuildEnv
 initBuildEnv wd sp = BuildEnv
@@ -420,6 +434,7 @@ initBuildEnv wd sp = BuildEnv
     , userName = Nothing
     , buildStrategy = MonadicStrategy
     , maxRecursionDepth = 100
+    , maxConcurrentBuilds = Nothing
     }
 
 -- | Initialize client build environment

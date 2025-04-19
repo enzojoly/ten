@@ -23,6 +23,11 @@ module Ten.Derivation (
     buildToGetInnerDerivation,
     isReturnContinuationDerivation,
 
+    -- Derivation storage
+    storeDerivation,
+    retrieveDerivation,
+    storeDerivationFile,
+
     -- Serialization
     serializeDerivation,
     deserializeDerivation,
@@ -74,11 +79,14 @@ import qualified System.Posix.Files as Posix
 import System.IO (withFile, IOMode(..))
 import System.Process
 import System.Exit
+import Control.Exception (try, SomeException, finally)
 
 import Ten.Core
 import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflicts
 import Ten.Store
 import Ten.Sandbox
+import Ten.DB.Core
+import Ten.DB.Derivations
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -191,9 +199,77 @@ isReturnContinuationDerivation name args env =
         "--return" `T.isPrefixOf` arg ||
         "--output-derivation" `T.isPrefixOf` arg
 
+-- | Store a derivation in the content-addressed store
+storeDerivation :: Derivation -> TenM p StorePath
+storeDerivation drv = do
+    -- Serialize the derivation to a ByteString
+    let serialized = serializeDerivation drv
+
+    -- Add to store with .drv extension
+    addToStore (derivName drv <> ".drv") serialized
+
+-- | Register a derivation file in the database and store
+storeDerivationFile :: Derivation -> TenM p StorePath
+storeDerivationFile drv = do
+    -- Store the derivation in the content store
+    derivPath <- storeDerivation drv
+
+    -- Register the derivation in the database
+    env <- ask
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+
+    -- Register in database
+    liftIO $ registerDerivationFile db drv derivPath `finally` closeDatabase db
+
+    -- Return the store path
+    return derivPath
+
+-- | Retrieve a derivation from the store
+retrieveDerivation :: StorePath -> TenM p (Maybe Derivation)
+retrieveDerivation path = do
+    env <- ask
+
+    -- Check if the derivation exists in the store
+    exists <- storePathExists path
+    if not exists
+        then return Nothing
+        else do
+            -- Read from store
+            content <- readFromStore path
+
+            -- Deserialize
+            case deserializeDerivation content of
+                Left err -> do
+                    logMsg 1 $ "Error deserializing derivation: " <> err
+                    return Nothing
+                Right drv -> return $ Just drv
+
+-- | Retrieve a derivation by hash from the database
+retrieveDerivationByHash :: Text -> TenM p (Maybe Derivation)
+retrieveDerivationByHash hash = do
+    env <- ask
+
+    -- Open database
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+
+    -- Query database for derivation path
+    result <- liftIO $ try $ do
+        mDrv <- retrieveDerivation db hash
+        closeDatabase db
+        return mDrv
+
+    case result of
+        Left (e :: SomeException) -> do
+            logMsg 1 $ "Error retrieving derivation from database: " <> T.pack (show e)
+            return Nothing
+        Right mDrv -> return mDrv
+
 -- | Instantiate a derivation for building
 instantiateDerivation :: Derivation -> TenM 'Build ()
 instantiateDerivation deriv = do
+    -- Ensure the derivation is stored in the content store
+    derivPath <- storeDerivationFile deriv
+
     -- Verify inputs exist
     forM_ (derivInputs deriv) $ \input -> do
         exists <- storePathExists (inputPath input)
@@ -286,6 +362,10 @@ buildToGetInnerDerivation drv = do
                     Right innerDrv -> do
                         -- Add proof that we successfully got a returned derivation
                         addProof RecursionProof
+
+                        -- Store the inner derivation in the database
+                        _ <- storeDerivationFile innerDrv
+
                         return innerDrv
             else
                 throwError $ BuildFailed $
@@ -446,3 +526,28 @@ setFileMode :: FilePath -> Int -> IO ()
 setFileMode path mode = do
     -- Use Posix.setFileMode which accepts a numeric mode
     Posix.setFileMode path (fromIntegral mode)
+
+-- | Prepare a sandbox environment with appropriate derivation variables
+prepareSandboxEnvironment :: BuildEnv -> FilePath -> Map Text Text -> Map Text Text
+prepareSandboxEnvironment env sandboxDir derivEnv =
+    Map.unions
+        [ derivEnv
+        , Map.fromList
+            [ ("TEN_STORE", T.pack $ storePath env)
+            , ("TEN_BUILD_DIR", T.pack sandboxDir)
+            , ("TEN_OUT", T.pack $ sandboxDir </> "out")
+            , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath sandboxDir)
+            , ("PATH", "/bin:/usr/bin:/usr/local/bin")
+            , ("HOME", T.pack sandboxDir)
+            , ("TMPDIR", T.pack $ sandboxDir </> "tmp")
+            ]
+        ]
+
+-- | Get the path where a return-continuation derivation should be written
+returnDerivationPath :: FilePath -> FilePath
+returnDerivationPath buildDir = buildDir </> "returned-derivation.drv"
+
+-- | Execute a process and read its output
+readCreateProcessWithExitCode :: CreateProcess -> String -> IO (ExitCode, String, String)
+readCreateProcessWithExitCode process input =
+    Process.readCreateProcessWithExitCode process input

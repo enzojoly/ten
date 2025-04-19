@@ -77,6 +77,9 @@ import Ten.Store
 import Ten.Derivation
 import Ten.Sandbox
 import Ten.Graph
+import Ten.DB.Core
+import Ten.DB.Derivations
+import Ten.DB.References
 
 -- | Result of a build operation
 data BuildResult = BuildResult
@@ -92,6 +95,14 @@ buildDerivation deriv = do
     -- Log start of build
     logMsg 1 $ "Building derivation: " <> derivName deriv
 
+    -- Serialize and store the derivation in the store
+    derivPath <- storeDerivationFile deriv
+
+    -- Register the derivation in the database
+    env <- ask
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    liftIO $ registerDerivationFile db deriv derivPath `finally` closeDatabase db
+
     -- First instantiate the derivation
     instantiateDerivation deriv
 
@@ -103,6 +114,15 @@ buildDerivation deriv = do
         MonadicStrategy -> do
             logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
             buildMonadicStrategy deriv
+
+-- | Store a derivation file in the store
+storeDerivationFile :: Derivation -> TenM 'Build StorePath
+storeDerivationFile drv = do
+    -- Serialize the derivation to a ByteString
+    let serialized = serializeDerivation drv
+
+    -- Generate a store path with .drv extension
+    addToStore (derivName drv <> ".drv") serialized
 
 -- | Build a derivation using applicative strategy (parallel dependencies)
 buildApplicativeStrategy :: Derivation -> TenM 'Build BuildResult
@@ -129,9 +149,6 @@ buildApplicativeStrategy deriv = do
         else do
             -- Build missing dependencies concurrently
             logMsg 2 $ "Building " <> T.pack (show $ length missingDeps) <> " dependencies first"
-
-            -- Create a map of dependency derivations
-            depDerivs <- liftIO $ atomically $ newTVarIO Map.empty
 
             -- Find the derivations for each missing dependency
             deps <- findDependencyDerivations missingDeps
@@ -162,46 +179,24 @@ buildApplicativeStrategy deriv = do
     getErrorMessage (SandboxError msg) = msg
     getErrorMessage _ = "Build error"
 
-    -- Find derivation objects for dependencies
-    findDependencyDerivations :: [StorePath] -> TenM 'Build (Map String Derivation)
-    findDependencyDerivations paths = do
-        -- In a real implementation, we would look up the derivations from
-        -- a derivation store that maps outputs to their derivations
-        -- For now, we'll create a simulated dependency mapping
-        foldM (\acc path -> do
-            let hash = T.unpack $ storeHash path
-            let name = T.unpack $ storeName path
-            -- Find or create a derivation for this path
-            drv <- simulateDerivationForOutput path
-            return $ Map.insert hash drv acc
-          ) Map.empty paths
+-- | Find derivation objects for dependencies
+findDependencyDerivations :: [StorePath] -> TenM 'Build (Map String Derivation)
+findDependencyDerivations paths = do
+    env <- ask
 
-    -- Create a simulated derivation for an output
-    simulateDerivationForOutput :: StorePath -> TenM 'Build Derivation
-    simulateDerivationForOutput path = do
-        env <- ask
+    -- Initialize the database connection
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
 
-        -- Create a simple builder that copies from the store to the output
-        let builderScript = T.unlines [
-                "#!/bin/sh",
-                "set -e",
-                "cp \"$1\" \"$TEN_OUT/" <> storeName path <> "\"",
-                "echo \"Built " <> storeName path <> "\""
-              ]
+    -- Use the database to look up derivations for the provided output paths
+    result <- liftIO $ findDerivationsByOutputs db paths `finally` closeDatabase db
 
-        -- Add builder to store
-        builder <- addToStore "simple-builder.sh" (TE.encodeUtf8 builderScript)
+    -- If any lookup failed, throw an error
+    when (Map.size result /= length paths) $ do
+        let missingPaths = filter (\p -> not $ any (\(h, d) -> (storeHash p) `T.isInfixOf` (T.pack h)) (Map.toList result)) paths
+        throwError $ StoreError $ "Could not find derivations for outputs: " <>
+                    T.intercalate ", " (map storeName missingPaths)
 
-        -- Create a derivation that produces this output
-        let name = "build-" <> storeName path
-        let args = [T.pack $ storePathToFilePath path env]
-        let inputs = Set.singleton (DerivationInput path (storeName path))
-        let outputs = Set.singleton (storeName path)
-        let envVars = Map.singleton "PATH" "/bin:/usr/bin"
-        let system = "x86_64-linux"
-
-        -- Create the derivation
-        mkDerivation name builder args inputs outputs envVars system
+    return result
 
 -- | Build a derivation using monadic strategy (sequential with return-continuation)
 buildMonadicStrategy :: Derivation -> TenM 'Build BuildResult
@@ -376,8 +371,8 @@ runBuilder program args buildDir envVars userEntry groupEntry = do
 
     -- Determine if we need to drop privileges
     needDropPrivs <- liftIO $ do
-        uid <- User.getRealUserID
-        return $ uid == 0 && User.userName userEntry /= "root"
+        euid <- User.getEffectiveUserID
+        return $ euid == 0 && User.userName userEntry /= "root"
 
     -- Start the builder process with proper privilege handling
     (mPid, result) <- liftIO $ mask $ \restore -> do
@@ -500,7 +495,7 @@ collectBuildResult deriv buildDir = do
     logMsg 2 $ "Output directory contents: " <> T.pack (show outFiles)
 
     -- Process each expected output
-    outputs <- forM (Set.toList $ derivOutputs deriv) $ \output -> do
+    outputPaths <- forM (Set.toList $ derivOutputs deriv) $ \output -> do
         let outputFile = outDir </> T.unpack (outputName output)
         exists <- liftIO $ doesFileExist outputFile
 
@@ -525,8 +520,34 @@ collectBuildResult deriv buildDir = do
     -- Add output proof
     addProof OutputProof
 
+    -- Register derivation-output mappings in the database
+    env <- ask
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+
+    -- Get derivation path in the store
+    derivPath <- storeDerivationFile deriv
+
+    -- Register each output in the database
+    liftIO $ withTransaction db ReadWrite $ \db' -> do
+        derivInfo <- getDerivationPath db' (derivHash deriv)
+        case derivInfo of
+            Just storedDerivPath -> do
+                -- Register each output for this derivation
+                derivId <- storeDerivation db' deriv storedDerivPath
+                forM_ (Set.toList $ derivOutputs deriv) $ \output -> do
+                    let outputPath' = outputPath output
+                    registerDerivationOutput db' derivId (outputName output) outputPath'
+
+                    -- Register reference from output to derivation
+                    addDerivationReference db' outputPath' storedDerivPath
+
+            Nothing -> return () -- Should never happen if we stored the derivation first
+
+    -- Close the database connection
+    liftIO $ closeDatabase db
+
     -- Return the set of outputs
-    return $ Set.fromList outputs
+    return $ Set.fromList outputPaths
 
 -- | Verify that a build result matches the expected outputs
 verifyBuildResult :: Derivation -> BuildResult -> TenM 'Build Bool
@@ -595,6 +616,14 @@ handleReturnedDerivation result = do
         Right innerDrv -> do
             -- Add proof that we successfully got a returned derivation
             addProof RecursionProof
+
+            -- Store the inner derivation in the content store
+            derivPath <- storeDerivationFile innerDrv
+
+            -- Register the inner derivation in the database
+            env <- ask
+            db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+            liftIO $ registerDerivationFile db innerDrv derivPath `finally` closeDatabase db
 
             -- Check for cycles
             chain <- gets buildChain

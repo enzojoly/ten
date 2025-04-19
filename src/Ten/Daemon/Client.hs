@@ -32,6 +32,14 @@ module Ten.Daemon.Client (
     getStorePathForFile,
     listStore,
 
+    -- Derivation operations
+    storeDerivation,
+    retrieveDerivation,
+    queryDerivationForOutput,
+    queryOutputsForDerivation,
+    listDerivations,
+    getDerivationInfo,
+
     -- GC operations
     collectGarbage,
 
@@ -77,13 +85,14 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
 import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr, BufferMode(..), hSetBuffering)
-import System.Process (createProcess, proc, waitForProcess, CreateProcess(..), StdStream(..))
+import System.Process (createProcess, proc, waitForProcess, StdStream(..))
 import System.Timeout (timeout)
 
 import Ten.Core hiding (UserCredentials) -- Import Core, but not UserCredentials
 import qualified Ten.Daemon.Protocol as Protocol -- Import Protocol qualified
 import Ten.Daemon.Auth (authenticateUser) -- Import Auth functions directly
 import Ten.Daemon.Config (getDefaultSocketPath)
+import Ten.Derivation (Derivation, serializeDerivation, deserializeDerivation)
 
 -- | Re-export UserCredentials from Protocol
 type UserCredentials = Protocol.UserCredentials
@@ -377,7 +386,7 @@ readMessage handle = do
               fromIntegral (BS.index lenBytes 3)
 
     -- Sanity check on message length
-    when (len > 100 * 1024 * 1024) $ -- 100 MB max
+    when (len > 100 * 1024 * 1024) $ -- 100 MB limit
         throwIO $ DaemonError $ "Message too large: " <> T.pack (show len) <> " bytes"
 
     -- Read message body
@@ -665,6 +674,135 @@ listStore conn = do
         Left err ->
             return $ Left err
 
+-- | Store a derivation in the store and database
+storeDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError StorePath)
+storeDerivation conn derivation = do
+    -- Serialize the derivation
+    let serialized = serializeDerivation derivation
+
+    -- Create store derivation request
+    let request = Protocol.StoreDerivationRequest {
+            Protocol.derivationContent = serialized,
+            Protocol.registerOutputs = True
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+    case response of
+        Right (Protocol.StoreDerivationResponse path) ->
+            return $ Right path
+
+        Right _ ->
+            return $ Left $ DaemonError "Invalid response type for store derivation request"
+
+        Left err ->
+            return $ Left err
+
+-- | Retrieve a derivation from the store by path
+retrieveDerivation :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
+retrieveDerivation conn path = do
+    -- Create retrieve derivation request
+    let request = Protocol.RetrieveDerivationRequest {
+            Protocol.derivationPath = path
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+    case response of
+        Right (Protocol.RetrieveDerivationResponse Nothing) ->
+            return $ Right Nothing
+
+        Right (Protocol.RetrieveDerivationResponse (Just derivation)) ->
+            return $ Right $ Just derivation
+
+        Right _ ->
+            return $ Left $ DaemonError "Invalid response type for retrieve derivation request"
+
+        Left err ->
+            return $ Left err
+
+-- | Query which derivation produced a particular output
+queryDerivationForOutput :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
+queryDerivationForOutput conn outputPath = do
+    -- Create query derivation request
+    let request = Protocol.QueryDerivationRequest {
+            Protocol.queryType = Protocol.QueryByOutput,
+            Protocol.queryPath = outputPath
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+    case response of
+        Right (Protocol.QueryDerivationResponse Nothing) ->
+            return $ Right Nothing
+
+        Right (Protocol.QueryDerivationResponse (Just derivation)) ->
+            return $ Right $ Just derivation
+
+        Right _ ->
+            return $ Left $ DaemonError "Invalid response type for query derivation request"
+
+        Left err ->
+            return $ Left err
+
+-- | Query all outputs produced by a derivation
+queryOutputsForDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError (Set StorePath))
+queryOutputsForDerivation conn derivation = do
+    -- Create query outputs request
+    let request = Protocol.QueryDerivationOutputsRequest {
+            Protocol.derivation = derivation
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+    case response of
+        Right (Protocol.QueryDerivationOutputsResponse outputs) ->
+            return $ Right outputs
+
+        Right _ ->
+            return $ Left $ DaemonError "Invalid response type for query derivation outputs request"
+
+        Left err ->
+            return $ Left err
+
+-- | List all derivations in the store
+listDerivations :: DaemonConnection -> IO (Either BuildError [StorePath])
+listDerivations conn = do
+    -- Create list derivations request
+    let request = Protocol.ListDerivationsRequest
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+    case response of
+        Right (Protocol.ListDerivationsResponse paths) ->
+            return $ Right paths
+
+        Right _ ->
+            return $ Left $ DaemonError "Invalid response type for list derivations request"
+
+        Left err ->
+            return $ Left err
+
+-- | Get detailed information about a derivation
+getDerivationInfo :: DaemonConnection -> StorePath -> IO (Either BuildError Protocol.DerivationInfo)
+getDerivationInfo conn path = do
+    -- Create get derivation info request
+    let request = Protocol.GetDerivationInfoRequest {
+            Protocol.infoPath = path
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+    case response of
+        Right (Protocol.GetDerivationInfoResponse info) ->
+            return $ Right info
+
+        Right _ ->
+            return $ Left $ DaemonError "Invalid response type for get derivation info request"
+
+        Left err ->
+            return $ Left err
+
 -- | Run garbage collection
 collectGarbage :: DaemonConnection -> Bool -> IO (Either BuildError GCStats)
 collectGarbage conn force = do
@@ -744,4 +882,4 @@ shiftL :: Int -> Int -> Int
 shiftL x n = x * (2 ^ n)
 
 (.|.) :: Int -> Int -> Int
-(.|.) = (Prelude.+)
+a .|. b = a + b

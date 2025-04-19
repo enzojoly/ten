@@ -32,6 +32,7 @@ module Ten.Daemon.Server (
     handleStatusRequest,
     handleConfigRequest,
     handleShutdownRequest,
+    handleDerivationRequest,
 
     -- Socket management
     createServerSocket,
@@ -59,6 +60,7 @@ module Ten.Daemon.Server (
 
 import Control.Concurrent (ThreadId, forkIO, forkFinally, myThreadId, killThread, threadDelay)
 import Control.Concurrent.STM
+import Control.Concurrent.Async (Async, async, cancel)
 import Control.Exception (bracket, finally, try, catch, handle, throwIO, SomeException, AsyncException(..), displayException)
 import Control.Monad (forever, void, when, unless, forM_, foldM, forM)
 import Control.Monad.IO.Class (liftIO)
@@ -76,21 +78,24 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime, diffUTCTime)
+import Data.Time.Format (formatTime, defaultTimeLocale)
 import Data.Word (Word32)
 import Network.Socket hiding (recv)
 import Network.Socket.ByteString (sendAll, recv)
 import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, getModificationTime)
-import System.Environment (getEnvironment)
-import System.FilePath (takeDirectory)
-import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, hSetBuffering, BufferMode(..))
+import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
+import System.Exit (ExitCode(..), exitSuccess, exitFailure, exitWith)
+import System.FilePath ((</>), takeDirectory)
+import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdout, stdin,
+                 openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError, catchIOError)
 import System.Posix.Files (setFileMode, getFileStatus, accessTime, modificationTime)
 import System.Posix.Types (FileMode)
 import System.Posix.User (UserID, GroupID, setUserID, setGroupID, getEffectiveUserID,
                           getUserEntryForName, groupID, userID, getUserEntryForID)
-import System.Exit (ExitCode(..))
-import System.Process (createProcess, proc, waitForProcess, StdStream(..))
+import System.Process (readProcess, createProcess, proc, waitForProcess)
 import System.Random (randomRIO)
 import Crypto.Hash (hash, Digest, SHA256)
 import qualified Crypto.Hash as Crypto
@@ -102,9 +107,11 @@ import Ten.Daemon.Protocol
 import Ten.Daemon.State
 import Ten.Daemon.Auth
 import Ten.Daemon.Config (DaemonConfig(..))
-import Ten.Derivation (serializeDerivation, deserializeDerivation, hashDerivation)
+import Ten.Derivation (serializeDerivation, deserializeDerivation, hashDerivation, storeDerivation, retrieveDerivation)
 import Ten.Store (storePathToFilePath, makeStorePath, addToStore)
 import Ten.Hash (hashByteString, showHash)
+import Ten.DB.Core
+import Ten.DB.Derivations
 
 -- | Information about a connected client
 data ClientInfo = ClientInfo {
@@ -826,7 +833,8 @@ validateCredentials' authDb creds clientAddr = do
             let userId = UserId (username creds)
 
             -- Grant basic permissions for this example
-            let permissions = Set.fromList [PermQueryBuild, PermQueryStore]
+            let permissions = Set.fromList [PermQueryBuild, PermQueryStore,
+                                            PermQueryDerivation, PermStoreDerivation]
 
             return $ Right (userId, AuthToken newToken, permissions)
 
@@ -898,6 +906,12 @@ getRequiredPermission request = case request of
     ConfigRequest -> PermAdmin
     ShutdownRequest -> PermShutdown
 
+    -- Derivation-related requests
+    StoreDerivationRequest{} -> PermStoreDerivation
+    QueryDerivationRequest{} -> PermQueryDerivation
+    GetDerivationForOutputRequest{} -> PermQueryDerivation
+    ListDerivationsRequest{} -> PermQueryDerivation
+
     -- Default to admin permission for anything else
     _ -> PermAdmin
 
@@ -911,6 +925,8 @@ permissionToText PermModifyStore = "modify-store"
 permissionToText PermRunGC = "run-gc"
 permissionToText PermShutdown = "shutdown"
 permissionToText PermManageUsers = "manage-users"
+permissionToText PermQueryDerivation = "query-derivation"
+permissionToText PermStoreDerivation = "store-derivation"
 permissionToText PermAdmin = "admin"
 
 -- | Dispatch a request to the appropriate handler
@@ -955,6 +971,18 @@ dispatchRequest request state config permissions = case request of
     ShutdownRequest ->
         handleShutdownRequest state config permissions
 
+    StoreDerivationRequest{..} ->
+        handleDerivationRequest (StoreDerivationCmd storeDerivationData) state config permissions
+
+    QueryDerivationRequest{..} ->
+        handleDerivationRequest (QueryDerivationCmd queryDerivationHash) state config permissions
+
+    GetDerivationForOutputRequest{..} ->
+        handleDerivationRequest (GetDerivationForOutputCmd getDerivationForPath) state config permissions
+
+    ListDerivationsRequest{..} ->
+        handleDerivationRequest ListDerivationsCmd state config permissions
+
     PingRequest ->
         return Pong
 
@@ -975,7 +1003,7 @@ handleBuildRequest filePath maybeContent options state permissions = do
             fileExists <- doesFileExist path
             if fileExists
                 then BS.readFile path
-                else return $ BS8.pack "File not found"
+                else return $ BC.pack "File not found"
 
     -- Create or get the build environment
     env <- getBuildEnv state options
@@ -1015,7 +1043,7 @@ handleEvalRequest filePath maybeContent options state permissions = do
             fileExists <- doesFileExist path
             if fileExists
                 then BS.readFile path
-                else return $ BS8.pack "File not found"
+                else return $ BC.pack "File not found"
 
     -- Create evaluation environment
     env <- getEvalEnv state
@@ -1082,25 +1110,156 @@ handleBuildDerivationRequest drv options state permissions = do
                 Left err -> return $ ErrorResponse err
                 Right buildResult -> return $ BuildResponse buildResult
 
+-- | Handle a derivation request
+handleDerivationRequest :: DerivationCommand -> DaemonState -> DaemonConfig -> Set Permission -> IO Response
+handleDerivationRequest cmd state config permissions = case cmd of
+    StoreDerivationCmd derivationData -> do
+        -- Verify store derivation permission
+        unless (PermStoreDerivation `Set.member` permissions) $
+            return $ ErrorResponse $ AuthError "Permission denied: store-derivation"
+
+        -- Parse the derivation data
+        case deserializeDerivation derivationData of
+            Left err ->
+                return $ ErrorResponse $ SerializationError $ "Failed to deserialize derivation: " <> err
+            Right drv -> do
+                -- Get build environment
+                env <- getBuildEnv state defaultBuildOptions
+
+                -- Store the derivation in the content store
+                derivPath <- runTen (storeDerivation drv) env (initBuildState Build)
+
+                case derivPath of
+                    Left err ->
+                        return $ ErrorResponse err
+                    Right (storePath, _) -> do
+                        -- Register the derivation in the database
+                        db <- initDatabase (defaultDBPath (daemonStorePath config)) 5000
+
+                        registerResult <- try $ registerDerivationFile db drv storePath `finally` closeDatabase db
+
+                        case registerResult of
+                            Left (e :: SomeException) ->
+                                return $ ErrorResponse $ DBError $ "Failed to register derivation: " <> T.pack (show e)
+                            Right _ ->
+                                return $ DerivationStoredResponse storePath
+
+    QueryDerivationCmd hash -> do
+        -- Verify query derivation permission
+        unless (PermQueryDerivation `Set.member` permissions) $
+            return $ ErrorResponse $ AuthError "Permission denied: query-derivation"
+
+        -- Get the derivation from the database
+        db <- initDatabase (defaultDBPath (daemonStorePath config)) 5000
+
+        queryResult <- try $ retrieveDerivation db hash `finally` closeDatabase db
+
+        case queryResult of
+            Left (e :: SomeException) ->
+                return $ ErrorResponse $ DBError $ "Failed to query derivation: " <> T.pack (show e)
+            Right Nothing ->
+                return $ ErrorResponse $ StoreError $ "Derivation not found: " <> hash
+            Right (Just drv) ->
+                return $ DerivationResponse drv
+
+    GetDerivationForOutputCmd outputPath -> do
+        -- Verify query derivation permission
+        unless (PermQueryDerivation `Set.member` permissions) $
+            return $ ErrorResponse $ AuthError "Permission denied: query-derivation"
+
+        -- Parse the output path
+        let mStorePath = parseStorePath $ T.unpack outputPath
+        case mStorePath of
+            Nothing ->
+                return $ ErrorResponse $ StoreError $ "Invalid store path format: " <> outputPath
+            Just sp -> do
+                -- Query the database for the derivation that produced this output
+                db <- initDatabase (defaultDBPath (daemonStorePath config)) 5000
+
+                queryResult <- try $ getDerivationForOutput db sp `finally` closeDatabase db
+
+                case queryResult of
+                    Left (e :: SomeException) ->
+                        return $ ErrorResponse $ DBError $ "Failed to query derivation: " <> T.pack (show e)
+                    Right Nothing ->
+                        return $ ErrorResponse $ StoreError $ "No derivation found for output: " <> outputPath
+                    Right (Just derivInfo) -> do
+                        -- Get the actual derivation from the store path
+                        env <- getBuildEnv state defaultBuildOptions
+                        drvResult <- runTen (retrieveDerivation (derivInfoStorePath derivInfo)) env (initBuildState Build)
+
+                        case drvResult of
+                            Left err ->
+                                return $ ErrorResponse err
+                            Right (Nothing, _) ->
+                                return $ ErrorResponse $ StoreError $ "Derivation file not found in store"
+                            Right (Just drv, _) ->
+                                return $ DerivationResponse drv
+
+    ListDerivationsCmd -> do
+        -- Verify query derivation permission
+        unless (PermQueryDerivation `Set.member` permissions) $
+            return $ ErrorResponse $ AuthError "Permission denied: query-derivation"
+
+        -- List all registered derivations from the database
+        db <- initDatabase (defaultDBPath (daemonStorePath config)) 5000
+
+        listResult <- try $ listRegisteredDerivations db `finally` closeDatabase db
+
+        case listResult of
+            Left (e :: SomeException) ->
+                return $ ErrorResponse $ DBError $ "Failed to list derivations: " <> T.pack (show e)
+            Right derivInfos -> do
+                -- Return the list of derivation info objects
+                return $ DerivationListResponse derivInfos
+
+-- | Build a derivation file
+buildDrvFile :: BuildEnv -> BS.ByteString -> BuildOptions -> IO (Either BuildError (BuildId, BuildResult))
+buildDrvFile env content options = do
+    -- Parse the derivation
+    case deserializeDerivation content of
+        Left err -> return $ Left $ SerializationError err
+        Right derivation -> do
+            -- Store the derivation in the store and database
+            storeResult <- runTen (storeDerivationFile derivation) env (initBuildState Build)
+
+            case storeResult of
+                Left err -> return $ Left err
+                Right _ -> do
+                    -- Build the derivation
+                    buildResult <- runTen (buildDerivation derivation) env (initBuildState Build)
+                    case buildResult of
+                        Left err -> return $ Left err
+                        Right (result, _) -> do
+                            -- Create a build ID
+                            buildId <- BuildId <$> newUnique
+                            return $ Right (buildId, result)
+
+-- | Store a derivation file
+storeDerivationFile :: Derivation -> TenM 'Build StorePath
+storeDerivationFile drv = do
+    -- Store the derivation in the content store
+    derivPath <- storeDerivation drv
+
+    -- Register the derivation in the database
+    env <- ask
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+
+    -- Register in database
+    liftIO $ registerDerivationFile db drv derivPath `finally` closeDatabase db
+
+    -- Return the store path
+    return derivPath
+
 -- | Simplified build function for Derivation
 buildDerivation' :: BuildEnv -> Derivation -> IO (Either BuildError BuildResult)
 buildDerivation' env drv = do
     -- In a real implementation, this would use Ten.Build.buildDerivation
-    -- For this example, we'll simulate a build with placeholder results
-
-    -- Simulate build time
-    threadDelay 500000  -- 0.5 second
-
-    -- Create a result with the expected outputs
-    let outputs = Set.map outputPath (derivOutputs drv)
-    let result = BuildResult {
-            resultOutputs = outputs,
-            resultExitCode = ExitSuccess,
-            resultLog = "Simulated build of " <> derivName drv <> " completed successfully",
-            resultMetadata = Map.empty
-        }
-
-    return $ Right result
+    -- For now, we'll run the actual buildDerivation function
+    result <- runTen (buildDerivation drv) env (initBuildState Build)
+    return $ case result of
+        Left err -> Left err
+        Right (buildResult, _) -> Right buildResult
 
 -- | Handle a build status request
 handleBuildStatusRequest :: BuildId -> DaemonState -> Set Permission -> IO Response
@@ -1154,6 +1313,13 @@ data StoreCommand
     | StoreVerifyCmd Text
     | StorePathCmd Text BS.ByteString
     | StoreListCmd
+
+-- | Derivation command type
+data DerivationCommand
+    = StoreDerivationCmd BS.ByteString
+    | QueryDerivationCmd Text
+    | GetDerivationForOutputCmd Text
+    | ListDerivationsCmd
 
 -- | Handle a store request
 handleStoreRequest :: StoreCommand -> DaemonState -> Set Permission -> IO Response
@@ -1414,59 +1580,6 @@ buildTenFile env content options = do
         }
 
     return $ Right (buildId, result)
-
--- | Build a derivation file
-buildDrvFile :: BuildEnv -> BS.ByteString -> BuildOptions -> IO (Either BuildError (BuildId, BuildResult))
-buildDrvFile env content options = do
-    -- Parse the derivation
-    case deserializeDerivation content of
-        Left err ->
-            return $ Left $ SerializationError err
-
-        Right derivation -> do
-            -- Create a build ID
-            buildId <- BuildId <$> newUnique
-
-            -- In a real implementation, this would build the derivation
-            -- For now, return a placeholder result
-            let result = BuildResult {
-                    resultOutputs = Set.map outputPath (derivOutputs derivation),
-                    resultExitCode = ExitSuccess,
-                    resultLog = "Simulated derivation build of " <> derivName derivation,
-                    resultMetadata = Map.empty
-                }
-
-            return $ Right (buildId, result)
-
--- | Evaluate a Ten expression
-evaluateContent :: BuildEnv -> BS.ByteString -> EvalOptions -> IO (Either BuildError Derivation)
-evaluateContent env content options = do
-    -- In a real implementation, this would evaluate the Ten expression
-
-    -- For now, return a placeholder derivation
-    let name = "placeholder"
-        hash = "abcdef1234567890"
-        builder = StorePath "placeholder-builder-hash" "bash"
-        args = ["-c", "echo placeholder > $out"]
-        inputs = Set.empty
-        outputs = Set.singleton (DerivationOutput "out" (StorePath "outputhash" "output"))
-        derivEnv = Map.empty
-        derivSystem = fromMaybe "x86_64-linux" (evalSystemType options)
-        derivStrategy = MonadicStrategy
-        derivMeta = Map.empty
-
-    return $ Right $ Derivation {
-        derivName = name,
-        derivHash = hash,
-        derivBuilder = builder,
-        derivArgs = args,
-        derivInputs = inputs,
-        derivOutputs = outputs,
-        derivEnv = derivEnv,
-        derivSystem = derivSystem,
-        derivStrategy = derivStrategy,
-        derivMeta = derivMeta
-    }
 
 -- | Check if content is in JSON format
 isJsonContent :: BS.ByteString -> Bool
@@ -1742,8 +1855,8 @@ saveAuthDb path db = do
     renameFile tempPath path
 
 -- | Generate a unique identifier
-newUnique :: IO Integer
-newUnique = do
+generateToken :: IO Text
+generateToken = do
     -- Get the current time as microseconds
     now <- getCurrentTime
     let micros = floor $ 1000000 * realToFrac (diffUTCTime now (read "1970-01-01 00:00:00 UTC"))
@@ -1752,7 +1865,7 @@ newUnique = do
     r <- randomRIO (0, 999) :: IO Int
 
     -- Combine time and random number
-    return $ micros * 1000 + fromIntegral r
+    return $ T.pack $ "ten_token_" ++ show micros ++ "_" ++ show r
 
 -- | Bit manipulation helpers
 shiftL :: Int -> Int -> Int
@@ -1818,6 +1931,8 @@ data Permission
     | PermShutdown           -- Can shut down daemon
     | PermManageUsers        -- Can manage users
     | PermAdmin              -- Administrative access
+    | PermQueryDerivation    -- Can query derivation information
+    | PermStoreDerivation    -- Can store derivations
     deriving (Show, Eq, Ord, Enum, Bounded)
 
 -- A stub for TokenInfo
@@ -1829,3 +1944,62 @@ data TokenInfo = TokenInfo {
     tiLastUsed :: UTCTime,     -- When the token was last used
     tiPermissions :: Set Permission -- Specific permissions for this token
 } deriving (Show, Eq)
+
+-- Check GC Lock
+checkGCLock :: DaemonState -> STM Bool
+checkGCLock _ = return True
+
+-- Acquire GC Lock
+acquireGCLock :: DaemonState -> STM ()
+acquireGCLock _ = return ()
+
+-- Release GC Lock
+releaseGCLock :: DaemonState -> STM ()
+releaseGCLock _ = return ()
+
+-- Helper function to get the from exception
+fromException :: Exception e => SomeException -> Maybe e
+fromException = Control.Exception.fromException
+
+-- Cancel build
+cancelBuild :: DaemonState -> BuildId -> IO Bool
+cancelBuild _ _ = return True
+
+-- Get build status
+getBuildStatus :: DaemonState -> BuildId -> IO BuildStatus
+getBuildStatus _ _ = return BuildPending
+
+-- Rename file
+renameFile :: FilePath -> FilePath -> IO ()
+renameFile old new = do
+    exists <- doesFileExist old
+    when exists $ do
+        BS.readFile old >>= BS.writeFile new
+        removeFile old
+
+-- DataKinds
+data BuildOptions = BuildOptions {
+    buildVerbosity :: Int,
+    buildMaxJobs :: Maybe Int,
+    buildTimeout :: Maybe Int,
+    buildSystemType :: Maybe Text,
+    buildArgs :: Map Text Text,
+    buildAsync :: Bool,
+    buildKeepTemp :: Bool
+}
+
+data EvalOptions = EvalOptions {
+    evalVerbosity :: Int,
+    evalSystemType :: Maybe Text
+}
+
+-- Used for error handling
+data DBError = DBError Text deriving (Show)
+instance Exception DBError
+
+-- Evaluate content
+evaluateContent :: BuildEnv -> BS.ByteString -> EvalOptions -> IO (Either BuildError Derivation)
+evaluateContent _ _ _ = do
+    -- This would be a real implementation
+    let buildError = BuildFailed "Not implemented"
+    return $ Left buildError

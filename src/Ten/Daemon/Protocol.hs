@@ -23,6 +23,13 @@ module Ten.Daemon.Protocol (
     BuildRequestInfo(..),
     BuildStatusUpdate(..),
 
+    -- Derivation operations
+    StoreDerivationRequest(..),
+    RetrieveDerivationRequest(..),
+    QueryDerivationRequest(..),
+    DerivationInfoResponse(..),
+    DerivationOutputMappingResponse(..),
+
     -- Serialization functions
     serializeRequest,
     deserializeRequest,
@@ -188,6 +195,166 @@ instance Aeson.FromJSON AuthResult where
                 return $ AuthRejected reason
             _ -> fail $ "Unknown auth status: " ++ T.unpack status
 
+-- | Request to store a derivation
+data StoreDerivationRequest = StoreDerivationRequest {
+    storeDerivation :: Derivation,
+    registerInDb :: Bool  -- Whether to register the derivation in the database
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON StoreDerivationRequest where
+    toJSON StoreDerivationRequest{..} = Aeson.object [
+            "derivation" .= TE.decodeUtf8 (serializeDerivation storeDerivation),
+            "registerInDb" .= registerInDb
+        ]
+
+instance Aeson.FromJSON StoreDerivationRequest where
+    parseJSON = Aeson.withObject "StoreDerivationRequest" $ \v -> do
+        derivText <- v .: "derivation" :: Aeson.Parser Text
+        registerInDb <- v .: "registerInDb"
+        case deserializeDerivation (TE.encodeUtf8 derivText) of
+            Left err -> fail $ "Invalid derivation: " ++ T.unpack err
+            Right drv -> return $ StoreDerivationRequest drv registerInDb
+
+-- | Request to retrieve a derivation
+data RetrieveDerivationRequest = RetrieveDerivationRequest {
+    derivationPath :: StorePath,
+    includeOutputs :: Bool  -- Whether to include output info in the response
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON RetrieveDerivationRequest where
+    toJSON RetrieveDerivationRequest{..} = Aeson.object [
+            "path" .= encodePath derivationPath,
+            "includeOutputs" .= includeOutputs
+        ]
+      where
+        encodePath (StorePath hash name) = Aeson.object [
+                "hash" .= hash,
+                "name" .= name
+            ]
+
+instance Aeson.FromJSON RetrieveDerivationRequest where
+    parseJSON = Aeson.withObject "RetrieveDerivationRequest" $ \v -> do
+        pathObj <- v .: "path"
+        path <- decodePath pathObj
+        includeOutputs <- v .: "includeOutputs"
+        return $ RetrieveDerivationRequest path includeOutputs
+      where
+        decodePath = Aeson.withObject "StorePath" $ \p -> do
+            hash <- p .: "hash"
+            name <- p .: "name"
+            return $ StorePath hash name
+
+-- | Request to query derivation information
+data QueryDerivationRequest = QueryDerivationRequest {
+    queryType :: Text,        -- "by-hash", "by-output", "by-name", etc.
+    queryValue :: Text,       -- Hash, output path, or name to search for
+    queryLimit :: Maybe Int   -- Optional limit on number of results
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON QueryDerivationRequest where
+    toJSON QueryDerivationRequest{..} = Aeson.object [
+            "queryType" .= queryType,
+            "queryValue" .= queryValue,
+            "queryLimit" .= queryLimit
+        ]
+
+instance Aeson.FromJSON QueryDerivationRequest where
+    parseJSON = Aeson.withObject "QueryDerivationRequest" $ \v -> do
+        queryType <- v .: "queryType"
+        queryValue <- v .: "queryValue"
+        queryLimit <- v .: "queryLimit"
+        return $ QueryDerivationRequest queryType queryValue queryLimit
+
+-- | Response with derivation information
+data DerivationInfoResponse = DerivationInfoResponse {
+    derivationResponseDrv :: Derivation,
+    derivationResponseOutputs :: Set StorePath,
+    derivationResponseInputs :: Set StorePath,
+    derivationResponseStorePath :: StorePath,
+    derivationResponseMetadata :: Map Text Text
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON DerivationInfoResponse where
+    toJSON DerivationInfoResponse{..} = Aeson.object [
+            "derivation" .= TE.decodeUtf8 (serializeDerivation derivationResponseDrv),
+            "outputs" .= map encodePath (Set.toList derivationResponseOutputs),
+            "inputs" .= map encodePath (Set.toList derivationResponseInputs),
+            "storePath" .= encodePath derivationResponseStorePath,
+            "metadata" .= derivationResponseMetadata
+        ]
+      where
+        encodePath (StorePath hash name) = Aeson.object [
+                "hash" .= hash,
+                "name" .= name
+            ]
+
+instance Aeson.FromJSON DerivationInfoResponse where
+    parseJSON = Aeson.withObject "DerivationInfoResponse" $ \v -> do
+        derivText <- v .: "derivation" :: Aeson.Parser Text
+        derivation <- case deserializeDerivation (TE.encodeUtf8 derivText) of
+            Left err -> fail $ "Invalid derivation: " ++ T.unpack err
+            Right d -> return d
+
+        outputsJson <- v .: "outputs"
+        outputs <- mapM decodePath outputsJson
+
+        inputsJson <- v .: "inputs"
+        inputs <- mapM decodePath inputsJson
+
+        storePathJson <- v .: "storePath"
+        storePath <- decodePath storePathJson
+
+        metadata <- v .: "metadata"
+
+        return $ DerivationInfoResponse derivation (Set.fromList outputs) (Set.fromList inputs) storePath metadata
+      where
+        decodePath = Aeson.withObject "StorePath" $ \p -> do
+            hash <- p .: "hash"
+            name <- p .: "name"
+            return $ StorePath hash name
+
+-- | Response with derivation-output mappings
+data DerivationOutputMappingResponse = DerivationOutputMappingResponse {
+    outputMappings :: [(StorePath, StorePath)],  -- [(derivation path, output path)]
+    outputMappingCount :: Int,
+    outputMappingComplete :: Bool   -- Whether all mappings were included
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON DerivationOutputMappingResponse where
+    toJSON DerivationOutputMappingResponse{..} = Aeson.object [
+            "mappings" .= map encodeMappings outputMappings,
+            "count" .= outputMappingCount,
+            "complete" .= outputMappingComplete
+        ]
+      where
+        encodeMappings (derivPath, outPath) = Aeson.object [
+                "derivation" .= encodePath derivPath,
+                "output" .= encodePath outPath
+            ]
+        encodePath (StorePath hash name) = Aeson.object [
+                "hash" .= hash,
+                "name" .= name
+            ]
+
+instance Aeson.FromJSON DerivationOutputMappingResponse where
+    parseJSON = Aeson.withObject "DerivationOutputMappingResponse" $ \v -> do
+        mappingsJson <- v .: "mappings"
+        mappings <- mapM decodeMappings mappingsJson
+        count <- v .: "count"
+        complete <- v .: "complete"
+        return $ DerivationOutputMappingResponse mappings count complete
+      where
+        decodeMappings = Aeson.withObject "Mapping" $ \m -> do
+            derivPathJson <- m .: "derivation"
+            derivPath <- decodePath derivPathJson
+            outPathJson <- m .: "output"
+            outPath <- decodePath outPathJson
+            return (derivPath, outPath)
+        decodePath = Aeson.withObject "StorePath" $ \p -> do
+            hash <- p .: "hash"
+            name <- p .: "name"
+            return $ StorePath hash name
+
 -- | Build request information
 data BuildRequestInfo = BuildRequestInfo {
     buildArgs :: [(Text, Text)],  -- Extra build arguments
@@ -326,6 +493,13 @@ data DaemonRequest
     | VerifyPath StorePath
     | ListStoreContents (Maybe Text)  -- Optional prefix filter
 
+    -- Derivation operations
+    | StoreDerivationRequest StoreDerivationRequest
+    | RetrieveDerivationRequest RetrieveDerivationRequest
+    | QueryDerivationRequest QueryDerivationRequest
+    | QueryDeriverForOutput StorePath
+    | ListDerivations (Maybe Int)  -- Limit of derivations to return
+
     -- Garbage collection
     | CollectGarbage Bool  -- force flag
     | AddGCRoot StorePath Text Bool  -- path, name, permanent flag
@@ -410,6 +584,31 @@ instance Aeson.ToJSON DaemonRequest where
         ListStoreContents prefix -> Aeson.object [
                 "type" .= ("list-store" :: Text),
                 "prefix" .= prefix
+            ]
+
+        StoreDerivationRequest req -> Aeson.object [
+                "type" .= ("store-derivation" :: Text),
+                "request" .= req
+            ]
+
+        RetrieveDerivationRequest req -> Aeson.object [
+                "type" .= ("retrieve-derivation" :: Text),
+                "request" .= req
+            ]
+
+        QueryDerivationRequest req -> Aeson.object [
+                "type" .= ("query-derivation" :: Text),
+                "request" .= req
+            ]
+
+        QueryDeriverForOutput path -> Aeson.object [
+                "type" .= ("query-deriver-for-output" :: Text),
+                "output" .= encodePath path
+            ]
+
+        ListDerivations limit -> Aeson.object [
+                "type" .= ("list-derivations" :: Text),
+                "limit" .= limit
             ]
 
         CollectGarbage force -> Aeson.object [
@@ -534,6 +733,27 @@ instance Aeson.FromJSON DaemonRequest where
                 prefix <- v .: "prefix"
                 return $ ListStoreContents prefix
 
+            "store-derivation" -> do
+                req <- v .: "request"
+                return $ StoreDerivationRequest req
+
+            "retrieve-derivation" -> do
+                req <- v .: "request"
+                return $ RetrieveDerivationRequest req
+
+            "query-derivation" -> do
+                req <- v .: "request"
+                return $ QueryDerivationRequest req
+
+            "query-deriver-for-output" -> do
+                pathObj <- v .: "output"
+                path <- decodePath pathObj
+                return $ QueryDeriverForOutput path
+
+            "list-derivations" -> do
+                limit <- v .: "limit"
+                return $ ListDerivations limit
+
             "collect-garbage" -> do
                 force <- v .: "force"
                 return $ CollectGarbage force
@@ -605,6 +825,13 @@ data DaemonResponse
     | PathAddedResponse StorePath
     | PathVerifiedResponse StorePath Bool  -- Path, isValid
     | StoreContentsResponse [StorePath]
+
+    -- Derivation responses
+    | DerivationStoredResponse StorePath  -- Path where the derivation was stored
+    | DerivationRetrievedResponse DerivationInfoResponse
+    | DerivationQueryResponse [DerivationInfoResponse]
+    | DerivationOutputResponse DerivationOutputMappingResponse
+    | DerivationListResponse [StorePath]
 
     -- Garbage collection responses
     | GCCompleted Int Int Integer Double  -- paths collected, paths kept, bytes freed, time taken
@@ -735,6 +962,31 @@ instance Aeson.ToJSON DaemonResponse where
                 "paths" .= map encodePath paths
             ]
 
+        DerivationStoredResponse path -> Aeson.object [
+                "type" .= ("derivation-stored" :: Text),
+                "path" .= encodePath path
+            ]
+
+        DerivationRetrievedResponse info -> Aeson.object [
+                "type" .= ("derivation-retrieved" :: Text),
+                "info" .= info
+            ]
+
+        DerivationQueryResponse results -> Aeson.object [
+                "type" .= ("derivation-query" :: Text),
+                "results" .= results
+            ]
+
+        DerivationOutputResponse mapping -> Aeson.object [
+                "type" .= ("derivation-output" :: Text),
+                "mapping" .= mapping
+            ]
+
+        DerivationListResponse paths -> Aeson.object [
+                "type" .= ("derivation-list" :: Text),
+                "paths" .= map encodePath paths
+            ]
+
         GCCompleted collected kept bytes time -> Aeson.object [
                 "type" .= ("gc-completed" :: Text),
                 "collected" .= collected,
@@ -825,6 +1077,7 @@ instance Aeson.ToJSON DaemonResponse where
             CyclicDependency msg -> T.pack $ "Cyclic dependency: " ++ T.unpack msg
             SerializationError msg -> T.pack $ "Serialization error: " ++ T.unpack msg
             RecursionLimit msg -> T.pack $ "Recursion limit exceeded: " ++ T.unpack msg
+            NetworkError msg -> T.pack $ "Network error: " ++ T.unpack msg
 
         showStatus :: BuildStatus -> Text
         showStatus BuildPending = "pending"
@@ -916,6 +1169,28 @@ instance Aeson.FromJSON DaemonResponse where
                 pathsJson <- v .: "paths"
                 paths <- mapM decodePath pathsJson
                 return $ StoreContentsResponse paths
+
+            "derivation-stored" -> do
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                return $ DerivationStoredResponse path
+
+            "derivation-retrieved" -> do
+                info <- v .: "info"
+                return $ DerivationRetrievedResponse info
+
+            "derivation-query" -> do
+                results <- v .: "results"
+                return $ DerivationQueryResponse results
+
+            "derivation-output" -> do
+                mapping <- v .: "mapping"
+                return $ DerivationOutputResponse mapping
+
+            "derivation-list" -> do
+                pathsJson <- v .: "paths"
+                paths <- mapM decodePath pathsJson
+                return $ DerivationListResponse paths
 
             "gc-completed" -> do
                 collected <- v .: "collected"
@@ -1196,6 +1471,21 @@ requestToText req = case req of
     ListStoreContents prefix ->
         T.pack $ "List store" ++ maybe "" (\p -> " (prefix: " ++ T.unpack p ++ ")") prefix
 
+    StoreDerivationRequest req ->
+        T.pack $ "Store derivation: " ++ T.unpack (T.take 40 (hashDerivation (storeDerivation req))) ++ "..."
+
+    RetrieveDerivationRequest req ->
+        T.pack $ "Retrieve derivation: " ++ T.unpack (storeHash (derivationPath req)) ++ "-" ++ T.unpack (storeName (derivationPath req))
+
+    QueryDerivationRequest req ->
+        T.pack $ "Query derivation: " ++ T.unpack (queryType req) ++ " = " ++ T.unpack (queryValue req)
+
+    QueryDeriverForOutput path ->
+        T.pack $ "Query deriver for output: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+
+    ListDerivations limit ->
+        T.pack $ "List derivations" ++ maybe "" (\n -> " (limit: " ++ show n ++ ")") limit
+
     CollectGarbage force ->
         T.pack $ "Collect garbage" ++ if force then " (force)" else ""
 
@@ -1272,6 +1562,21 @@ responseToText resp = case resp of
     StoreContentsResponse paths ->
         T.pack $ "Store contents: " ++ show (length paths) ++ " paths"
 
+    DerivationStoredResponse path ->
+        T.pack $ "Derivation stored at: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+
+    DerivationRetrievedResponse info ->
+        T.pack $ "Derivation retrieved: " ++ T.unpack (derivName (derivationResponseDrv info))
+
+    DerivationQueryResponse results ->
+        T.pack $ "Derivation query results: " ++ show (length results) ++ " derivations"
+
+    DerivationOutputResponse mapping ->
+        T.pack $ "Derivation output mappings: " ++ show (outputMappingCount mapping) ++ " mappings"
+
+    DerivationListResponse paths ->
+        T.pack $ "Derivation list: " ++ show (length paths) ++ " derivations"
+
     GCCompleted collected kept bytes time ->
         T.pack $ "GC completed: " ++ show collected ++ " paths collected, " ++
                  show kept ++ " paths kept, " ++ formatBytes bytes ++ " freed in " ++
@@ -1331,6 +1636,7 @@ responseToText resp = case resp of
     showError (CyclicDependency msg) = "Cyclic dependency: " ++ T.unpack msg
     showError (SerializationError msg) = "Serialization error: " ++ T.unpack msg
     showError (RecursionLimit msg) = "Recursion limit exceeded: " ++ T.unpack msg
+    showError (NetworkError msg) = "Network error: " ++ T.unpack msg
 
     formatBytes :: Integer -> String
     formatBytes bytes
