@@ -119,17 +119,42 @@ import System.IO.Error (isDoesNotExistError)
 import Control.Exception (bracket, try, SomeException, Exception)
 import System.Environment (lookupEnv)
 import System.Posix.Types (ProcessID)
+import Text.Read (readPrec)
+import qualified Text.Read as Read
+import System.IO.Unsafe (unsafePerformIO)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
     deriving (Show, Eq)
 
 -- | Build identifier type
-newtype BuildId = BuildId Unique
+data BuildId
+    = BuildId Unique               -- Normal constructor
+    | BuildIdFromInt Int           -- For deserialization only
     deriving (Eq, Ord)
 
 instance Show BuildId where
     show (BuildId u) = "build-" ++ show (hashUnique u)
+    show (BuildIdFromInt n) = "build-" ++ show n
+
+-- | Read instance for BuildId to support deserialization
+instance Read BuildId where
+    readPrec = do
+        Read.Ident s <- Read.lexP
+        case stripPrefix "build-" s of
+            Just numStr ->
+                case reads numStr of
+                    [(n, "")] -> return $ BuildIdFromInt n
+                    _ -> Read.pfail
+            Nothing -> Read.pfail
+
+-- Helper function to strip prefix (like Data.List.stripPrefix)
+stripPrefix :: String -> String -> Maybe String
+stripPrefix [] ys = Just ys
+stripPrefix (x:xs) (y:ys)
+    | x == y = stripPrefix xs ys
+    | otherwise = Nothing
+stripPrefix _ _ = Nothing
 
 -- | Core error types
 data BuildError
