@@ -30,7 +30,7 @@ module Ten.Derivation (
     derivationFromJSON,
 
     -- Hashing and identity
-    Ten.Hash.hashDerivation,
+    hashDerivation,       -- Export our wrapper function instead
     hashDerivationInputs,
 
     -- Build strategy analysis
@@ -76,7 +76,7 @@ import System.Process
 import System.Exit
 
 import Ten.Core
-import Ten.Hash
+import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflicts
 import Ten.Store
 import Ten.Sandbox
 
@@ -97,6 +97,10 @@ detectRecursionCycle derivations =
 -- | Get chain length
 derivationChainLength :: DerivationChain -> Int
 derivationChainLength (DerivationChain hashes) = length hashes
+
+-- | Hash a derivation to get its textual representation
+hashDerivation :: Derivation -> Text
+hashDerivation drv = Hash.showHash $ Hash.hashDerivation (derivName drv) (derivArgs drv) (derivEnv drv)
 
 -- | Create a new derivation
 mkDerivation :: Text                      -- ^ Name
@@ -119,7 +123,7 @@ mkDerivation name builder args inputs outputNames env system = do
             , system
             ]
 
-    let derivHash' = T.pack $ show $ hashText hashBase
+    let derivHash' = T.pack $ show $ Hash.hashText hashBase
 
     -- Create output specifications with predicted paths
     let outputs = Set.map (\outName -> DerivationOutput
@@ -433,7 +437,7 @@ derivationFromJSON v =
 -- | Hash a derivation's inputs for dependency tracking
 hashDerivationInputs :: Derivation -> Text
 hashDerivationInputs drv =
-    T.pack $ show $ Ten.Hash.hashText $ T.intercalate ":" $
+    T.pack $ show $ Hash.hashText $ T.intercalate ":" $
         map (\input -> storeHash $ inputPath input) $
         Set.toList $ derivInputs drv
 
