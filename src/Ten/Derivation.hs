@@ -46,7 +46,7 @@ module Ten.Derivation (
 
 import Control.Concurrent.STM
 import Control.Monad
-import Control.Monad.Reader (ask)
+import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (modify, gets)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (liftIO)
@@ -63,10 +63,12 @@ import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Aeson.Encoding as Aeson
+import qualified Data.Aeson.Key as Aeson
+import qualified Data.Aeson.KeyMap as Aeson.KeyMap
 import qualified Data.Vector as Vector
 import qualified Data.HashMap.Strict as HashMap
 import System.FilePath
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, setPermissions)
 import System.IO (withFile, IOMode(..))
 import System.Process
 import System.Exit
@@ -311,14 +313,14 @@ derivationToJSON Derivation{..} = Aeson.object
     , "hash" .= derivHash
     , "builder" .= storePathToJSON derivBuilder
     , "args" .= derivArgs
-    , "inputs" .= Aeson.Array (Aeson.toJSON <$> Set.toList derivInputs)
-    , "outputs" .= Aeson.Array (Aeson.toJSON <$> Set.toList derivOutputs)
-    , "env" .= Aeson.object (map (\(k, v) -> k .= v) $ Map.toList derivEnv)
+    , "inputs" .= Aeson.Array (Vector.fromList $ map Aeson.toJSON $ Set.toList derivInputs)
+    , "outputs" .= Aeson.Array (Vector.fromList $ map Aeson.toJSON $ Set.toList derivOutputs)
+    , "env" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList derivEnv)
     , "system" .= derivSystem
     , "strategy" .= (case derivStrategy of
                         ApplicativeStrategy -> "applicative" :: Text
                         MonadicStrategy -> "monadic")
-    , "meta" .= Aeson.object (map (\(k, v) -> k .= v) $ Map.toList derivMeta)
+    , "meta" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList derivMeta)
     ]
 
 -- Helper to convert StorePath to JSON
@@ -351,47 +353,49 @@ deserializeDerivation bs =
 
 -- | Convert JSON to Derivation
 derivationFromJSON :: Aeson.Value -> Either Text Derivation
-derivationFromJSON = Aeson.parseEither $ \o -> do
-    name <- o .: "name"
-    hash <- o .: "hash"
-    builderJSON <- o .: "builder"
-    args <- o .: "args"
-    inputsJSON <- o .: "inputs"
-    outputsJSON <- o .: "outputs"
-    envObj <- o .: "env"
-    system <- o .: "system"
-    strategyText <- o .: "strategy"
-    metaObj <- o .: "meta"
-
-    -- Parse nested objects
-    builder <- parseStorePath builderJSON
-
-    -- Parse arrays
-    inputs <- parseInputs inputsJSON
-    outputs <- parseOutputs outputsJSON
-
-    -- Parse maps
-    let env = parseEnv envObj
-    let meta = parseEnv metaObj
-
-    -- Parse strategy
-    let strategy = case strategyText of
-            "monadic" -> MonadicStrategy
-            _ -> ApplicativeStrategy
-
-    return Derivation
-        { derivName = name
-        , derivHash = hash
-        , derivBuilder = builder
-        , derivArgs = args
-        , derivInputs = Set.fromList inputs
-        , derivOutputs = Set.fromList outputs
-        , derivEnv = env
-        , derivSystem = system
-        , derivStrategy = strategy
-        , derivMeta = meta
-        }
+derivationFromJSON = Aeson.parseEither parseDerivation
   where
+    parseDerivation = Aeson.withObject "Derivation" $ \o -> do
+        name <- o .: "name"
+        hash <- o .: "hash"
+        builderJSON <- o .: "builder"
+        args <- o .: "args"
+        inputsJSON <- o .: "inputs"
+        outputsJSON <- o .: "outputs"
+        envObj <- o .: "env"
+        system <- o .: "system"
+        strategyText <- o .: "strategy"
+        metaObj <- o .: "meta"
+
+        -- Parse nested objects
+        builder <- parseStorePath builderJSON
+
+        -- Parse arrays
+        inputs <- parseInputs inputsJSON
+        outputs <- parseOutputs outputsJSON
+
+        -- Parse maps
+        let env = parseEnv envObj
+        let meta = parseEnv metaObj
+
+        -- Parse strategy
+        let strategy = case strategyText of
+                "monadic" -> MonadicStrategy
+                _ -> ApplicativeStrategy
+
+        return Derivation
+            { derivName = name
+            , derivHash = hash
+            , derivBuilder = builder
+            , derivArgs = args
+            , derivInputs = Set.fromList inputs
+            , derivOutputs = Set.fromList outputs
+            , derivEnv = env
+            , derivSystem = system
+            , derivStrategy = strategy
+            , derivMeta = meta
+            }
+
     parseStorePath :: Aeson.Value -> Aeson.Parser StorePath
     parseStorePath = Aeson.withObject "StorePath" $ \o -> do
         hash <- o .: "hash"
@@ -421,14 +425,16 @@ derivationFromJSON = Aeson.parseEither $ \o -> do
         return $ DerivationOutput name path
 
     parseEnv :: Aeson.Value -> Map Text Text
-    parseEnv (Aeson.Object obj) = Map.fromList $
-        map (\(k, Aeson.String v) -> (k, v)) $ HashMap.toList obj
-    parseEnv _ = Map.empty
+    parseEnv = Aeson.withObject "Environment" $ \obj ->
+        Map.fromList $ map convertKeyValue $ Aeson.KeyMap.toList obj
+      where
+        convertKeyValue (k, Aeson.String v) = (Aeson.toText k, v)
+        convertKeyValue _ = ("", "") -- Fallback for non-string values
 
 -- | Hash a derivation's inputs for dependency tracking
 hashDerivationInputs :: Derivation -> Text
 hashDerivationInputs drv =
-    T.pack $ show $ hashText $ T.intercalate ":" $
+    T.pack $ show $ Ten.Hash.hashText $ T.intercalate ":" $
         map (\input -> storeHash $ inputPath input) $
         Set.toList $ derivInputs drv
 
@@ -441,4 +447,4 @@ setFileMode :: FilePath -> Int -> IO ()
 setFileMode path mode = do
     -- Convert to proper FileMode type and set
     let fileMode' = fromIntegral mode
-    setFilePermissions path fileMode'
+    setPermissions path fileMode'
