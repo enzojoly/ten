@@ -576,7 +576,7 @@ data DaemonResponse
     | BuildStatusResponse BuildStatusUpdate
     | BuildFinished BuildId (Either BuildError (Set StorePath))
     | BuildOutputResponse BuildId Text  -- Build log
-    | BuildListResponse [(BuildId, BuildStatus, Double)]  -- BuildId, status, progress
+    | BuildListResponse [(BuildId, BuildStatus, Float)]  -- BuildId, status, progress (changed from Double to Float)
 
     -- Store responses
     | PathInfoResponse StorePath Bool Text  -- StorePath, exists, info
