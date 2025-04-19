@@ -27,11 +27,19 @@ ten
 │   │               │       │   ├── Config.dyn_hi
 │   │               │       │   ├── Config.dyn_o
 │   │               │       │   ├── Config.hi
-│   │               │       │   └── Config.o
+│   │               │       │   ├── Config.o
+│   │               │       │   ├── Protocol.dyn_hi
+│   │               │       │   ├── Protocol.dyn_o
+│   │               │       │   ├── Protocol.hi
+│   │               │       │   └── Protocol.o
 │   │               │       ├── Derivation.dyn_hi
 │   │               │       ├── Derivation.dyn_o
 │   │               │       ├── Derivation.hi
 │   │               │       ├── Derivation.o
+│   │               │       ├── Graph.dyn_hi
+│   │               │       ├── Graph.dyn_o
+│   │               │       ├── Graph.hi
+│   │               │       ├── Graph.o
 │   │               │       ├── Hash.dyn_hi
 │   │               │       ├── Hash.dyn_o
 │   │               │       ├── Hash.hi
@@ -78,6 +86,11 @@ ten
 │   │   │   ├── Protocol.hs
 │   │   │   ├── Server.hs
 │   │   │   └── State.hs
+│   │   ├── DB
+│   │   │   ├── Core.hs
+│   │   │   ├── Derivations.hs
+│   │   │   ├── References.hs
+│   │   │   └── Schema.hs
 │   │   ├── Derivation.hs
 │   │   ├── GC.hs
 │   │   ├── Graph.hs
@@ -92,4 +105,4 @@ ten
 ├── 典
 └── 天
 
-21 directories, 72 files
+22 directories, 84 files
