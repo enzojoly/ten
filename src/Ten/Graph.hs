@@ -96,7 +96,7 @@ data GraphError
 
 -- | Proof about a build graph
 data GraphProof
-    = GraphAcyclicProof      -- Graph has no cycles
+    = AcyclicProof      -- Graph has no cycles
     | CompleteProof     -- Graph contains all dependencies
     | ValidProof        -- Graph is both acyclic and complete
     deriving (Show, Eq)
@@ -267,7 +267,7 @@ topologicalSort :: BuildGraph -> TenM 'Eval [BuildNode]
 topologicalSort graph = do
     -- Verify the graph is acyclic
     case graphProof graph of
-        Just GraphAcyclicProof -> pure ()
+        Just AcyclicProof -> pure ()
         Just ValidProof -> pure ()
         _ -> do
             hasCycles <- detectCycles graph
