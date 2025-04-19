@@ -80,13 +80,13 @@ import System.IO (withFile, IOMode(..))
 import System.Process
 import System.Exit
 import Control.Exception (try, SomeException, finally)
+import Database.SQLite.Simple (Only(..))
 
 import Ten.Core
 import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflicts
 import Ten.Store
 import Ten.Sandbox
 import Ten.DB.Core
-import Ten.DB.Derivations
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -208,6 +208,10 @@ storeDerivation drv = do
     -- Add to store with .drv extension
     addToStore (derivName drv <> ".drv") serialized
 
+-- | Convert a store path to text
+storePathToText :: StorePath -> Text
+storePathToText (StorePath hash name) = hash <> "-" <> name
+
 -- | Register a derivation file in the database and store
 storeDerivationFile :: Derivation -> TenM p StorePath
 storeDerivationFile drv = do
@@ -218,8 +222,57 @@ storeDerivationFile drv = do
     env <- ask
     db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
 
-    -- Register in database
-    liftIO $ registerDerivationFile db drv derivPath `finally` closeDatabase db
+    -- Check if derivation already exists
+    existing <- liftIO $ dbQuery db
+        "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
+        (Only (derivHash drv))
+
+    derivId <- liftIO $ if not (null existing)
+        then do
+            -- Get the ID if it exists
+            [Only derivId] <- dbQuery db
+                "SELECT id FROM Derivations WHERE hash = ?"
+                (Only (derivHash drv))
+            return derivId
+        else do
+            -- Insert new derivation
+            dbExecute db
+                "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
+                (derivHash drv, storePathToText derivPath)
+
+            -- Get the last inserted ID
+            [Only derivId] <- dbQuery_ db "SELECT last_insert_rowid()"
+
+            -- Register the derivation path as valid
+            dbExecute db
+                "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
+                \VALUES (?, ?, strftime('%s','now'), ?, 1)"
+                (storePathToText derivPath, storeHash derivPath, Just (storePathToText derivPath) :: Maybe Text)
+
+            return derivId
+
+    -- Register outputs
+    liftIO $ forM_ (Set.toList $ derivOutputs drv) $ \output -> do
+        -- Insert output record
+        dbExecute db
+            "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
+            (derivId, outputName output, storePathToText (outputPath output))
+
+        -- Register the output path as valid
+        dbExecute db
+            "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
+            \VALUES (?, ?, strftime('%s','now'), ?, 1)"
+            (storePathToText (outputPath output), storeHash (outputPath output),
+             Just (storePathToText derivPath) :: Maybe Text)
+
+    -- Register input references
+    liftIO $ forM_ (Set.toList $ derivInputs drv) $ \input -> do
+        dbExecute db
+            "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
+            (storePathToText derivPath, storePathToText (inputPath input))
+
+    -- Close the database
+    liftIO $ closeDatabase db
 
     -- Return the store path
     return derivPath
@@ -252,17 +305,31 @@ retrieveDerivationByHash hash = do
     -- Open database
     db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
 
-    -- Query database for derivation path
-    result <- liftIO $ try $ do
-        mDrv <- retrieveDerivation db hash
-        closeDatabase db
-        return mDrv
+    -- Query for store path
+    storePaths <- liftIO $ dbQuery db
+        "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
+        (Only hash)
 
-    case result of
-        Left (e :: SomeException) -> do
-            logMsg 1 $ "Error retrieving derivation from database: " <> T.pack (show e)
-            return Nothing
-        Right mDrv -> return mDrv
+    -- Parse store path and retrieve derivation
+    derivResult <- case storePaths of
+        [Only pathText] ->
+            case parseStorePathText pathText of
+                Just sp -> retrieveDerivation sp
+                Nothing -> return Nothing
+        _ -> return Nothing
+
+    -- Close the database
+    liftIO $ closeDatabase db
+
+    return derivResult
+
+-- | Parse a store path from text
+parseStorePathText :: Text -> Maybe StorePath
+parseStorePathText path =
+    case T.breakOn "-" path of
+        (hash, name) | not (T.null name) ->
+            Just $ StorePath hash (T.drop 1 name)
+        _ -> Nothing
 
 -- | Instantiate a derivation for building
 instantiateDerivation :: Derivation -> TenM 'Build ()

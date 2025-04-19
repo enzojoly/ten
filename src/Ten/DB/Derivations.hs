@@ -141,25 +141,25 @@ storePathToText (StorePath hash name) = hash <> "-" <> name
 
 -- | Store a derivation in the database
 storeDerivation :: Database -> Derivation -> StorePath -> IO Int64
-storeDerivation db derivation storePath = withTransaction db ReadWrite $ \_ -> do
+storeDerivation db derivation storePath = dbWithTransaction db ReadWrite $ \_ -> do
     -- Check if derivation already exists
     existing <- isDerivationRegistered db (derivHash derivation)
 
     if existing
         then do
             -- Get the ID
-            [Only derivId] <- query db
+            [Only derivId] <- dbQuery db
                 "SELECT id FROM Derivations WHERE hash = ?"
                 (Only (derivHash derivation))
             return derivId
         else do
             -- Insert new derivation
-            execute db
+            dbExecute db
                 "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
                 (derivHash derivation, storePathToText storePath)
 
             -- Get the last inserted ID
-            [Only derivId] <- query_ db "SELECT last_insert_rowid()"
+            [Only derivId] <- dbQuery_ db "SELECT last_insert_rowid()"
 
             -- Register the derivation path as valid
             registerValidPath db storePath (Just storePath)
@@ -186,7 +186,7 @@ registerDerivationFile db derivation storePath = do
 retrieveDerivation :: Database -> Text -> IO (Maybe Derivation)
 retrieveDerivation db hash = do
     -- Query for derivation
-    derivRows <- query db
+    derivRows <- dbQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d WHERE d.hash = ?"
         (Only hash)
 
@@ -230,7 +230,7 @@ readDerivationFile path = do
 registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> IO ()
 registerDerivationOutput db derivId outputName outputPath = do
     -- Insert output record
-    execute db
+    dbExecute db
         "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
         (derivId, outputName, storePathToText outputPath)
 
@@ -240,14 +240,14 @@ registerDerivationOutput db derivId outputName outputPath = do
 -- | Get all outputs for a derivation
 getOutputsForDerivation :: Database -> Int64 -> IO [OutputInfo]
 getOutputsForDerivation db derivId = do
-    query db
+    dbQuery db
         "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
         (Only derivId)
 
 -- | Find the derivation that produced a particular output
 getDerivationForOutput :: Database -> StorePath -> IO (Maybe DerivationInfo)
 getDerivationForOutput db outputPath = do
-    results <- query db
+    results <- dbQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
         \JOIN Outputs o ON d.id = o.derivation_id \
         \WHERE o.path = ?"
@@ -263,7 +263,7 @@ findDerivationsByOutputs db outputPaths = do
     let pathTexts = map storePathToText outputPaths
 
     -- First get the derivation info
-    derivInfos <- query db
+    derivInfos <- dbQuery db
         "SELECT DISTINCT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
         \JOIN Outputs o ON d.id = o.derivation_id \
         \WHERE o.path IN (?);"
@@ -282,14 +282,14 @@ findDerivationsByOutputs db outputPaths = do
 -- | Add a reference between two paths
 addDerivationReference :: Database -> StorePath -> StorePath -> IO ()
 addDerivationReference db referrer reference = do
-    execute db
+    dbExecute db
         "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
         (storePathToText referrer, storePathToText reference)
 
 -- | Get all references from a path
 getDerivationReferences :: Database -> StorePath -> IO [StorePath]
 getDerivationReferences db path = do
-    results <- query db
+    results <- dbQuery db
         "SELECT reference FROM References WHERE referrer = ?"
         (Only (storePathToText path))
 
@@ -299,7 +299,7 @@ getDerivationReferences db path = do
 -- | Get all paths that refer to a given path
 getReferrers :: Database -> StorePath -> IO [StorePath]
 getReferrers db path = do
-    results <- query db
+    results <- dbQuery db
         "SELECT referrer FROM References WHERE reference = ?"
         (Only (storePathToText path))
 
@@ -309,7 +309,7 @@ getReferrers db path = do
 -- | Check if a derivation is already registered
 isDerivationRegistered :: Database -> Text -> IO Bool
 isDerivationRegistered db hash = do
-    results <- query db
+    results <- dbQuery db
         "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
         (Only hash)
     return $ not (null results)
@@ -317,12 +317,12 @@ isDerivationRegistered db hash = do
 -- | List all registered derivations
 listRegisteredDerivations :: Database -> IO [DerivationInfo]
 listRegisteredDerivations db = do
-    query_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+    dbQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
 
 -- | Get the store path for a derivation by hash
 getDerivationPath :: Database -> Text -> IO (Maybe StorePath)
 getDerivationPath db hash = do
-    results <- query db
+    results <- dbQuery db
         "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
         (Only hash)
 
@@ -337,7 +337,7 @@ registerValidPath db path mDeriver = do
             Just deriver -> Just (storePathToText deriver)
             Nothing -> Nothing
 
-    execute db
+    dbExecute db
         "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
         \VALUES (?, ?, strftime('%s','now'), ?, 1)"
         (storePathToText path, storeHash path, deriverText)
@@ -345,14 +345,14 @@ registerValidPath db path mDeriver = do
 -- | Mark a path as invalid
 invalidatePath :: Database -> StorePath -> IO ()
 invalidatePath db path = do
-    execute db
+    dbExecute db
         "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
         (Only (storePathToText path))
 
 -- | Check if a path is valid
 isPathValid :: Database -> StorePath -> IO Bool
 isPathValid db path = do
-    results <- query db
+    results <- dbQuery db
         "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
         (Only (storePathToText path))
 
@@ -362,7 +362,7 @@ isPathValid db path = do
 
 -- | Register a derivation with all its outputs in a single transaction
 registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> IO Int64
-registerDerivationWithOutputs db derivation storePath = withTransaction db ReadWrite $ \_ -> do
+registerDerivationWithOutputs db derivation storePath = dbWithTransaction db ReadWrite $ \_ -> do
     -- Register the derivation
     derivId <- storeDerivation db derivation storePath
 
