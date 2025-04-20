@@ -71,6 +71,7 @@ import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
 import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
+-- Foreign.Storable is a VERY broad import making most other Imports here redundant W.I.P.
 import Foreign.Storable
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)

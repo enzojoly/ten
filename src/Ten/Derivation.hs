@@ -52,7 +52,7 @@ module Ten.Derivation (
 import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (modify, gets)
+import Control.Monad.State (modify, gets, get)
 import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Map.Strict (Map)
@@ -77,7 +77,7 @@ import System.FilePath
 import System.Directory (doesFileExist)
 import qualified System.Posix.Files as Posix
 import System.IO (withFile, IOMode(..))
-import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode, StdStream(NoStream, CreatePipe))
 import System.Exit
 import Control.Exception (try, SomeException, finally)
 import Database.SQLite.Simple (Only(..))
@@ -85,8 +85,9 @@ import Database.SQLite.Simple (Only(..))
 import Ten.Core
 import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflicts
 import Ten.Store
-import Ten.Sandbox (returnDerivationPath, prepareSandboxEnvironment)
-import Ten.DB.Core (initDatabase, closeDatabase)
+import Ten.Sandbox (returnDerivationPath, prepareSandboxEnvironment,
+                   SandboxConfig, withSandbox, defaultSandboxConfig)
+import Ten.DB.Core (initDatabase, closeDatabase, dbQuery, dbQuery_, dbExecute)
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes

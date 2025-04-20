@@ -66,7 +66,7 @@ import System.Posix.IO (openFd, closeFd, defaultFileFlags, OpenMode(..))
 import System.Posix.Types (Fd, FileMode)
 import qualified System.Posix.IO.ByteString as PosixBS
 
-import Ten.Core hiding (storePathToFilePath)
+import Ten.Core
 import Ten.Hash
 
 -- | Global store cache for store paths - implemented as a TVar for thread safety
