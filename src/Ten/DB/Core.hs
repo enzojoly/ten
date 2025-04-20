@@ -20,6 +20,7 @@ module Ten.DB.Core (
     -- Low-level query functions
     dbExecute,
     dbExecute_,
+    dbExecuteSimple_,
     dbQuery,
     dbQuery_,
 
@@ -158,16 +159,16 @@ dbWithTransaction db mode action = do
     -- Execute transaction in a bracket for safety
     catch
         (bracket
-            (dbExecute_ db beginStmt)
+            (dbExecuteSimple_ db (Query beginStmt))
             (\_ -> rollbackOnError db)
             (\_ -> do
                 result <- action db
-                dbExecute_ db "COMMIT;"
+                dbExecuteSimple_ db "COMMIT;"
                 return result))
         (\(e :: SomeException) -> do
             -- Try to roll back if anything went wrong
             void $ catch
-                (dbExecute_ db "ROLLBACK;")
+                (dbExecuteSimple_ db "ROLLBACK;")
                 (\(_ :: SomeException) -> return ())
             throwIO $ DBTransactionError $ T.pack $ "Transaction failed: " ++ show e)
 
@@ -178,18 +179,26 @@ withTransaction = dbWithTransaction
 -- | Roll back transaction on error
 rollbackOnError :: Database -> IO ()
 rollbackOnError db = catch
-    (dbExecute_ db "ROLLBACK;")
+    (dbExecuteSimple_ db "ROLLBACK;")
     (\(e :: SomeException) ->
         putStrLn $ "Warning: Error rolling back transaction: " ++ show e)
 
 -- | Execute a statement with parameters, returning the number of rows affected
 dbExecute :: ToRow q => Database -> Query -> q -> IO Int64
-dbExecute db query params = retryOnBusy db $
+dbExecute db query params = retryOnBusy db $ do
+    -- Execute the query
     SQLite.execute (dbConn db) query params
+    -- Get the number of changes (rows affected) and convert from Int to Int64
+    fromIntegral <$> SQLite.changes (dbConn db)
 
 -- | Execute a statement with parameters, discarding the result
 dbExecute_ :: ToRow q => Database -> Query -> q -> IO ()
 dbExecute_ db query params = void $ dbExecute db query params
+
+-- | Execute a simple SQL statement without parameters
+dbExecuteSimple_ :: Database -> Query -> IO ()
+dbExecuteSimple_ db query = retryOnBusy db $
+    SQLite.execute_ (dbConn db) query
 
 -- | Execute a query with parameters
 dbQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> IO [r]
@@ -244,14 +253,14 @@ retryOnBusy db action = retryWithCount 0
 getSchemaVersion :: Database -> IO Int
 getSchemaVersion db = do
     -- Check if the version table exists
-    hasVersionTable <- dbQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';"
+    hasVersionTable <- dbQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: IO [Only Int]
 
     case hasVersionTable of
-        [(count :: Int)] | count > 0 -> do
+        [Only count] | count > 0 -> do
             -- Table exists, get the version
-            results <- dbQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;"
+            results <- dbQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: IO [Only Int]
             case results of
-                [(version :: Int)] -> return version
+                [Only version] -> return version
                 _ -> return 0  -- No version record found
         _ -> return 0  -- Table doesn't exist
 
@@ -259,32 +268,32 @@ getSchemaVersion db = do
 updateSchemaVersion :: Database -> Int -> IO ()
 updateSchemaVersion db version = do
     -- Check if the version table exists
-    hasVersionTable <- dbQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';"
+    hasVersionTable <- dbQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: IO [Only Int]
 
     case hasVersionTable of
-        [(count :: Int)] | count > 0 -> do
+        [Only count] | count > 0 -> do
             -- Table exists, update the version
             dbExecute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
         _ -> do
             -- Table doesn't exist, create it
-            dbExecute_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+            dbExecuteSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
             dbExecute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
 
 -- | Initialize the database schema
 initializeSchema :: Database -> IO ()
 initializeSchema db = dbWithTransaction db Exclusive $ \_ -> do
     -- Create schema version tracking table
-    dbExecute_ db "CREATE TABLE IF NOT EXISTS SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
 
     -- Create Derivations table
-    dbExecute_ db "CREATE TABLE IF NOT EXISTS Derivations (\
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS Derivations (\
                 \id INTEGER PRIMARY KEY, \
                 \hash TEXT NOT NULL UNIQUE, \
                 \store_path TEXT NOT NULL UNIQUE, \
                 \timestamp INTEGER NOT NULL DEFAULT (strftime('%s','now')));"
 
     -- Create Outputs table
-    dbExecute_ db "CREATE TABLE IF NOT EXISTS Outputs (\
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS Outputs (\
                 \derivation_id INTEGER NOT NULL, \
                 \output_name TEXT NOT NULL, \
                 \path TEXT NOT NULL UNIQUE, \
@@ -292,13 +301,13 @@ initializeSchema db = dbWithTransaction db Exclusive $ \_ -> do
                 \FOREIGN KEY (derivation_id) REFERENCES Derivations(id));"
 
     -- Create References table
-    dbExecute_ db "CREATE TABLE IF NOT EXISTS References (\
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS References (\
                 \referrer TEXT NOT NULL, \
                 \reference TEXT NOT NULL, \
                 \PRIMARY KEY (referrer, reference));"
 
     -- Create ValidPaths table
-    dbExecute_ db "CREATE TABLE IF NOT EXISTS ValidPaths (\
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS ValidPaths (\
                 \path TEXT PRIMARY KEY, \
                 \hash TEXT NOT NULL, \
                 \registration_time INTEGER NOT NULL DEFAULT (strftime('%s','now')), \
@@ -306,11 +315,11 @@ initializeSchema db = dbWithTransaction db Exclusive $ \_ -> do
                 \is_valid INTEGER NOT NULL DEFAULT 1);"
 
     -- Create indices for performance
-    dbExecute_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
-    dbExecute_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
-    dbExecute_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
-    dbExecute_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
-    dbExecute_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
 
     -- Set schema version
     updateSchemaVersion db 1
