@@ -387,11 +387,19 @@ joinDerivation outerDrv = do
 buildToGetInnerDerivation :: Derivation -> TenM 'Build Derivation
 buildToGetInnerDerivation drv = do
     env <- ask
+    state <- get
 
-    -- Create a temporary sandbox for the build
-    let config = defaultSandboxConfig { sandboxReturnSupport = True }
+    -- Create a temporary sandbox for the build - default Return Continuation support
 
-    withSandbox (Set.map inputPath $ derivInputs drv) config $ \sandboxDir -> do
+    {-
+        If the system is designed with return continuation always enabled by default, then:
+
+         The default configuration already handles all cases correctly
+         Derivations that don't use return continuation can ignore it without penalty
+         Derivations that do need it have it available automatically
+    -}
+
+    withSandbox (Set.map inputPath $ derivInputs drv) defaultSandboxConfig $ \sandboxDir -> do
         -- Get the builder from the store
         builderContent <- readFromStore (derivBuilder drv)
 
@@ -401,7 +409,7 @@ buildToGetInnerDerivation drv = do
         liftIO $ Posix.setFileMode builderPath 0o755
 
         -- Prepare environment variables
-        let buildEnv = prepareSandboxEnvironment env sandboxDir (derivEnv drv)
+        let buildEnv = prepareSandboxEnvironment env state sandboxDir (derivEnv drv)
 
         -- Configure the process
         let processConfig = sandboxedProcessConfig

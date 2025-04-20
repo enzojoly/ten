@@ -44,7 +44,7 @@ import Control.Monad.Reader (ask)
 import Control.Monad.State (get, gets)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
-import Data.List (isPrefixOf, isInfixOf)
+import Data.List (isPrefixOf, isInfixOf, sort)
 import Control.Exception (bracket, try, tryJust, throwIO, catch, finally, handle, SomeException, IOException)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -875,7 +875,7 @@ bindMount source dest writable = do
         withCString dest' $ \destPtr ->
             withCString "none" $ \fsTypePtr ->
                 withCString "" $ \dataPtr -> do
-                    ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND dataPtr
+                    ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND (castPtr dataPtr)
                     when (ret /= 0) $ do
                         errno <- getErrno
                         throwErrno $ "Failed to bind mount " ++ source' ++ " to " ++ dest' ++
@@ -888,7 +888,7 @@ bindMount source dest writable = do
                 withCString "none" $ \fsTypePtr ->
                     withCString "" $ \dataPtr -> do
                         let flags = mS_BIND .|. mS_REMOUNT .|. mS_RDONLY
-                        ret <- c_mount sourcePtr destPtr fsTypePtr flags dataPtr
+                        ret <- c_mount sourcePtr destPtr fsTypePtr flags (castPtr dataPtr)
                         when (ret /= 0) $ do
                             errno <- getErrno
                             -- Don't fail, just warn - the mount is already established
@@ -1019,8 +1019,8 @@ sandboxedProcessConfig sandboxDir programPath args envVars config =
 
 -- | Prepare environment variables for sandbox
 -- | Enhanced with consolidated functionality from Ten.Derivation implementation
-prepareSandboxEnvironment :: BuildEnv -> FilePath -> Map Text Text -> Map Text Text
-prepareSandboxEnvironment env sandboxDir extraEnv =
+prepareSandboxEnvironment :: BuildEnv -> BuildState -> FilePath -> Map Text Text -> Map Text Text
+prepareSandboxEnvironment env buildState sandboxDir extraEnv =
     Map.unions
         [ -- Base essential environment variables
           baseEnv
@@ -1055,7 +1055,7 @@ prepareSandboxEnvironment env sandboxDir extraEnv =
 
     -- Build information variables
     buildInfoEnv = Map.fromList
-        [ ("TEN_BUILD_ID", maybe "unknown" (T.pack . showBuildId) $ userName env)
+        [ ("TEN_BUILD_ID", maybe "unknown" (T.pack . showBuildId) $ currentBuildId buildState)
         ]
 
 -- | Drop privileges to run as unprivileged user
