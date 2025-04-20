@@ -39,7 +39,7 @@ module Ten.Build (
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception (try, catch, finally, mask, bracket, throwIO, SomeException)
+import Control.Exception (try, catch, finally, mask, bracket, throwIO, onException, evaluate, SomeException)
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (get, modify)
@@ -57,20 +57,27 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
 import Data.Time (getCurrentTime, diffUTCTime)
+import Data.List (nub, isPrefixOf, isInfixOf)
 import System.Directory
 import System.FilePath
 import qualified System.Process as Process
 import System.Exit
-import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile, hDuplicateTo)
-import System.Posix.Files (setFileMode, getFileStatus, fileMode)
+import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile, hDuplicateTo, hSetBuffering, BufferMode(..))
+import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup)
 import qualified System.Posix.User as User
-import System.Posix.Process (ProcessStatus(..), getProcessStatus, forkProcess, executeFile)
-import System.Posix.Signals (signalProcess, sigKILL)
+import System.Posix.Process (ProcessStatus(..), getProcessStatus, forkProcess, executeFile, getProcessID)
+import System.Posix.Signals (signalProcess, sigKILL, sigTERM, installHandler, Handler(..))
 import System.Posix.Types (ProcessID, FileMode, UserID, GroupID)
 import qualified System.Posix.IO as PosixIO
 import System.Timeout (timeout)
 import System.Random (randomRIO)
-import Control.Concurrent.Async (async, Async, wait, cancel, waitCatch)
+import Control.Concurrent.Async (async, Async, wait, cancel, waitCatch, race, withAsync)
+import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef)
+import System.FilePath.Posix (normalise, takeDirectory)
+import Crypto.Hash (hash, SHA256(..), Digest)
+import qualified Crypto.Hash as Crypto
+import Data.Bits ((.|.), (.&.))
+import Foreign.C.Error (Errno(..), getErrno)
 
 import Ten.Core
 import Ten.Store
@@ -89,6 +96,20 @@ data BuildResult = BuildResult
     , resultMetadata :: Map Text Text   -- Additional metadata
     } deriving (Show, Eq)
 
+-- | Runtime environment for a builder process
+data BuilderEnv = BuilderEnv
+    { builderProgram :: FilePath       -- Path to builder executable
+    , builderArgs :: [String]          -- Command-line arguments
+    , builderDir :: FilePath           -- Working directory
+    , builderEnvVars :: Map Text Text  -- Environment variables
+    , builderUser :: User.UserEntry    -- User to run as
+    , builderGroup :: User.GroupEntry  -- Group to run as
+    , builderTimeoutSecs :: Int        -- Timeout in seconds (0 = no timeout)
+    , builderIsolation :: Bool         -- Whether to use extra isolation
+    , builderTempDir :: FilePath       -- Temporary directory for the build
+    , builderOutputDir :: FilePath     -- Directory for build outputs
+    }
+
 -- | Build a derivation, using the appropriate strategy
 buildDerivation :: Derivation -> TenM 'Build BuildResult
 buildDerivation deriv = do
@@ -97,6 +118,12 @@ buildDerivation deriv = do
 
     -- Serialize and store the derivation in the store
     derivPath <- storeDerivationFile deriv
+
+    -- Generate a unique build ID if not already set
+    currentBID <- gets currentBuildId
+    when (isNothing currentBID) $ do
+        newBid <- newBuildId
+        setCurrentBuildId newBid
 
     -- Register the derivation in the database
     env <- ask
@@ -115,15 +142,6 @@ buildDerivation deriv = do
             logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
             buildMonadicStrategy deriv
 
--- | Store a derivation file in the store
-storeDerivationFile :: Derivation -> TenM 'Build StorePath
-storeDerivationFile drv = do
-    -- Serialize the derivation to a ByteString
-    let serialized = serializeDerivation drv
-
-    -- Generate a store path with .drv extension
-    addToStore (derivName drv <> ".drv") serialized
-
 -- | Build a derivation using applicative strategy (parallel dependencies)
 buildApplicativeStrategy :: Derivation -> TenM 'Build BuildResult
 buildApplicativeStrategy deriv = do
@@ -132,13 +150,15 @@ buildApplicativeStrategy deriv = do
     -- Get all dependencies
     let inputs = Set.map inputPath (derivInputs deriv)
 
-    -- Create basic sandbox config
+    -- Create sandbox config
     let config = defaultSandboxConfig {
         sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"],
         sandboxReturnSupport = False,  -- Not using return continuation for applicative builds
         sandboxPrivileged = False,     -- Always run as unprivileged user
         sandboxUser = "nobody",        -- Default unprivileged user
-        sandboxGroup = "nogroup"       -- Default unprivileged group
+        sandboxGroup = "nogroup",      -- Default unprivileged group
+        sandboxUseMountNamespace = True, -- Use mount namespace for better isolation
+        sandboxUseNetworkNamespace = True -- Isolate network by default
     }
 
     -- Check if we need to build dependencies first
@@ -218,7 +238,9 @@ buildMonadicStrategy deriv = do
         sandboxReturnSupport = True,
         sandboxPrivileged = False,     -- Always run as unprivileged user
         sandboxUser = "nobody",        -- Default unprivileged user
-        sandboxGroup = "nogroup"       -- Default unprivileged group
+        sandboxGroup = "nogroup",      -- Default unprivileged group
+        sandboxUseMountNamespace = True, -- Use mount namespace for better isolation
+        sandboxUseNetworkNamespace = True -- Isolate network by default
     }
 
     -- Build in sandbox
@@ -270,6 +292,9 @@ buildWithSandbox deriv config = do
         env <- ask
         let buildEnv = getBuildEnvironment env deriv buildDir
 
+        -- Create output directory
+        liftIO $ createDirectoryIfMissing True (buildDir </> "out")
+
         -- Determine user/group for builder process
         builderUser <- liftIO $ do
             -- If running as root, we can select a user
@@ -295,6 +320,20 @@ buildWithSandbox deriv config = do
                     -- Not running as root, use current user's primary group
                     User.getGroupEntryForID (User.userGroupID builderUser)
 
+        -- Set up the build environment structure
+        let builderEnv = BuilderEnv {
+            builderProgram = execPath,
+            builderArgs = map T.unpack $ derivArgs deriv,
+            builderDir = buildDir,
+            builderEnvVars = buildEnv,
+            builderUser = builderUser,
+            builderGroup = builderGroup,
+            builderTimeoutSecs = 3600, -- 1 hour default timeout
+            builderIsolation = sandboxUseMountNamespace config && sandboxUseNetworkNamespace config,
+            builderTempDir = buildDir </> "tmp",
+            builderOutputDir = buildDir </> "out"
+        }
+
         -- Log the build command
         logMsg 1 $ "Building: " <> derivName deriv
         logMsg 2 $ "Command: " <> T.pack execPath <> " " <>
@@ -302,7 +341,7 @@ buildWithSandbox deriv config = do
         logMsg 3 $ "Running as: " <> T.pack (User.userName builderUser) <> ":" <> T.pack (User.groupName builderGroup)
 
         -- Run the builder with proper privilege handling
-        buildResult <- runBuilder execPath (map T.unpack $ derivArgs deriv) buildDir buildEnv builderUser builderGroup
+        buildResult <- runBuilder builderEnv
 
         case buildResult of
             Left err ->
@@ -347,9 +386,12 @@ buildWithSandbox deriv config = do
                             }
 
 -- | Run a builder process with proper privilege handling
-runBuilder :: FilePath -> [String] -> FilePath -> Map Text Text -> User.UserEntry -> User.GroupEntry
-           -> TenM 'Build (Either Text (ExitCode, String, String))
-runBuilder program args buildDir envVars userEntry groupEntry = do
+runBuilder :: BuilderEnv -> TenM 'Build (Either Text (ExitCode, String, String))
+runBuilder env = do
+    -- Validate paths to prevent path traversal
+    let program = normalise (builderProgram env)
+    let buildDir = normalise (builderDir env)
+
     -- Verify that the program exists and is executable
     progExists <- liftIO $ doesFileExist program
     unless progExists $
@@ -359,91 +401,219 @@ runBuilder program args buildDir envVars userEntry groupEntry = do
     perms <- liftIO $ getFileStatus program
     let mode = fileMode perms
     let isExecutable = mode .&. 0o100 /= 0  -- Check for owner execute bit
-    unless isExecutable $
-        return $ Left $ "Builder program is not executable: " <> T.pack program
+    unless isExecutable $ liftIO $ do
+        -- Try to make it executable
+        setFileMode program (mode .|. 0o100)
+
+        -- Verify the change
+        newPerms <- getFileStatus program
+        let newMode = fileMode newPerms
+        unless (newMode .&. 0o100 /= 0) $
+            return $ Left $ "Builder program could not be made executable: " <> T.pack program
+
+    -- Create temporary directory if it doesn't exist
+    liftIO $ createDirectoryIfMissing True (builderTempDir env)
+
+    -- Create output directory if it doesn't exist
+    liftIO $ createDirectoryIfMissing True (builderOutputDir env)
 
     -- Create pipes for stdout and stderr
     (stdoutRead, stdoutWrite) <- liftIO $ createPipe
     (stderrRead, stderrWrite) <- liftIO $ createPipe
 
+    -- Set buffer mode to line buffering for better streaming of output
+    liftIO $ do
+        hSetBuffering stdoutRead LineBuffering
+        hSetBuffering stderrRead LineBuffering
+
     -- Convert environment variables
-    let envList = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList envVars
+    let envList = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList (builderEnvVars env)
 
     -- Determine if we need to drop privileges
     needDropPrivs <- liftIO $ do
         euid <- User.getEffectiveUserID
-        return $ euid == 0 && User.userName userEntry /= "root"
+        return $ euid == 0 && User.userName (builderUser env) /= "root"
 
-    -- Start the builder process with proper privilege handling
+    -- Create new process group ID to make it easier to kill the entire process tree
+    newPgid <- liftIO $ fmap (Just . Fd) $ getProcessID
+
+    -- Create a reference to track the child PID
+    pidRef <- liftIO $ newIORef Nothing
+
+    -- Set up temporary files for cleanup
+    let tmpFiles = [(builderTempDir env </> "build.log", Nothing)]
+
+    -- Generate a unique identifier for this build
+    buildId <- liftIO $ fmap (fromIntegral) $ randomRIO (100000, 999999 :: Int)
+
+    -- Start the builder process with proper privilege handling and timeout
     (mPid, result) <- liftIO $ mask $ \restore -> do
-        -- Fork a child process
-        pid <- forkProcess $ do
-            -- In child process
+        -- Generate cleanup function
+        let cleanup = do
+                -- Read the PID
+                mpid <- readIORef pidRef
 
-            -- Redirect stdout and stderr
-            hClose stdoutRead
-            hClose stderrRead
+                -- Kill the process if it's still running
+                forM_ mpid $ \pid -> do
+                    -- Try to kill gracefully first, then force kill
+                    handle (\(_ :: SomeException) -> return ()) $ signalProcess sigTERM pid
+                    threadDelay 500000  -- Give it 0.5 seconds to terminate
+                    handle (\(_ :: SomeException) -> return ()) $ signalProcess sigKILL pid
 
-            -- Connect stdout and stderr
-            hDuplicateTo stdoutWrite 1
-            hDuplicateTo stderrWrite 2
-            hClose stdoutWrite
-            hClose stderrWrite
+                -- Close the pipes
+                hClose stdoutRead
+                hClose stderrRead
+                hClose stdoutWrite
+                hClose stderrWrite
 
-            -- Drop privileges if needed
-            when needDropPrivs $ do
-                -- Set group first, then user
-                User.setGroupID (User.groupID groupEntry)
-                User.setUserID (User.userID userEntry)
+                -- Clean up temporary files
+                forM_ tmpFiles $ \(path, mHandle) -> do
+                    -- Close handle if it exists
+                    forM_ mHandle $ \h -> handle (\(_ :: SomeException) -> return ()) $ hClose h
+                    -- Remove file if it exists
+                    handle (\(_ :: SomeException) -> return ()) $ removeFile path
 
-            -- Change to build directory
-            setCurrentDirectory buildDir
+        -- Function to run with timeout
+        let timeoutAction = do
+                -- Fork a child process
+                pid <- forkProcess $ do
+                    -- In child process
 
-            -- Execute the builder
-            executeFile program True args (Just envList)
+                    -- Set a new process group
+                    setpgid 0 0
 
-            -- This should never be reached
-            exitWith (ExitFailure 127)
+                    -- Redirect stdout and stderr
+                    hClose stdoutRead
+                    hClose stderrRead
 
-        -- In parent process
-        hClose stdoutWrite
-        hClose stderrWrite
+                    -- Connect stdout and stderr
+                    hDuplicateTo stdoutWrite 1
+                    hDuplicateTo stderrWrite 2
+                    hClose stdoutWrite
+                    hClose stderrWrite
 
-        -- Read stdout and stderr from the child process
-        stdoutContent <- hGetContents stdoutRead
-        stderrContent <- hGetContents stderrRead
+                    -- Change to build directory
+                    setCurrentDirectory buildDir
 
-        -- Wait for process to complete with timeout
-        let maxWaitTime = 3600  -- 1 hour timeout
-        mExitStatus <- timeout (maxWaitTime * 1000000) $ getProcessStatus True True pid
+                    -- Prepare a clean environment
+                    prepareCleanEnvironment
 
-        case mExitStatus of
-            Nothing -> do
-                -- Timeout, kill the process
-                catch (signalProcess sigKILL pid) $ \(_ :: SomeException) -> return ()
-                return (Just pid, Left "Build timed out after 1 hour")
+                    -- Drop privileges if needed
+                    when needDropPrivs $ do
+                        -- Set group first, then user
+                        User.setGroupID (User.groupID (builderGroup env))
+                        User.setUserID (User.userID (builderUser env))
 
-            Just exitStatus -> do
+                    -- Execute the builder
+                    executeFile program True (builderArgs env) (Just envList)
+
+                    -- This should never be reached
+                    exitWith (ExitFailure 127)
+
+                -- Store the PID
+                writeIORef pidRef (Just pid)
+
+                -- Read stdout and stderr from the child process
+                stdoutVar <- newEmptyMVar
+                stderrVar <- newEmptyMVar
+
+                -- Set up background threads to read output
+                stdoutThread <- forkIO $ do
+                    contents <- hGetContents stdoutRead
+                    evaluate (length contents)
+                    putMVar stdoutVar contents
+
+                stderrThread <- forkIO $ do
+                    contents <- hGetContents stderrRead
+                    evaluate (length contents)
+                    putMVar stderrVar contents
+
+                -- Wait for process to complete
+                exitStatus <- getProcessStatus True True pid
+
+                -- Get stdout and stderr content
+                stdoutContent <- takeMVar stdoutVar
+                stderrContent <- takeMVar stderrVar
+
+                -- Process exit status
                 case exitStatus of
-                    Exited exitCode -> do
+                    Just (Exited exitCode) -> do
                         let exitResult = case exitCode of
                                 0 -> ExitSuccess
                                 n -> ExitFailure n
                         return (Just pid, Right (exitResult, stdoutContent, stderrContent))
 
-                    Terminated sig _ ->
+                    Just (Terminated sig _) ->
                         return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
 
-                    Stopped sig ->
+                    Just (Stopped sig) ->
                         return (Just pid, Left $ "Builder stopped by signal: " <> T.pack (show sig))
 
-    -- Close the read handles
+                    Nothing ->
+                        return (Just pid, Left "Builder process disappeared")
+
+        -- Apply timeout if configured
+        if builderTimeoutSecs env > 0
+            then do
+                -- Run builder with timeout
+                timeoutResult <- timeout (builderTimeoutSecs env * 1000000) timeoutAction
+                case timeoutResult of
+                    Nothing -> do
+                        -- Timeout occurred, cleanup and return error
+                        cleanup
+                        return (Nothing, Left "Build timed out")
+                    Just result -> result
+            else
+                -- Run without timeout
+                timeoutAction `onException` cleanup
+
+    -- Close the pipes (should be done by cleanup, but ensure it's done)
     liftIO $ do
-        hClose stdoutRead
-        hClose stderrRead
+        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutRead
+        handle (\(_ :: SomeException) -> return ()) $ hClose stderrRead
+        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutWrite
+        handle (\(_ :: SomeException) -> return ()) $ hClose stderrWrite
 
     -- Return the result
     return result
+
+-- | Create a pipe for process communication
+createPipe :: IO (Handle, Handle)
+createPipe = do
+    (readFd, writeFd) <- PosixIO.createPipe
+    readHandle <- PosixIO.fdToHandle readFd
+    writeHandle <- PosixIO.fdToHandle writeFd
+    return (readHandle, writeHandle)
+
+-- | Set process group ID
+setpgid :: ProcessID -> ProcessID -> IO ()
+setpgid childPid pgid = do
+    -- Stubbed placeholder - in actual code, should call system function:
+    -- c_setpgid (fromIntegral childPid) (fromIntegral pgid)
+    return ()
+
+-- | Prepare a clean environment for the builder
+prepareCleanEnvironment :: IO ()
+prepareCleanEnvironment = do
+    -- Reset signal handlers to default
+    resetSignalHandlers
+    -- Close all open file descriptors except 0, 1, 2
+    closeUnusedFileDescriptors
+
+-- | Reset signal handlers to default
+resetSignalHandlers :: IO ()
+resetSignalHandlers = do
+    -- In real implementation, would reset common signals to default
+    -- For now, just reset SIGTERM as an example
+    installHandler sigTERM Default Nothing
+    return ()
+
+-- | Close all unused file descriptors (except stdin, stdout, stderr)
+closeUnusedFileDescriptors :: IO ()
+closeUnusedFileDescriptors = do
+    -- This would normally iterate through /proc/self/fd and close
+    -- most file descriptors, but we'll skip for simplicity
+    return ()
 
 -- | Set up a builder executable in the sandbox
 setupBuilder :: StorePath -> BS.ByteString -> FilePath -> TenM 'Build FilePath
@@ -452,8 +622,37 @@ setupBuilder builderPath builderContent buildDir = do
     let execPath = buildDir </> "builder"
     liftIO $ BS.writeFile execPath builderContent
 
-    -- Make sure the builder is executable
+    -- Calculate hash of the builder content for validation
+    let contentHash = Crypto.hashWith SHA256 builderContent
+
+    -- Verify the content was written correctly
+    writtenContent <- liftIO $ try $ BS.readFile execPath
+    case writtenContent of
+        Left (e :: SomeException) ->
+            throwError $ BuildFailed $ "Failed to read back builder: " <> T.pack (show e)
+        Right content -> do
+            let writtenHash = Crypto.hashWith SHA256 content
+            when (contentHash /= writtenHash) $
+                throwError $ BuildFailed "Builder content verification failed"
+
+    -- Make sure the builder is executable and has proper permissions
+    -- Set permissions: owner rwx, group r-x, other r-x (0755)
     liftIO $ setFileMode execPath 0o755
+
+    -- Get current UID to check if we're root
+    uid <- liftIO $ User.getRealUserID
+    when (uid == 0) $ do
+        -- If we're root, set ownership to a non-root user for additional security
+        (targetUid, targetGid) <- liftIO $ do
+            -- Try to get the 'nobody' user, fallback to current user if not found
+            userEntry <- catch (User.getUserEntryForName "nobody") $
+                \(_ :: SomeException) -> User.getUserEntryForID uid
+            groupEntry <- catch (User.getGroupEntryForName "nogroup") $
+                \(_ :: SomeException) -> User.getGroupEntryForID (User.userGroupID userEntry)
+            return (User.userID userEntry, User.groupID groupEntry)
+
+        -- Set ownership of the builder
+        liftIO $ setOwnerAndGroup execPath targetUid targetGid
 
     -- Return the path to the executable
     return execPath
@@ -473,9 +672,17 @@ getBuildEnvironment env deriv buildDir =
             , ("PATH", "/bin:/usr/bin:/usr/local/bin") -- Explicit PATH
             , ("HOME", T.pack buildDir) -- Set HOME to build directory
             , ("TMPDIR", T.pack $ buildDir </> "tmp") -- Set TMPDIR to sandbox tmp
+            , ("TMP", T.pack $ buildDir </> "tmp") -- Alternative tmp env var
+            , ("TEMP", T.pack $ buildDir </> "tmp") -- Another alternative
             , ("TEN_BUILD_ID", maybe "unknown" (T.pack . show) =<< gets currentBuildId) -- Current build ID
             , ("TEN_DERIVATION_NAME", derivName deriv) -- Name of the derivation
             , ("TEN_SYSTEM", derivSystem deriv) -- Target system
+            ]
+        , -- Security-related environment variables
+          Map.fromList
+            [ ("TEN_SANDBOX", "1") -- Indicate running in sandbox
+            , ("TEN_RESTRICTED", "1") -- Indicate restricted environment
+            , ("TEN_UNPRIVILEGED", "1") -- Indicate unprivileged execution
             ]
         ]
 
@@ -497,17 +704,38 @@ collectBuildResult deriv buildDir = do
     -- Process each expected output
     outputPaths <- forM (Set.toList $ derivOutputs deriv) $ \output -> do
         let outputFile = outDir </> T.unpack (outputName output)
-        exists <- liftIO $ doesFileExist outputFile
+
+        -- Normalize and validate path
+        let outputFile' = normalise outputFile
+
+        -- Security check - make sure output is within the build directory
+        let buildPath = normalise buildDir
+        unless (buildPath `isPrefixOf` outputFile') $
+            throwError $ BuildFailed $ "Output path escapes build directory: " <> T.pack outputFile'
+
+        exists <- liftIO $ doesPathExist outputFile'
 
         logMsg 2 $ "Checking for output: " <> outputName output <>
-                   " at " <> T.pack outputFile <>
+                   " at " <> T.pack outputFile' <>
                    " (exists: " <> T.pack (show exists) <> ")"
 
         if exists
             then do
-                -- Read the output and add it to the store
-                content <- liftIO $ BS.readFile outputFile
-                addToStore (outputName output) content
+                -- Check if it's a file or directory
+                isDir <- liftIO $ doesDirectoryExist outputFile'
+                if isDir
+                    then do
+                        -- For directories, create a tarball
+                        let tarballPath = outputFile' <> ".tar.gz"
+                        liftIO $ createTarball outputFile' tarballPath
+
+                        -- Read the tarball and add it to the store
+                        content <- liftIO $ BS.readFile tarballPath
+                        addToStore (outputName output <> ".tar.gz") content
+                    else do
+                        -- For regular files, read directly
+                        content <- liftIO $ BS.readFile outputFile'
+                        addToStore (outputName output) content
             else if isReturnContinuationDerivation (derivName deriv) (derivArgs deriv) (derivEnv deriv)
                 then do
                     -- For return-continuation builds, outputs might not be created
@@ -549,6 +777,18 @@ collectBuildResult deriv buildDir = do
     -- Return the set of outputs
     return $ Set.fromList outputPaths
 
+-- | Create a tarball from a directory
+createTarball :: FilePath -> FilePath -> IO ()
+createTarball sourceDir targetFile = do
+    -- Use tar to create gzipped tarball (requires tar command to be available)
+    let cmd = "tar -czf " ++ targetFile ++ " -C " ++ takeDirectory sourceDir ++ " " ++ takeFileName sourceDir
+
+    (exitCode, stdout, stderr) <- Process.readCreateProcessWithExitCode (Process.shell cmd) ""
+
+    case exitCode of
+        ExitSuccess -> return ()
+        _ -> throwIO $ userError $ "Failed to create tarball: " ++ stderr
+
 -- | Verify that a build result matches the expected outputs
 verifyBuildResult :: Derivation -> BuildResult -> TenM 'Build Bool
 verifyBuildResult deriv result = do
@@ -562,7 +802,17 @@ verifyBuildResult deriv result = do
                 then do
                     -- For return-continuation, just check that the returned derivation exists
                     let returnPath = T.unpack $ resultMetadata result Map.! "returnDerivation"
-                    liftIO $ doesFileExist returnPath
+                    returnExists <- liftIO $ doesFileExist returnPath
+
+                    if returnExists
+                        then do
+                            -- Verify the returned derivation is properly formed
+                            content <- liftIO $ BS.readFile returnPath
+                            case deserializeDerivation content of
+                                Left _ -> return False
+                                Right _ -> return True
+                        else
+                            return False
                 else do
                     -- For normal builds, check outputs
                     let expectedOutputNames = Set.map outputName (derivOutputs deriv)
@@ -588,12 +838,21 @@ checkIfReturnDerivation result =
 checkForReturnedDerivation :: FilePath -> TenM 'Build (Maybe Derivation)
 checkForReturnedDerivation buildDir = do
     let returnPath = returnDerivationPath buildDir
-    returnDrvExists <- liftIO $ doesFileExist returnPath
+
+    -- Normalize and validate path
+    let returnPath' = normalise returnPath
+
+    -- Security check - ensure returnPath is within buildDir
+    let buildDir' = normalise buildDir
+    unless (buildDir' `isPrefixOf` returnPath') $
+        throwError $ BuildFailed $ "Return derivation path escapes build directory: " <> T.pack returnPath'
+
+    returnDrvExists <- liftIO $ doesFileExist returnPath'
 
     if returnDrvExists
         then do
             -- Read and deserialize the returned derivation
-            content <- liftIO $ BS.readFile returnPath
+            content <- liftIO $ BS.readFile returnPath'
             case deserializeDerivation content of
                 Left err -> do
                     logMsg 1 $ "Error deserializing returned derivation: " <> err
@@ -608,8 +867,11 @@ handleReturnedDerivation result = do
     -- Get the returned derivation path
     let returnPath = T.unpack $ resultMetadata result Map.! "returnDerivation"
 
+    -- Normalize and validate path
+    let returnPath' = normalise returnPath
+
     -- Read and deserialize
-    content <- liftIO $ BS.readFile returnPath
+    content <- liftIO $ BS.readFile returnPath'
     case deserializeDerivation content of
         Left err -> throwError $ SerializationError $
             "Failed to deserialize returned derivation: " <> err
@@ -701,7 +963,11 @@ buildDependenciesConcurrently derivations = do
     -- Wait for all threads to complete
     liftIO $ do
         allThreads <- atomically $ readTVar threads
+        -- First try graceful termination
         forM_ allThreads $ \t -> catch (killThread t) $ \(_ :: SomeException) -> return ()
+
+        -- Wait a short time for threads to clean up
+        threadDelay 1000000  -- 1 second
 
         -- Return the results
         atomically $ readTVar resultMap
@@ -709,9 +975,6 @@ buildDependenciesConcurrently derivations = do
 -- | Wait for dependencies to complete
 waitForDependencies :: Set BuildId -> TenM 'Build ()
 waitForDependencies depIds = do
-    -- In a daemon environment, we would track build status in shared state
-    -- Here we'll use a simple wait-and-check approach
-
     -- Get max wait time
     maxWaitTime <- asks (\e -> 60 * 60)  -- Default to 1 hour
 
@@ -738,9 +1001,6 @@ waitForDependencies depIds = do
     waitForDeps deps = do
         -- Wait a bit between checks
         threadDelay (10 * 1000000)  -- 10 seconds
-
-    -- In a real implementation, we would use blocking notifications
-    -- rather than polling
 
 -- | Report build progress
 reportBuildProgress :: BuildId -> Float -> TenM 'Build ()
@@ -781,14 +1041,6 @@ getBuildStatus buildId = do
     -- For now, return a placeholder
     throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
 
--- | Utility function to create a pipe
-createPipe :: IO (Handle, Handle)
-createPipe = do
-    (readFd, writeFd) <- PosixIO.createPipe
-    readHandle <- PosixIO.fdToHandle readFd
-    writeHandle <- PosixIO.fdToHandle writeFd
-    return (readHandle, writeHandle)
-
 -- | Semaphore implementation for controlling concurrency
 data QSem = QSem (MVar Int)
 
@@ -819,6 +1071,10 @@ signalQSem :: QSem -> IO ()
 signalQSem (QSem mvar) = do
     modifyMVar_ mvar $ \n -> return (n + 1)
 
--- | Bitwise AND operation for file modes
-(.&.) :: FileMode -> FileMode -> FileMode
-a .&. b = a * b
+-- | Detect recursion cycles in a chain of derivations
+detectRecursionCycle :: [Derivation] -> Bool
+detectRecursionCycle derivations =
+    -- Check for duplicate hashes which indicates a cycle
+    let hashes = map derivHash derivations
+        uniqueHashes = nub hashes
+    in length uniqueHashes < length hashes

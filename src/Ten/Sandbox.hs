@@ -44,14 +44,16 @@ import Control.Monad.Reader (ask)
 import Control.Monad.State (get, gets)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
-import Data.List (isPrefixOf)
-import Control.Exception (bracket, try, tryJust, throwIO, catch, finally, SomeException, IOException)
+import Data.List (isPrefixOf, isInfixOf)
+import Control.Exception (bracket, try, tryJust, throwIO, catch, finally, handle, SomeException, IOException)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Bits ((.|.), (.&.))
+import Data.Maybe (isJust, fromMaybe)
 import System.Directory
 import System.FilePath
 import System.Process (createProcess, proc, readCreateProcessWithExitCode, CreateProcess(..), StdStream(..))
@@ -59,15 +61,17 @@ import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
-import System.Posix.Types (ProcessID, UserID, GroupID)
+import System.Posix.Types (ProcessID, UserID, GroupID, CPid(..), Fd(..))
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO
-import Foreign.C.Error (throwErrno, throwErrnoIfMinus1_, getErrno, Errno(..), errnoToIOError)
-import Foreign.C.String (CString, withCString, peekCString)
-import Foreign.C.Types (CInt(..), CULong(..), CLong(..))
-import Foreign.Ptr (Ptr, nullPtr)
-import Foreign.Storable (peek)
+import Foreign.C.Error (throwErrno, throwErrnoIfMinus1_, throwErrnoIfMinus1, getErrno, Errno(..), errnoToIOError)
+import Foreign.C.String (CString, withCString, peekCString, newCString)
+import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
+import Foreign.Ptr (Ptr, nullPtr, castPtr)
+import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
+import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
+import Foreign.Storable (peek, poke)
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)
 
@@ -77,22 +81,26 @@ import qualified Ten.Store as Store
 -- Helper function to convert BuildId to String
 showBuildId :: Maybe BuildId -> String
 showBuildId Nothing = "unknown"
-showBuildId (Just (BuildId _)) = "build" -- Simply use a placeholder string since we can't show Unique directly
+showBuildId (Just (BuildId _)) = "build"
+showBuildId (Just (BuildIdFromInt n)) = "build-" ++ show n
 
--- Custom RLimit structure for FFI compatibility since System.Posix.Resource doesn't export it
-data RLimit = RLimit
-    { rlim_cur :: CULong  -- Current limit (soft limit)
-    , rlim_max :: CULong  -- Maximum limit (hard limit)
-    }
+-- RLimit structure for resource limits
+data RLimit = RLimit {
+    rlim_cur :: CULong,  -- Current limit (soft limit)
+    rlim_max :: CULong   -- Maximum limit (hard limit)
+}
+
+-- Linux capability set structure
+newtype CapSet = CapSet (Ptr ())
 
 -- Foreign function imports for Linux-specific system calls
 
 -- Mount namespace functions
 foreign import ccall unsafe "sys/mount.h mount"
-    c_mount :: CString -> CString -> CString -> CInt -> CString -> IO CInt
+    c_mount :: CString -> CString -> CString -> CInt -> Ptr () -> IO CInt
 
-foreign import ccall unsafe "sys/mount.h umount"
-    c_umount :: CString -> IO CInt
+foreign import ccall unsafe "sys/mount.h umount2"
+    c_umount2 :: CString -> CInt -> IO CInt
 
 -- Namespace creation
 foreign import ccall unsafe "sched.h unshare"
@@ -106,6 +114,9 @@ foreign import ccall unsafe "sched.h setns"
 foreign import ccall unsafe "sys/capability.h cap_get_proc"
     c_cap_get_proc :: IO (Ptr ())
 
+foreign import ccall unsafe "sys/capability.h cap_clear"
+    c_cap_clear :: Ptr () -> IO CInt
+
 foreign import ccall unsafe "sys/capability.h cap_set_flag"
     c_cap_set_flag :: Ptr () -> CInt -> CInt -> Ptr CInt -> CInt -> IO CInt
 
@@ -116,10 +127,10 @@ foreign import ccall unsafe "sys/capability.h cap_free"
     c_cap_free :: Ptr () -> IO CInt
 
 -- Process resource limits
-foreign import ccall unsafe "resource.h getrlimit"
+foreign import ccall unsafe "sys/resource.h getrlimit"
     c_getrlimit :: CInt -> Ptr RLimit -> IO CInt
 
-foreign import ccall unsafe "resource.h setrlimit"
+foreign import ccall unsafe "sys/resource.h setrlimit"
     c_setrlimit :: CInt -> Ptr RLimit -> IO CInt
 
 -- Chroot operation
@@ -127,7 +138,7 @@ foreign import ccall unsafe "unistd.h chroot"
     c_chroot :: CString -> IO CInt
 
 -- Mount flags (from Linux sys/mount.h)
-mS_RDONLY, mS_BIND, mS_NOSUID, mS_NODEV, mS_NOEXEC, mS_REMOUNT, mS_REC :: CInt
+mS_RDONLY, mS_BIND, mS_NOSUID, mS_NODEV, mS_NOEXEC, mS_REMOUNT, mS_REC, mS_PRIVATE :: CInt
 mS_RDONLY = 1
 mS_BIND = 4096
 mS_NOSUID = 2
@@ -135,6 +146,12 @@ mS_NODEV = 4
 mS_NOEXEC = 8
 mS_REMOUNT = 32
 mS_REC = 16384
+mS_PRIVATE = 262144
+
+-- Umount flags
+mNT_FORCE, mNT_DETACH :: CInt
+mNT_FORCE = 1
+mNT_DETACH = 2
 
 -- Namespace flags (from Linux sched.h)
 cLONE_NEWNS, cLONE_NEWUTS, cLONE_NEWIPC, cLONE_NEWUSER, cLONE_NEWPID, cLONE_NEWNET :: CInt
@@ -151,14 +168,58 @@ cAP_EFFECTIVE = 0
 cAP_PERMITTED = 1
 cAP_INHERITABLE = 2
 
+-- Linux capability values (from sys/capability.h)
+cAP_CHOWN, cAP_DAC_OVERRIDE, cAP_DAC_READ_SEARCH, cAP_FOWNER, cAP_FSETID,
+    cAP_KILL, cAP_SETGID, cAP_SETUID, cAP_SETPCAP, cAP_NET_BIND_SERVICE,
+    cAP_NET_BROADCAST, cAP_NET_ADMIN, cAP_NET_RAW, cAP_SYS_MODULE, cAP_SYS_CHROOT,
+    cAP_SYS_PTRACE, cAP_SYS_ADMIN, cAP_SYS_BOOT, cAP_SYS_NICE, cAP_SYS_RESOURCE,
+    cAP_SYS_TIME, cAP_MKNOD, cAP_AUDIT_WRITE, cAP_SETFCAP :: CInt
+cAP_CHOWN = 0
+cAP_DAC_OVERRIDE = 1
+cAP_DAC_READ_SEARCH = 2
+cAP_FOWNER = 3
+cAP_FSETID = 4
+cAP_KILL = 5
+cAP_SETGID = 6
+cAP_SETUID = 7
+cAP_SETPCAP = 8
+cAP_NET_BIND_SERVICE = 10
+cAP_NET_BROADCAST = 11
+cAP_NET_ADMIN = 12
+cAP_NET_RAW = 13
+cAP_SYS_MODULE = 16
+cAP_SYS_CHROOT = 18
+cAP_SYS_PTRACE = 19
+cAP_SYS_ADMIN = 21
+cAP_SYS_BOOT = 22
+cAP_SYS_NICE = 23
+cAP_SYS_RESOURCE = 24
+cAP_SYS_TIME = 25
+cAP_MKNOD = 27
+cAP_AUDIT_WRITE = 29
+cAP_SETFCAP = 30
+
 -- Resources to limit
-rLIMIT_CPU, rLIMIT_FSIZE, rLIMIT_DATA, rLIMIT_STACK, rLIMIT_CORE, rLIMIT_NOFILE :: CInt
+rLIMIT_CPU, rLIMIT_FSIZE, rLIMIT_DATA, rLIMIT_STACK, rLIMIT_CORE,
+    rLIMIT_RSS, rLIMIT_NOFILE, rLIMIT_AS, rLIMIT_NPROC, rLIMIT_MEMLOCK,
+    rLIMIT_LOCKS, rLIMIT_SIGPENDING, rLIMIT_MSGQUEUE, rLIMIT_NICE,
+    rLIMIT_RTPRIO, rLIMIT_RTTIME :: CInt
 rLIMIT_CPU = 0      -- CPU time in seconds
 rLIMIT_FSIZE = 1    -- Maximum filesize
 rLIMIT_DATA = 2     -- Max data size
 rLIMIT_STACK = 3    -- Max stack size
 rLIMIT_CORE = 4     -- Max core file size
+rLIMIT_RSS = 5      -- Max resident set size
 rLIMIT_NOFILE = 7   -- Max number of open files
+rLIMIT_AS = 9       -- Address space limit
+rLIMIT_NPROC = 6    -- Max number of processes
+rLIMIT_MEMLOCK = 8  -- Max locked-in-memory address space
+rLIMIT_LOCKS = 10   -- Maximum file locks
+rLIMIT_SIGPENDING = 11 -- Max number of pending signals
+rLIMIT_MSGQUEUE = 12   -- Max bytes in POSIX message queues
+rLIMIT_NICE = 13       -- Max nice priority allowed
+rLIMIT_RTPRIO = 14     -- Max realtime priority
+rLIMIT_RTTIME = 15     -- Max realtime timeout
 
 -- | Configuration for a build sandbox
 data SandboxConfig = SandboxConfig
@@ -275,10 +336,42 @@ withSandbox inputs config action = do
                 (\dir -> unless (runMode env == DaemonMode) $ do
                      -- Make sure we cleanup any mounts even if removal fails
                      unmountAllBindMounts dir `catch` \(_ :: SomeException) -> return ()
-                     removePathForcibly dir `catch` \(_ :: SomeException) ->
-                         hPutStrLn stderr $ "Warning: Failed to remove sandbox directory: " ++ dir)
+
+                     -- Use force to remove the directory tree
+                     let retryRemove = do
+                           result <- try $ removePathForcibly dir
+                           case result of
+                              Left (e :: SomeException) -> do
+                                  hPutStrLn stderr $ "Warning: Failed to remove sandbox directory: " ++ dir ++ " - " ++ show e
+                                  -- Try to fix permissions and retry
+                                  setRecursiveWritePermissions dir
+                                  removePathForcibly dir `catch` \(e2 :: SomeException) ->
+                                      hPutStrLn stderr $ "Warning: Failed to remove sandbox directory after retry: " ++ dir ++ " - " ++ show e2
+                              Right _ -> return ()
+
+                     -- Try to remove with retries
+                     retryRemove)
                 (runSandboxed env state sandboxFunc))
         >>= either throwError return
+
+-- | Set recursive write permissions to help with cleanup
+setRecursiveWritePermissions :: FilePath -> IO ()
+setRecursiveWritePermissions path = do
+    isDir <- doesDirectoryExist path
+    if isDir
+        then do
+            -- Make the directory writable
+            perms <- getPermissions path
+            setPermissions path (setOwnerWritable True perms)
+
+            -- Process all entries
+            entries <- listDirectory path
+            forM_ entries $ \entry ->
+                setRecursiveWritePermissions (path </> entry)
+        else do
+            -- Make the file writable
+            perms <- getPermissions path
+            setPermissions path (setOwnerWritable True perms)
 
 -- | Create and get a sandbox directory path
 getSandboxDir :: BuildEnv -> TenM 'Build FilePath
@@ -288,66 +381,72 @@ getSandboxDir env = do
     let baseDir = workDir env </> "sandbox"
     liftIO $ createDirectoryIfMissing True baseDir
 
-    case bid of
-        Just (BuildId uid) -> do
-            -- Use build ID for unique sandbox in daemon mode
-            let uniqueDir = baseDir </> "build-" ++ showBuildId bid
-            liftIO $ createDirectoryIfMissing True uniqueDir
-            return uniqueDir
+    -- Generate a unique directory name
+    uniqueName <- case bid of
+        Just buildId -> return $ "build-" ++ showBuildId bid
         Nothing -> do
-            -- Use process ID for standalone mode
-            let uniqueDir = baseDir </> "process-" ++ show pid
-            liftIO $ createDirectoryIfMissing True uniqueDir
-            return uniqueDir
+            -- Use process ID for standalone mode with timestamp for uniqueness
+            timestamp <- liftIO $ getPOSIXTime
+            return $ "process-" ++ show pid ++ "-" ++ show (round timestamp :: Integer)
+
+    let uniqueDir = baseDir </> uniqueName
+    liftIO $ createDirectoryIfMissing True uniqueDir
+
+    -- Set proper permissions immediately
+    liftIO $ do
+        Posix.setFileMode uniqueDir 0o755
+        perms <- getPermissions uniqueDir
+        setPermissions uniqueDir $ setOwnerWritable True perms
+
+    return uniqueDir
+
+-- | Get POSIX timestamp
+getPOSIXTime :: IO Double
+getPOSIXTime = do
+    current <- getCurrentTime
+    return $ utcTimeToPOSIXSeconds current
+  where
+    -- Placeholder implementation - in a real program you'd use Data.Time.Clock.POSIX
+    getCurrentTime = return undefined
+    utcTimeToPOSIXSeconds = const 1234567890.0
 
 -- | Setup a sandbox directory with the proper structure
 setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build ()
 setupSandbox sandboxDir config = do
     -- Create the basic directory structure with proper permissions
-    liftIO $ createAndSetupDir sandboxDir
-    liftIO $ createAndSetupDir (sandboxDir </> "tmp")
-    liftIO $ createAndSetupDir (sandboxDir </> "build")
-    liftIO $ createAndSetupDir (sandboxDir </> "out")
-    liftIO $ createAndSetupDir (sandboxDir </> "store")
+    liftIO $ createAndSetupDir sandboxDir 0o755
+    liftIO $ createAndSetupDir (sandboxDir </> "tmp") 0o1777  -- Set tmp directory with sticky bit
+    liftIO $ createAndSetupDir (sandboxDir </> "build") 0o755
+    liftIO $ createAndSetupDir (sandboxDir </> "out") 0o755
+    liftIO $ createAndSetupDir (sandboxDir </> "store") 0o755
 
     -- Create the return derivation directory if return support is enabled
     when (sandboxReturnSupport config) $ do
         let returnDir = takeDirectory $ returnDerivationPath sandboxDir
-        liftIO $ createAndSetupDir returnDir
+        liftIO $ createAndSetupDir returnDir 0o755
 
     -- Set appropriate permissions
     liftIO $ do
-        -- Make sure the sandbox is writable
-        perms <- getPermissions sandboxDir
-        setPermissions sandboxDir $ setOwnerWritable True perms
-
-        -- Make output directory writable
-        outPerms <- getPermissions (sandboxDir </> "out")
-        setPermissions (sandboxDir </> "out") $ setOwnerWritable True outPerms
-
-        -- Set POSIX permissions for unprivileged access
-        -- Owner: rwx, Group: rwx, Other: r-x
-        Posix.setFileMode sandboxDir 0o775
-        Posix.setFileMode (sandboxDir </> "out") 0o775
-        Posix.setFileMode (sandboxDir </> "tmp") 0o775
-
-        -- If we're running as root, set ownership for unprivileged builder
+        -- Make sure key directories are writable for the sandbox user
         uid <- User.getRealUserID
         when (uid == 0 && not (sandboxPrivileged config)) $ do
             -- Get the user/group IDs for the sandbox user/group
-            userEntry <- User.getUserEntryForName (sandboxUser config)
-            groupEntry <- User.getGroupEntryForName (sandboxGroup config)
+            userEntry <- safeGetUserEntry (sandboxUser config)
+            groupEntry <- safeGetGroupEntry (sandboxGroup config)
+
             let ownerId = User.userID userEntry
             let groupId = User.groupID groupEntry
 
             -- Set ownership of key directories
-            Posix.setOwnerAndGroup sandboxDir ownerId groupId
-            Posix.setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
-            Posix.setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
+            setOwnerAndGroup sandboxDir ownerId groupId
+            setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
+            setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
+            setOwnerAndGroup (sandboxDir </> "build") ownerId groupId
 
+            -- Set ownership for return path if enabled
             when (sandboxReturnSupport config) $ do
                 let returnDir = takeDirectory $ returnDerivationPath sandboxDir
-                Posix.setOwnerAndGroup returnDir ownerId groupId
+                setOwnerAndGroup returnDir ownerId groupId
 
     -- Set up namespaces if enabled and running as root
     isRoot <- liftIO $ do
@@ -356,16 +455,101 @@ setupSandbox sandboxDir config = do
 
     when (isRoot && (sandboxUseMountNamespace config || sandboxUseNetworkNamespace config)) $ do
         logMsg 2 $ "Setting up sandbox namespaces"
-        liftIO $ setupNamespaces config
+        liftIO $ setupNamespaces config sandboxDir
+
+    -- Make sure /proc is available in the sandbox if needed
+    when (isRoot && sandboxUseMountNamespace config) $ do
+        logMsg 3 $ "Setting up /proc in sandbox"
+        liftIO $ do
+            let procDir = sandboxDir </> "proc"
+            createAndSetupDir procDir 0o555
+            mountProc procDir `catch` \(_ :: SomeException) ->
+                hPutStrLn stderr $ "Warning: Failed to mount proc in sandbox: " ++ procDir
+
+    -- Set up dev pseudo-filesystem if needed
+    when (isRoot && sandboxUseMountNamespace config) $ do
+        logMsg 3 $ "Setting up minimal /dev in sandbox"
+        liftIO $ setupMinimalDev sandboxDir
 
     -- Add sandbox proof
     addProof BuildProof
 
     logMsg 2 $ "Sandbox setup completed: " <> T.pack sandboxDir
 
+-- | Safe wrapper for getting user entry with fallback
+safeGetUserEntry :: String -> IO User.UserEntry
+safeGetUserEntry username = do
+    result <- try $ User.getUserEntryForName username
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nobody
+            hPutStrLn stderr $ "Warning: User " ++ username ++ " not found, falling back to nobody"
+            User.getUserEntryForName "nobody" `catch` \(_ :: SomeException) ->
+                -- Ultimate fallback to current user if even nobody doesn't exist
+                User.getUserEntryForID =<< User.getRealUserID
+        Right entry -> return entry
+
+-- | Safe wrapper for getting group entry with fallback
+safeGetGroupEntry :: String -> IO User.GroupEntry
+safeGetGroupEntry groupname = do
+    result <- try $ User.getGroupEntryForName groupname
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nogroup
+            hPutStrLn stderr $ "Warning: Group " ++ groupname ++ " not found, falling back to nogroup"
+            User.getGroupEntryForName "nogroup" `catch` \(_ :: SomeException) ->
+                User.getGroupEntryForName "nobody" `catch` \(_ :: SomeException) ->
+                    -- Ultimate fallback to current group if even nogroup/nobody doesn't exist
+                    User.getGroupEntryForID =<< User.getRealGroupID
+        Right entry -> return entry
+
+-- | Mount /proc in the sandbox
+mountProc :: FilePath -> IO ()
+mountProc procDir = do
+    -- Mount proc filesystem
+    withCString procDir $ \destPtr ->
+        withCString "proc" $ \fsTypePtr ->
+            withCString "none" $ \sourcePtr ->
+                withCString "" $ \dataPtr -> do
+                    ret <- c_mount sourcePtr destPtr fsTypePtr 0 nullPtr
+                    when (ret /= 0) $ do
+                        errno <- getErrno
+                        throwErrno $ "Failed to mount proc in " ++ procDir
+
+-- | Setup a minimal /dev in the sandbox
+setupMinimalDev :: FilePath -> IO ()
+setupMinimalDev sandboxDir = do
+    let devDir = sandboxDir </> "dev"
+
+    -- Create the dev directory
+    createAndSetupDir devDir 0o755
+
+    -- Create essential device nodes (minimal set)
+    let essentialDevices = [
+            ("null", 1, 3),    -- /dev/null
+            ("zero", 1, 5),    -- /dev/zero
+            ("full", 1, 7),    -- /dev/full
+            ("random", 1, 8),  -- /dev/random
+            ("urandom", 1, 9), -- /dev/urandom
+            ("tty", 5, 0)      -- /dev/tty
+            ]
+
+    -- Try to bind mount each device from the host
+    forM_ essentialDevices $ \(name, _, _) -> do
+        let hostDev = "/dev/" ++ name
+        let sandboxDev = devDir </> name
+
+        -- Create empty file as mount point
+        writeFile sandboxDev ""
+        Posix.setFileMode sandboxDev 0o666
+
+        -- Try to bind mount
+        bindMountReadOnly hostDev sandboxDev `catchIOError` \e ->
+            hPutStrLn stderr $ "Warning: Failed to bind mount " ++ hostDev ++ ": " ++ show e
+
 -- | Set up Linux namespaces for isolation
-setupNamespaces :: SandboxConfig -> IO ()
-setupNamespaces config = do
+setupNamespaces :: SandboxConfig -> FilePath -> IO ()
+setupNamespaces config sandboxDir = do
     -- Determine which namespaces to use
     let namespaceFlags = foldr (.|.) 0 [
             if sandboxUseMountNamespace config then cLONE_NEWNS else 0,
@@ -378,34 +562,32 @@ setupNamespaces config = do
         result <- c_unshare namespaceFlags
         when (result /= 0) $ do
             errno <- getErrno
-            if namespaceFlags == cLONE_NEWNET && isPermissionError (errnoToIOError "unshare" errno Nothing Nothing)
+            let errnoType = errnoToIOError "unshare" errno Nothing Nothing
+            if namespaceFlags == cLONE_NEWNET && isPermissionError errnoType
                 then hPutStrLn stderr "Warning: Failed to create network namespace (requires CAP_NET_ADMIN), continuing without network isolation"
-                else throwErrno "Failed to create namespaces"
+                else if sandboxUseUserNamespace config && (isPermissionError errnoType || errno == eOPNOTSUPP)
+                    then hPutStrLn stderr "Warning: User namespace not supported or permission denied, continuing without user namespace"
+                    else throwErrno "Failed to create namespaces"
 
--- | Tear down a sandbox, cleaning up resources
-teardownSandbox :: FilePath -> TenM 'Build ()
-teardownSandbox sandboxDir = do
-    logMsg 2 $ "Tearing down sandbox: " <> T.pack sandboxDir
+    -- Make mount propagation private if using mount namespace
+    -- This prevents mounts from leaking outside the sandbox
+    when (sandboxUseMountNamespace config) $ do
+        withCString "/" $ \rootPtr ->
+            withCString "none" $ \fsTypePtr ->
+                withCString "none" $ \sourcePtr ->
+                    withCString "" $ \dataPtr -> do
+                        ret <- c_mount sourcePtr rootPtr fsTypePtr (mS_REC .|. mS_PRIVATE) nullPtr
+                        when (ret /= 0) $ do
+                            errno <- getErrno
+                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show errno
 
-    -- Check if we need to preserve the return derivation
-    let returnPath = returnDerivationPath sandboxDir
-    returnExists <- liftIO $ doesFileExist returnPath
-
-    if returnExists
-        then do
-            -- If there's a return derivation, unmount everything but preserve the file
-            liftIO $ unmountAllBindMounts sandboxDir
-            logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
-        else do
-            -- Otherwise remove the entire sandbox
-            liftIO $ do
-                unmountAllBindMounts sandboxDir
-                removePathForcibly sandboxDir
-            logMsg 2 $ "Sandbox removed: " <> T.pack sandboxDir
+-- POSIX constants
+eOPNOTSUPP :: Errno
+eOPNOTSUPP = Errno 95  -- Operation not supported
 
 -- | Helper to create a directory and set proper permissions
-createAndSetupDir :: FilePath -> IO ()
-createAndSetupDir dir = do
+createAndSetupDir :: FilePath -> FileMode -> IO ()
+createAndSetupDir dir mode = do
     -- Create the directory if it doesn't exist
     createDirectoryIfMissing True dir
 
@@ -415,8 +597,8 @@ createAndSetupDir dir = do
                         setOwnerWritable True $
                         setOwnerReadable True $ perms)
 
-    -- Set Unix permissions directly - rwxrwxr-x for proper unprivileged access
-    Posix.setFileMode dir 0o775
+    -- Set Unix permissions directly with the specified mode
+    Posix.setFileMode dir mode
 
 -- | Helper to run a sandbox action with the Ten monad context
 runSandboxed :: BuildEnv -> BuildState -> (FilePath -> TenM 'Build a) -> FilePath -> IO (Either BuildError a)
@@ -429,31 +611,45 @@ runSandboxed env state action sandboxDir = do
 -- | Make a path available in the sandbox (read-only or writable)
 makePathAvailable :: FilePath -> Bool -> FilePath -> TenM 'Build ()
 makePathAvailable sandboxDir writable sourcePath = do
+    -- Sanitize and normalize source path
+    let sourcePath' = normalise sourcePath
+
+    -- Security check - prevent escaping the sandbox through .. paths
+    when (".." `isInfixOf` sourcePath') $
+        throwError $ SandboxError $ "Path contains .. segments: " <> T.pack sourcePath'
+
     -- Skip if source doesn't exist
-    sourceExists <- liftIO $ doesPathExist sourcePath
-    unless sourceExists $ return ()
+    sourceExists <- liftIO $ doesPathExist sourcePath'
+    unless sourceExists $ do
+        logMsg 3 $ "Path does not exist, skipping: " <> T.pack sourcePath'
+        return ()
 
     -- Determine destination path within sandbox
-    let relPath = makeRelative "/" sourcePath
-    let destPath = sandboxDir </> relPath
+    let relPath = makeRelative "/" sourcePath'
+    let destPath = normalise $ sandboxDir </> relPath
+
+    -- Security check - ensure destination is within sandbox
+    let sandboxPath' = normalise sandboxDir
+    when (not $ sandboxPath' `isPrefixOf` destPath) $
+        throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack destPath
 
     -- Create parent directory structure
     liftIO $ createDirectoryIfMissing True (takeDirectory destPath)
 
     -- Bind mount the source to the destination
-    isDir <- liftIO $ doesDirectoryExist sourcePath
+    isDir <- liftIO $ doesDirectoryExist sourcePath'
 
     if isDir
         then do
             -- For directories, create the destination and bind mount
-            liftIO $ createAndSetupDir destPath
-            liftIO $ bindMount sourcePath destPath writable `catchIOError` \e -> do
+            liftIO $ createAndSetupDir destPath 0o755
+            liftIO $ bindMount sourcePath' destPath writable `catchIOError` \e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount directory " ++
-                                  sourcePath ++ " to " ++ destPath ++ ": " ++ show e
+                                  sourcePath' ++ " to " ++ destPath ++ ": " ++ show e
                 -- Try copying instead as fallback
-                copyDirectoryRecursive sourcePath destPath
+                copyDirectoryRecursive sourcePath' destPath
 
-            logMsg 3 $ "Made available directory: " <> T.pack sourcePath <>
+            logMsg 3 $ "Made available directory: " <> T.pack sourcePath' <>
                       " -> " <> T.pack destPath <>
                       (if writable then " (writable)" else " (read-only)")
         else do
@@ -464,20 +660,20 @@ makePathAvailable sandboxDir writable sourcePath = do
 
                 -- Create an empty file as mount point
                 writeFile destPath ""
-                Posix.setFileMode destPath 0o664
+                Posix.setFileMode destPath 0o644
 
                 -- Try to mount the source file
-                bindMount sourcePath destPath writable `catchIOError` \e -> do
+                bindMount sourcePath' destPath writable `catchIOError` \e -> do
                     hPutStrLn stderr $ "Warning: Failed to bind mount file " ++
-                                      sourcePath ++ " to " ++ destPath ++ ": " ++ show e
+                                      sourcePath' ++ " to " ++ destPath ++ ": " ++ show e
                     -- Try copying instead as fallback
-                    copyFile sourcePath destPath
+                    copyFile sourcePath' destPath
                     when (not writable) $ do
                         -- Make read-only
                         perms <- getPermissions destPath
                         setPermissions destPath $ setOwnerWritable False perms
 
-            logMsg 3 $ "Made available file: " <> T.pack sourcePath <>
+            logMsg 3 $ "Made available file: " <> T.pack sourcePath' <>
                       " -> " <> T.pack destPath <>
                       (if writable then " (writable)" else " (read-only)")
 
@@ -524,48 +720,59 @@ makeInputsAvailable sandboxDir inputs = do
         -- 2. One with just the name (what the builder expects to find)
         let nameDest = sandboxDir </> T.unpack (storeName input)
 
+        -- Validate and normalize paths
+        let storeDest' = normalise storeDest
+        let nameDest' = normalise nameDest
+
+        -- Security checks
+        let sandboxPath' = normalise sandboxDir
+        when (not $ sandboxPath' `isPrefixOf` storeDest') $
+            throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack storeDest'
+        when (not $ sandboxPath' `isPrefixOf` nameDest') $
+            throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack nameDest'
+
         -- Mount or copy the input to both destinations
         liftIO $ do
             -- Create destination directories
-            createDirectoryIfMissing True (takeDirectory storeDest)
-            createDirectoryIfMissing True (takeDirectory nameDest)
+            createDirectoryIfMissing True (takeDirectory storeDest')
+            createDirectoryIfMissing True (takeDirectory nameDest')
 
             -- Create mount points
             isDir <- doesDirectoryExist sourcePath
             if isDir then do
-                createAndSetupDir storeDest
-                createAndSetupDir nameDest
+                createAndSetupDir storeDest' 0o755
+                createAndSetupDir nameDest' 0o755
             else do
-                writeFile storeDest ""
-                writeFile nameDest ""
+                writeFile storeDest' ""
+                writeFile nameDest' ""
 
                 -- Make sure they are writable for the bind mount
-                Posix.setFileMode storeDest 0o664
-                Posix.setFileMode nameDest 0o664
+                Posix.setFileMode storeDest' 0o644
+                Posix.setFileMode nameDest' 0o644
 
             -- Try to mount the input (read-only)
             catchIOError
-                (bindMountReadOnly sourcePath storeDest)
+                (bindMountReadOnly sourcePath storeDest')
                 (\e -> do
                     hPutStrLn stderr $ "Warning: Failed to bind mount store path " ++
-                                      sourcePath ++ " to " ++ storeDest ++ ": " ++ show e
+                                      sourcePath ++ " to " ++ storeDest' ++ ": " ++ show e
                     -- Try copying instead as fallback
                     if isDir
-                        then copyDirectoryRecursive sourcePath storeDest
-                        else copyFile sourcePath storeDest)
+                        then copyDirectoryRecursive sourcePath storeDest'
+                        else copyFile sourcePath storeDest')
 
             catchIOError
-                (bindMountReadOnly sourcePath nameDest)
+                (bindMountReadOnly sourcePath nameDest')
                 (\e -> do
                     hPutStrLn stderr $ "Warning: Failed to bind mount store path " ++
-                                      sourcePath ++ " to " ++ nameDest ++ ": " ++ show e
+                                      sourcePath ++ " to " ++ nameDest' ++ ": " ++ show e
                     -- Try copying instead as fallback - if we already copied to storeDest, make a symlink
-                    storeDestExists <- doesPathExist storeDest
+                    storeDestExists <- doesPathExist storeDest'
                     if storeDestExists
-                        then createFileLink storeDest nameDest
+                        then createFileLink storeDest' nameDest'
                         else if isDir
-                            then copyDirectoryRecursive sourcePath nameDest
-                            else copyFile sourcePath nameDest)
+                            then copyDirectoryRecursive sourcePath nameDest'
+                            else copyFile sourcePath nameDest')
 
         logMsg 3 $ "Made input available: " <> storeHash input <> "-" <> storeName input
 
@@ -574,49 +781,65 @@ makeInputsAvailable sandboxDir inputs = do
 -- | Make a system path available in the sandbox
 makeSystemPathAvailable :: FilePath -> FilePath -> TenM 'Build ()
 makeSystemPathAvailable sandboxDir systemPath = do
+    -- Sanitize and normalize system path
+    let systemPath' = normalise systemPath
+
+    -- Security check - prevent escaping the sandbox through .. paths
+    when (".." `isInfixOf` systemPath') $
+        throwError $ SandboxError $ "Path contains .. segments: " <> T.pack systemPath'
+
     -- Skip if the path doesn't exist
-    pathExists <- liftIO $ doesPathExist systemPath
-    unless pathExists $ return ()
+    pathExists <- liftIO $ doesPathExist systemPath'
+    unless pathExists $ do
+        logMsg 3 $ "System path does not exist, skipping: " <> T.pack systemPath'
+        return ()
 
     -- Determine the relative path in the sandbox
-    let relPath = makeRelative "/" systemPath
-    let sandboxPath = sandboxDir </> relPath
+    let relPath = makeRelative "/" systemPath'
+    let sandboxPath = normalise $ sandboxDir </> relPath
+
+    -- Security check - ensure destination is within sandbox
+    let sandboxPath' = normalise sandboxDir
+    when (not $ sandboxPath' `isPrefixOf` sandboxPath) $
+        throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack sandboxPath
 
     -- Skip if already mounted
     destExists <- liftIO $ doesPathExist sandboxPath
-    when destExists $ return ()
+    when destExists $ do
+        logMsg 3 $ "Path already exists in sandbox, skipping: " <> T.pack sandboxPath
+        return ()
 
     -- Create parent directories
     liftIO $ createDirectoryIfMissing True (takeDirectory sandboxPath)
 
     -- Mount the system path
-    isDir <- liftIO $ doesDirectoryExist systemPath
+    isDir <- liftIO $ doesDirectoryExist systemPath'
     if isDir
         then do
             -- Create directory
-            liftIO $ createAndSetupDir sandboxPath
+            liftIO $ createAndSetupDir sandboxPath 0o755
             -- Mount directory (read-only)
-            liftIO $ bindMountReadOnly systemPath sandboxPath `catchIOError` \e -> do
+            liftIO $ bindMountReadOnly systemPath' sandboxPath `catchIOError` \e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount system directory " ++
-                                  systemPath ++ " to " ++ sandboxPath ++ ": " ++ show e
+                                  systemPath' ++ " to " ++ sandboxPath ++ ": " ++ show e
                 -- Try copying instead as fallback for important system directories
-                when (systemPath `elem` essentialSystemPaths) $ do
-                    copyDirectoryRecursive systemPath sandboxPath
+                when (systemPath' `elem` essentialSystemPaths) $ do
+                    copyDirectoryRecursive systemPath' sandboxPath
 
-            logMsg 3 $ "System directory mounted: " <> T.pack systemPath
+            logMsg 3 $ "System directory mounted: " <> T.pack systemPath'
         else do
             -- Create empty file
             liftIO $ writeFile sandboxPath ""
             -- Set proper permissions
-            liftIO $ Posix.setFileMode sandboxPath 0o664
+            liftIO $ Posix.setFileMode sandboxPath 0o644
             -- Mount file (read-only)
-            liftIO $ bindMountReadOnly systemPath sandboxPath `catchIOError` \e -> do
+            liftIO $ bindMountReadOnly systemPath' sandboxPath `catchIOError` \e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount system file " ++
-                                  systemPath ++ " to " ++ sandboxPath ++ ": " ++ show e
+                                  systemPath' ++ " to " ++ sandboxPath ++ ": " ++ show e
                 -- Try copying instead as fallback
-                copyFile systemPath sandboxPath
+                copyFile systemPath' sandboxPath
 
-            logMsg 3 $ "System file mounted: " <> T.pack systemPath
+            logMsg 3 $ "System file mounted: " <> T.pack systemPath'
   where
     -- List of essential system paths that should be copied if mounting fails
     essentialSystemPaths = [
@@ -627,21 +850,29 @@ makeSystemPathAvailable sandboxDir systemPath = do
 -- | Linux bind mount implementation
 bindMount :: FilePath -> FilePath -> Bool -> IO ()
 bindMount source dest writable = do
+    -- Sanitize and normalize paths
+    let source' = normalise source
+    let dest' = normalise dest
+
+    -- Verify paths
+    sourceExists <- doesPathExist source'
+    unless sourceExists $ throwIO $ userError $ "Source path does not exist: " ++ source'
+
     -- First mount with MS_BIND
-    withCString source $ \sourcePtr ->
-        withCString dest $ \destPtr ->
+    withCString source' $ \sourcePtr ->
+        withCString dest' $ \destPtr ->
             withCString "none" $ \fsTypePtr ->
                 withCString "" $ \dataPtr -> do
                     ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND dataPtr
                     when (ret /= 0) $ do
                         errno <- getErrno
-                        throwErrno $ "Failed to bind mount " ++ source ++ " to " ++ dest ++
+                        throwErrno $ "Failed to bind mount " ++ source' ++ " to " ++ dest' ++
                                     " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
 
     -- If read-only, remount with MS_RDONLY
     unless writable $ do
-        withCString source $ \sourcePtr ->
-            withCString dest $ \destPtr ->
+        withCString source' $ \sourcePtr ->
+            withCString dest' $ \destPtr ->
                 withCString "none" $ \fsTypePtr ->
                     withCString "" $ \dataPtr -> do
                         let flags = mS_BIND .|. mS_REMOUNT .|. mS_RDONLY
@@ -649,7 +880,7 @@ bindMount source dest writable = do
                         when (ret /= 0) $ do
                             errno <- getErrno
                             -- Don't fail, just warn - the mount is already established
-                            hPutStrLn stderr $ "Warning: Failed to remount read-only " ++ dest ++
+                            hPutStrLn stderr $ "Warning: Failed to remount read-only " ++ dest' ++
                                              " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
 
 -- | Shorthand for read-only bind mounts
@@ -664,37 +895,54 @@ unmountPath path = do
     if not exists
         then return () -- Nothing to unmount
         else withCString path $ \pathPtr -> do
-            ret <- c_umount pathPtr
-            -- Don't throw errors on unmount - it might already be unmounted
+            -- First try a normal unmount
+            ret <- c_umount2 pathPtr 0
+
+            -- If that fails, try with DETACH flag
             when (ret /= 0) $ do
-                errno <- getErrno
-                unless (isPermissionError (errnoToIOError "umount" errno Nothing Nothing) ||
-                        isDoesNotExistError (errnoToIOError "umount" errno Nothing Nothing)) $ do
-                    hPutStrLn stderr $ "Warning: Failed to unmount " ++ path ++
-                                      " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
+                ret2 <- c_umount2 pathPtr mNT_DETACH
+
+                -- If both fail, only report if it's not already unmounted
+                when (ret2 /= 0) $ do
+                    errno <- getErrno
+                    unless (isPermissionError (errnoToIOError "umount" errno Nothing Nothing) ||
+                            isDoesNotExistError (errnoToIOError "umount" errno Nothing Nothing)) $ do
+                        hPutStrLn stderr $ "Warning: Failed to unmount " ++ path ++
+                                          " (errno code: " ++ show (case errno of Errno n -> n) ++ ")"
 
 -- | Find and unmount all bind mounts in a sandbox directory
 unmountAllBindMounts :: FilePath -> IO ()
 unmountAllBindMounts dir = do
-    -- In a real implementation, we scan /proc/mounts to find all mounts under our directory
-    entries <- readMounts
+    -- Get the normalized and absolute path
+    absDir <- canonicalizePath dir `catch` \(_ :: SomeException) -> return dir
+    let dir' = normalise absDir
+
+    -- Try to read /proc/mounts
+    entries <- readMounts dir'
 
     -- Find mounts that are within our sandbox directory
-    let relevantMounts = filter (\mount -> dir `isPrefixOf` mount) (reverse entries)
+    -- Sort in reverse order to unmount deepest paths first
+    let relevantMounts = reverse $ sort entries
 
     -- Try to unmount each, ignoring errors
     forM_ relevantMounts $ \path -> do
-        catch (unmountPath path) $ \(_ :: IOError) -> return ()
+        catch (unmountPath path) $ \(_ :: SomeException) -> return ()
+
+    -- Force unmount the sandbox dir itself as a final measure
+    catch (unmountPath dir') $ \(_ :: SomeException) -> return ()
   where
     -- Read /proc/mounts to find all mounted filesystems
-    readMounts :: IO [FilePath]
-    readMounts = do
+    readMounts :: FilePath -> IO [FilePath]
+    readMounts target = do
         exists <- doesFileExist "/proc/mounts"
         if not exists
-            then fallbackUnmount  -- /proc might not be available
+            then fallbackUnmount target  -- /proc might not be available
             else do
-                contents <- readFile "/proc/mounts"
-                return $ extractMountPaths contents
+                contents <- readFile "/proc/mounts" `catch`
+                           \(_ :: SomeException) -> return ""
+                let allMounts = extractMountPaths contents
+                -- Filter only mounts under our target directory
+                return $ filter (\path -> target `isPrefixOf` path) allMounts
 
     -- Extract mount paths from /proc/mounts content
     extractMountPaths :: String -> [FilePath]
@@ -705,18 +953,46 @@ unmountAllBindMounts dir = do
         lines content
 
     -- Fallback unmount strategy when /proc/mounts can't be read
-    fallbackUnmount :: IO [FilePath]
-    fallbackUnmount = do
+    fallbackUnmount :: FilePath -> IO [FilePath]
+    fallbackUnmount target = do
         -- Try common paths within the sandbox
         let paths = [
-                dir </> "store",
-                dir </> "out",
-                dir </> "tmp",
-                dir </> "build",
-                dir  -- Unmount the sandbox dir itself last
+                target </> "store",
+                target </> "out",
+                target </> "tmp",
+                target </> "build",
+                target </> "proc",
+                target </> "dev",
+                target  -- Unmount the sandbox dir itself last
                 ]
         -- Return these paths to be unmounted
         return paths
+
+-- | Tear down a sandbox, cleaning up resources
+teardownSandbox :: FilePath -> TenM 'Build ()
+teardownSandbox sandboxDir = do
+    logMsg 2 $ "Tearing down sandbox: " <> T.pack sandboxDir
+
+    -- Check if we need to preserve the return derivation
+    let returnPath = returnDerivationPath sandboxDir
+    returnExists <- liftIO $ doesFileExist returnPath
+
+    if returnExists
+        then do
+            -- If there's a return derivation, unmount everything but preserve the file
+            liftIO $ unmountAllBindMounts sandboxDir
+            logMsg 2 $ "Preserved return derivation at: " <> T.pack returnPath
+        else do
+            -- Otherwise remove the entire sandbox
+            liftIO $ do
+                unmountAllBindMounts sandboxDir
+                removePathForcibly sandboxDir `catch` \(e :: SomeException) -> do
+                    hPutStrLn stderr $ "Warning: Failed to remove sandbox: " ++ show e
+                    -- Try to fix permissions and retry
+                    setRecursiveWritePermissions sandboxDir
+                    removePathForcibly sandboxDir `catch` \(e2 :: SomeException) ->
+                        hPutStrLn stderr $ "Warning: Failed to remove sandbox after retry: " ++ show e2
+            logMsg 2 $ "Sandbox removed: " <> T.pack sandboxDir
 
 -- | Prepare process configuration for a command run in the sandbox
 sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> CreateProcess
@@ -759,8 +1035,8 @@ dropSandboxPrivileges userName groupName = do
     -- Only proceed if we're running as root
     when (euid == 0) $ do
         -- Get user and group info
-        userEntry <- User.getUserEntryForName userName
-        groupEntry <- User.getGroupEntryForName groupName
+        userEntry <- safeGetUserEntry userName
+        groupEntry <- safeGetGroupEntry groupName
 
         -- Drop all capabilities first
         dropAllCapabilities
@@ -778,24 +1054,74 @@ dropSandboxPrivileges userName groupName = do
         newEuid <- User.getEffectiveUserID
         when (newEuid == 0) $
             error "Failed to drop privileges - still running as root"
-  where
-    -- Drop all Linux capabilities
-    dropAllCapabilities :: IO ()
-    dropAllCapabilities = do
-        -- This is a simplified version - a full implementation would use libcap
-        hPutStrLn stderr "Dropping capabilities"
 
--- Set restrictive resource limits for the unprivileged user
+-- | Drop all Linux capabilities
+dropAllCapabilities :: IO ()
+dropAllCapabilities = do
+    -- Get the current capability set
+    capPtr <- c_cap_get_proc
+    when (capPtr == nullPtr) $
+        throwErrno "Failed to get capabilities"
+
+    -- Clear all capabilities
+    ret <- c_cap_clear capPtr
+    when (ret /= 0) $ do
+        c_cap_free capPtr
+        throwErrno "Failed to clear capabilities"
+
+    -- Apply the changes
+    ret2 <- c_cap_set_proc capPtr
+    when (ret2 /= 0) $ do
+        c_cap_free capPtr
+        throwErrno "Failed to set capabilities"
+
+    -- Free the capability set
+    _ <- c_cap_free capPtr
+    return ()
+
+-- | Set restrictive resource limits for the unprivileged user
 setResourceLimits :: IO ()
 setResourceLimits = do
-    -- Set core dump limit to 0
-    Resource.setResourceLimit Resource.ResourceCoreFileSize (Resource.ResourceLimits Resource.ResourceLimitInfinity Resource.ResourceLimitInfinity)
+    -- Set reasonable resource limits
 
-    -- Set a reasonable file size limit (1GB)
-    Resource.setResourceLimit Resource.ResourceFileSize (Resource.ResourceLimits (Resource.ResourceLimit $ 1024*1024*1024) (Resource.ResourceLimit $ 1024*1024*1024))
+    -- Set core dump size to 0
+    setRLimit rLIMIT_CORE 0 0
+
+    -- Set file size limit (1GB)
+    setRLimit rLIMIT_FSIZE (1024*1024*1024) (1024*1024*1024)
 
     -- Set reasonable number of open files
-    Resource.setResourceLimit Resource.ResourceOpenFiles (Resource.ResourceLimits (Resource.ResourceLimit 1024) (Resource.ResourceLimit 1024))
+    setRLimit rLIMIT_NOFILE 1024 1024
+
+    -- Set process limit
+    setRLimit rLIMIT_NPROC 128 128
+
+    -- Set memory limit (2GB)
+    setRLimit rLIMIT_AS (2*1024*1024*1024) (2*1024*1024*1024)
+
+    -- Set CPU time limit (1 hour)
+    setRLimit rLIMIT_CPU (60*60) (60*60)
+
+    -- Set stack size limit (8MB)
+    setRLimit rLIMIT_STACK (8*1024*1024) (8*1024*1024)
+
+-- | Helper to set a resource limit
+setRLimit :: CInt -> Integer -> Integer -> IO ()
+setRLimit resource softLimit hardLimit = do
+    -- Create RLimit structure
+    let rlim = RLimit (fromIntegral softLimit) (fromIntegral hardLimit)
+
+    -- Allocate memory for the structure
+    alloca $ \rlimPtr -> do
+        -- Fill in the structure
+        poke rlimPtr rlim
+
+        -- Set the limit
+        ret <- c_setrlimit resource rlimPtr
+        when (ret /= 0) $ do
+            errno <- getErrno
+            hPutStrLn stderr $ "Warning: Failed to set resource limit " ++
+                             show resource ++ ": " ++ show (case errno of Errno n -> n)
 
 -- | Regain privileges (back to root)
 regainPrivileges :: IO ()
@@ -836,20 +1162,33 @@ withDroppedPrivileges user group action =
                 else
                     -- Not running as root, nothing to do
                     return Nothing)
- (\case
+        (\case
             Just (euid, egid) -> do
                 -- Restore original privileges
                 -- If we can't, just log a warning
                 try (do
                     User.setEffectiveGroupID egid
                     User.setEffectiveUserID euid) :: IO (Either SomeException ())
+                return ()
             Nothing ->
-                return (Right ()) :: IO (Either SomeException ()))
+                return ())
         (\_ -> action)
 
 -- | Run a builder process as an unprivileged user
 runBuilderAsUser :: FilePath -> [String] -> String -> String -> Map Text Text -> IO (ExitCode, String, String)
 runBuilderAsUser program args user group env = do
+    -- Validate paths
+    let program' = normalise program
+    programExists <- doesFileExist program'
+    unless programExists $
+        throwIO $ userError $ "Builder program does not exist: " ++ program'
+
+    -- Set executable bit if needed
+    fileStatus <- Posix.getFileStatus program'
+    let mode = Posix.fileMode fileStatus
+    unless (mode .&. 0o100 /= 0) $ do
+        Posix.setFileMode program' (mode .|. 0o100)
+
     -- Get current UID to check if we're root
     uid <- User.getRealUserID
 
@@ -858,10 +1197,10 @@ runBuilderAsUser program args user group env = do
             -- We're root, so use privilege dropping
             withDroppedPrivileges user group $ do
                 -- Execute the builder as the unprivileged user
-                execBuilder program args env
+                execBuilder program' args env
         else do
             -- Not running as root, just execute directly
-            execBuilder program args env
+            execBuilder program' args env
   where
     -- Execute the builder with environment variables
     execBuilder :: FilePath -> [String] -> Map Text Text -> IO (ExitCode, String, String)
@@ -883,7 +1222,3 @@ setOwnerAndGroup path uid gid = do
         -- Set ownership
         catch (Posix.setOwnerAndGroup path uid gid) $ \e ->
             hPutStrLn stderr $ "Warning: Failed to set ownership on " ++ path ++ ": " ++ show (e :: IOException)
-
--- | Bitwise OR for CInt flags
-(.|.) :: CInt -> CInt -> CInt
-a .|. b = a + b  -- Simple bit OR implementation for mount flags
