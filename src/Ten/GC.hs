@@ -26,6 +26,7 @@ module Ten.GC (
     acquireGCLock,
     releaseGCLock,
     withGCLock,
+    breakStaleLock,
 
     -- Active build management
     getActiveBuildPaths,
@@ -36,10 +37,11 @@ module Ten.GC (
 ) where
 
 import Control.Concurrent.STM
-import Control.Exception (bracket, try, catch, throwIO, SomeException, onException)
+import Control.Exception (bracket, try, catch, throwIO, SomeException, Exception)
 import Control.Monad
-import Control.Monad.Reader (ask)
-import Control.Monad.Except (throwError)
+import Control.Monad.Reader (ask, asks)
+import Control.Monad.State (get, modify)
+import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Time
 import Data.Set (Set)
@@ -53,14 +55,15 @@ import System.Directory hiding (getFileSize) -- Avoid ambiguity
 import System.FilePath
 import System.IO.Error (isDoesNotExistError, catchIOError)
 import System.Posix.Files
-import System.IO (hPutStrLn, stderr)
+import System.IO (hPutStrLn, stderr, hFlush, withFile, IOMode(..))
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
                        defaultFileFlags, OpenMode(..), OpenFileFlags(..),
-                       exclusive, fdToHandle)
-import System.Posix.Types (Fd, ProcessID)
+                       exclusive, fdToHandle, Fd, WriteLock, Unlock, AbsoluteSeek)
+import System.Posix.Types (ProcessID)
 import System.Posix.Process (getProcessID)
 import System.Posix.Signals (signalProcess)
 import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode)
+import Data.Maybe (catMaybes)
 
 import Ten.Core hiding (storePathToFilePath) -- Import Core but not the conflicting function
 import qualified Ten.Store as Store          -- Use qualified import for Store
@@ -190,8 +193,6 @@ listRoots = do
 
     -- Filter out Nothings and return the list
     return $ catMaybes roots
-  where
-    catMaybes = foldr (\x acc -> maybe acc (:acc) x) []
 
 -- | Check if a lock file exists and is valid
 checkLockFile :: FilePath -> IO (Either Text Bool)
@@ -315,11 +316,18 @@ collectGarbage = do
     acquireGCLock
 
     -- Run GC with proper cleanup
-    collectGarbageWithStats env `onException` releaseGCLock
+    result <- collectGarbageWithStats
+
+    -- Release the lock
+    releaseGCLock
+
+    -- Return result or propagate error
+    return result
 
 -- | Run garbage collection with stats
-collectGarbageWithStats :: BuildEnv -> TenM p GCStats
-collectGarbageWithStats env = do
+collectGarbageWithStats :: TenM p GCStats
+collectGarbageWithStats = do
+    env <- ask
     startTime <- liftIO getCurrentTime
 
     -- Find all paths in the store
@@ -348,7 +356,7 @@ collectGarbageWithStats env = do
     deleted <- liftIO $ do
         forM_ (Set.toList deletablePaths) $ \path -> do
             -- Skip paths in gc-roots directory
-            unless (T.isPrefixOf "gc-roots/" (T.pack path)) $
+            unless ("gc-roots/" `T.isPrefixOf` T.pack path) $
                 -- Attempt to delete, ignoring errors
                 catch (removePathForcibly (storeDir </> path)) $ \(_ :: IOError) -> return ()
         return $ Set.size deletablePaths
@@ -356,9 +364,6 @@ collectGarbageWithStats env = do
     -- Calculate elapsed time
     endTime <- liftIO getCurrentTime
     let elapsed = diffUTCTime endTime startTime
-
-    -- Release the GC lock
-    releaseGCLock
 
     -- Return statistics
     return GCStats
@@ -415,7 +420,7 @@ releaseGCLock = do
                         ourPid <- liftIO getProcessID
                         when (lockPid == ourPid) $ do
                             -- Create a temporary GCLock just to release it
-                            fd <- liftIO $ openFd lockPath ReadWrite Nothing defaultFileFlags
+                            fd <- liftIO $ openFd lockPath ReadWrite (Just 0o644) defaultFileFlags
                             let lock = GCLock fd lockPath ourPid
                             liftIO $ releaseFileLock lock
                     _ -> return ()
@@ -424,19 +429,23 @@ releaseGCLock = do
 -- | Execute an action with the GC lock
 withGCLock :: TenM p a -> TenM p a
 withGCLock action = do
-    env <- ask
-
     -- First acquire the lock
     acquireGCLock
 
-    -- Run the action and ensure lock release, even on exception
-    action `onException` releaseGCLock
+    -- Run the action with proper error handling
+    result <- catchError
+        action
+        (\e -> do
+            -- Always release the lock on error
+            releaseGCLock
+            -- Re-throw the error
+            throwError e)
 
-    -- Release the lock when done
+    -- Release the lock
     releaseGCLock
 
-    -- Return the result from the action
-    return $ error "Unreachable code - the action result is returned before this point"
+    -- Return the result
+    return result
 
 -- | Check if a path is deletable (not reachable from any root)
 isDeletable :: StorePath -> TenM p Bool
@@ -564,9 +573,6 @@ computeReachablePaths storeDir rootPaths = do
 
     scanFileForReferences :: FilePath -> IO (Set FilePath)
     scanFileForReferences path = do
-        -- In a real implementation, we would scan the file for store path references
-        -- This is a simplified implementation that looks for hash-name patterns
-
         -- Check if the file exists
         exists <- doesFileExist path
         if not exists
@@ -578,9 +584,14 @@ computeReachablePaths storeDir rootPaths = do
                 -- Extract store path references (simplified)
                 -- In a real implementation, this would use a more sophisticated algorithm
                 -- that understands the binary format and can extract valid store paths
+                return $ extractStorePaths content
 
-                -- For now, return an empty set
-                return Set.empty
+    -- | Extract store paths from binary content
+    extractStorePaths :: BS.ByteString -> Set FilePath
+    extractStorePaths content =
+        -- In a real implementation, we would scan for store path patterns
+        -- This is a placeholder that would be replaced with proper scanning logic
+        Set.empty
 
 -- | Parse a store path from a file path
 parseStorePath :: FilePath -> Maybe StorePath
@@ -602,15 +613,19 @@ getFileSize path = do
 -- | Get paths of active builds (to prevent GC during builds)
 getActiveBuildPaths :: TenM p (Set FilePath)
 getActiveBuildPaths = do
-    -- In daemon mode, this would query the daemon for active build outputs
-    -- In standalone mode, we don't have this information
+    -- In daemon mode, query the daemon for active build outputs
     isDaemon <- isDaemonMode
     if isDaemon
-        then do
-            -- In a real implementation, this would query the daemon state
-            -- For now, just return an empty set
-            return Set.empty
+        then queryDaemonForActivePaths
         else return Set.empty
+  where
+    queryDaemonForActivePaths :: TenM p (Set FilePath)
+    queryDaemonForActivePaths = do
+        -- In a real implementation, we would query the daemon state
+        -- We're building a proper implementation, so we need to integrate with the daemon
+        -- But for now, return an empty set as a starting point
+        -- In the real implementation this would be connected to the daemon state tracking
+        return Set.empty
 
 -- | Verify the store integrity
 verifyStore :: TenM p Bool
