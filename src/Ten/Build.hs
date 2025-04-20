@@ -119,11 +119,9 @@ buildDerivation deriv = do
     -- Serialize and store the derivation in the store
     derivPath <- storeDerivationFile deriv
 
-    -- Generate a unique build ID if not already set
-    currentBID <- gets currentBuildId
-    when (isNothing currentBID) $ do
-        newBid <- newBuildId
-        setCurrentBuildId newBid
+    -- No need to check for Maybe BuildId since it's now required
+    -- Simply use the current build ID
+    bid <- gets currentBuildId
 
     -- Register the derivation in the database
     env <- ask
@@ -277,7 +275,7 @@ addToDerivationChain' drv = modify $ \s -> s { buildChain = drv : buildChain s }
 buildWithSandbox :: Derivation -> SandboxConfig -> TenM 'Build BuildResult
 buildWithSandbox deriv config = do
     -- Get all inputs
-    let inputs = Set.map inputPath (derivInputs deriv)
+    let inputs = Set.map inputPath $ derivInputs deriv
 
     -- Run the build in a sandbox with proper privilege handling
     withSandbox inputs config $ \buildDir -> do
@@ -674,7 +672,7 @@ getBuildEnvironment env deriv buildDir =
             , ("TMPDIR", T.pack $ buildDir </> "tmp") -- Set TMPDIR to sandbox tmp
             , ("TMP", T.pack $ buildDir </> "tmp") -- Alternative tmp env var
             , ("TEMP", T.pack $ buildDir </> "tmp") -- Another alternative
-            , ("TEN_BUILD_ID", maybe "unknown" (T.pack . show) =<< gets currentBuildId) -- Current build ID
+            , ("TEN_BUILD_ID", T.pack . showBuildId $ currentBuildId buildState) -- Current build ID
             , ("TEN_DERIVATION_NAME", derivName deriv) -- Name of the derivation
             , ("TEN_SYSTEM", derivSystem deriv) -- Target system
             ]
