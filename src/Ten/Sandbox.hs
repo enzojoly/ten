@@ -62,7 +62,6 @@ import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
 import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
-import System.Posix.User (UserEntry, GroupEntry)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO
@@ -432,22 +431,19 @@ setupSandbox sandboxDir config = do
         uid <- User.getRealUserID
         when (uid == 0 && not (sandboxPrivileged config)) $ do
             -- Get the user/group IDs for the sandbox user/group
-            userEntry <- safeGetUserEntry (sandboxUser config)
-            groupEntry <- safeGetGroupEntry (sandboxGroup config)
-
-            let ownerId = User.userID userEntry
-            let groupId = User.groupID groupEntry
+            uid' <- safeGetUserUID (sandboxUser config)
+            gid <- safeGetGroupGID (sandboxGroup config)
 
             -- Set ownership of key directories
-            setOwnerAndGroup sandboxDir ownerId groupId
-            setOwnerAndGroup (sandboxDir </> "out") ownerId groupId
-            setOwnerAndGroup (sandboxDir </> "tmp") ownerId groupId
-            setOwnerAndGroup (sandboxDir </> "build") ownerId groupId
+            setOwnerAndGroup sandboxDir uid' gid
+            setOwnerAndGroup (sandboxDir </> "out") uid' gid
+            setOwnerAndGroup (sandboxDir </> "tmp") uid' gid
+            setOwnerAndGroup (sandboxDir </> "build") uid' gid
 
             -- Set ownership for return path if enabled
             when (sandboxReturnSupport config) $ do
                 let returnDir = takeDirectory $ returnDerivationPath sandboxDir
-                setOwnerAndGroup returnDir ownerId groupId
+                setOwnerAndGroup returnDir uid' gid
 
     -- Set up namespaces if enabled and running as root
     isRoot <- liftIO $ do
@@ -477,32 +473,47 @@ setupSandbox sandboxDir config = do
 
     logMsg 2 $ "Sandbox setup completed: " <> T.pack sandboxDir
 
--- | Safe wrapper for getting user entry with fallback
-safeGetUserEntry :: String -> IO UserEntry
-safeGetUserEntry username = do
+-- | Safely get a user's UID with fallback options
+safeGetUserUID :: String -> IO UserID
+safeGetUserUID username = do
     result <- try $ User.getUserEntryForName username
     case result of
         Left (_ :: SomeException) -> do
             -- Fallback to nobody
             hPutStrLn stderr $ "Warning: User " ++ username ++ " not found, falling back to nobody"
-            User.getUserEntryForName "nobody" `catch` \(_ :: SomeException) ->
-                -- Ultimate fallback to current user if even nobody doesn't exist
-                User.getUserEntryForID =<< User.getRealUserID
-        Right entry -> return entry
+            nobodyResult <- try $ User.getUserEntryForName "nobody"
+            case nobodyResult of
+                Left (_ :: SomeException) -> do
+                    -- Ultimate fallback to current user if even nobody doesn't exist
+                    User.getRealUserID
+                Right entry ->
+                    return $ User.userID entry
+        Right entry ->
+            return $ User.userID entry
 
--- | Safe wrapper for getting group entry with fallback
-safeGetGroupEntry :: String -> IO GroupEntry
-safeGetGroupEntry groupname = do
+-- | Safely get a group's GID with fallback options
+safeGetGroupGID :: String -> IO GroupID
+safeGetGroupGID groupname = do
     result <- try $ User.getGroupEntryForName groupname
     case result of
         Left (_ :: SomeException) -> do
             -- Fallback to nogroup
             hPutStrLn stderr $ "Warning: Group " ++ groupname ++ " not found, falling back to nogroup"
-            User.getGroupEntryForName "nogroup" `catch` \(_ :: SomeException) ->
-                User.getGroupEntryForName "nobody" `catch` \(_ :: SomeException) ->
-                    -- Ultimate fallback to current group if even nogroup/nobody doesn't exist
-                    User.getGroupEntryForID =<< User.getRealGroupID
-        Right entry -> return entry
+            nogroupResult <- try $ User.getGroupEntryForName "nogroup"
+            case nogroupResult of
+                Left (_ :: SomeException) -> do
+                    -- Try nobody as group
+                    nobodyResult <- try $ User.getGroupEntryForName "nobody"
+                    case nobodyResult of
+                        Left (_ :: SomeException) -> do
+                            -- Ultimate fallback to current group
+                            User.getRealGroupID
+                        Right entry ->
+                            return $ User.groupID entry
+                Right entry ->
+                    return $ User.groupID entry
+        Right entry ->
+            return $ User.groupID entry
 
 -- | Mount /proc in the sandbox
 mountProc :: FilePath -> IO ()
@@ -1036,8 +1047,8 @@ dropSandboxPrivileges userName groupName = do
     -- Only proceed if we're running as root
     when (euid == 0) $ do
         -- Get user and group info
-        userEntry <- safeGetUserEntry userName
-        groupEntry <- safeGetGroupEntry groupName
+        uid <- safeGetUserUID userName
+        gid <- safeGetGroupGID groupName
 
         -- Drop all capabilities first
         dropAllCapabilities
@@ -1046,10 +1057,10 @@ dropSandboxPrivileges userName groupName = do
         setResourceLimits
 
         -- Set the group ID first (must be done before dropping user privileges)
-        User.setGroupID (User.groupID groupEntry)
+        User.setGroupID gid
 
         -- Then set the user ID
-        User.setUserID (User.userID userEntry)
+        User.setUserID uid
 
         -- Verify the change
         newEuid <- User.getEffectiveUserID
