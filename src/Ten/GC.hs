@@ -65,11 +65,11 @@ import System.Posix.Process (getProcessID)
 import System.Posix.Signals (signalProcess)
 import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode)
 import Data.Maybe (catMaybes)
-import System.Posix.IO.ByteString (createLink, removeLink)
+import System.Posix.Files.ByteString (createLink, removeLink)
+import System.IO (SeekMode(AbsoluteSeek))
 import qualified Data.ByteString.Char8 as BC
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import System.Posix.IO (SeekMode(AbsoluteSeek))
 
 import Ten.Core hiding (storePathToFilePath) -- Import Core but not the conflicting function
 import qualified Ten.Store as Store          -- Use qualified import for Store
