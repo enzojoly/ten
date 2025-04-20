@@ -26,7 +26,6 @@ module Ten.Derivation (
     -- Derivation storage
     storeDerivation,
     retrieveDerivation,
-    storeDerivationFile,
 
     -- Serialization
     serializeDerivation,
@@ -46,7 +45,11 @@ module Ten.Derivation (
     newDerivationChain,
     Ten.Core.addToDerivationChain,
     Ten.Core.isInDerivationChain,
-    derivationChainLength
+    derivationChainLength,
+
+    -- Utilities for external use
+    parseStorePathText,
+    storePathToText
 ) where
 
 import Control.Concurrent.STM
@@ -88,8 +91,7 @@ import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflic
 import Ten.Store
 import Ten.Sandbox (returnDerivationPath, prepareSandboxEnvironment,
                    SandboxConfig, withSandbox, defaultSandboxConfig)
-import Ten.DB.Core (initDatabase, closeDatabase)
-import Ten.DB.Derivations (registerDerivationFile, registerValidPath, storeDerivation)
+import Ten.DB.Core (initDatabase, closeDatabase, dbQuery, dbQuery_, dbExecute)
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -215,24 +217,13 @@ storeDerivation drv = do
 storePathToText :: StorePath -> Text
 storePathToText (StorePath hash name) = hash <> "-" <> name
 
--- | Register a derivation file in the database and store
-storeDerivationFile :: Derivation -> TenM p StorePath
-storeDerivationFile drv = do
-    -- Store the derivation in the content store
-    derivPath <- storeDerivation drv
-
-    -- Register the derivation in the database using the proper DB module function
-    env <- ask
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
-
-    -- Use the dedicated function from Ten.DB.Derivations for this operation
-    liftIO $ registerDerivationFile db drv derivPath
-
-    -- Close the database
-    liftIO $ closeDatabase db
-
-    -- Return the store path
-    return derivPath
+-- | Parse a store path from text
+parseStorePathText :: Text -> Maybe StorePath
+parseStorePathText path =
+    case T.breakOn "-" path of
+        (hash, name) | not (T.null name) ->
+            Just $ StorePath hash (T.drop 1 name)
+        _ -> Nothing
 
 -- | Retrieve a derivation from the store
 retrieveDerivation :: StorePath -> TenM p (Maybe Derivation)
@@ -254,45 +245,11 @@ retrieveDerivation path = do
                     return Nothing
                 Right drv -> return $ Just drv
 
--- | Retrieve a derivation by hash from the database
-retrieveDerivationByHash :: Text -> TenM p (Maybe Derivation)
-retrieveDerivationByHash hash = do
-    env <- ask
-
-    -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
-
-    -- Query for store path
-    storePaths <- liftIO $ Ten.DB.Core.dbQuery db
-        "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only hash) :: IO [Only Text]
-
-    -- Parse store path and retrieve derivation
-    derivResult <- case storePaths of
-        [Only pathText] ->
-            case parseStorePathText pathText of
-                Just sp -> retrieveDerivation sp
-                Nothing -> return Nothing
-        _ -> return Nothing
-
-    -- Close the database
-    liftIO $ closeDatabase db
-
-    return derivResult
-
--- | Parse a store path from text
-parseStorePathText :: Text -> Maybe StorePath
-parseStorePathText path =
-    case T.breakOn "-" path of
-        (hash, name) | not (T.null name) ->
-            Just $ StorePath hash (T.drop 1 name)
-        _ -> Nothing
-
 -- | Instantiate a derivation for building
 instantiateDerivation :: Derivation -> TenM 'Build ()
 instantiateDerivation deriv = do
-    -- Ensure the derivation is stored in the content store
-    derivPath <- storeDerivationFile deriv
+    -- First store the derivation in the content-addressed store
+    derivPath <- storeDerivation deriv
 
     -- Verify inputs exist
     forM_ (derivInputs deriv) $ \input -> do
@@ -395,8 +352,8 @@ buildToGetInnerDerivation drv = do
                         -- Add proof that we successfully got a returned derivation
                         addProof RecursionProof
 
-                        -- Store the inner derivation in the database
-                        _ <- storeDerivationFile innerDrv
+                        -- Store the inner derivation
+                        _ <- storeDerivation innerDrv
 
                         return innerDrv
             else

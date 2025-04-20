@@ -7,6 +7,7 @@ module Ten.DB.Derivations (
     storeDerivation,
     retrieveDerivation,
     registerDerivationFile,
+    storeDerivationInDB,
 
     -- Output mapping
     registerDerivationOutput,
@@ -23,6 +24,7 @@ module Ten.DB.Derivations (
     isDerivationRegistered,
     listRegisteredDerivations,
     getDerivationPath,
+    retrieveDerivationByHash,
 
     -- Path validity
     registerValidPath,
@@ -40,6 +42,8 @@ module Ten.DB.Derivations (
 
 import Control.Exception (try, catch, throwIO, SomeException)
 import Control.Monad (forM, forM_, when, unless, void)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (ask)
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe, listToMaybe, catMaybes)
 import Data.Set (Set)
@@ -67,8 +71,6 @@ import System.Time.Extra (offsetTime, showDuration)
 import Ten.DB.Core
 import Ten.Core
 import Ten.Derivation
-import Ten.Hash
-import Ten.Store (storePathToFilePath)
 
 -- | Information about a stored derivation
 data DerivationInfo = DerivationInfo {
@@ -127,18 +129,6 @@ instance FromRow DerivationReference where
             Nothing -> SQLite.returnError SQLite.ConversionFailed
                        "StorePath" "Invalid store path format"
 
--- | Parse a store path from text
-parseStorePathText :: Text -> Maybe StorePath
-parseStorePathText path =
-    case T.breakOn "-" path of
-        (hash, name) | not (T.null name) ->
-            Just $ StorePath hash (T.drop 1 name)
-        _ -> Nothing
-
--- | Convert a store path to text
-storePathToText :: StorePath -> Text
-storePathToText (StorePath hash name) = hash <> "-" <> name
-
 -- | Store a derivation in the database
 storeDerivation :: Database -> Derivation -> StorePath -> IO Int64
 storeDerivation db derivation storePath = dbWithTransaction db ReadWrite $ \_ -> do
@@ -150,7 +140,7 @@ storeDerivation db derivation storePath = dbWithTransaction db ReadWrite $ \_ ->
             -- Get the ID
             [Only derivId] <- dbQuery db
                 "SELECT id FROM Derivations WHERE hash = ?"
-                (Only (derivHash derivation))
+                (Only (derivHash derivation)) :: IO [Only Int64]
             return derivId
         else do
             -- Insert new derivation
@@ -159,12 +149,27 @@ storeDerivation db derivation storePath = dbWithTransaction db ReadWrite $ \_ ->
                 (derivHash derivation, storePathToText storePath)
 
             -- Get the last inserted ID
-            [Only derivId] <- dbQuery_ db "SELECT last_insert_rowid()"
+            [Only derivId] <- dbQuery_ db "SELECT last_insert_rowid()" :: IO [Only Int64]
 
             -- Register the derivation path as valid
             registerValidPath db storePath (Just storePath)
 
             return derivId
+
+-- | New function to handle database operations for storing a derivation
+-- This replaces Ten.Derivation.storeDerivationFile's database operations
+storeDerivationInDB :: Derivation -> StorePath -> FilePath -> IO Int64
+storeDerivationInDB drv derivPath dbPath = do
+    -- Initialize database
+    db <- initDatabase dbPath 5000
+
+    -- Register the derivation file using the existing function
+    derivId <- registerDerivationFile db drv derivPath
+
+    -- Close the database
+    closeDatabase db
+
+    return derivId
 
 -- | Register a derivation file in the database
 registerDerivationFile :: Database -> Derivation -> StorePath -> IO Int64
@@ -188,7 +193,7 @@ retrieveDerivation db hash = do
     -- Query for derivation
     derivRows <- dbQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d WHERE d.hash = ?"
-        (Only hash)
+        (Only hash) :: IO [DerivationInfo]
 
     case derivRows of
         [] -> return Nothing
@@ -206,6 +211,49 @@ retrieveDerivation db hash = do
                     return Nothing
                 Right drv -> return $ Just drv
         _ -> error "Multiple derivations with same hash - database corruption"
+
+-- | Retrieve a derivation by hash
+-- This was moved from Ten.Derivation to avoid circular dependencies
+retrieveDerivationByHash :: FilePath -> Text -> IO (Maybe Derivation)
+retrieveDerivationByHash dbPath hash = do
+    -- Open database
+    db <- initDatabase dbPath 5000
+
+    -- Query for store path
+    storePaths <- dbQuery db
+        "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
+        (Only hash) :: IO [Only Text]
+
+    -- Get the derivation
+    result <- case storePaths of
+        [Only pathText] ->
+            case parseStorePathText pathText of
+                Just sp -> do
+                    derivMaybe <- retrieveDerivationFromStore sp
+                    return derivMaybe
+                Nothing -> return Nothing
+        _ -> return Nothing
+
+    -- Close the database
+    closeDatabase db
+
+    return result
+  where
+    retrieveDerivationFromStore :: StorePath -> IO (Maybe Derivation)
+    retrieveDerivationFromStore sp = do
+        -- Construct the full path
+        let fullPath = "/var/lib/ten/store/" ++ T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
+
+        -- Check if it exists
+        exists <- doesFileExist fullPath
+        if not exists
+            then return Nothing
+            else do
+                -- Read and deserialize
+                content <- BS.readFile fullPath
+                case deserializeDerivation content of
+                    Left _ -> return Nothing
+                    Right drv -> return $ Just drv
 
 -- | Read and deserialize a derivation file
 readDerivationFile :: StorePath -> IO (Either Text Derivation)
@@ -242,7 +290,7 @@ getOutputsForDerivation :: Database -> Int64 -> IO [OutputInfo]
 getOutputsForDerivation db derivId = do
     dbQuery db
         "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
-        (Only derivId)
+        (Only derivId) :: IO [OutputInfo]
 
 -- | Find the derivation that produced a particular output
 getDerivationForOutput :: Database -> StorePath -> IO (Maybe DerivationInfo)
@@ -251,7 +299,7 @@ getDerivationForOutput db outputPath = do
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
         \JOIN Outputs o ON d.id = o.derivation_id \
         \WHERE o.path = ?"
-        (Only (storePathToText outputPath))
+        (Only (storePathToText outputPath)) :: IO [DerivationInfo]
 
     return $ listToMaybe results
 
@@ -267,7 +315,7 @@ findDerivationsByOutputs db outputPaths = do
         "SELECT DISTINCT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
         \JOIN Outputs o ON d.id = o.derivation_id \
         \WHERE o.path IN (?);"
-        (SQLite.In pathTexts)
+        (SQLite.In pathTexts) :: IO [DerivationInfo]
 
     -- Now load each derivation
     derivations <- forM derivInfos $ \derivInfo -> do
@@ -291,7 +339,7 @@ getDerivationReferences :: Database -> StorePath -> IO [StorePath]
 getDerivationReferences db path = do
     results <- dbQuery db
         "SELECT reference FROM References WHERE referrer = ?"
-        (Only (storePathToText path))
+        (Only (storePathToText path)) :: IO [Only Text]
 
     return $ map (\(Only t) ->
         fromMaybe (error $ "Invalid store path: " ++ T.unpack t) (parseStorePathText t)) results
@@ -301,7 +349,7 @@ getReferrers :: Database -> StorePath -> IO [StorePath]
 getReferrers db path = do
     results <- dbQuery db
         "SELECT referrer FROM References WHERE reference = ?"
-        (Only (storePathToText path))
+        (Only (storePathToText path)) :: IO [Only Text]
 
     return $ map (\(Only t) ->
         fromMaybe (error $ "Invalid store path: " ++ T.unpack t) (parseStorePathText t)) results
@@ -311,20 +359,20 @@ isDerivationRegistered :: Database -> Text -> IO Bool
 isDerivationRegistered db hash = do
     results <- dbQuery db
         "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only hash)
+        (Only hash) :: IO [Only Int]
     return $ not (null results)
 
 -- | List all registered derivations
 listRegisteredDerivations :: Database -> IO [DerivationInfo]
 listRegisteredDerivations db = do
-    dbQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+    dbQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC" :: IO [DerivationInfo]
 
 -- | Get the store path for a derivation by hash
 getDerivationPath :: Database -> Text -> IO (Maybe StorePath)
 getDerivationPath db hash = do
     results <- dbQuery db
         "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only hash)
+        (Only hash) :: IO [Only Text]
 
     case results of
         [Only path] -> return $ parseStorePathText path
@@ -354,10 +402,10 @@ isPathValid :: Database -> StorePath -> IO Bool
 isPathValid db path = do
     results <- dbQuery db
         "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
-        (Only (storePathToText path))
+        (Only (storePathToText path)) :: IO [Only Int]
 
     case results of
-        [Only valid] -> return (valid == (1 :: Int))
+        [Only valid] -> return (valid == 1)
         _ -> return False
 
 -- | Register a derivation with all its outputs in a single transaction

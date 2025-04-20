@@ -1,0 +1,14 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+Module graph contains a cycle:
+        module ‘Ten.DB.Derivations’ (src/Ten/DB/Derivations.hs)
+        imports module ‘Ten.Derivation’ (src/Ten/Derivation.hs)
+  which imports module ‘Ten.DB.Derivations’ (src/Ten/DB/Derivations.hs)
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+
