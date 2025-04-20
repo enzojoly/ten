@@ -74,15 +74,15 @@ import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
 import Foreign.Storable (peek, poke)
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 
 import Ten.Core
 import qualified Ten.Store as Store
 
 -- Helper function to convert BuildId to String
-showBuildId :: Maybe BuildId -> String
-showBuildId Nothing = "unknown"
-showBuildId (Just (BuildId _)) = "build"
-showBuildId (Just (BuildIdFromInt n)) = "build-" ++ show n
+showBuildId :: BuildId -> String
+showBuildId (BuildId _) = "build"
+showBuildId (BuildIdFromInt n) = "build-" ++ show n
 
 -- RLimit structure for resource limits
 data RLimit = RLimit {
@@ -376,18 +376,13 @@ setRecursiveWritePermissions path = do
 -- | Create and get a sandbox directory path
 getSandboxDir :: BuildEnv -> TenM 'Build FilePath
 getSandboxDir env = do
-    bid <- gets currentBuildId
+    bid <- gets currentBuildId  -- Now bid is a BuildId, not Maybe BuildId
     pid <- liftIO getProcessID
     let baseDir = workDir env </> "sandbox"
     liftIO $ createDirectoryIfMissing True baseDir
 
-    -- Generate a unique directory name
-    uniqueName <- case bid of
-        Just buildId -> return $ "build-" ++ showBuildId bid
-        Nothing -> do
-            -- Use process ID for standalone mode with timestamp for uniqueness
-            timestamp <- liftIO $ getPOSIXTime
-            return $ "process-" ++ show pid ++ "-" ++ show (round timestamp :: Integer)
+    -- Generate a unique directory name using the BuildId directly
+    let uniqueName = "build-" ++ showBuildId bid
 
     let uniqueDir = baseDir </> uniqueName
     liftIO $ createDirectoryIfMissing True uniqueDir
@@ -399,16 +394,6 @@ getSandboxDir env = do
         setPermissions uniqueDir $ setOwnerWritable True perms
 
     return uniqueDir
-
--- | Get POSIX timestamp
-getPOSIXTime :: IO Double
-getPOSIXTime = do
-    current <- getCurrentTime
-    return $ utcTimeToPOSIXSeconds current
-  where
-    -- Placeholder implementation - in a real program you'd use Data.Time.Clock.POSIX
-    getCurrentTime = return undefined
-    utcTimeToPOSIXSeconds = const 1234567890.0
 
 -- | Setup a sandbox directory with the proper structure
 setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build ()
@@ -1018,7 +1003,6 @@ sandboxedProcessConfig sandboxDir programPath args envVars config =
         }
 
 -- | Prepare environment variables for sandbox
--- | Enhanced with consolidated functionality from Ten.Derivation implementation
 prepareSandboxEnvironment :: BuildEnv -> BuildState -> FilePath -> Map Text Text -> Map Text Text
 prepareSandboxEnvironment env buildState sandboxDir extraEnv =
     Map.unions
@@ -1055,7 +1039,7 @@ prepareSandboxEnvironment env buildState sandboxDir extraEnv =
 
     -- Build information variables
     buildInfoEnv = Map.fromList
-        [ ("TEN_BUILD_ID", maybe "unknown" (T.pack . showBuildId) $ currentBuildId buildState)
+        [ ("TEN_BUILD_ID", T.pack $ showBuildId $ currentBuildId buildState)
         ]
 
 -- | Drop privileges to run as unprivileged user

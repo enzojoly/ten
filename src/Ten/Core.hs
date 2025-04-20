@@ -125,6 +125,7 @@ import System.Posix.Types (ProcessID)
 import Text.Read (readPrec)
 import qualified Text.Read as Read
 import System.IO.Unsafe (unsafePerformIO)
+import Control.Concurrent (ThreadId)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -304,26 +305,20 @@ data ConnectionState = ConnectionState {
     csHandle :: Handle,                     -- ^ Handle for socket I/O
     csUserId :: UserId,                     -- ^ Authenticated user ID
     csToken :: AuthToken,                   -- ^ Authentication token
-    csRequestMap :: IORef (Map RequestId (MVar Response)), -- ^ Map of pending requests
-    csNextReqId :: IORef RequestId,         -- ^ Next request ID
+    csRequestMap :: TVar (Map RequestId (MVar Response)), -- ^ Map of pending requests
+    csNextReqId :: TVar RequestId,          -- ^ Next request ID
     csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
-    csShutdown :: IORef Bool                -- ^ Flag to indicate connection shutdown
+    csShutdown :: TVar Bool                 -- ^ Flag to indicate connection shutdown
 }
 
 -- | Request ID type
 type RequestId = Int
 
--- | Request type (stub for compilation)
+-- | Request type (for communication with daemon)
 data Request = Request deriving (Show, Eq)
 
--- | Response type (stub for compilation)
+-- | Response type (for communication with daemon)
 data Response = Response deriving (Show, Eq)
-
--- | Thread ID type (stub for compilation)
-type ThreadId = Int
-
--- | IORef type (stub for compilation)
-type IORef a = TVar a
 
 -- | Running mode for Ten
 data RunMode
@@ -394,7 +389,7 @@ data BuildState = BuildState
     , buildProofs :: [Proof 'Build]      -- Accumulated proofs
     , buildInputs :: Set StorePath       -- Input paths for current build
     , buildOutputs :: Set StorePath      -- Output paths for current build
-    , currentBuildId :: Maybe BuildId    -- Current build identifier
+    , currentBuildId :: BuildId          -- Current build identifier (changed from Maybe BuildId)
     , buildChain :: [Derivation]         -- Chain of return-continuation derivations
     , recursionDepth :: Int              -- Tracks recursion depth for cycles
     } deriving (Show)
@@ -450,14 +445,14 @@ initDaemonEnv wd sp user = (initBuildEnv wd sp)
     , userName = user
     }
 
--- | Initialize build state for a given phase
-initBuildState :: Phase -> BuildState
-initBuildState phase = BuildState
+-- | Initialize build state for a given phase with a BuildId
+initBuildState :: Phase -> BuildId -> BuildState
+initBuildState phase bid = BuildState
     { currentPhase = phase
     , buildProofs = []
     , buildInputs = Set.empty
     , buildOutputs = Set.empty
-    , currentBuildId = Nothing
+    , currentBuildId = bid
     , buildChain = []
     , recursionDepth = 0
     }
@@ -468,11 +463,15 @@ runTen m env state = runExceptT $ runStateT (runReaderT (runTenM m) env) state
 
 -- | Execute an evaluation-phase computation
 evalTen :: TenM 'Eval a -> BuildEnv -> IO (Either BuildError (a, BuildState))
-evalTen m env = runTen m env (initBuildState Eval)
+evalTen m env = do
+    bid <- BuildId <$> newUnique  -- Generate a new build ID
+    runTen m env (initBuildState Eval bid)
 
 -- | Execute a build-phase computation
 buildTen :: TenM 'Build a -> BuildEnv -> IO (Either BuildError (a, BuildState))
-buildTen m env = runTen m env (initBuildState Build)
+buildTen m env = do
+    bid <- BuildId <$> newUnique  -- Generate a new build ID
+    runTen m env (initBuildState Build bid)
 
 -- | Safely transition between phases
 transitionPhase :: PhaseTransition p q -> TenM p a -> TenM q a
@@ -507,7 +506,7 @@ newBuildId = liftIO $ BuildId <$> newUnique
 
 -- | Set the current build ID
 setCurrentBuildId :: BuildId -> TenM p ()
-setCurrentBuildId bid = modify $ \s -> s { currentBuildId = Just bid }
+setCurrentBuildId bid = modify $ \s -> s { currentBuildId = bid }
 
 -- | Add a derivation to the build chain
 addToDerivationChain :: Derivation -> TenM p ()
