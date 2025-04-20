@@ -15,6 +15,7 @@ module Ten.DB.Core (
 
     -- Transaction management
     dbWithTransaction,
+    withTransaction,
 
     -- Low-level query functions
     dbExecute,
@@ -170,6 +171,10 @@ dbWithTransaction db mode action = do
                 (\(_ :: SomeException) -> return ())
             throwIO $ DBTransactionError $ T.pack $ "Transaction failed: " ++ show e)
 
+-- | Alias for dbWithTransaction for backward compatibility
+withTransaction :: Database -> TransactionMode -> (Database -> IO a) -> IO a
+withTransaction = dbWithTransaction
+
 -- | Roll back transaction on error
 rollbackOnError :: Database -> IO ()
 rollbackOnError db = catch
@@ -177,15 +182,14 @@ rollbackOnError db = catch
     (\(e :: SomeException) ->
         putStrLn $ "Warning: Error rolling back transaction: " ++ show e)
 
--- | Execute a statement with parameters
+-- | Execute a statement with parameters, returning the number of rows affected
 dbExecute :: ToRow q => Database -> Query -> q -> IO Int64
 dbExecute db query params = retryOnBusy db $
     SQLite.execute (dbConn db) query params
 
--- | Execute a statement without parameters
-dbExecute_ :: Database -> Query -> IO ()
-dbExecute_ db query = retryOnBusy db $
-    SQLite.execute_ (dbConn db) query
+-- | Execute a statement with parameters, discarding the result
+dbExecute_ :: ToRow q => Database -> Query -> q -> IO ()
+dbExecute_ db query params = void $ dbExecute db query params
 
 -- | Execute a query with parameters
 dbQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> IO [r]
@@ -260,11 +264,11 @@ updateSchemaVersion db version = do
     case hasVersionTable of
         [(count :: Int)] | count > 0 -> do
             -- Table exists, update the version
-            dbExecute db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
+            dbExecute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
         _ -> do
             -- Table doesn't exist, create it
             dbExecute_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
-            dbExecute db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
+            dbExecute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
 
 -- | Initialize the database schema
 initializeSchema :: Database -> IO ()
