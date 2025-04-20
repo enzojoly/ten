@@ -17,11 +17,13 @@ module Ten.Daemon.Protocol (
 
     -- Authentication types
     UserCredentials(..),
+    AuthRequest(..),
     AuthResult(..),
 
     -- Build tracking
     BuildRequestInfo(..),
     BuildStatusUpdate(..),
+    defaultBuildRequestInfo,
 
     -- Derivation operations
     StoreDerivationRequest(..),
@@ -31,8 +33,12 @@ module Ten.Daemon.Protocol (
     DerivationOutputMappingResponse(..),
 
     -- GC status request/response
-    GCStatusRequest(..),
-    GCStatusResponse(..),
+    GCStatusRequestData(..),
+    GCStatusResponseData(..),
+
+    -- Request & response type tags
+    RequestTag(..),
+    ResponseTag(..),
 
     -- Serialization functions
     serializeRequest,
@@ -169,10 +175,33 @@ instance Aeson.FromJSON UserCredentials where
         token <- v .: "token"
         return UserCredentials{..}
 
+-- | Authentication request
+data AuthRequest = AuthRequest {
+    authVersion :: ProtocolVersion,
+    authUser :: Text,
+    authToken :: Text
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON AuthRequest where
+    toJSON AuthRequest{..} = Aeson.object [
+            "version" .= authVersion,
+            "user" .= authUser,
+            "token" .= authToken
+        ]
+
+instance Aeson.FromJSON AuthRequest where
+    parseJSON = Aeson.withObject "AuthRequest" $ \v -> do
+        authVersion <- v .: "version"
+        authUser <- v .: "user"
+        authToken <- v .: "token"
+        return AuthRequest{..}
+
 -- | Authentication result
 data AuthResult
     = AuthAccepted UserId AuthToken
     | AuthRejected Text
+    | AuthSuccess UserId AuthToken  -- For backwards compatibility
+    | AuthFailure Text              -- For backwards compatibility
     deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON AuthResult where
@@ -183,6 +212,15 @@ instance Aeson.ToJSON AuthResult where
         ]
     toJSON (AuthRejected reason) = Aeson.object [
             "status" .= ("rejected" :: Text),
+            "reason" .= reason
+        ]
+    toJSON (AuthSuccess (UserId uid) (AuthToken token)) = Aeson.object [
+            "status" .= ("success" :: Text),
+            "userId" .= uid,
+            "token" .= token
+        ]
+    toJSON (AuthFailure reason) = Aeson.object [
+            "status" .= ("failure" :: Text),
             "reason" .= reason
         ]
 
@@ -197,6 +235,13 @@ instance Aeson.FromJSON AuthResult where
             "rejected" -> do
                 reason <- v .: "reason"
                 return $ AuthRejected reason
+            "success" -> do
+                uid <- v .: "userId"
+                token <- v .: "token"
+                return $ AuthSuccess (UserId uid) (AuthToken token)
+            "failure" -> do
+                reason <- v .: "reason"
+                return $ AuthFailure reason
             _ -> fail $ "Unknown auth status: " ++ T.unpack status
 
 -- | Request to store a derivation
@@ -475,41 +520,101 @@ instance Aeson.FromJSON BuildStatusUpdate where
                 _ -> fail $ "Unknown status type: " ++ T.unpack statusType
             ) obj
 
--- | GC Status Request
-data GCStatusRequest = GCStatusRequest {
+-- | GC Status Request Data
+data GCStatusRequestData = GCStatusRequestData {
     forceCheck :: Bool  -- Whether to force recheck the lock file
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusRequest where
-    toJSON GCStatusRequest{..} = Aeson.object [
+instance Aeson.ToJSON GCStatusRequestData where
+    toJSON GCStatusRequestData{..} = Aeson.object [
             "forceCheck" .= forceCheck
         ]
 
-instance Aeson.FromJSON GCStatusRequest where
-    parseJSON = Aeson.withObject "GCStatusRequest" $ \v -> do
+instance Aeson.FromJSON GCStatusRequestData where
+    parseJSON = Aeson.withObject "GCStatusRequestData" $ \v -> do
         forceCheck <- v .: "forceCheck"
-        return GCStatusRequest{..}
+        return GCStatusRequestData{..}
 
--- | GC Status Response
-data GCStatusResponse = GCStatusResponse {
+-- | GC Status Response Data
+data GCStatusResponseData = GCStatusResponseData {
     gcRunning :: Bool,           -- Whether GC is currently running
     gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
     gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusResponse where
-    toJSON GCStatusResponse{..} = Aeson.object [
+instance Aeson.ToJSON GCStatusResponseData where
+    toJSON GCStatusResponseData{..} = Aeson.object [
             "running" .= gcRunning,
             "owner" .= gcOwner,
             "lockTime" .= gcLockTime
         ]
 
-instance Aeson.FromJSON GCStatusResponse where
-    parseJSON = Aeson.withObject "GCStatusResponse" $ \v -> do
+instance Aeson.FromJSON GCStatusResponseData where
+    parseJSON = Aeson.withObject "GCStatusResponseData" $ \v -> do
         gcRunning <- v .: "running"
         gcOwner <- v .: "owner"
         gcLockTime <- v .: "lockTime"
-        return GCStatusResponse{..}
+        return GCStatusResponseData{..}
+
+-- Request tags to distinguish different types of requests
+data RequestTag =
+      TagAuth
+    | TagBuild
+    | TagEval
+    | TagBuildDerivation
+    | TagBuildStatus
+    | TagCancelBuild
+    | TagQueryBuildOutput
+    | TagListBuilds
+    | TagStoreAdd
+    | TagStoreVerify
+    | TagStorePath
+    | TagStoreList
+    | TagStoreDerivation
+    | TagRetrieveDerivation
+    | TagQueryDerivation
+    | TagGetDerivationForOutput
+    | TagListDerivations
+    | TagGC
+    | TagGCStatus
+    | TagAddGCRoot
+    | TagRemoveGCRoot
+    | TagListGCRoots
+    | TagPing
+    | TagShutdown
+    | TagStatus
+    | TagConfig
+    deriving (Show, Eq, Generic)
+
+-- Response tags to distinguish different types of responses
+data ResponseTag =
+      TagAuthResponse
+    | TagBuildStartedResponse
+    | TagBuildResponse
+    | TagBuildStatusResponse
+    | TagBuildOutputResponse
+    | TagBuildListResponse
+    | TagStoreAddResponse
+    | TagStoreVerifyResponse
+    | TagStorePathResponse
+    | TagStoreListResponse
+    | TagDerivationResponse
+    | TagDerivationStoredResponse
+    | TagDerivationRetrievedResponse
+    | TagDerivationQueryResponse
+    | TagDerivationOutputResponse
+    | TagDerivationListResponse
+    | TagGCResponse
+    | TagGCStatusResponse
+    | TagGCRootAddedResponse
+    | TagGCRootRemovedResponse
+    | TagGCRootsListResponse
+    | TagPongResponse
+    | TagShutdownResponse
+    | TagStatusResponse
+    | TagConfigResponse
+    | TagErrorResponse
+    deriving (Show, Eq, Generic)
 
 -- | Daemon request types
 data DaemonRequest
@@ -559,9 +664,9 @@ data DaemonRequest
     | StoreListRequest
 
     -- Derivation operations
-    | StoreDerivationRequest StoreDerivationRequest
-    | RetrieveDerivationRequest RetrieveDerivationRequest
-    | QueryDerivationRequest QueryDerivationRequest
+    | StoreDerivationCmd StoreDerivationRequest
+    | RetrieveDerivationCmd RetrieveDerivationRequest
+    | QueryDerivationCmd QueryDerivationRequest
     | GetDerivationForOutputRequest {
         getDerivationForPath :: Text
       }
@@ -573,7 +678,7 @@ data DaemonRequest
     | GCRequest {
         gcForce :: Bool  -- Force GC (run even if unsafe)
       }
-    | GCStatusRequest GCStatusRequest
+    | GCStatusCmd GCStatusRequestData
     | AddGCRootRequest {
         rootPath :: StorePath,
         rootName :: Text,
@@ -660,17 +765,17 @@ instance Aeson.ToJSON DaemonRequest where
                 "type" .= ("store-list" :: Text)
             ]
 
-        StoreDerivationRequest req -> Aeson.object [
+        StoreDerivationCmd req -> Aeson.object [
                 "type" .= ("store-derivation" :: Text),
                 "request" .= req
             ]
 
-        RetrieveDerivationRequest req -> Aeson.object [
+        RetrieveDerivationCmd req -> Aeson.object [
                 "type" .= ("retrieve-derivation" :: Text),
                 "request" .= req
             ]
 
-        QueryDerivationRequest req -> Aeson.object [
+        QueryDerivationCmd req -> Aeson.object [
                 "type" .= ("query-derivation" :: Text),
                 "request" .= req
             ]
@@ -690,7 +795,7 @@ instance Aeson.ToJSON DaemonRequest where
                 "force" .= gcForce
             ]
 
-        GCStatusRequest req -> Aeson.object [
+        GCStatusCmd req -> Aeson.object [
                 "type" .= ("gc-status" :: Text),
                 "request" .= req
             ]
@@ -807,15 +912,15 @@ instance Aeson.FromJSON DaemonRequest where
 
             "store-derivation" -> do
                 req <- v .: "request"
-                return $ StoreDerivationRequest req
+                return $ StoreDerivationCmd req
 
             "retrieve-derivation" -> do
                 req <- v .: "request"
-                return $ RetrieveDerivationRequest req
+                return $ RetrieveDerivationCmd req
 
             "query-derivation" -> do
                 req <- v .: "request"
-                return $ QueryDerivationRequest req
+                return $ QueryDerivationCmd req
 
             "get-derivation-for-output" -> do
                 path <- v .: "path"
@@ -831,7 +936,7 @@ instance Aeson.FromJSON DaemonRequest where
 
             "gc-status" -> do
                 req <- v .: "request"
-                return $ GCStatusRequest req
+                return $ GCStatusCmd req
 
             "add-gc-root" -> do
                 pathObj <- v .: "path"
@@ -889,7 +994,7 @@ data DaemonResponse
 
     -- Garbage collection responses
     | GCResponse GCStats
-    | GCStatusResponse GCStatusResponse
+    | GCStatusResponse GCStatusResponseData
     | GCRootAddedResponse Text
     | GCRootRemovedResponse Text
     | GCRootsListResponse [(StorePath, Text, Bool)]
@@ -1718,13 +1823,13 @@ requestToText req = case req of
     StoreListRequest ->
         "List store contents"
 
-    StoreDerivationRequest _ ->
+    StoreDerivationCmd _ ->
         "Store derivation"
 
-    RetrieveDerivationRequest _ ->
+    RetrieveDerivationCmd _ ->
         "Retrieve derivation"
 
-    QueryDerivationRequest _ ->
+    QueryDerivationCmd _ ->
         "Query derivation"
 
     GetDerivationForOutputRequest{..} ->
@@ -1736,7 +1841,7 @@ requestToText req = case req of
     GCRequest{..} ->
         "Collect garbage" <> if gcForce then " (force)" else ""
 
-    GCStatusRequest req ->
+    GCStatusCmd req ->
         "Check GC status" <> if forceCheck req then " (force check)" else ""
 
     AddGCRootRequest{..} ->
@@ -1767,6 +1872,12 @@ responseToText resp = case resp of
         "Auth accepted: " <> case uid of UserId u -> u
 
     AuthResponse (AuthRejected reason) ->
+        "Auth rejected: " <> reason
+
+    AuthResponse (AuthSuccess uid _) ->
+        "Auth accepted: " <> case uid of UserId u -> u
+
+    AuthResponse (AuthFailure reason) ->
         "Auth rejected: " <> reason
 
     BuildStartedResponse buildId ->
@@ -1950,3 +2061,12 @@ shiftL x n = x * (2 ^ n)
 
 (.|.) :: Int -> Int -> Int
 a .|. b = a + b
+
+-- | GC Stats type (to be imported from Ten.GC in a real implementation)
+data GCStats = GCStats {
+    gcTotal :: Int,             -- Total paths in store
+    gcLive :: Int,              -- Paths still reachable
+    gcCollected :: Int,         -- Paths collected
+    gcBytes :: Integer,         -- Bytes freed
+    gcElapsedTime :: Double     -- Time taken for GC
+} deriving (Show, Eq)

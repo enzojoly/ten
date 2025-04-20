@@ -70,7 +70,7 @@ import System.Time.Extra (offsetTime, showDuration)
 
 import Ten.DB.Core
 import Ten.Core
-import Ten.Derivation
+import qualified Ten.Derivation as TenDeriv
 
 -- | Information about a stored derivation
 data DerivationInfo = DerivationInfo {
@@ -93,60 +93,54 @@ data DerivationReference = DerivationReference {
     refReference :: StorePath  -- ^ Path being referred to
 } deriving (Show, Eq)
 
+-- | Custom RowParser for StorePath
+parseStorePath :: SQLite.RowParser StorePath
+parseStorePath = do
+  path <- SQLite.field :: SQLite.RowParser Text
+  case parseStorePathText path of
+    Just sp -> return sp
+    Nothing -> fail $ "Invalid store path format: " ++ T.unpack path
+
 -- Make DerivationInfo an instance of FromRow
 instance FromRow DerivationInfo where
-    fromRow = DerivationInfo <$> field <*> field <*> parseStorePath <*> field
-      where
-        parseStorePath :: RowParser StorePath
-        parseStorePath = do
-          path <- field :: RowParser Text
-          case parseStorePathText path of
-            Just sp -> return sp
-            Nothing -> SQLite.returnError SQLite.ConversionFailed
-                       "StorePath" "Invalid store path format"
+    fromRow = DerivationInfo <$> SQLite.field <*> SQLite.field <*> parseStorePath <*> SQLite.field
 
 -- Make OutputInfo an instance of FromRow
 instance FromRow OutputInfo where
-    fromRow = OutputInfo <$> field <*> field <*> parseStorePath
-      where
-        parseStorePath :: RowParser StorePath
-        parseStorePath = do
-          path <- field :: RowParser Text
-          case parseStorePathText path of
-            Just sp -> return sp
-            Nothing -> SQLite.returnError SQLite.ConversionFailed
-                       "StorePath" "Invalid store path format"
+    fromRow = OutputInfo <$> SQLite.field <*> SQLite.field <*> parseStorePath
 
 -- Make DerivationReference an instance of FromRow
 instance FromRow DerivationReference where
     fromRow = DerivationReference <$> parseStorePath <*> parseStorePath
-      where
-        parseStorePath :: RowParser StorePath
-        parseStorePath = do
-          path <- field :: RowParser Text
-          case parseStorePathText path of
-            Just sp -> return sp
-            Nothing -> SQLite.returnError SQLite.ConversionFailed
-                       "StorePath" "Invalid store path format"
+
+-- Helper function to parse StorePath from Text
+parseStorePathText :: Text -> Maybe StorePath
+parseStorePathText path = case T.breakOn "-" path of
+    (hash, name) | not (T.null name) -> Just $ StorePath hash (T.drop 1 name)
+    _ -> Nothing
+
+-- Helper function to convert StorePath to Text
+storePathToText :: StorePath -> Text
+storePathToText (StorePath hash name) = hash <> "-" <> name
 
 -- | Store a derivation in the database
-storeDerivation :: Database -> Derivation -> StorePath -> IO Int64
+storeDerivation :: Database -> TenDeriv.Derivation -> StorePath -> IO Int64
 storeDerivation db derivation storePath = dbWithTransaction db ReadWrite $ \_ -> do
     -- Check if derivation already exists
-    existing <- isDerivationRegistered db (derivHash derivation)
+    existing <- isDerivationRegistered db (TenDeriv.derivHash derivation)
 
     if existing
         then do
             -- Get the ID
             [Only derivId] <- dbQuery db
                 "SELECT id FROM Derivations WHERE hash = ?"
-                (Only (derivHash derivation)) :: IO [Only Int64]
+                (Only (TenDeriv.derivHash derivation)) :: IO [Only Int64]
             return derivId
         else do
             -- Insert new derivation
             dbExecute db
                 "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
-                (derivHash derivation, storePathToText storePath)
+                (TenDeriv.derivHash derivation, storePathToText storePath)
 
             -- Get the last inserted ID
             [Only derivId] <- dbQuery_ db "SELECT last_insert_rowid()" :: IO [Only Int64]
@@ -158,7 +152,7 @@ storeDerivation db derivation storePath = dbWithTransaction db ReadWrite $ \_ ->
 
 -- | New function to handle database operations for storing a derivation
 -- This replaces Ten.Derivation.storeDerivationFile's database operations
-storeDerivationInDB :: Derivation -> StorePath -> FilePath -> IO Int64
+storeDerivationInDB :: TenDeriv.Derivation -> StorePath -> FilePath -> IO Int64
 storeDerivationInDB drv derivPath dbPath = do
     -- Initialize database
     db <- initDatabase dbPath 5000
@@ -172,23 +166,23 @@ storeDerivationInDB drv derivPath dbPath = do
     return derivId
 
 -- | Register a derivation file in the database
-registerDerivationFile :: Database -> Derivation -> StorePath -> IO Int64
+registerDerivationFile :: Database -> TenDeriv.Derivation -> StorePath -> IO Int64
 registerDerivationFile db derivation storePath = do
     -- Store in database
     derivId <- storeDerivation db derivation storePath
 
     -- Register outputs
-    forM_ (Set.toList $ derivOutputs derivation) $ \output -> do
-        registerDerivationOutput db derivId (outputName output) (outputPath output)
+    forM_ (Set.toList $ TenDeriv.derivOutputs derivation) $ \output -> do
+        registerDerivationOutput db derivId (TenDeriv.outputName output) (TenDeriv.outputPath output)
 
     -- Register input references
-    forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-        addDerivationReference db storePath (inputPath input)
+    forM_ (Set.toList $ TenDeriv.derivInputs derivation) $ \input -> do
+        addDerivationReference db storePath (TenDeriv.inputPath input)
 
     return derivId
 
 -- | Retrieve a derivation from the database
-retrieveDerivation :: Database -> Text -> IO (Maybe Derivation)
+retrieveDerivation :: Database -> Text -> IO (Maybe TenDeriv.Derivation)
 retrieveDerivation db hash = do
     -- Query for derivation
     derivRows <- dbQuery db
@@ -213,8 +207,7 @@ retrieveDerivation db hash = do
         _ -> error "Multiple derivations with same hash - database corruption"
 
 -- | Retrieve a derivation by hash
--- This was moved from Ten.Derivation to avoid circular dependencies
-retrieveDerivationByHash :: FilePath -> Text -> IO (Maybe Derivation)
+retrieveDerivationByHash :: FilePath -> Text -> IO (Maybe TenDeriv.Derivation)
 retrieveDerivationByHash dbPath hash = do
     -- Open database
     db <- initDatabase dbPath 5000
@@ -239,7 +232,7 @@ retrieveDerivationByHash dbPath hash = do
 
     return result
   where
-    retrieveDerivationFromStore :: StorePath -> IO (Maybe Derivation)
+    retrieveDerivationFromStore :: StorePath -> IO (Maybe TenDeriv.Derivation)
     retrieveDerivationFromStore sp = do
         -- Construct the full path
         let fullPath = "/var/lib/ten/store/" ++ T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
@@ -251,12 +244,12 @@ retrieveDerivationByHash dbPath hash = do
             else do
                 -- Read and deserialize
                 content <- BS.readFile fullPath
-                case deserializeDerivation content of
+                case TenDeriv.deserializeDerivation content of
                     Left _ -> return Nothing
                     Right drv -> return $ Just drv
 
 -- | Read and deserialize a derivation file
-readDerivationFile :: StorePath -> IO (Either Text Derivation)
+readDerivationFile :: StorePath -> IO (Either Text TenDeriv.Derivation)
 readDerivationFile path = do
     -- Construct the full path
     let filePath = "/var/lib/ten/store/" ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
@@ -270,7 +263,7 @@ readDerivationFile path = do
             content <- BS.readFile filePath
 
             -- Deserialize
-            case deserializeDerivation content of
+            case TenDeriv.deserializeDerivation content of
                 Left err -> return $ Left $ "Failed to deserialize derivation: " <> err
                 Right drv -> return $ Right drv
 
@@ -304,18 +297,20 @@ getDerivationForOutput db outputPath = do
     return $ listToMaybe results
 
 -- | Find derivations that produced the given outputs
-findDerivationsByOutputs :: Database -> [StorePath] -> IO (Map String Derivation)
+findDerivationsByOutputs :: Database -> [StorePath] -> IO (Map String TenDeriv.Derivation)
 findDerivationsByOutputs db [] = return Map.empty
 findDerivationsByOutputs db outputPaths = do
     -- Convert StorePath to text for query
     let pathTexts = map storePathToText outputPaths
 
     -- First get the derivation info
-    derivInfos <- dbQuery db
-        "SELECT DISTINCT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
-        \JOIN Outputs o ON d.id = o.derivation_id \
-        \WHERE o.path IN (?);"
-        (SQLite.In pathTexts) :: IO [DerivationInfo]
+    -- We use a more robust approach for handling the IN clause
+    placeholders <- placeholdersForIn (length pathTexts)
+    let queryStr = "SELECT DISTINCT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
+                  \JOIN Outputs o ON d.id = o.derivation_id \
+                  \WHERE o.path IN " ++ placeholders
+
+    derivInfos <- dbQuery db (Query $ T.pack queryStr) pathTexts :: IO [DerivationInfo]
 
     -- Now load each derivation
     derivations <- forM derivInfos $ \derivInfo -> do
@@ -326,6 +321,18 @@ findDerivationsByOutputs db outputPaths = do
 
     -- Filter out Nothings and convert to Map
     return $ Map.fromList $ catMaybes derivations
+
+-- Helper function to create placeholders for SQL IN clause
+placeholdersForIn :: Int -> IO String
+placeholdersForIn n = do
+    let params = replicate n "?"
+    return $ "(" ++ intercalate ", " params ++ ")"
+
+-- Helper function for string intercalation
+intercalate :: String -> [String] -> String
+intercalate sep [] = ""
+intercalate sep [x] = x
+intercalate sep (x:xs) = x ++ sep ++ intercalate sep xs
 
 -- | Add a reference between two paths
 addDerivationReference :: Database -> StorePath -> StorePath -> IO ()
@@ -409,17 +416,17 @@ isPathValid db path = do
         _ -> return False
 
 -- | Register a derivation with all its outputs in a single transaction
-registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> IO Int64
+registerDerivationWithOutputs :: Database -> TenDeriv.Derivation -> StorePath -> IO Int64
 registerDerivationWithOutputs db derivation storePath = dbWithTransaction db ReadWrite $ \_ -> do
     -- Register the derivation
     derivId <- storeDerivation db derivation storePath
 
     -- Register all outputs
-    forM_ (Set.toList $ derivOutputs derivation) $ \output -> do
-        registerDerivationOutput db derivId (outputName output) (outputPath output)
+    forM_ (Set.toList $ TenDeriv.derivOutputs derivation) $ \output -> do
+        registerDerivationOutput db derivId (TenDeriv.outputName output) (TenDeriv.outputPath output)
 
     -- Register all input references
-    forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-        addDerivationReference db storePath (inputPath input)
+    forM_ (Set.toList $ TenDeriv.derivInputs derivation) $ \input -> do
+        addDerivationReference db storePath (TenDeriv.inputPath input)
 
     return derivId

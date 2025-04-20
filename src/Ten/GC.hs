@@ -57,13 +57,19 @@ import System.IO.Error (isDoesNotExistError, catchIOError)
 import System.Posix.Files
 import System.IO (hPutStrLn, stderr, hFlush, withFile, IOMode(..))
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
-                       defaultFileFlags, OpenMode(..), OpenFileFlags(..),
-                       exclusive, fdToHandle, Fd, WriteLock, Unlock, AbsoluteSeek)
-import System.Posix.Types (ProcessID)
+                        defaultFileFlags, OpenMode(..), OpenFileFlags(..),
+                        exclusive, fdToHandle)
+import System.Posix.IO (LockRequest(WriteLock, Unlock))
+import System.Posix.Types (Fd, ProcessID)
 import System.Posix.Process (getProcessID)
 import System.Posix.Signals (signalProcess)
 import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode)
 import Data.Maybe (catMaybes)
+import System.Posix.IO.ByteString (createLink, removeLink)
+import qualified Data.ByteString.Char8 as BC
+import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import System.Posix.IO (SeekMode(AbsoluteSeek))
 
 import Ten.Core hiding (storePathToFilePath) -- Import Core but not the conflicting function
 import qualified Ten.Store as Store          -- Use qualified import for Store
@@ -94,6 +100,11 @@ data GCLock = GCLock {
     lockPath :: FilePath,      -- Path to the lock file
     lockPid :: ProcessID       -- Process ID holding the lock
 }
+
+-- | Global reference to hold the GC lock file descriptor
+{-# NOINLINE globalGCLockFdRef #-}
+globalGCLockFdRef :: IORef (Maybe (Fd, FilePath))
+globalGCLockFdRef = unsafePerformIO $ newIORef Nothing
 
 -- | Add a root to protect a path from garbage collection
 addRoot :: StorePath -> Text -> Bool -> TenM p GCRoot
@@ -399,7 +410,9 @@ acquireGCLock = do
 
     case result of
         Left err -> throwError $ ResourceError $ "Could not acquire GC lock: " <> err
-        Right _ -> return ()
+        Right lock -> do
+            -- Keep the fd in a global reference to avoid GC
+            liftIO $ writeIORef globalGCLockFdRef (Just (lockFd lock, lockPath))
 
 -- | Release the GC lock
 releaseGCLock :: TenM p ()
@@ -419,10 +432,16 @@ releaseGCLock = do
                         -- Check if it's our PID
                         ourPid <- liftIO getProcessID
                         when (lockPid == ourPid) $ do
-                            -- Create a temporary GCLock just to release it
-                            fd <- liftIO $ openFd lockPath ReadWrite (Just 0o644) defaultFileFlags
-                            let lock = GCLock fd lockPath ourPid
-                            liftIO $ releaseFileLock lock
+                            -- Get the file descriptor from the global reference
+                            mFdInfo <- liftIO $ readIORef globalGCLockFdRef
+                            case mFdInfo of
+                                Just (fd, path) | path == lockPath -> do
+                                    -- Create a temporary GCLock just to release it
+                                    let lock = GCLock fd lockPath ourPid
+                                    liftIO $ releaseFileLock lock
+                                    -- Clear the global reference
+                                    liftIO $ writeIORef globalGCLockFdRef Nothing
+                                _ -> return ()
                     _ -> return ()
             _ -> return ()
 
@@ -494,9 +513,9 @@ findStorePaths storeDir = do
                     else Just <$> isValidStorePath fullPath entry
 
             -- Return valid store paths
-            return $ Set.fromList $ catMaybes paths
+            return $ Set.fromList $ catMaybes (concat paths)
   where
-    isValidStorePath :: FilePath -> FilePath -> IO (Maybe FilePath)
+    isValidStorePath :: FilePath -> FilePath -> IO [Maybe FilePath]
     isValidStorePath fullPath name = do
         -- Check if it looks like a store path (hash-name format)
         let parts = T.splitOn "-" (T.pack name)
@@ -505,9 +524,9 @@ findStorePaths storeDir = do
                 -- Make sure it's a regular file
                 fileExists <- doesFileExist fullPath
                 if fileExists
-                    then return $ Just name
-                    else return Nothing
-            else return Nothing
+                    then return [Just name]
+                    else return [Nothing]
+            else return [Nothing]
 
 -- | Find all root paths
 findRootPaths :: FilePath -> TenM p (Set FilePath)
@@ -581,17 +600,59 @@ computeReachablePaths storeDir rootPaths = do
                 -- Read the file in binary mode
                 content <- BS.readFile path
 
-                -- Extract store path references (simplified)
-                -- In a real implementation, this would use a more sophisticated algorithm
-                -- that understands the binary format and can extract valid store paths
-                return $ extractStorePaths content
+                -- Extract store path references
+                extractReferencesFromBinary path content
 
-    -- | Extract store paths from binary content
-    extractStorePaths :: BS.ByteString -> Set FilePath
-    extractStorePaths content =
-        -- In a real implementation, we would scan for store path patterns
-        -- This is a placeholder that would be replaced with proper scanning logic
-        Set.empty
+-- | Extract store path references from binary content
+extractReferencesFromBinary :: FilePath -> BS.ByteString -> IO (Set FilePath)
+extractReferencesFromBinary path content = do
+    -- If file is too small, skip
+    if BS.length content < 8
+        then return Set.empty
+        else do
+            -- Check if it's an ELF file or text file
+            let header = BS.take 4 content
+            if header == BS.pack [0x7f, 0x45, 0x4c, 0x46] -- ELF magic number
+                then scanElfFile content
+                else scanTextFile content
+  where
+    scanElfFile :: BS.ByteString -> IO (Set FilePath)
+    scanElfFile bs = do
+        -- Extract strings from ELF file (simplified)
+        let chunks = BC.split '\0' bs
+        let strings = filter isValidString chunks
+        let paths = extractPaths strings
+        return $ Set.fromList paths
+
+    scanTextFile :: BS.ByteString -> IO (Set FilePath)
+    scanTextFile bs = do
+        -- Extract potential store paths from text
+        let text = BC.unpack bs
+        let lines = words text
+        let paths = extractPaths $ map BC.pack lines
+        return $ Set.fromList paths
+
+    isValidString :: BS.ByteString -> Bool
+    isValidString bs =
+        BS.length bs > 10 &&
+        not (BS.null bs) &&
+        BS.all (\c -> c >= 32 && c < 127 || c == 9 || c == 10) bs
+
+    extractPaths :: [BS.ByteString] -> [FilePath]
+    extractPaths chunks =
+        -- Filter for potential store paths
+        let candidates = filter isStorePathCandidate chunks
+        in map BC.unpack candidates
+
+    isStorePathCandidate :: BS.ByteString -> Bool
+    isStorePathCandidate bs =
+        let str = BC.unpack bs
+        in case break (=='-') str of
+            (hash, '-':_) -> length hash >= 8 && all isHexDigit hash
+            _ -> False
+
+    isHexDigit :: Char -> Bool
+    isHexDigit c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
 -- | Parse a store path from a file path
 parseStorePath :: FilePath -> Maybe StorePath
@@ -621,11 +682,21 @@ getActiveBuildPaths = do
   where
     queryDaemonForActivePaths :: TenM p (Set FilePath)
     queryDaemonForActivePaths = do
-        -- In a real implementation, we would query the daemon state
-        -- We're building a proper implementation, so we need to integrate with the daemon
-        -- But for now, return an empty set as a starting point
-        -- In the real implementation this would be connected to the daemon state tracking
-        return Set.empty
+        env <- ask
+        case runMode env of
+            DaemonMode -> do
+                -- Query state for active build paths
+                -- We can't access the daemon state directly from GC module
+                -- so we'll need to rely on environment information
+                return Set.empty  -- This would be populated from daemon state in practice
+
+            ClientMode conn -> do
+                -- Ask the daemon via protocol
+                result <- withDaemon $ \_ ->
+                    return $ Right Set.empty  -- This would make an RPC call in practice
+                return result
+
+            _ -> return Set.empty
 
 -- | Verify the store integrity
 verifyStore :: TenM p Bool
@@ -691,7 +762,7 @@ repairStore = do
         -- Read the content and verify hash
         content <- liftIO $ try $ BS.readFile fullPath
         case content of
-            Left (_ :: SomeException) -> do
+            Left (e :: SomeException) -> do
                 -- Remove invalid path
                 liftIO $ removeFile fullPath
                 return (validCount, invalidCount + 1, totalSize)
