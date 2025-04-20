@@ -64,8 +64,8 @@ currentSchemaVersion = 1
 data Migration = Migration {
     migrationVersion :: SchemaVersion,
     migrationDescription :: Text,
-    migrationUp :: Database -> IO (),
-    migrationDown :: Database -> IO ()
+    migrationUp :: DBCore.Database -> IO (),
+    migrationDown :: DBCore.Database -> IO ()
 }
 
 -- | Schema element types
@@ -90,7 +90,7 @@ data SchemaError =
 instance Exception SchemaError
 
 -- | Ensure the database schema is properly set up
-ensureSchema :: Database -> IO ()
+ensureSchema :: DBCore.Database -> IO ()
 ensureSchema db = do
     -- Get current schema version
     currentVersion <- getSchemaVersion db
@@ -114,40 +114,40 @@ ensureSchema db = do
                     validateSchema db
 
 -- | Create all database tables
-createTables :: Database -> IO ()
+createTables :: DBCore.Database -> IO ()
 createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Create Derivations table
-    execute_ db derivationsTableDef
+    execute_ (DBCore.dbConn db) derivationsTableDef
 
     -- Create Outputs table
-    execute_ db outputsTableDef
+    execute_ (DBCore.dbConn db) outputsTableDef
 
     -- Create References table
-    execute_ db referencesTableDef
+    execute_ (DBCore.dbConn db) referencesTableDef
 
     -- Create ValidPaths table
-    execute_ db validPathsTableDef
+    execute_ (DBCore.dbConn db) validPathsTableDef
 
 -- | Create all indices for performance
-createIndices :: Database -> IO ()
+createIndices :: DBCore.Database -> IO ()
 createIndices db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Derivations indices
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
 
     -- Outputs indices
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
 
     -- References indices
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
 
     -- ValidPaths indices
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
-    execute_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    execute_ (DBCore.dbConn db) "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
 
 -- | Validate the schema is correct
-validateSchema :: Database -> IO ()
+validateSchema :: DBCore.Database -> IO ()
 validateSchema db = do
     -- Get all required tables
     let requiredTables = [
@@ -169,7 +169,7 @@ validateSchema db = do
     validateValidPathsTable db
 
 -- | Validate Derivations table structure
-validateDerivationsTable :: Database -> IO ()
+validateDerivationsTable :: DBCore.Database -> IO ()
 validateDerivationsTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "Derivations" col
@@ -177,7 +177,7 @@ validateDerivationsTable db = do
     requiredColumns = ["id", "hash", "store_path", "timestamp"]
 
 -- | Validate Outputs table structure
-validateOutputsTable :: Database -> IO ()
+validateOutputsTable :: DBCore.Database -> IO ()
 validateOutputsTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "Outputs" col
@@ -185,7 +185,7 @@ validateOutputsTable db = do
     requiredColumns = ["derivation_id", "output_name", "path"]
 
 -- | Validate References table structure
-validateReferencesTable :: Database -> IO ()
+validateReferencesTable :: DBCore.Database -> IO ()
 validateReferencesTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "References" col
@@ -193,7 +193,7 @@ validateReferencesTable db = do
     requiredColumns = ["referrer", "reference"]
 
 -- | Validate ValidPaths table structure
-validateValidPathsTable :: Database -> IO ()
+validateValidPathsTable :: DBCore.Database -> IO ()
 validateValidPathsTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "ValidPaths" col
@@ -201,21 +201,21 @@ validateValidPathsTable db = do
     requiredColumns = ["path", "hash", "registration_time", "deriver", "is_valid"]
 
 -- | Ensure a column exists in a table
-ensureColumnExists :: Database -> Text -> Text -> IO ()
+ensureColumnExists :: DBCore.Database -> Text -> Text -> IO ()
 ensureColumnExists db tableName columnName = do
     exists <- columnExists db tableName columnName
     unless exists $ throwIO $ SchemaMissingColumn tableName columnName
 
 -- | Check if a table exists
-tableExists :: Database -> Text -> IO Bool
+tableExists :: DBCore.Database -> Text -> IO Bool
 tableExists db tableName = do
-    results <- query db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName]
+    results <- query (DBCore.dbConn db) "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName]
     case results of
         [(count :: Int)] -> return $ count > 0
         _ -> return False
 
 -- | Check if a column exists in a table
-columnExists :: Database -> Text -> Text -> IO Bool
+columnExists :: DBCore.Database -> Text -> Text -> IO Bool
 columnExists db tableName columnName = do
     -- First check table exists
     tableExists' <- tableExists db tableName
@@ -223,35 +223,35 @@ columnExists db tableName columnName = do
         then return False
         else do
             -- Query table schema and look for column
-            results <- try $ query db ("PRAGMA table_info(" <> tableName <> ")") ()
+            results <- try $ query (DBCore.dbConn db) ("PRAGMA table_info(" <> tableName <> ")") ()
                       :: IO (Either SomeException [(Int, Text, Text, Int, Maybe Text, Int)])
             case results of
                 Left _ -> return False
                 Right rows -> return $ any (\(_, name, _, _, _, _) -> name == columnName) rows
 
 -- | Check if an index exists
-indexExists :: Database -> Text -> IO Bool
+indexExists :: DBCore.Database -> Text -> IO Bool
 indexExists db indexName = do
-    results <- query db "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName]
+    results <- query (DBCore.dbConn db) "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName]
     case results of
         [(count :: Int)] -> return $ count > 0
         _ -> return False
 
 -- | Get all schema elements (tables, indices, etc.)
-getSchemaElements :: Database -> IO [SchemaElement]
+getSchemaElements :: DBCore.Database -> IO [SchemaElement]
 getSchemaElements db = do
     -- Get all tables
-    tables <- query_ db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    tables <- query_ (DBCore.dbConn db) "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         :: IO [[Text]]
     let tableElements = map (Table . head) tables
 
     -- Get all indices
-    indices <- query_ db "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+    indices <- query_ (DBCore.dbConn db) "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
         :: IO [[Text]]
     let indexElements = map (Index . head) indices
 
     -- Get all triggers
-    triggers <- query_ db "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
+    triggers <- query_ (DBCore.dbConn db) "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
         :: IO [[Text]]
     let triggerElements = map (Trigger . head) triggers
 
@@ -263,14 +263,14 @@ getSchemaElements db = do
   where
     getTableColumns :: Text -> IO [SchemaElement]
     getTableColumns tableName = do
-        columns <- try $ query db ("PRAGMA table_info(" <> tableName <> ")") ()
+        columns <- try $ query (DBCore.dbConn db) ("PRAGMA table_info(" <> tableName <> ")") ()
                    :: IO (Either SomeException [(Int, Text, Text, Int, Maybe Text, Int)])
         case columns of
             Left _ -> return []
             Right cols -> return $ map (\(_, name, _, _, _, _) -> Column tableName name) cols
 
 -- | Migrate the schema from one version to another
-migrateSchema :: Database -> SchemaVersion -> SchemaVersion -> IO ()
+migrateSchema :: DBCore.Database -> SchemaVersion -> SchemaVersion -> IO ()
 migrateSchema db fromVersion toVersion =
     if fromVersion >= toVersion
         then return () -- Nothing to do
@@ -305,10 +305,10 @@ migrations = [
             createTables db
             createIndices db,
         migrationDown = \db -> do
-            execute_ db "DROP TABLE IF EXISTS Outputs;"
-            execute_ db "DROP TABLE IF EXISTS References;"
-            execute_ db "DROP TABLE IF EXISTS ValidPaths;"
-            execute_ db "DROP TABLE IF EXISTS Derivations;"
+            execute_ (DBCore.dbConn db) "DROP TABLE IF EXISTS Outputs;"
+            execute_ (DBCore.dbConn db) "DROP TABLE IF EXISTS References;"
+            execute_ (DBCore.dbConn db) "DROP TABLE IF EXISTS ValidPaths;"
+            execute_ (DBCore.dbConn db) "DROP TABLE IF EXISTS Derivations;"
     }
 
     -- Add new migrations here as the schema evolves

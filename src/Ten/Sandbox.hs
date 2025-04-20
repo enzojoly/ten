@@ -61,7 +61,7 @@ import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
-import System.Posix.Types (ProcessID, UserID, GroupID, CPid(..), Fd(..))
+import System.Posix.Types (ProcessID, UserID, GroupID, CPid(..), Fd(..), FileMode)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO

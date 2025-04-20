@@ -428,7 +428,7 @@ computeReachablePaths db roots = do
     placeholders n
         | n <= 0    = ""
         | n == 1    = "(?)"
-        | otherwise = "(?)" ++ replicate (n-1) ',(?)'
+        | otherwise = "(?)" ++ concat (replicate (n-1) ",(?)")
 
 -- | Check if a path is reachable from the given roots
 isReachableFrom :: Database -> [Text] -> Text -> IO Bool
