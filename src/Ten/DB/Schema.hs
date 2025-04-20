@@ -93,14 +93,14 @@ instance Exception SchemaError
 ensureSchema :: DBCore.Database -> IO ()
 ensureSchema db = do
     -- Get current schema version
-    currentVersion <- getSchemaVersion db
+    currentVersion <- DBCore.getSchemaVersion db
 
     if currentVersion == 0
         then do
             -- New database, create schema from scratch
             createTables db
             createIndices db
-            updateSchemaVersion db currentSchemaVersion
+            DBCore.updateSchemaVersion db currentSchemaVersion
         else if currentVersion < currentSchemaVersion
             then do
                 -- Existing database needs migration
@@ -292,7 +292,7 @@ migrateSchema db fromVersion toVersion =
                                 (T.pack $ "Migration failed: " ++ show e))
 
                     -- Update schema version
-                    updateSchemaVersion db (migrationVersion migration)
+                    DBCore.updateSchemaVersion db (migrationVersion migration)
 
 -- | Migration definitions
 migrations :: [Migration]
