@@ -40,7 +40,7 @@ module Ten.DB.Schema (
     SchemaError(..)
 ) where
 
-import Control.Exception (catch, throwIO, try, SomeException)
+import Control.Exception (catch, throwIO, try, SomeException, Exception)
 import Control.Monad (forM_, when, unless, void)
 import Data.List (sort, intercalate)
 import Data.Text (Text)
@@ -51,7 +51,7 @@ import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.FromField
 import Database.SQLite.Simple.Types
 
-import Ten.DB.Core
+import qualified Ten.DB.Core as DBCore
 
 -- | Schema version type
 type SchemaVersion = Int
@@ -115,7 +115,7 @@ ensureSchema db = do
 
 -- | Create all database tables
 createTables :: Database -> IO ()
-createTables db = withTransaction db Exclusive $ \_ -> do
+createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Create Derivations table
     execute_ db derivationsTableDef
 
@@ -130,7 +130,7 @@ createTables db = withTransaction db Exclusive $ \_ -> do
 
 -- | Create all indices for performance
 createIndices :: Database -> IO ()
-createIndices db = withTransaction db Exclusive $ \_ -> do
+createIndices db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Derivations indices
     execute_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
 
@@ -282,7 +282,7 @@ migrateSchema db fromVersion toVersion =
 
             -- Apply each migration in a transaction
             forM_ requiredMigrations $ \migration ->
-                withTransaction db Exclusive $ \_ -> do
+                DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
                     -- Run the migration
                     catch
                         (migrationUp migration db)

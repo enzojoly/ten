@@ -1,0 +1,188 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[ 3 of 21] Compiling Ten.DB.References ( src/Ten/DB/References.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/References.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/References.dyn_o )
+
+src/Ten/DB/References.hs:431:49: error: [GHC-58481]
+    parse error on input ‘,’
+    |
+431 |         | otherwise = "(?)" ++ replicate (n-1) ',(?)'
+    |                                                 ^
+[ 4 of 21] Compiling Ten.DB.Schema    ( src/Ten/DB/Schema.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Schema.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Schema.dyn_o )
+
+src/Ten/DB/Schema.hs:67:20: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+   |
+67 |     migrationUp :: Database -> IO (),
+   |                    ^^^^^^^^
+
+src/Ten/DB/Schema.hs:68:22: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+   |
+68 |     migrationDown :: Database -> IO ()
+   |                      ^^^^^^^^
+
+src/Ten/DB/Schema.hs:93:17: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+   |
+93 | ensureSchema :: Database -> IO ()
+   |                 ^^^^^^^^
+
+src/Ten/DB/Schema.hs:117:17: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+117 | createTables :: Database -> IO ()
+    |                 ^^^^^^^^
+
+src/Ten/DB/Schema.hs:132:18: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+132 | createIndices :: Database -> IO ()
+    |                  ^^^^^^^^
+
+src/Ten/DB/Schema.hs:150:19: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+150 | validateSchema :: Database -> IO ()
+    |                   ^^^^^^^^
+
+src/Ten/DB/Schema.hs:172:29: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+172 | validateDerivationsTable :: Database -> IO ()
+    |                             ^^^^^^^^
+
+src/Ten/DB/Schema.hs:180:25: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+180 | validateOutputsTable :: Database -> IO ()
+    |                         ^^^^^^^^
+
+src/Ten/DB/Schema.hs:188:28: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+188 | validateReferencesTable :: Database -> IO ()
+    |                            ^^^^^^^^
+
+src/Ten/DB/Schema.hs:196:28: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+196 | validateValidPathsTable :: Database -> IO ()
+    |                            ^^^^^^^^
+
+src/Ten/DB/Schema.hs:204:23: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+204 | ensureColumnExists :: Database -> Text -> Text -> IO ()
+    |                       ^^^^^^^^
+
+src/Ten/DB/Schema.hs:210:16: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+210 | tableExists :: Database -> Text -> IO Bool
+    |                ^^^^^^^^
+
+src/Ten/DB/Schema.hs:218:17: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+218 | columnExists :: Database -> Text -> Text -> IO Bool
+    |                 ^^^^^^^^
+
+src/Ten/DB/Schema.hs:233:16: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+233 | indexExists :: Database -> Text -> IO Bool
+    |                ^^^^^^^^
+
+src/Ten/DB/Schema.hs:241:22: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+241 | getSchemaElements :: Database -> IO [SchemaElement]
+    |                      ^^^^^^^^
+
+src/Ten/DB/Schema.hs:273:18: error: [GHC-76037]
+    Not in scope: type constructor or class ‘Database’
+    Suggested fix:
+      Perhaps use one of these:
+        ‘DBCore.Database’ (imported from Ten.DB.Core),
+        data constructor ‘DBCore.Database’ (imported from Ten.DB.Core)
+    |
+273 | migrateSchema :: Database -> SchemaVersion -> SchemaVersion -> IO ()
+    |                  ^^^^^^^^
+[ 9 of 21] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o ) [Source file changed]
+
+src/Ten/Sandbox.hs:589:34: error: [GHC-76037]
+    Not in scope: type constructor or class ‘FileMode’
+    Suggested fix:
+      Add ‘FileMode’ to the import list in the import of
+      ‘System.Posix.Types’ (at src/Ten/Sandbox.hs:64:1-72).
+    |
+589 | createAndSetupDir :: FilePath -> FileMode -> IO ()
+    |                                  ^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+
