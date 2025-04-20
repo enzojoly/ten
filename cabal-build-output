@@ -1,0 +1,859 @@
+Resolving dependencies...
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Configuring library for ten-0.1.0.0...
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[ 1 of 21] Compiling Ten.Core         ( src/Ten/Core.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Core.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Core.dyn_o )
+
+src/Ten/Core.hs:99:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Monad.IO.Class’ is redundant
+      except perhaps to import instances from ‘Control.Monad.IO.Class’
+    To import instances alone, use: import Control.Monad.IO.Class()
+   |
+99 | import Control.Monad.IO.Class
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:100:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.ByteString’ is redundant
+      except perhaps to import instances from ‘Data.ByteString’
+    To import instances alone, use: import Data.ByteString()
+    |
+100 | import Data.ByteString (ByteString)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:101:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString’ is redundant
+      except perhaps to import instances from ‘Data.ByteString’
+    To import instances alone, use: import Data.ByteString()
+    |
+101 | import qualified Data.ByteString as BS
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:104:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Map.Strict’ is redundant
+      except perhaps to import instances from ‘Data.Map.Strict’
+    To import instances alone, use: import Data.Map.Strict()
+    |
+104 | import qualified Data.Map.Strict as Map
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:111:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.Process’ is redundant
+      except perhaps to import instances from ‘System.Process’
+    To import instances alone, use: import System.Process()
+    |
+111 | import System.Process
+    | ^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:112:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.Exit’ is redundant
+      except perhaps to import instances from ‘System.Exit’
+    To import instances alone, use: import System.Exit()
+    |
+112 | import System.Exit
+    | ^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:113:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Unique’ is redundant
+      except perhaps to import instances from ‘Data.Unique’
+    To import instances alone, use: import Data.Unique()
+    |
+113 | import Data.Unique (Unique, newUnique)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:116:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Maybe’ is redundant
+      except perhaps to import instances from ‘Data.Maybe’
+    To import instances alone, use: import Data.Maybe()
+    |
+116 | import Data.Maybe (isJust)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:121:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO.Error’ is redundant
+      except perhaps to import instances from ‘System.IO.Error’
+    To import instances alone, use: import System.IO.Error()
+    |
+121 | import System.IO.Error (isDoesNotExistError)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:122:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘ErrorCall, SomeException, bracket, catch, throwIO,
+                   try’
+    from module ‘Control.Exception’ is redundant
+    |
+122 | import Control.Exception (bracket, try, catch, throwIO, SomeException, Exception, ErrorCall(..))
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:123:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.Environment’ is redundant
+      except perhaps to import instances from ‘System.Environment’
+    To import instances alone, use: import System.Environment()
+    |
+123 | import System.Environment (lookupEnv)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:124:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.Posix.Types’ is redundant
+      except perhaps to import instances from ‘System.Posix.Types’
+    To import instances alone, use: import System.Posix.Types()
+    |
+124 | import System.Posix.Types (ProcessID)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:127:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO.Unsafe’ is redundant
+      except perhaps to import instances from ‘System.IO.Unsafe’
+    To import instances alone, use: import System.IO.Unsafe()
+    |
+127 | import System.IO.Unsafe (unsafePerformIO)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:295:25: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: data constructor ‘DaemonConnection’
+    |
+295 | data DaemonConnection = DaemonConnection
+    |                         ^^^^^^^^^^^^^^^^...
+
+src/Ten/Core.hs:296:7: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of DaemonConnection ‘connSocket’
+    |
+296 |     { connSocket :: Socket
+    |       ^^^^^^^^^^
+
+src/Ten/Core.hs:297:7: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of DaemonConnection ‘connUserId’
+    |
+297 |     , connUserId :: UserId
+    |       ^^^^^^^^^^
+
+src/Ten/Core.hs:298:7: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used:
+      record field of DaemonConnection ‘connAuthToken’
+    |
+298 |     , connAuthToken :: AuthToken
+    |       ^^^^^^^^^^^^^
+
+src/Ten/Core.hs:299:7: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used:
+      record field of DaemonConnection ‘connectionState’
+    |
+299 |     , connectionState :: ConnectionState
+    |       ^^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:303:24: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: data constructor ‘ConnectionState’
+    |
+303 | data ConnectionState = ConnectionState {
+    |                        ^^^^^^^^^^^^^^^^^...
+
+src/Ten/Core.hs:304:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of ConnectionState ‘csSocket’
+    |
+304 |     csSocket :: Socket,                     -- ^ Socket connected to daemon
+    |     ^^^^^^^^
+
+src/Ten/Core.hs:305:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of ConnectionState ‘csHandle’
+    |
+305 |     csHandle :: Handle,                     -- ^ Handle for socket I/O
+    |     ^^^^^^^^
+
+src/Ten/Core.hs:306:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of ConnectionState ‘csUserId’
+    |
+306 |     csUserId :: UserId,                     -- ^ Authenticated user ID
+    |     ^^^^^^^^
+
+src/Ten/Core.hs:307:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of ConnectionState ‘csToken’
+    |
+307 |     csToken :: AuthToken,                   -- ^ Authentication token
+    |     ^^^^^^^
+
+src/Ten/Core.hs:308:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used:
+      record field of ConnectionState ‘csRequestMap’
+    |
+308 |     csRequestMap :: TVar (Map RequestId (MVar Response)), -- ^ Map of pending requests
+    |     ^^^^^^^^^^^^
+
+src/Ten/Core.hs:309:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of ConnectionState ‘csNextReqId’
+    |
+309 |     csNextReqId :: TVar RequestId,          -- ^ Next request ID
+    |     ^^^^^^^^^^^
+
+src/Ten/Core.hs:310:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used:
+      record field of ConnectionState ‘csReaderThread’
+    |
+310 |     csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
+    |     ^^^^^^^^^^^^^^
+
+src/Ten/Core.hs:311:5: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: record field of ConnectionState ‘csShutdown’
+    |
+311 |     csShutdown :: TVar Bool                 -- ^ Flag to indicate connection shutdown
+    |     ^^^^^^^^^^
+
+src/Ten/Core.hs:462:14: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘state’ shadows the existing binding
+      imported from ‘Control.Monad.State’ at src/Ten/Core.hs:98:1-26
+      (and originally defined in ‘Control.Monad.State.Class’)
+    |
+462 | runTen m env state = runExceptT $ runStateT (runReaderT (runTenM m) env) state
+    |              ^^^^^
+
+src/Ten/Core.hs:480:5: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘state’ shadows the existing binding
+      imported from ‘Control.Monad.State’ at src/Ten/Core.hs:98:1-26
+      (and originally defined in ‘Control.Monad.State.Class’)
+    |
+480 |     state <- get
+    |     ^^^^^
+
+src/Ten/Core.hs:539:5: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘p’
+    |
+539 |     p@(ComposeProof p1 p2) -> do
+    |     ^
+[ 2 of 21] Compiling Ten.DB.Core      ( src/Ten/DB/Core.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Core.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Core.dyn_o )
+
+src/Ten/DB/Core.hs:45:40: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘</>’ from module ‘System.FilePath’ is redundant
+   |
+45 | import System.FilePath (takeDirectory, (</>))
+   |                                        ^^^^^
+
+src/Ten/DB/Core.hs:48:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Ten.Core’ is redundant
+      except perhaps to import instances from ‘Ten.Core’
+    To import instances alone, use: import Ten.Core()
+   |
+48 | import Ten.Core (defaultDBPath)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Core.hs:208:13: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘db’
+    |
+208 | runDBAction db action = catch
+    |             ^^
+[ 3 of 21] Compiling Ten.DB.References ( src/Ten/DB/References.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/References.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/References.dyn_o )
+
+src/Ten/DB/References.hs:37:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘bracket, catch, throwIO’
+    from module ‘Control.Exception’ is redundant
+   |
+37 | import Control.Exception (bracket, catch, try, throwIO, SomeException)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:38:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘forM, unless, void, when’
+    from module ‘Control.Monad’ is redundant
+   |
+38 | import Control.Monad (forM, forM_, when, unless, foldM, void)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:39:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Binary’ is redundant
+      except perhaps to import instances from ‘Data.Binary’
+    To import instances alone, use: import Data.Binary()
+   |
+39 | import Data.Binary (decode, encode)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:40:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Binary.Get’ is redundant
+      except perhaps to import instances from ‘Data.Binary.Get’
+    To import instances alone, use: import Data.Binary.Get()
+   |
+40 | import Data.Binary.Get (runGet, getWord32le, getWord16le, skip, getByteString, getRemainingLazyByteString)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:41:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Bits’ is redundant
+      except perhaps to import instances from ‘Data.Bits’
+    To import instances alone, use: import Data.Bits()
+   |
+41 | import Data.Bits ((.|.), (.&.), shiftL, shiftR)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:45:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString.Lazy’ is redundant
+      except perhaps to import instances from ‘Data.ByteString.Lazy’
+    To import instances alone, use: import Data.ByteString.Lazy()
+   |
+45 | import qualified Data.ByteString.Lazy as LBS
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:46:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString.Lazy.Char8’ is redundant
+      except perhaps to import instances from ‘Data.ByteString.Lazy.Char8’
+    To import instances alone, use: import Data.ByteString.Lazy.Char8()
+   |
+46 | import qualified Data.ByteString.Lazy.Char8 as LBC
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:48:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Int’ is redundant
+      except perhaps to import instances from ‘Data.Int’
+    To import instances alone, use: import Data.Int()
+   |
+48 | import Data.Int (Int64)
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:49:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘isInfixOf, isPrefixOf’
+    from module ‘Data.List’ is redundant
+   |
+49 | import Data.List (nub, isInfixOf, isPrefixOf)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:50:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Maybe’ is redundant
+      except perhaps to import instances from ‘Data.Maybe’
+    To import instances alone, use: import Data.Maybe()
+   |
+50 | import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:57:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Foreign.Marshal.Alloc’ is redundant
+      except perhaps to import instances from ‘Foreign.Marshal.Alloc’
+    To import instances alone, use: import Foreign.Marshal.Alloc()
+   |
+57 | import Foreign.Marshal.Alloc (allocaBytes)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:58:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Foreign.Marshal.Array’ is redundant
+      except perhaps to import instances from ‘Foreign.Marshal.Array’
+    To import instances alone, use: import Foreign.Marshal.Array()
+   |
+58 | import Foreign.Marshal.Array (peekArray)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:59:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Foreign.Ptr’ is redundant
+      except perhaps to import instances from ‘Foreign.Ptr’
+    To import instances alone, use: import Foreign.Ptr()
+   |
+59 | import Foreign.Ptr (Ptr, plusPtr, castPtr)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:60:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Foreign.Storable’ is redundant
+      except perhaps to import instances from ‘Foreign.Storable’
+    To import instances alone, use: import Foreign.Storable()
+   |
+60 | import Foreign.Storable (peekByteOff, peek, Storable(..))
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:61:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO’ is redundant
+      except perhaps to import instances from ‘System.IO’
+    To import instances alone, use: import System.IO()
+   |
+61 | import System.IO (IOMode(..), withFile, hFileSize, Handle)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:67:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Database.SQLite.Simple.ToField’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple.ToField’
+    To import instances alone, use: import Database.SQLite.Simple.ToField()
+   |
+67 | import Database.SQLite.Simple.ToField
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:68:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Database.SQLite.Simple.FromField’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple.FromField’
+    To import instances alone, use: import Database.SQLite.Simple.FromField()
+   |
+68 | import Database.SQLite.Simple.FromField
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/References.hs:291:9: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘lines’ shadows the existing binding
+      imported from ‘Prelude’ at src/Ten/DB/References.hs:6:8-24
+      (and originally defined in ‘base-4.19.1.0:Data.OldList’)
+    |
+291 |     let lines = T.splitOn "\n" text
+    |         ^^^^^
+
+src/Ten/DB/References.hs:524:48: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘db'’
+    |
+524 |     removed <- withTransaction db ReadWrite $ \db' ->
+    |                                                ^^^
+[ 4 of 21] Compiling Ten.DB.Schema    ( src/Ten/DB/Schema.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Schema.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Schema.dyn_o )
+
+src/Ten/DB/Schema.hs:44:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘void, when’ from module ‘Control.Monad’ is redundant
+   |
+44 | import Control.Monad (forM_, when, unless, void)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:45:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.List’ is redundant
+      except perhaps to import instances from ‘Data.List’
+    To import instances alone, use: import Data.List()
+   |
+45 | import Data.List (sort, intercalate)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:49:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Database.SQLite.Simple’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple’
+    To import instances alone, use: import Database.SQLite.Simple()
+   |
+49 | import qualified Database.SQLite.Simple as SQLite
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:50:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Database.SQLite.Simple.ToField’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple.ToField’
+    To import instances alone, use: import Database.SQLite.Simple.ToField()
+   |
+50 | import Database.SQLite.Simple.ToField
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:51:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Database.SQLite.Simple.FromField’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple.FromField’
+    To import instances alone, use: import Database.SQLite.Simple.FromField()
+   |
+51 | import Database.SQLite.Simple.FromField
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:52:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Database.SQLite.Simple.Types’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple.Types’
+    To import instances alone, use: import Database.SQLite.Simple.Types()
+   |
+52 | import Database.SQLite.Simple.Types
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:205:33: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘columnName’ shadows the existing binding
+      imported from ‘Database.SQLite.Simple’ at src/Ten/DB/Schema.hs:48:1-29
+    |
+205 | ensureColumnExists db tableName columnName = do
+    |                                 ^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:219:27: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘columnName’ shadows the existing binding
+      imported from ‘Database.SQLite.Simple’ at src/Ten/DB/Schema.hs:48:1-29
+    |
+219 | columnExists db tableName columnName = do
+    |                           ^^^^^^^^^^
+
+src/Ten/DB/Schema.hs:247:38: warning: [GHC-63394] [-Wx-partial]
+    In the use of ‘head’
+    (imported from Prelude, but defined in GHC.List):
+    "This is a partial function, it throws an error on empty lists. Use pattern matching or Data.List.uncons instead. Consider refactoring to use Data.List.NonEmpty."
+    |
+247 |     let tableElements = map (Table . head) tables
+    |                                      ^^^^
+
+src/Ten/DB/Schema.hs:252:38: warning: [GHC-63394] [-Wx-partial]
+    In the use of ‘head’
+    (imported from Prelude, but defined in GHC.List):
+    "This is a partial function, it throws an error on empty lists. Use pattern matching or Data.List.uncons instead. Consider refactoring to use Data.List.NonEmpty."
+    |
+252 |     let indexElements = map (Index . head) indices
+    |                                      ^^^^
+
+src/Ten/DB/Schema.hs:257:42: warning: [GHC-63394] [-Wx-partial]
+    In the use of ‘head’
+    (imported from Prelude, but defined in GHC.List):
+    "This is a partial function, it throws an error on empty lists. Use pattern matching or Data.List.uncons instead. Consider refactoring to use Data.List.NonEmpty."
+    |
+257 |     let triggerElements = map (Trigger . head) triggers
+    |                                          ^^^^
+
+src/Ten/DB/Schema.hs:260:61: warning: [GHC-62161] [-Wincomplete-uni-patterns]
+    Pattern match(es) are non-exhaustive
+    In a lambda abstraction:
+        Patterns of type ‘SchemaElement’ not matched:
+            Index _
+            Column _ _
+            Constraint _ _
+            Trigger _
+    |
+260 |     columnElements <- concat <$> mapM getTableColumns (map (\(Table t) -> t) tableElements)
+    |                                                             ^^^^^^^^^^^^^^^
+[ 5 of 21] Compiling Ten.Daemon.Auth  ( src/Ten/Daemon/Auth.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Auth.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Auth.dyn_o )
+
+src/Ten/Daemon/Auth.hs:61:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Concurrent.MVar’ is redundant
+      except perhaps to import instances from ‘Control.Concurrent.MVar’
+    To import instances alone, use: import Control.Concurrent.MVar()
+   |
+61 | import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:62:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘bracket, catch, finally’
+    from module ‘Control.Exception’ is redundant
+   |
+62 | import Control.Exception (catch, throwIO, try, bracket, SomeException, Exception, finally)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:63:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘forM, forM_, void’
+    from module ‘Control.Monad’ is redundant
+   |
+63 | import Control.Monad (void, when, unless, forM, forM_)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:64:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘SHA512, digestFromByteString, hash’
+    from module ‘Crypto.Hash’ is redundant
+   |
+64 | import Crypto.Hash (hash, digestFromByteString, Digest, SHA256, SHA512)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:68:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘eitherDecode, encode’
+    from module ‘Data.Aeson’ is redundant
+   |
+68 | import Data.Aeson ((.:), (.=), eitherDecode, encode)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:70:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Aeson.Types’ is redundant
+      except perhaps to import instances from ‘Data.Aeson.Types’
+    To import instances alone, use: import Data.Aeson.Types()
+   |
+70 | import qualified Data.Aeson.Types as Aeson
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:74:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString.Char8’ is redundant
+      except perhaps to import instances from ‘Data.ByteString.Char8’
+    To import instances alone, use: import Data.ByteString.Char8()
+   |
+74 | import qualified Data.ByteString.Char8 as BS8
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:76:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.IORef’ is redundant
+      except perhaps to import instances from ‘Data.IORef’
+    To import instances alone, use: import Data.IORef()
+   |
+76 | import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:79:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘catMaybes, fromMaybe, isNothing’
+    from module ‘Data.Maybe’ is redundant
+   |
+79 | import Data.Maybe (isJust, fromMaybe, catMaybes, isNothing)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:86:57: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘parseTimeM’
+    from module ‘Data.Time.Format’ is redundant
+   |
+86 | import Data.Time.Format (formatTime, defaultTimeLocale, parseTimeM)
+   |                                                         ^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:87:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.UUID’ is redundant
+      except perhaps to import instances from ‘Data.UUID’
+    To import instances alone, use: import Data.UUID()
+   |
+87 | import Data.UUID (UUID)
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:90:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘getPermissions, setPermissions’
+    from module ‘System.Directory’ is redundant
+   |
+90 | import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, getPermissions, setPermissions)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:92:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO’ is redundant
+      except perhaps to import instances from ‘System.IO’
+    To import instances alone, use: import System.IO()
+   |
+92 | import System.IO (withFile, IOMode(..), hClose, stderr, hPutStrLn)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:93:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO.Error’ is redundant
+      except perhaps to import instances from ‘System.IO.Error’
+    To import instances alone, use: import System.IO.Error()
+   |
+93 | import System.IO.Error (isDoesNotExistError)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:96:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘getAllGroupEntries, getAllUserEntries,
+                   getEffectiveUserID, getRealUserID, getUserEntryForID,
+                   homeDirectory’
+    from module ‘System.Posix.User’ is redundant
+   |
+96 | import System.Posix.User (
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^...
+
+src/Ten/Daemon/Auth.hs:102:23: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘randomIO’ from module ‘System.Random’ is redundant
+    |
+102 | import System.Random (randomIO, randomRIO)
+    |                       ^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:287:9: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘hash’ shadows the existing binding
+      imported from ‘Crypto.Hash’ at src/Ten/Daemon/Auth.hs:64:21-24
+    |
+287 |     let hash = pbkdf2Hash (TE.encodeUtf8 password) salt iterations 64
+    |         ^^^^
+
+src/Ten/Daemon/Auth.hs:487:13: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘sysUser’
+    |
+487 |             sysUser <- case uiSystemUser user of
+    |             ^^^^^^^
+
+src/Ten/Daemon/Auth.hs:535:22: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘db’
+    |
+535 | createUserFromSystem db username clientInfo = do
+    |                      ^^
+
+src/Ten/Daemon/Auth.hs:535:34: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘clientInfo’
+    |
+535 | createUserFromSystem db username clientInfo = do
+    |                                  ^^^^^^^^^^
+
+src/Ten/Daemon/Auth.hs:540:15: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘uid’
+    |
+540 |         Just (uid, name, _) -> do
+    |               ^^^
+
+src/Ten/Daemon/Auth.hs:540:20: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘name’
+    |
+540 |         Just (uid, name, _) -> do
+    |                    ^^^^
+
+src/Ten/Daemon/Auth.hs:603:67: warning: [GHC-18042] [-Wtype-defaults]
+    • Defaulting the type variable ‘a0’ to type ‘Integer’ in the following constraint
+        Integral a0 arising from a use of ‘floor’
+    • In the first argument of ‘($)’, namely ‘floor’
+      In the second argument of ‘($)’, namely
+        ‘floor $ diffUTCTime expiry now’
+      In the expression: Just $ floor $ diffUTCTime expiry now
+    |
+603 |                                             Just expiry -> Just $ floor $ diffUTCTime expiry now
+    |                                                                   ^^^^^
+
+src/Ten/Daemon/Auth.hs:792:9: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘hashText’ shadows the existing binding
+      defined at src/Ten/Daemon/Auth.hs:327:1
+    |
+792 |         hashText <- v .: "hash"
+    |         ^^^^^^^^
+[ 6 of 21] Compiling Ten.Daemon.Config ( src/Ten/Daemon/Config.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Config.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Config.dyn_o )
+
+src/Ten/Daemon/Config.hs:36:29: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘unless’ from module ‘Control.Monad’ is redundant
+   |
+36 | import Control.Monad (when, unless)
+   |                             ^^^^^^
+
+src/Ten/Daemon/Config.hs:39:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Aeson.Types’ is redundant
+      except perhaps to import instances from ‘Data.Aeson.Types’
+    To import instances alone, use: import Data.Aeson.Types()
+   |
+39 | import qualified Data.Aeson.Types as Aeson
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Config.hs:42:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘isJust, isNothing’
+    from module ‘Data.Maybe’ is redundant
+   |
+42 | import Data.Maybe (fromMaybe, isNothing, isJust)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Config.hs:47:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Text.Encoding’ is redundant
+      except perhaps to import instances from ‘Data.Text.Encoding’
+    To import instances alone, use: import Data.Text.Encoding()
+   |
+47 | import qualified Data.Text.Encoding as TE
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Config.hs:48:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Text.IO’ is redundant
+      except perhaps to import instances from ‘Data.Text.IO’
+    To import instances alone, use: import Data.Text.IO()
+   |
+48 | import qualified Data.Text.IO as TIO
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Config.hs:51:28: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘getEnv’
+    from module ‘System.Environment’ is redundant
+   |
+51 | import System.Environment (getEnv, lookupEnv)
+   |                            ^^^^^^
+
+src/Ten/Daemon/Config.hs:54:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘System.IO.Error’ is redundant
+      except perhaps to import instances from ‘System.IO.Error’
+    To import instances alone, use: import System.IO.Error()
+   |
+54 | import qualified System.IO.Error as IOE
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Config.hs:56:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Ten.Core’ is redundant
+      except perhaps to import instances from ‘Ten.Core’
+    To import instances alone, use: import Ten.Core()
+   |
+56 | import Ten.Core (BuildError(..))
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Config.hs:157:5: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘homeDir’
+    |
+157 |     homeDir <- getHomeDirectory
+    |     ^^^^^^^
+
+src/Ten/Daemon/Config.hs:402:42: warning: [GHC-18042] [-Wtype-defaults]
+    • Defaulting the type variable ‘a0’ to type ‘Integer’ in the following constraints
+        (Eq a0)
+          arising from a use of ‘==’ at src/Ten/Daemon/Config.hs:402:42-43
+        (Read a0)
+          arising from a use of ‘read’ at src/Ten/Daemon/Config.hs:402:35-38
+        (Num a0)
+          arising from the literal ‘0’ at src/Ten/Daemon/Config.hs:402:45
+    • In the expression: read i == 0
+      In the expression: if read i == 0 then Nothing else Just (read i)
+      In a record update at field ‘daemonGcInterval’,
+      with type constructor ‘DaemonConfig’
+      and data constructor ‘DaemonConfig’.
+    |
+402 |             daemonGcInterval = if read i == 0 then Nothing else Just (read i)
+    |                                          ^^
+[ 7 of 21] Compiling Ten.Hash         ( src/Ten/Hash.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Hash.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Hash.dyn_o )
+
+src/Ten/Hash.hs:29:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Crypto.Hash.Algorithms’ is redundant
+      except perhaps to import instances from ‘Crypto.Hash.Algorithms’
+    To import instances alone, use: import Crypto.Hash.Algorithms()
+   |
+29 | import qualified Crypto.Hash.Algorithms as Crypto
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:32:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString.Char8’ is redundant
+      except perhaps to import instances from ‘Data.ByteString.Char8’
+    To import instances alone, use: import Data.ByteString.Char8()
+   |
+32 | import qualified Data.ByteString.Char8 as BS8
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:37:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.List’ is redundant
+      except perhaps to import instances from ‘Data.List’
+    To import instances alone, use: import Data.List()
+   |
+37 | import Data.List (intercalate)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:43:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Monad.IO.Class’ is redundant
+      except perhaps to import instances from ‘Control.Monad.IO.Class’
+    To import instances alone, use: import Control.Monad.IO.Class()
+   |
+43 | import Control.Monad.IO.Class (liftIO)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Hash.hs:120:1: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: ‘hashFileIO’
+    |
+120 | hashFileIO path = do
+    | ^^^^^^^^^^
+[ 8 of 21] Compiling Ten.Store        ( src/Ten/Store.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Store.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Store.dyn_o )
+
+src/Ten/Store.hs:43:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘bracket, catch’
+    from module ‘Control.Exception’ is redundant
+   |
+43 | import Control.Exception (bracket, catch, try, SomeException)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Store.hs:58:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Text.Encoding’ is redundant
+      except perhaps to import instances from ‘Data.Text.Encoding’
+    To import instances alone, use: import Data.Text.Encoding()
+   |
+58 | import qualified Data.Text.Encoding as TE
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Store.hs:61:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO’ is redundant
+      except perhaps to import instances from ‘System.IO’
+    To import instances alone, use: import System.IO()
+   |
+61 | import System.IO
+   | ^^^^^^^^^^^^^^^^
+
+src/Ten/Store.hs:62:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO.Error’ is redundant
+      except perhaps to import instances from ‘System.IO.Error’
+    To import instances alone, use: import System.IO.Error()
+   |
+62 | import System.IO.Error (isDoesNotExistError)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Store.hs:65:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.Posix.IO’ is redundant
+      except perhaps to import instances from ‘System.Posix.IO’
+    To import instances alone, use: import System.Posix.IO()
+   |
+65 | import System.Posix.IO (openFd, closeFd, defaultFileFlags, OpenMode(..))
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Store.hs:66:28: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘Fd’ from module ‘System.Posix.Types’ is redundant
+   |
+66 | import System.Posix.Types (Fd, FileMode)
+   |                            ^^
+
+src/Ten/Store.hs:67:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘System.Posix.IO.ByteString’ is redundant
+      except perhaps to import instances from ‘System.Posix.IO.ByteString’
+    To import instances alone, use: import System.Posix.IO.ByteString()
+   |
+67 | import qualified System.Posix.IO.ByteString as PosixBS
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Store.hs:69:25: warning: [GHC-61689] [-Wdodgy-imports]
+    Module ‘Ten.Core’ does not export ‘storePathToFilePath’.
+   |
+69 | import Ten.Core hiding (storePathToFilePath)
+   |                         ^^^^^^^^^^^^^^^^^^^
+[ 9 of 21] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o )
+
+src/Ten/Sandbox.hs:1156:1: error: [GHC-58481]
+    parse error (possibly incorrect indentation or mismatched brackets)
+     |
+1156 | regainPrivileges :: IO ()
+     | ^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+

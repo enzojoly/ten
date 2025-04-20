@@ -71,7 +71,7 @@ import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
 import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
-import Foreign.Storable (peek, poke)
+import Foreign.Storable
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -89,6 +89,19 @@ data RLimit = RLimit {
     rlim_cur :: CULong,  -- Current limit (soft limit)
     rlim_max :: CULong   -- Maximum limit (hard limit)
 }
+
+instance Storable RLimit where
+    sizeOf _ = 16
+    alignment _ = 8
+
+    peek ptr = do
+        cur <- peekByteOff ptr 0 :: IO CULong
+        max <- peekByteOff ptr 8 :: IO CULong
+        return $ RLimit cur max
+
+    poke ptr (RLimit cur max) = do
+        pokeByteOff ptr 0 cur
+        pokeByteOff ptr 8 max
 
 -- Linux capability set structure
 newtype CapSet = CapSet (Ptr ())
@@ -576,7 +589,7 @@ setupNamespaces config sandboxDir = do
                         ret <- c_mount sourcePtr rootPtr fsTypePtr (mS_REC .|. mS_PRIVATE) nullPtr
                         when (ret /= 0) $ do
                             errno <- getErrno
-                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show errno
+                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show (case errno of Errno n -> n)
 
 -- POSIX constants
 eOPNOTSUPP :: Errno
