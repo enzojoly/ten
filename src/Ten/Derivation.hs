@@ -77,7 +77,7 @@ import System.FilePath
 import System.Directory (doesFileExist)
 import qualified System.Posix.Files as Posix
 import System.IO (withFile, IOMode(..))
-import System.Process
+import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode)
 import System.Exit
 import Control.Exception (try, SomeException, finally)
 import Database.SQLite.Simple (Only(..))
@@ -85,8 +85,8 @@ import Database.SQLite.Simple (Only(..))
 import Ten.Core
 import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflicts
 import Ten.Store
-import Ten.Sandbox
-import Ten.DB.Core
+import Ten.Sandbox (returnDerivationPath, prepareSandboxEnvironment)
+import Ten.DB.Core (initDatabase, closeDatabase)
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -588,33 +588,13 @@ hashDerivationInputs drv =
         map (\input -> storeHash $ inputPath input) $
         Set.toList $ derivInputs drv
 
--- | Set the file mode (permissions) for a file
-setFileMode :: FilePath -> Int -> IO ()
-setFileMode path mode = do
-    -- Use Posix.setFileMode which accepts a numeric mode
-    Posix.setFileMode path (fromIntegral mode)
-
--- | Prepare a sandbox environment with appropriate derivation variables
-prepareSandboxEnvironment :: BuildEnv -> FilePath -> Map Text Text -> Map Text Text
-prepareSandboxEnvironment env sandboxDir derivEnv =
-    Map.unions
-        [ derivEnv
-        , Map.fromList
-            [ ("TEN_STORE", T.pack $ storePath env)
-            , ("TEN_BUILD_DIR", T.pack sandboxDir)
-            , ("TEN_OUT", T.pack $ sandboxDir </> "out")
-            , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath sandboxDir)
-            , ("PATH", "/bin:/usr/bin:/usr/local/bin")
-            , ("HOME", T.pack sandboxDir)
-            , ("TMPDIR", T.pack $ sandboxDir </> "tmp")
-            ]
-        ]
-
--- | Get the path where a return-continuation derivation should be written
-returnDerivationPath :: FilePath -> FilePath
-returnDerivationPath buildDir = buildDir </> "returned-derivation.drv"
-
--- | Execute a process and read its output
-readCreateProcessWithExitCode :: CreateProcess -> String -> IO (ExitCode, String, String)
-readCreateProcessWithExitCode process input =
-    Process.readCreateProcessWithExitCode process input
+-- | Create a sandbox process configuration
+sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> CreateProcess
+sandboxedProcessConfig sandboxDir programPath args envVars config =
+    (proc programPath args)
+        { cwd = Just sandboxDir
+        , env = Just $ map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList envVars
+        , std_in = NoStream
+        , std_out = CreatePipe
+        , std_err = CreatePipe
+        }

@@ -44,7 +44,7 @@ import Control.Monad.Reader (ask)
 import Control.Monad.State (get, gets)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
-import Data.List (isPrefixOf, isInfixOf, sort)
+import Data.List (isPrefixOf, isInfixOf)
 import Control.Exception (bracket, try, tryJust, throwIO, catch, finally, handle, SomeException, IOException)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -68,10 +68,10 @@ import qualified System.Posix.IO as PosixIO
 import Foreign.C.Error (throwErrno, throwErrnoIfMinus1_, throwErrnoIfMinus1, getErrno, Errno(..), errnoToIOError)
 import Foreign.C.String (CString, withCString, peekCString, newCString)
 import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
-import Foreign.Ptr (Ptr, nullPtr, castPtr, plusPtr)
+import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
-import Foreign.Storable (Storable(..), peek, poke)
+import Foreign.Storable (peek, poke)
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)
 
@@ -89,20 +89,6 @@ data RLimit = RLimit {
     rlim_cur :: CULong,  -- Current limit (soft limit)
     rlim_max :: CULong   -- Maximum limit (hard limit)
 }
-
--- Implementation of Storable for RLimit
-instance Storable RLimit where
-    sizeOf _ = 16  -- Size of two CULong values (8 bytes each on 64-bit systems)
-    alignment _ = alignment (undefined :: CULong)
-
-    peek ptr = do
-        cur <- peek (castPtr ptr)
-        max <- peek (plusPtr (castPtr ptr) 8)
-        return (RLimit cur max)
-
-    poke ptr (RLimit cur max) = do
-        poke (castPtr ptr) cur
-        poke (plusPtr (castPtr ptr) 8) max
 
 -- Linux capability set structure
 newtype CapSet = CapSet (Ptr ())
@@ -537,7 +523,7 @@ mountProc procDir = do
         withCString "proc" $ \fsTypePtr ->
             withCString "none" $ \sourcePtr ->
                 withCString "" $ \dataPtr -> do
-                    ret <- c_mount sourcePtr destPtr fsTypePtr 0 (castPtr dataPtr)
+                    ret <- c_mount sourcePtr destPtr fsTypePtr 0 nullPtr
                     when (ret /= 0) $ do
                         errno <- getErrno
                         throwErrno $ "Failed to mount proc in " ++ procDir
@@ -602,10 +588,10 @@ setupNamespaces config sandboxDir = do
             withCString "none" $ \fsTypePtr ->
                 withCString "none" $ \sourcePtr ->
                     withCString "" $ \dataPtr -> do
-                        ret <- c_mount sourcePtr rootPtr fsTypePtr (mS_REC .|. mS_PRIVATE) (castPtr dataPtr)
+                        ret <- c_mount sourcePtr rootPtr fsTypePtr (mS_REC .|. mS_PRIVATE) nullPtr
                         when (ret /= 0) $ do
                             errno <- getErrno
-                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show (case errno of Errno n -> n)
+                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show errno
 
 -- POSIX constants
 eOPNOTSUPP :: Errno
@@ -889,7 +875,7 @@ bindMount source dest writable = do
         withCString dest' $ \destPtr ->
             withCString "none" $ \fsTypePtr ->
                 withCString "" $ \dataPtr -> do
-                    ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND (castPtr dataPtr)
+                    ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND dataPtr
                     when (ret /= 0) $ do
                         errno <- getErrno
                         throwErrno $ "Failed to bind mount " ++ source' ++ " to " ++ dest' ++
@@ -902,7 +888,7 @@ bindMount source dest writable = do
                 withCString "none" $ \fsTypePtr ->
                     withCString "" $ \dataPtr -> do
                         let flags = mS_BIND .|. mS_REMOUNT .|. mS_RDONLY
-                        ret <- c_mount sourcePtr destPtr fsTypePtr flags (castPtr dataPtr)
+                        ret <- c_mount sourcePtr destPtr fsTypePtr flags dataPtr
                         when (ret /= 0) $ do
                             errno <- getErrno
                             -- Don't fail, just warn - the mount is already established
@@ -1032,24 +1018,44 @@ sandboxedProcessConfig sandboxDir programPath args envVars config =
         }
 
 -- | Prepare environment variables for sandbox
+-- | Enhanced with consolidated functionality from Ten.Derivation implementation
 prepareSandboxEnvironment :: BuildEnv -> FilePath -> Map Text Text -> Map Text Text
 prepareSandboxEnvironment env sandboxDir extraEnv =
     Map.unions
-        [ baseEnv
+        [ -- Base essential environment variables
+          baseEnv
+          -- Custom environment variables from extra configuration
         , extraEnv
+          -- Security-related environment variables
+        , securityEnv
+          -- Build information variables
+        , buildInfoEnv
         ]
   where
+    -- Core environment variables that all sandboxes need
     baseEnv = Map.fromList
         [ ("TEN_STORE", T.pack $ storePath env)
         , ("TEN_BUILD_DIR", T.pack sandboxDir)
         , ("TEN_OUT", T.pack $ sandboxDir </> "out")
         , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath sandboxDir)
         , ("TEN_TMP", T.pack $ sandboxDir </> "tmp")
-        , ("PATH", "/bin:/usr/bin:/usr/local/bin") -- Explicit PATH
-        , ("HOME", T.pack sandboxDir)              -- Set HOME to sandbox
-        , ("TMPDIR", T.pack $ sandboxDir </> "tmp") -- Set TMPDIR
-        , ("TMP", T.pack $ sandboxDir </> "tmp")   -- Alternative tmp env var
-        , ("TEMP", T.pack $ sandboxDir </> "tmp")  -- Another alternative
+        , ("PATH", "/bin:/usr/bin:/usr/local/bin")     -- Explicit PATH
+        , ("HOME", T.pack sandboxDir)                  -- Set HOME to sandbox
+        , ("TMPDIR", T.pack $ sandboxDir </> "tmp")    -- Set TMPDIR
+        , ("TMP", T.pack $ sandboxDir </> "tmp")       -- Alternative tmp env var
+        , ("TEMP", T.pack $ sandboxDir </> "tmp")      -- Another alternative
+        ]
+
+    -- Security-related variables
+    securityEnv = Map.fromList
+        [ ("TEN_SANDBOX", "1")           -- Indicate running in sandbox
+        , ("TEN_RESTRICTED", "1")        -- Indicate restricted environment
+        , ("TEN_UNPRIVILEGED", "1")      -- Indicate unprivileged execution
+        ]
+
+    -- Build information variables
+    buildInfoEnv = Map.fromList
+        [ ("TEN_BUILD_ID", maybe "unknown" (T.pack . showBuildId) $ userName env)
         ]
 
 -- | Drop privileges to run as unprivileged user
