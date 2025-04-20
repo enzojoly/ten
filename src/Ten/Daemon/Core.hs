@@ -46,14 +46,18 @@ module Ten.Daemon.Core (
     -- Internal utilities for testing
     ensureDirectories,
     checkStoreAccess,
-    acquireGlobalLock
+    acquireGlobalLock,
+
+    -- GC coordination
+    isGCRunning,
+    checkGCLockStatus
 ) where
 
 import Control.Concurrent (forkIO, killThread, ThreadId, threadDelay, myThreadId)
 import Control.Concurrent.STM
 import Control.Concurrent.Async (Async, async, cancel)
 import Control.Exception (bracket, finally, try, catch, handle, throwIO, SomeException, Exception, ErrorCall(..))
-import Control.Monad (forever, void, when, unless, forM_)
+import Control.Monad (forever, void, when, unless, forM_, foldM)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
@@ -62,14 +66,14 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust, fromJust, isNothing, catMaybes)
+import Data.Maybe (isJust, fromJust, isNothing, catMaybes, fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
+import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, addUTCTime)
 import Data.Time.Format (formatTime, defaultTimeLocale)
 import Network.Socket (Socket, SockAddr(..), socketToHandle, socket, Family(..), SocketType(..), setSocketOption,
                        SocketOption(..), bind, listen, close, accept, withFdSocket, setCloseOnExecIfNeeded)
@@ -108,7 +112,8 @@ import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, daemonSocketPa
                         daemonGroup, daemonLogFile, daemonLogLevel, DaemonConfig(..))
 import Ten.Daemon.Auth (authenticateUser, validateToken, revokeToken, UserCredentials(..))
 import Ten.Daemon.State (initDaemonState, loadStateFromFile, saveStateToFile, DaemonState(..),
-                        registerBuild, updateBuildStatus, appendBuildLog, collectGarbage)
+                        registerBuild, updateBuildStatus, appendBuildLog, acquireGCLock,
+                        releaseGCLock, checkGCLock)
 import Ten.Daemon.Client (isDaemonRunning, startDaemonIfNeeded)
 import Ten.Daemon.Server (startServer, stopServer, ServerControl(..))
 import Ten.GC (GCStats(..))
@@ -350,6 +355,9 @@ shutdownDaemon context logHandle = do
     -- Kill background workers
     killBackgroundWorkers context
 
+    -- Release GC lock if we're holding it
+    releaseGCLockIfNeeded context
+
     -- Save state
     saveDaemonState (ctxConfig context) (ctxState context)
 
@@ -361,6 +369,43 @@ shutdownDaemon context logHandle = do
 
     logMessage logHandle (daemonLogLevel (ctxConfig context)) LogNormal
         "Ten daemon shutdown complete."
+
+-- | Release GC lock if the daemon is holding it
+releaseGCLockIfNeeded :: DaemonContext -> IO ()
+releaseGCLockIfNeeded context = do
+    let config = ctxConfig context
+    let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config))
+
+    -- Check if lock file exists
+    exists <- doesFileExist lockPath
+    when exists $ do
+        -- Check if we own the lock (read PID from lock file)
+        pidContent <- try $ readFile lockPath
+        case pidContent of
+            Left (_ :: SomeException) ->
+                return () -- Couldn't read lock file, probably not ours
+
+            Right content ->
+                case reads content of
+                    [(lockPid, "")] -> do
+                        -- Check if that's our PID
+                        ourPid <- getProcessID
+                        when (lockPid == ourPid) $ do
+                            -- We own the lock, release it
+                            logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
+                                "Releasing GC lock held by daemon"
+
+                            -- Create a build environment to use in releasing the lock
+                            let env = initBuildEnv (daemonTmpDir config) (daemonStorePath config)
+
+                            -- Open the lock file descriptor
+                            fd <- openFd lockPath ReadWrite Nothing defaultFileFlags
+
+                            -- Release the lock by removing the file
+                            closeFd fd
+                            removeFile lockPath `catch` \(_ :: SomeException) -> return ()
+
+                    _ -> return () -- Invalid format, probably not our lock
 
 -- | Initialize daemon context
 initDaemonContext :: DaemonConfig -> IO DaemonContext
@@ -556,32 +601,42 @@ gcWorker context interval = do
                 canGC <- atomically $ checkGCLock state
 
                 when canGC $ do
-                    -- Log GC start
-                    logMessage logHandle (daemonLogLevel config) LogNormal
-                        "Starting automatic garbage collection..."
+                    -- Check if another process is already running GC
+                    let storeDir = daemonStorePath config
+                        lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) storeDir)
 
-                    -- Acquire GC lock
-                    atomically $ acquireGCLock state
+                    gcRunning <- isGCRunning lockPath
 
-                    -- Create build environment
-                    env <- mkBuildEnv config
+                    unless gcRunning $ do
+                        -- Log GC start
+                        logMessage logHandle (daemonLogLevel config) LogNormal
+                            "Starting automatic garbage collection..."
 
-                    -- Run GC
-                    result <- runTen (Ten.Daemon.State.collectGarbage) env (initBuildState Build)
+                        -- Acquire GC lock in daemon state
+                        atomically $ acquireGCLock state
 
-                    -- Process result
-                    case result of
-                        Left err ->
-                            logMessage logHandle (daemonLogLevel config) LogNormal $
-                                "Garbage collection failed: " ++ show err
-                        Right (stats, _) ->
-                            logMessage logHandle (daemonLogLevel config) LogNormal $
-                                "Garbage collection completed: " ++
-                                show (gcCollected stats) ++ " paths collected, " ++
-                                show (gcBytes stats) ++ " bytes freed."
+                        -- Create build environment
+                        let env = initBuildEnv (daemonTmpDir config) storeDir
 
-                    -- Release GC lock
-                    atomically $ releaseGCLock state
+                        -- Run GC
+                        result <- try $ runTen Ten.GC.collectGarbage env (initBuildState Build (BuildIdFromInt 0))
+
+                        -- Process result
+                        case result of
+                            Left (err :: SomeException) ->
+                                logMessage logHandle (daemonLogLevel config) LogNormal $
+                                    "Garbage collection failed: " ++ show err
+                            Right (Right (stats, _)) ->
+                                logMessage logHandle (daemonLogLevel config) LogNormal $
+                                    "Garbage collection completed: " ++
+                                    show (gcCollected stats) ++ " paths collected, " ++
+                                    show (gcBytes stats) ++ " bytes freed."
+                            Right (Left err) ->
+                                logMessage logHandle (daemonLogLevel config) LogNormal $
+                                    "Garbage collection error: " ++ show err
+
+                        -- Release GC lock
+                        atomically $ releaseGCLock state
 
                 -- Sleep
                 threadDelay (interval * 1000000)
@@ -594,6 +649,57 @@ gcWorker context interval = do
             Just ThreadKilled -> return ()
             _ -> logMessage logHandle (daemonLogLevel config) LogNormal $
                     "GC worker terminated: " ++ show e
+
+-- | Check if a GC process is running (by checking the lock file)
+isGCRunning :: FilePath -> IO Bool
+isGCRunning lockPath = do
+    -- Check if lock file exists
+    exists <- doesFileExist lockPath
+
+    if not exists
+        then return False
+        else do
+            -- Read PID from lock file
+            content <- try $ readFile lockPath
+            case content of
+                Left (_ :: SomeException) ->
+                    return False -- Can't read lock file
+
+                Right pidStr ->
+                    case reads pidStr of
+                        [(pid, "")] -> do
+                            -- Check if process is running
+                            isProcessRunning pid
+                        _ ->
+                            -- Invalid lock file format
+                            return False
+
+-- | Check the status of the GC lock
+checkGCLockStatus :: FilePath -> IO (Bool, Maybe ProcessID)
+checkGCLockStatus lockPath = do
+    -- Check if lock file exists
+    exists <- doesFileExist lockPath
+
+    if not exists
+        then return (False, Nothing) -- Not locked
+        else do
+            -- Read PID from lock file
+            content <- try $ readFile lockPath
+            case content of
+                Left (_ :: SomeException) ->
+                    return (False, Nothing) -- Can't read lock file
+
+                Right pidStr ->
+                    case reads pidStr of
+                        [(pid, "")] -> do
+                            -- Check if process is running
+                            running <- isProcessRunning pid
+                            if running
+                                then return (True, Just pid) -- Locked by running process
+                                else return (False, Just pid) -- Stale lock
+                        _ ->
+                            -- Invalid lock file format
+                            return (False, Nothing)
 
 -- | Set up initial signal handlers before full daemon initialization
 setupInitialSignalHandlers :: IO ()
@@ -666,36 +772,51 @@ handleSigUsr1 context = do
 
     -- Start GC in a separate thread
     void $ forkIO $ do
+        let config = ctxConfig context
+        let state = ctxState context
+
         -- Check if we can run GC
-        canGC <- atomically $ checkGCLock (ctxState context)
+        canGC <- atomically $ checkGCLock state
 
         if canGC
             then do
-                -- Acquire GC lock
-                atomically $ acquireGCLock (ctxState context)
+                -- Check if another process is already running GC
+                let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config))
+                gcRunning <- isGCRunning lockPath
 
-                -- Create build environment
-                env <- mkBuildEnv (ctxConfig context)
+                if gcRunning
+                    then do
+                        logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
+                            "Cannot run garbage collection: already in progress by another process"
+                    else do
+                        -- Acquire GC lock
+                        atomically $ acquireGCLock state
 
-                -- Run GC
-                result <- runTen (Ten.Daemon.State.collectGarbage) env (initBuildState Build)
+                        -- Create build environment
+                        let env = initBuildEnv (daemonTmpDir config) (daemonStorePath config)
 
-                -- Process result
-                case result of
-                    Left err ->
-                        logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
-                            "Manual garbage collection failed: " ++ show err
-                    Right (stats, _) ->
-                        logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
-                            "Manual garbage collection completed: " ++
-                            show (gcCollected stats) ++ " paths collected, " ++
-                            show (gcBytes stats) ++ " bytes freed."
+                        -- Run GC
+                        result <- try $ runTen Ten.GC.collectGarbage env (initBuildState Build (BuildIdFromInt 0))
 
-                -- Release GC lock
-                atomically $ releaseGCLock (ctxState context)
+                        -- Process result
+                        case result of
+                            Left (err :: SomeException) ->
+                                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
+                                    "Manual garbage collection failed: " ++ show err
+                            Right (Right (stats, _)) ->
+                                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
+                                    "Manual garbage collection completed: " ++
+                                    show (gcCollected stats) ++ " paths collected, " ++
+                                    show (gcBytes stats) ++ " bytes freed."
+                            Right (Left err) ->
+                                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
+                                    "Manual garbage collection error: " ++ show err
+
+                        -- Release GC lock
+                        atomically $ releaseGCLock state
             else
-                logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
-                    "Cannot run garbage collection: already in progress."
+                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
+                    "Cannot run garbage collection: daemon lock already held"
 
 -- | Create a build environment for daemon operations
 mkBuildEnv :: DaemonConfig -> IO BuildEnv
@@ -1025,7 +1146,9 @@ ensureDirectories config = do
             daemonStorePath config,
             daemonTmpDir config,
             takeDirectory (daemonStateFile config),
-            maybe "" takeDirectory (daemonLogFile config)
+            maybe "" takeDirectory (daemonLogFile config),
+            -- Add GC lock directory to ensure it exists with correct permissions
+            takeDirectory (daemonStorePath config </> "var/ten/gc.lock")
             ]
 
     -- Create each directory with appropriate permissions
@@ -1052,7 +1175,7 @@ checkStoreAccess config = do
         initializeStore (daemonStorePath config)
 
         -- Create subdirectories
-        forM_ ["tmp", "gc-roots"] $ \subdir -> do
+        forM_ ["tmp", "gc-roots", "var/ten"] $ \subdir -> do
             let path = daemonStorePath config </> subdir
             createDirectoryIfMissing True path
 
@@ -1172,24 +1295,6 @@ setFileCreationMask mode = do
 -- | Helper to convert raw exception to a specialized exception if possible
 fromException :: Exception e => SomeException -> Maybe e
 fromException = Control.Exception.fromException
-
--- | Check if the GC lock is available on the daemon state
-checkGCLock :: DaemonState -> STM Bool
-checkGCLock state = do
-    -- This is a stub - in the real implementation, it would check the GC lock in the state
-    return True
-
--- | Acquire the GC lock from the daemon state
-acquireGCLock :: DaemonState -> STM ()
-acquireGCLock state = do
-    -- This is a stub - in the real implementation, it would take the GC lock in the state
-    return ()
-
--- | Release the GC lock from the daemon state
-releaseGCLock :: DaemonState -> STM ()
-releaseGCLock state = do
-    -- This is a stub - in the real implementation, it would release the GC lock in the state
-    return ()
 
 -- | Constants for other file modes
 otherReadMode, otherWriteMode, otherExecuteMode :: FileMode

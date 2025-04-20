@@ -87,7 +87,11 @@ module Ten.Core (
     -- Linux-specific operations
     dropPrivileges,
     getSystemUser,
-    getSystemGroup
+    getSystemGroup,
+
+    -- GC lock path helpers
+    getGCLockPath,
+    ensureLockDirExists
 ) where
 
 import Control.Concurrent.STM
@@ -126,6 +130,7 @@ import Text.Read (readPrec)
 import qualified Text.Read as Read
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Concurrent (ThreadId)
+import System.Posix.Files (setFileMode)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -381,6 +386,7 @@ data BuildEnv = BuildEnv
     , buildStrategy :: BuildStrategy     -- How to build derivations
     , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
     , maxConcurrentBuilds :: Maybe Int   -- Maximum concurrent builds
+    , gcLockPath :: FilePath             -- Path to GC lock file
     } deriving (Show, Eq)
 
 -- | State carried through build operations
@@ -430,6 +436,7 @@ initBuildEnv wd sp = BuildEnv
     , buildStrategy = MonadicStrategy
     , maxRecursionDepth = 100
     , maxConcurrentBuilds = Nothing
+    , gcLockPath = sp </> "var/ten/gc.lock"
     }
 
 -- | Initialize client build environment
@@ -618,3 +625,15 @@ getSystemGroup :: Text -> TenM p GroupID
 getSystemGroup groupname = liftIO $ do
     groupEntry <- getGroupEntryForName (T.unpack groupname)
     return $ groupID groupEntry
+
+-- | Get the GC lock path from the BuildEnv
+getGCLockPath :: BuildEnv -> FilePath
+getGCLockPath = gcLockPath
+
+-- | Ensure the directory for a lock file exists
+ensureLockDirExists :: FilePath -> IO ()
+ensureLockDirExists lockPath = do
+    let dir = takeDirectory lockPath
+    createDirectoryIfMissing True dir
+    -- Set appropriate permissions (0755 - rwxr-xr-x)
+    setFileMode dir 0o755

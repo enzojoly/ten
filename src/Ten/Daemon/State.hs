@@ -51,6 +51,7 @@ module Ten.Daemon.State (
     acquireGCLock,
     releaseGCLock,
     withGCLock,
+    checkGCLock,
 
     -- System statistics
     DaemonStats(..),
@@ -82,6 +83,7 @@ module Ten.Daemon.State (
 
 import Control.Concurrent
 import Control.Concurrent.STM
+import Control.Concurrent.Async (Async, async, cancel)
 import Control.Exception (Exception, throwIO, try, catch, finally, bracket, SomeException, IOException)
 import Control.Monad (when, unless, forM, forM_, void, foldM)
 import Data.Aeson ((.:), (.=))
@@ -90,7 +92,7 @@ import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
-import Data.List (sort, sortOn)
+import Data.List (sort, sortOn, sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
@@ -100,27 +102,29 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, addUTCTime)
-import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile)
-import System.FilePath (takeDirectory)
-import System.IO (Handle, withFile, IOMode(..), hClose)
-import System.IO.Error (isDoesNotExistError)
+import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, removeFile)
+import System.FilePath (takeDirectory, (</>))
+import System.IO (Handle, withFile, IOMode(..), hClose, hPutStrLn, stderr, stdout, hFlush)
+import System.IO.Error (isDoesNotExistError, catchIOError)
 import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit)
 import System.Posix.Signals (installHandler, Handler(..), sigTERM)
-import System.Posix.Process (getProcessID)
-import Data.List (sortBy)
-import Data.Ord (comparing)
-import System.Posix.Signals (Signal)
+import System.Posix.Process (getProcessID, signalProcess)
+import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode)
+import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock, fdToHandle,
+                       OpenMode(..), defaultFileFlags, Fd, FdOption(..))
 import System.Posix.Types (ProcessID)
 import qualified System.Posix.Signals as Signals
 import System.Posix.Sysconf (getSysconfVar, SysconfVar(..))
-import System.Posix.Files (fileSize, getFileStatus)
 import System.Posix.Memory (sysconfPageSize)
-import Control.Concurrent.Async (Async, async, cancel)
+import Data.Ord (comparing)
+import System.Posix.Signals (Signal)
+import System.Posix.Files.ByteString (createLink, removeLink)
+import qualified Data.ByteString.Char8 as BC
 
 -- Import Ten modules
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), UserId(..),
                  AuthToken(..), BuildState(..), BuildStrategy(..),
-                 BuildEnv(..), runTen, Phase(..))
+                 BuildEnv(..), runTen, Phase(..), getGCLockPath, ensureLockDirExists)
 import Ten.Derivation (Derivation, DerivationInput, DerivationOutput,
                       derivationEquals, derivHash, hashDerivation)
 import Ten.Build (BuildResult(..))
@@ -198,7 +202,9 @@ data DaemonState = DaemonState {
     dsDerivationGraphs :: TVar (Map Text Graph.BuildGraph),
 
     -- Garbage collection
-    dsGCLock :: TMVar (),
+    dsGCLock :: TMVar (),  -- For backwards compatibility
+    dsGCLockOwner :: TVar (Maybe ProcessID),  -- Process ID that owns the GC lock
+    dsGCLockPath :: FilePath,  -- Path to the GC lock file
     dsLastGC :: TVar (Maybe UTCTime),
     dsGCStats :: TVar (UTCTime, Int, Int, Integer),  -- Last GC time, collected, kept, bytes freed
 
@@ -245,6 +251,8 @@ initDaemonState stateFile maxJobs maxHistory = do
     derivationGraphsVar <- newTVarIO Map.empty
 
     gcLockVar <- newTMVarIO ()
+    gcLockOwnerVar <- newTVarIO Nothing
+    let gcLockPath = takeDirectory stateFile </> "gc.lock"
     lastGCVar <- newTVarIO Nothing
     gcStatsVar <- newTVarIO (now, 0, 0, 0)
 
@@ -273,6 +281,8 @@ initDaemonState stateFile maxJobs maxHistory = do
             dsDerivationGraphs = derivationGraphsVar,
 
             dsGCLock = gcLockVar,
+            dsGCLockOwner = gcLockOwnerVar,
+            dsGCLockPath = gcLockPath,
             dsLastGC = lastGCVar,
             dsGCStats = gcStatsVar,
 
@@ -286,6 +296,9 @@ initDaemonState stateFile maxJobs maxHistory = do
             dsMaxFailedBuilds = maxHistory,
             dsMaxConcurrentBuilds = maxJobs
         }
+
+    -- Ensure the lock directory exists
+    ensureLockDirExists gcLockPath
 
     -- Set up maintenance thread
     setupMaintenanceThread state
@@ -802,19 +815,156 @@ getTransitiveDependencies state derivation = do
             -- For now, just return an empty set
             return Set.empty
 
+-- | Check if a process is still running
+isProcessRunning :: ProcessID -> IO Bool
+isProcessRunning pid = do
+    -- Try to send signal 0 to the process
+    result <- try $ signalProcess 0 pid
+    case result of
+        Left (_ :: SomeException) -> return False  -- Process doesn't exist
+        Right _ -> return True  -- Process exists
+
+-- | Check if the GC lock file exists and is valid
+checkGCLockFile :: FilePath -> IO (Either Text Bool)
+checkGCLockFile lockPath = do
+    -- Check if lock file exists
+    exists <- doesFileExist lockPath
+
+    if not exists
+        then return $ Right False  -- Lock file doesn't exist
+        else do
+            -- Read the lock file to get PID
+            result <- try $ readFile lockPath
+            case result of
+                Left (e :: SomeException) ->
+                    return $ Left $ "Error reading lock file: " <> T.pack (show e)
+
+                Right content -> do
+                    -- Parse the PID
+                    case reads content of
+                        [(pid, "")] -> do
+                            -- Check if the process is still running
+                            pidRunning <- isProcessRunning pid
+                            return $ Right pidRunning
+
+                        _ -> return $ Left "Invalid lock file format"
+
+-- | Create and acquire a GC lock file
+acquireGCLockFile :: FilePath -> IO (Either Text (Fd, ProcessID))
+acquireGCLockFile lockPath = do
+    -- Ensure parent directory exists
+    ensureLockDirExists (takeDirectory lockPath)
+
+    -- Get our process ID
+    pid <- getProcessID
+
+    -- Check if lock already exists
+    lockStatus <- checkGCLockFile lockPath
+
+    case lockStatus of
+        Left err -> return $ Left err
+        Right True ->
+            return $ Left "Another garbage collection is in progress"
+        Right False -> do
+            -- Create the lock file with our PID
+            result <- try $ do
+                -- Open or create the file
+                fd <- openFd lockPath ReadWrite (Just 0o644) defaultFileFlags {trunc = True}
+
+                -- Write our PID to it
+                handle <- fdToHandle fd
+                hPutStrLn handle (show pid)
+                hFlush handle
+
+                -- Set exclusive lock (non-blocking)
+                setLock fd (WriteLock, AbsoluteSeek, 0, 0)
+
+                -- Return file descriptor and PID
+                return (fd, pid)
+
+            case result of
+                Left (e :: SomeException) ->
+                    return $ Left $ "Failed to create lock file: " <> T.pack (show e)
+                Right lockInfo -> return $ Right lockInfo
+
+-- | Release a GC lock file
+releaseGCLockFile :: FilePath -> Fd -> IO ()
+releaseGCLockFile lockPath fd = do
+    -- Release the lock
+    setLock fd (Unlock, AbsoluteSeek, 0, 0)
+
+    -- Close the file descriptor
+    closeFd fd
+
+    -- Remove the lock file
+    catchIOError (removeFile lockPath) (\_ -> return ())
+
+-- | Check if GC lock is available (can be acquired)
+checkGCLock :: DaemonState -> STM Bool
+checkGCLock state = do
+    -- Check if we have a recorded owner
+    mOwner <- readTVar (dsGCLockOwner state)
+    case mOwner of
+        Nothing -> return True  -- No owner, lock is available
+        Just _ -> return False  -- Owned by some process
+
 -- | Acquire the GC lock
 acquireGCLock :: DaemonState -> IO ()
 acquireGCLock state = do
-    -- Try to take the GC lock
-    taken <- atomically $ tryTakeTMVar (dsGCLock state)
-    unless taken $
-        throwIO $ StateError $ StateLockError "GC already in progress"
+    -- Try to get the file-based lock
+    result <- acquireGCLockFile (dsGCLockPath state)
+
+    case result of
+        Left err ->
+            throwIO $ StateError $ StateLockError $ "Failed to acquire GC lock: " <> err
+        Right (fd, pid) -> do
+            -- Record the lock state in memory too
+            atomically $ do
+                -- Update the lock owner
+                writeTVar (dsGCLockOwner state) (Just pid)
+
+                -- For backwards compatibility, try to take the TMVar lock too
+                empty <- isEmptyTMVar (dsGCLock state)
+                unless empty $ do
+                    void $ takeTMVar (dsGCLock state)
+
+            -- Keep the fd in a global reference to avoid GC
+            -- (This is a bit of a hack, but we don't have a place to store it in the state)
+            -- In a real implementation you'd want to track this properly
+            writeIORef globalGCLockFdRef (Just (fd, dsGCLockPath state))
 
 -- | Release the GC lock
 releaseGCLock :: DaemonState -> IO ()
 releaseGCLock state = do
-    -- Release the GC lock
-    atomically $ putTMVar (dsGCLock state) ()
+    -- Get the file descriptor from the global reference
+    mFdInfo <- readIORef globalGCLockFdRef
+
+    case mFdInfo of
+        Just (fd, path) | path == dsGCLockPath state -> do
+            -- Release the file lock
+            releaseGCLockFile path fd
+
+            -- Clear the global reference
+            writeIORef globalGCLockFdRef Nothing
+
+            -- Update memory state
+            atomically $ do
+                -- Clear the lock owner
+                writeTVar (dsGCLockOwner state) Nothing
+
+                -- For backwards compatibility, release the TMVar lock too
+                empty <- isEmptyTMVar (dsGCLock state)
+                when empty $ do
+                    putTMVar (dsGCLock state) ()
+
+        _ ->
+            -- Not our lock or not found
+            return ()
+
+-- | Global reference to hold the GC lock file descriptor
+{-# NOINLINE globalGCLockFdRef #-}
+globalGCLockFdRef :: IORef (Maybe (Fd, FilePath))
+globalGCLockFdRef = unsafePerformIO $ newIORef Nothing
 
 -- | Execute an action with the GC lock
 withGCLock :: DaemonState -> IO a -> IO a
@@ -1098,6 +1248,12 @@ handleTermSignal state = do
         Just thread -> cancel thread
         Nothing -> return ()
 
+    -- Release GC lock if we have it
+    mOwner <- atomically $ readTVar (dsGCLockOwner state)
+    case mOwner of
+        Just _ -> releaseGCLock state
+        Nothing -> return ()
+
     -- Exit
     putStrLn "Shutdown complete."
     exitSuccess
@@ -1183,6 +1339,13 @@ newUnique = do
 -- | Microsecond delay
 threadDelay :: Int -> IO ()
 threadDelay = Control.Concurrent.threadDelay
+
+-- | Random number generation (to replace missing randomIO)
+randomIO :: IO Int
+randomIO = do
+    now <- getCurrentTime
+    let ns = floor (realToFrac (diffUTCTime now (read "1970-01-01 00:00:00 UTC")) * 1000000000)
+    return $ fromIntegral (ns `mod` maxBound)
 
 -- | Exit successfully
 exitSuccess :: IO a

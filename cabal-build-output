@@ -1,0 +1,374 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[10 of 21] Compiling Ten.Derivation   ( src/Ten/Derivation.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Derivation.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Derivation.dyn_o )
+
+src/Ten/Derivation.hs:55:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Concurrent.STM’ is redundant
+      except perhaps to import instances from ‘Control.Concurrent.STM’
+    To import instances alone, use: import Control.Concurrent.STM()
+   |
+55 | import Control.Concurrent.STM
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:68:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Text.Encoding’ is redundant
+      except perhaps to import instances from ‘Data.Text.Encoding’
+    To import instances alone, use: import Data.Text.Encoding()
+   |
+68 | import qualified Data.Text.Encoding as TE
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:74:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Aeson.Encoding’ is redundant
+      except perhaps to import instances from ‘Data.Aeson.Encoding’
+    To import instances alone, use: import Data.Aeson.Encoding()
+   |
+74 | import qualified Data.Aeson.Encoding as Aeson
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:78:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.HashMap.Strict’ is redundant
+      except perhaps to import instances from ‘Data.HashMap.Strict’
+    To import instances alone, use: import Data.HashMap.Strict()
+   |
+78 | import qualified Data.HashMap.Strict as HashMap
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:82:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO’ is redundant
+      except perhaps to import instances from ‘System.IO’
+    To import instances alone, use: import System.IO()
+   |
+82 | import System.IO (withFile, IOMode(..))
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:85:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Exception’ is redundant
+      except perhaps to import instances from ‘Control.Exception’
+    To import instances alone, use: import Control.Exception()
+   |
+85 | import Control.Exception (try, SomeException, finally)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:86:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Database.SQLite.Simple’ is redundant
+      except perhaps to import instances from ‘Database.SQLite.Simple’
+    To import instances alone, use: import Database.SQLite.Simple()
+   |
+86 | import Database.SQLite.Simple (Only(..))
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:87:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Data.Int’ is redundant
+      except perhaps to import instances from ‘Data.Int’
+    To import instances alone, use: import Data.Int()
+   |
+87 | import Data.Int (Int64)
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:94:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Ten.DB.Core’ is redundant
+      except perhaps to import instances from ‘Ten.DB.Core’
+    To import instances alone, use: import Ten.DB.Core()
+   |
+94 | import Ten.DB.Core (initDatabase, closeDatabase, dbQuery, dbQuery_, dbExecute)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:106:1: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: ‘detectRecursionCycle’
+    |
+106 | detectRecursionCycle derivations =
+    | ^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:231:5: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘env’
+    |
+231 |     env <- ask
+    |     ^^^
+
+src/Ten/Derivation.hs:252:5: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘derivPath’
+    |
+252 |     derivPath <- storeDerivation deriv
+    |     ^^^^^^^^^
+
+src/Ten/Derivation.hs:403:1: warning: [GHC-90177] [-Worphans]
+    Orphan class instance: instance Aeson.ToJSON DerivationInput
+    Suggested fix:
+      Move the instance declaration to the module of the class or of the type, or
+      wrap the type with a newtype and declare the instance on the new type.
+    |
+403 | instance Aeson.ToJSON DerivationInput where
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^...
+
+src/Ten/Derivation.hs:410:1: warning: [GHC-90177] [-Worphans]
+    Orphan class instance: instance Aeson.ToJSON DerivationOutput
+    Suggested fix:
+      Move the instance declaration to the module of the class or of the type, or
+      wrap the type with a newtype and declare the instance on the new type.
+    |
+410 | instance Aeson.ToJSON DerivationOutput where
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^...
+
+src/Ten/Derivation.hs:503:42: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘v’ shadows the existing binding
+      bound at src/Ten/Derivation.hs:425:20
+    |
+503 |         convertKeyValue (k, Aeson.String v) = (Aeson.toText k, v)
+    |                                          ^
+
+src/Ten/Derivation.hs:515:60: warning: [GHC-40910] [-Wunused-matches]
+    Defined but not used: ‘config’
+    |
+515 | sandboxedProcessConfig sandboxDir programPath args envVars config =
+    |                                                            ^^^^^^
+[11 of 21] Compiling Ten.Graph        ( src/Ten/Graph.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Graph.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Graph.dyn_o )
+
+src/Ten/Graph.hs:49:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Concurrent.STM’ is redundant
+      except perhaps to import instances from ‘Control.Concurrent.STM’
+    To import instances alone, use: import Control.Concurrent.STM()
+   |
+49 | import Control.Concurrent.STM
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:51:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Monad.Reader’ is redundant
+      except perhaps to import instances from ‘Control.Monad.Reader’
+    To import instances alone, use: import Control.Monad.Reader()
+   |
+51 | import Control.Monad.Reader (ask, asks)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:52:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Monad.State’ is redundant
+      except perhaps to import instances from ‘Control.Monad.State’
+    To import instances alone, use: import Control.Monad.State()
+   |
+52 | import Control.Monad.State (get, modify)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:54:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘Control.Monad.IO.Class’ is redundant
+      except perhaps to import instances from ‘Control.Monad.IO.Class’
+    To import instances alone, use: import Control.Monad.IO.Class()
+   |
+54 | import Control.Monad.IO.Class (liftIO)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:62:1: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘fromJust, isJust’
+    from module ‘Data.Maybe’ is redundant
+   |
+62 | import Data.Maybe (isJust, fromJust, catMaybes)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:64:20: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘.:’ from module ‘Data.Aeson’ is redundant
+   |
+64 | import Data.Aeson ((.:), (.=))
+   |                    ^^^^
+
+src/Ten/Graph.hs:66:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.Aeson.Types’ is redundant
+      except perhaps to import instances from ‘Data.Aeson.Types’
+    To import instances alone, use: import Data.Aeson.Types()
+   |
+66 | import qualified Data.Aeson.Types as Aeson
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:69:1: warning: [GHC-66111] [-Wunused-imports]
+    The qualified import of ‘Data.ByteString’ is redundant
+      except perhaps to import instances from ‘Data.ByteString’
+    To import instances alone, use: import Data.ByteString()
+   |
+69 | import qualified Data.ByteString as BS
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:71:1: warning: [GHC-66111] [-Wunused-imports]
+    The import of ‘System.IO’ is redundant
+      except perhaps to import instances from ‘System.IO’
+    To import instances alone, use: import System.IO()
+   |
+71 | import System.IO (withFile, IOMode(..))
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:74:24: warning: [GHC-38856] [-Wunused-imports]
+    The import of ‘hashDerivation’
+    from module ‘Ten.Derivation’ is redundant
+   |
+74 | import Ten.Derivation (hashDerivation, deserializeDerivation)
+   |                        ^^^^^^^^^^^^^^
+
+src/Ten/Graph.hs:214:22: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘visited’ shadows the existing binding
+      bound at src/Ten/Graph.hs:201:31
+    |
+214 |     checkDep (False, visited, recStack) depId =
+    |                      ^^^^^^^
+
+src/Ten/Graph.hs:214:31: warning: [GHC-63397] [-Wname-shadowing]
+    This binding for ‘recStack’ shadows the existing binding
+      bound at src/Ten/Graph.hs:201:39
+    |
+214 |     checkDep (False, visited, recStack) depId =
+    |                               ^^^^^^^^
+
+src/Ten/Graph.hs:406:1: warning: [GHC-40910] [-Wunused-top-binds]
+    Defined but not used: ‘addToDerivationChain’
+    |
+406 | addToDerivationChain drv chain = drv:chain
+    | ^^^^^^^^^^^^^^^^^^^^
+[12 of 21] Compiling Ten.GC           ( src/Ten/GC.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/GC.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/GC.dyn_o )
+
+src/Ten/GC.hs:84:16: error: [GHC-88464]
+    Variable not in scope: unsafePerformIO :: IO (TMVar ()) -> TMVar ()
+   |
+84 | globalGCLock = unsafePerformIO $ atomically $ newTMVar ()
+   |                ^^^^^^^^^^^^^^^
+
+src/Ten/GC.hs:92:15: error: [GHC-88464]
+    Variable not in scope: storePathExists :: StorePath -> TenM p Bool
+    Suggested fix:
+      Perhaps use ‘Store.storePathExists’ (imported from Ten.Store)
+   |
+92 |     exists <- storePathExists path
+   |               ^^^^^^^^^^^^^^^
+
+src/Ten/GC.hs:184:33: error: [GHC-88464]
+    Variable not in scope: isPrefixOf :: t1 -> FilePath -> Bool
+    Suggested fixes:
+      • Perhaps use one of these:
+          ‘T.isPrefixOf’ (imported from Data.Text),
+          ‘BS.isPrefixOf’ (imported from Data.ByteString),
+          ‘T.isInfixOf’ (imported from Data.Text)
+      • Add ‘isPrefixOf’ to the import list in the import of ‘Data.Text’
+        (at src/Ten/GC.hs:49:1-23).
+    |
+184 |             unless ("gc-roots/" `isPrefixOf` path) $
+    |                                 ^^^^^^^^^^^^
+
+src/Ten/GC.hs:253:48: error: [GHC-88464]
+    Variable not in scope: isPrefixOf :: t0 -> FilePath -> Bool
+    Suggested fixes:
+      • Perhaps use one of these:
+          ‘T.isPrefixOf’ (imported from Data.Text),
+          ‘BS.isPrefixOf’ (imported from Data.ByteString),
+          ‘T.isInfixOf’ (imported from Data.Text)
+      • Add ‘isPrefixOf’ to the import list in the import of ‘Data.Text’
+        (at src/Ten/GC.hs:49:1-23).
+    |
+253 |                 let isPermanent = "permanent-" `isPrefixOf` file
+    |                                                ^^^^^^^^^^^^
+
+src/Ten/GC.hs:320:5: error: [GHC-83865]
+    • Couldn't match expected type: TenM p a
+                  with actual type: IO c0
+    • In a stmt of a 'do' block:
+        bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+      In the expression:
+        do bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+      In an equation for ‘withGCLock’:
+          withGCLock action
+            = do bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+    • Relevant bindings include
+        action :: TenM p a (bound at src/Ten/GC.hs:318:12)
+        withGCLock :: TenM p a -> TenM p a (bound at src/Ten/GC.hs:318:1)
+    |
+320 |     bracket
+    |     ^^^^^^^...
+
+src/Ten/GC.hs:321:9: error: [GHC-83865]
+    • Couldn't match expected type: IO a0
+                  with actual type: TenM p0 ()
+    • In the first argument of ‘bracket’, namely ‘acquireGCLock’
+      In a stmt of a 'do' block:
+        bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+      In the expression:
+        do bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+    |
+321 |         acquireGCLock
+    |         ^^^^^^^^^^^^^
+
+src/Ten/GC.hs:322:16: error: [GHC-83865]
+    • Couldn't match expected type: IO b1
+                  with actual type: TenM p1 ()
+    • In the expression: releaseGCLock
+      In the second argument of ‘bracket’, namely
+        ‘(\ _ -> releaseGCLock)’
+      In a stmt of a 'do' block:
+        bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+    |
+322 |         (\_ -> releaseGCLock)
+    |                ^^^^^^^^^^^^^
+
+src/Ten/GC.hs:323:16: error: [GHC-83865]
+    • Couldn't match expected type: IO c0
+                  with actual type: TenM p a
+    • In the expression: action
+      In the third argument of ‘bracket’, namely ‘(\ _ -> action)’
+      In a stmt of a 'do' block:
+        bracket acquireGCLock (\ _ -> releaseGCLock) (\ _ -> action)
+    • Relevant bindings include
+        action :: TenM p a (bound at src/Ten/GC.hs:318:12)
+        withGCLock :: TenM p a -> TenM p a (bound at src/Ten/GC.hs:318:1)
+    |
+323 |         (\_ -> action)
+    |                ^^^^^^
+
+src/Ten/GC.hs:496:14: error: [GHC-88464]
+    Variable not in scope: get :: TenM p BuildState
+    |
+496 |     state <- get
+    |              ^^^
+
+src/Ten/GC.hs:509:57: error: [GHC-88464]
+    Variable not in scope: toException :: BuildError -> e0
+    Suggested fixes:
+      • Perhaps use ‘onException’ (line 494)
+      • Add ‘toException’ to the import list in the import of
+        ‘Control.Exception’ (at src/Ten/GC.hs:39:1-61).
+    |
+509 | gcThrowErrorSTM err = Control.Concurrent.STM.throwSTM $ toException err
+    |                                                         ^^^^^^^^^^^
+[13 of 21] Compiling Ten.Daemon.Protocol ( src/Ten/Daemon/Protocol.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Protocol.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Daemon/Protocol.dyn_o )
+
+src/Ten/Daemon/Protocol.hs:497:7: error: [GHC-29916]
+    Multiple declarations of ‘StoreDerivationRequest’
+    Declared at: src/Ten/Daemon/Protocol.hs:199:31
+                 src/Ten/Daemon/Protocol.hs:497:7
+    |
+497 |     | StoreDerivationRequest StoreDerivationRequest
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Protocol.hs:498:7: error: [GHC-29916]
+    Multiple declarations of ‘RetrieveDerivationRequest’
+    Declared at: src/Ten/Daemon/Protocol.hs:219:34
+                 src/Ten/Daemon/Protocol.hs:498:7
+    |
+498 |     | RetrieveDerivationRequest RetrieveDerivationRequest
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Daemon/Protocol.hs:499:7: error: [GHC-29916]
+    Multiple declarations of ‘QueryDerivationRequest’
+    Declared at: src/Ten/Daemon/Protocol.hs:248:31
+                 src/Ten/Daemon/Protocol.hs:499:7
+    |
+499 |     | QueryDerivationRequest QueryDerivationRequest
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[15 of 21] Compiling Ten.DB.Derivations ( src/Ten/DB/Derivations.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Derivations.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/DB/Derivations.dyn_o )
+
+src/Ten/DB/Derivations.hs:69:1: error: [GHC-87110]
+    Could not find module ‘System.Time.Extra’.
+    Use -v to see a list of the files searched for.
+   |
+69 | import System.Time.Extra (offsetTime, showDuration)
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+

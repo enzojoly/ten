@@ -188,7 +188,7 @@ options =
         "Keep build outputs even if build fails"
     , Option ['f'] ["force"]
         (NoArg (\opts -> opts { optForce = True }))
-        "Force operation even if risky"
+        "Force operation even if risky (can break stale locks)"
     , Option [] ["no-daemon"]
         (NoArg (\opts -> opts { optUseDaemon = False }))
         "Don't use daemon even if available"
@@ -1146,7 +1146,7 @@ buildTenExpression env file = do
             return $ Left $ InputNotFound $ "Error reading file: " ++ show e
         Right content -> do
             -- Run the evaluation phase to get the derivation
-            evalResult <- evalExpression env content
+            evalResult <- evaluateContent env content
             case evalResult of
                 Left err -> return $ Left err
                 Right derivation -> do
@@ -1165,8 +1165,8 @@ buildTenExpression env file = do
                                     return $ Right ()
 
 -- | Evaluate a Ten expression file to get a derivation
-evalExpression :: BuildEnv -> BS.ByteString -> IO (Either BuildError Derivation)
-evalExpression env content = do
+evaluateContent :: BuildEnv -> BS.ByteString -> IO (Either BuildError Derivation)
+evaluateContent env content = do
     -- Set up evaluation environment
     let evalEnv = env { verbosity = verbosity env + 1 }
 
@@ -1252,7 +1252,7 @@ handleEval env file = do
                     return $ Left $ InputNotFound $ "Error reading file: " ++ show e
                 Right content -> do
                     -- Evaluate the expression
-                    evalResult <- evalExpression env content
+                    evalResult <- evaluateContent env content
                     case evalResult of
                         Left err -> return $ Left err
                         Right derivation -> do
@@ -1281,10 +1281,25 @@ handleGC env force = do
 
     if continue
         then do
+            -- If force is true, try to break any stale locks first
+            when force $ do
+                let lockPath = getGCLockPath env
+                exists <- doesFileExist lockPath
+                when exists $ do
+                    hPutStrLn stderr "Found existing GC lock file. Breaking stale lock with --force."
+                    -- Import the breakStaleLock function from Ten.GC
+                    liftIO $ breakStaleLock lockPath
+
             -- Run garbage collection
             result <- runTen collectGarbage env (initBuildState Build)
             case result of
-                Left err -> return $ Left err
+                Left err ->
+                    case err of
+                        ResourceError msg | "Could not acquire GC lock" `T.isPrefixOf` msg ->
+                            return $ Left $ ResourceError $
+                                "Could not acquire GC lock. Another garbage collection may be in progress. " <>
+                                "Use --force to break a stale lock if you're sure no other GC is running."
+                        _ -> return $ Left err
                 Right (stats, _) -> do
                     -- Show GC stats
                     putStrLn $ "GC completed successfully"
@@ -1396,7 +1411,7 @@ listStorePaths env = do
                 Right entries -> do
                     -- Filter out non-store paths
                     let isStorePath name = case break (== '-') name of
-                            (hash, '-':_) -> not (null hash) && not (hash `elem` ["tmp", "gc-roots"])
+                            (hash, '-':_) -> not (null hash) && not (hash `elem` ["tmp", "gc-roots", "var"])
                             _ -> False
 
                     return $ filter isStorePath entries
@@ -1440,6 +1455,7 @@ handleInfo env path = do
             case existsResult of
                 Left (e :: SomeException) ->
                     return $ Left $ StoreError $ "Error checking path existence: " <> T.pack (show e)
+
                 Right (Left err) -> return $ Left err
                 Right (Right (True, _)) -> do
                     -- Check if this is a derivation file
@@ -1869,22 +1885,20 @@ getStorePathForFile file = do
 
                     return $ Right path
 
--- | List directory with error handling
-listDirectory :: FilePath -> IO [FilePath]
-listDirectory dir = do
-    -- Check if directory exists
-    exists <- doesDirectoryExist dir
-    if not exists
-        then return []
-        else do
-            -- Try to list directory
-            entriesResult <- try $ System.Directory.listDirectory dir
-            case entriesResult of
-                Left (e :: SomeException) -> do
-                    hPutStrLn stderr $ "Error listing directory " ++ dir ++ ": " ++ show e
-                    return []
-                Right entries -> return entries
+-- Utility functions for working with store paths
 
--- | Convert StorePath to Text for database operations
+-- | Convert a StorePath to a text representation for database operations
 storePathToText :: StorePath -> Text
 storePathToText (StorePath hash name) = hash <> "-" <> name
+
+-- | Get paths that a derivation produces
+derivationOutputPaths :: Derivation -> Set StorePath
+derivationOutputPaths drv = Set.map outputPath (derivOutputs drv)
+
+-- | Check if file exists
+fileExists :: FilePath -> IO Bool
+fileExists = doesFileExist
+
+-- | Break a stale lock - imported from Ten.GC
+breakStaleLock :: FilePath -> IO ()
+breakStaleLock = error "Function imported from Ten.GC"

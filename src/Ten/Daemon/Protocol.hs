@@ -30,6 +30,10 @@ module Ten.Daemon.Protocol (
     DerivationInfoResponse(..),
     DerivationOutputMappingResponse(..),
 
+    -- GC status request/response
+    GCStatusRequest(..),
+    GCStatusResponse(..),
+
     -- Serialization functions
     serializeRequest,
     deserializeRequest,
@@ -197,23 +201,21 @@ instance Aeson.FromJSON AuthResult where
 
 -- | Request to store a derivation
 data StoreDerivationRequest = StoreDerivationRequest {
-    storeDerivation :: Derivation,
-    registerInDb :: Bool  -- Whether to register the derivation in the database
+    derivationContent :: BS.ByteString,  -- Serialized derivation
+    registerOutputs :: Bool              -- Whether to register outputs in the DB
 } deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON StoreDerivationRequest where
     toJSON StoreDerivationRequest{..} = Aeson.object [
-            "derivation" .= TE.decodeUtf8 (serializeDerivation storeDerivation),
-            "registerInDb" .= registerInDb
+            "derivation" .= TE.decodeUtf8 derivationContent,
+            "registerOutputs" .= registerOutputs
         ]
 
 instance Aeson.FromJSON StoreDerivationRequest where
     parseJSON = Aeson.withObject "StoreDerivationRequest" $ \v -> do
         derivText <- v .: "derivation" :: Aeson.Parser Text
-        registerInDb <- v .: "registerInDb"
-        case deserializeDerivation (TE.encodeUtf8 derivText) of
-            Left err -> fail $ "Invalid derivation: " ++ T.unpack err
-            Right drv -> return $ StoreDerivationRequest drv registerInDb
+        registerOutputs <- v .: "registerOutputs"
+        return $ StoreDerivationRequest (TE.encodeUtf8 derivText) registerOutputs
 
 -- | Request to retrieve a derivation
 data RetrieveDerivationRequest = RetrieveDerivationRequest {
@@ -473,50 +475,120 @@ instance Aeson.FromJSON BuildStatusUpdate where
                 _ -> fail $ "Unknown status type: " ++ T.unpack statusType
             ) obj
 
+-- | GC Status Request
+data GCStatusRequest = GCStatusRequest {
+    forceCheck :: Bool  -- Whether to force recheck the lock file
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON GCStatusRequest where
+    toJSON GCStatusRequest{..} = Aeson.object [
+            "forceCheck" .= forceCheck
+        ]
+
+instance Aeson.FromJSON GCStatusRequest where
+    parseJSON = Aeson.withObject "GCStatusRequest" $ \v -> do
+        forceCheck <- v .: "forceCheck"
+        return GCStatusRequest{..}
+
+-- | GC Status Response
+data GCStatusResponse = GCStatusResponse {
+    gcRunning :: Bool,           -- Whether GC is currently running
+    gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
+    gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON GCStatusResponse where
+    toJSON GCStatusResponse{..} = Aeson.object [
+            "running" .= gcRunning,
+            "owner" .= gcOwner,
+            "lockTime" .= gcLockTime
+        ]
+
+instance Aeson.FromJSON GCStatusResponse where
+    parseJSON = Aeson.withObject "GCStatusResponse" $ \v -> do
+        gcRunning <- v .: "running"
+        gcOwner <- v .: "owner"
+        gcLockTime <- v .: "lockTime"
+        return GCStatusResponse{..}
+
 -- | Daemon request types
 data DaemonRequest
     -- Authentication
     = AuthRequest ProtocolVersion UserCredentials
 
     -- Build operations
-    | BuildDerivation Derivation BuildRequestInfo
-    | BuildFile FilePath BuildRequestInfo
-    | CancelBuild BuildId
-    | QueryBuildStatus BuildId
-    | QueryBuildOutput BuildId
-    | ListBuilds (Maybe Int)  -- Limit of builds to return, Nothing = all
+    | BuildRequest {
+        buildFilePath :: Text,
+        buildFileContent :: Maybe BS.ByteString,
+        buildOptions :: BuildRequestInfo
+      }
+    | EvalRequest {
+        evalFilePath :: Text,
+        evalFileContent :: Maybe BS.ByteString,
+        evalOptions :: BuildRequestInfo
+      }
+    | BuildDerivationRequest {
+        buildDerivation :: Derivation,
+        buildDerivOptions :: BuildRequestInfo
+      }
+    | BuildStatusRequest {
+        statusBuildId :: BuildId
+      }
+    | CancelBuildRequest {
+        cancelBuildId :: BuildId
+      }
+    | QueryBuildOutputRequest {
+        outputBuildId :: BuildId
+      }
+    | ListBuildsRequest {
+        listLimit :: Maybe Int  -- Limit on number of builds to return
+      }
 
     -- Store operations
-    | QueryPath StorePath
-    | AddToStore Text BS.ByteString
-    | EnsureInStore Text FilePath
-    | VerifyPath StorePath
-    | ListStoreContents (Maybe Text)  -- Optional prefix filter
+    | StoreAddRequest {
+        storeAddPath :: Text,
+        storeAddContent :: BS.ByteString
+      }
+    | StoreVerifyRequest {
+        storeVerifyPath :: Text
+      }
+    | StorePathRequest {
+        storePathForFile :: Text,
+        storePathContent :: BS.ByteString
+      }
+    | StoreListRequest
 
     -- Derivation operations
     | StoreDerivationRequest StoreDerivationRequest
     | RetrieveDerivationRequest RetrieveDerivationRequest
     | QueryDerivationRequest QueryDerivationRequest
-    | QueryDeriverForOutput StorePath
-    | ListDerivations (Maybe Int)  -- Limit of derivations to return
+    | GetDerivationForOutputRequest {
+        getDerivationForPath :: Text
+      }
+    | ListDerivationsRequest {
+        listDerivLimit :: Maybe Int  -- Limit on number of derivations to return
+      }
 
-    -- Garbage collection
-    | CollectGarbage Bool  -- force flag
-    | AddGCRoot StorePath Text Bool  -- path, name, permanent flag
-    | RemoveGCRoot Text  -- root name
-    | ListGCRoots
+    -- Garbage collection operations
+    | GCRequest {
+        gcForce :: Bool  -- Force GC (run even if unsafe)
+      }
+    | GCStatusRequest GCStatusRequest
+    | AddGCRootRequest {
+        rootPath :: StorePath,
+        rootName :: Text,
+        rootPermanent :: Bool
+      }
+    | RemoveGCRootRequest {
+        rootNameToRemove :: Text
+      }
+    | ListGCRootsRequest
 
-    -- Daemon control
-    | Ping
-    | Shutdown
-    | QueryDaemonStatus
-
-    -- Graph operations
-    | DetectCycle [Derivation]
-    | ComputeBuildGraph Derivation
-
-    -- Return-continuation specific
-    | JoinDerivation Derivation
+    -- Daemon management operations
+    | PingRequest
+    | ShutdownRequest
+    | StatusRequest
+    | ConfigRequest
     deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON DaemonRequest where
@@ -527,63 +599,65 @@ instance Aeson.ToJSON DaemonRequest where
                 "credentials" .= creds
             ]
 
-        BuildDerivation drv info -> Aeson.object [
+        BuildRequest{..} -> Aeson.object [
+                "type" .= ("build" :: Text),
+                "path" .= buildFilePath,
+                "content" .= maybe Aeson.Null (\c -> Aeson.String (TE.decodeUtf8 c)) buildFileContent,
+                "options" .= buildOptions
+            ]
+
+        EvalRequest{..} -> Aeson.object [
+                "type" .= ("eval" :: Text),
+                "path" .= evalFilePath,
+                "content" .= maybe Aeson.Null (\c -> Aeson.String (TE.decodeUtf8 c)) evalFileContent,
+                "options" .= evalOptions
+            ]
+
+        BuildDerivationRequest{..} -> Aeson.object [
                 "type" .= ("build-derivation" :: Text),
-                "derivation" .= encodeDrv drv,
-                "info" .= info
+                "derivation" .= TE.decodeUtf8 (serializeDerivation buildDerivation),
+                "options" .= buildDerivOptions
             ]
 
-        BuildFile path info -> Aeson.object [
-                "type" .= ("build-file" :: Text),
-                "path" .= path,
-                "info" .= info
+        BuildStatusRequest{..} -> Aeson.object [
+                "type" .= ("build-status" :: Text),
+                "buildId" .= renderBuildId statusBuildId
             ]
 
-        CancelBuild buildId -> Aeson.object [
+        CancelBuildRequest{..} -> Aeson.object [
                 "type" .= ("cancel-build" :: Text),
-                "buildId" .= renderBuildId buildId
+                "buildId" .= renderBuildId cancelBuildId
             ]
 
-        QueryBuildStatus buildId -> Aeson.object [
-                "type" .= ("query-build-status" :: Text),
-                "buildId" .= renderBuildId buildId
+        QueryBuildOutputRequest{..} -> Aeson.object [
+                "type" .= ("build-output" :: Text),
+                "buildId" .= renderBuildId outputBuildId
             ]
 
-        QueryBuildOutput buildId -> Aeson.object [
-                "type" .= ("query-build-output" :: Text),
-                "buildId" .= renderBuildId buildId
-            ]
-
-        ListBuilds limit -> Aeson.object [
+        ListBuildsRequest{..} -> Aeson.object [
                 "type" .= ("list-builds" :: Text),
-                "limit" .= limit
+                "limit" .= listLimit
             ]
 
-        QueryPath path -> Aeson.object [
-                "type" .= ("query-path" :: Text),
-                "path" .= encodePath path
+        StoreAddRequest{..} -> Aeson.object [
+                "type" .= ("store-add" :: Text),
+                "path" .= storeAddPath,
+                "content" .= TE.decodeUtf8 storeAddContent
             ]
 
-        AddToStore name content -> Aeson.object [
-                "type" .= ("add-to-store" :: Text),
-                "name" .= name,
-                "content" .= Aeson.String (TE.decodeUtf8 content)
+        StoreVerifyRequest{..} -> Aeson.object [
+                "type" .= ("store-verify" :: Text),
+                "path" .= storeVerifyPath
             ]
 
-        EnsureInStore name path -> Aeson.object [
-                "type" .= ("ensure-in-store" :: Text),
-                "name" .= name,
-                "path" .= path
+        StorePathRequest{..} -> Aeson.object [
+                "type" .= ("store-path" :: Text),
+                "path" .= storePathForFile,
+                "content" .= TE.decodeUtf8 storePathContent
             ]
 
-        VerifyPath path -> Aeson.object [
-                "type" .= ("verify-path" :: Text),
-                "path" .= encodePath path
-            ]
-
-        ListStoreContents prefix -> Aeson.object [
-                "type" .= ("list-store" :: Text),
-                "prefix" .= prefix
+        StoreListRequest -> Aeson.object [
+                "type" .= ("store-list" :: Text)
             ]
 
         StoreDerivationRequest req -> Aeson.object [
@@ -601,65 +675,58 @@ instance Aeson.ToJSON DaemonRequest where
                 "request" .= req
             ]
 
-        QueryDeriverForOutput path -> Aeson.object [
-                "type" .= ("query-deriver-for-output" :: Text),
-                "output" .= encodePath path
+        GetDerivationForOutputRequest{..} -> Aeson.object [
+                "type" .= ("get-derivation-for-output" :: Text),
+                "path" .= getDerivationForPath
             ]
 
-        ListDerivations limit -> Aeson.object [
+        ListDerivationsRequest{..} -> Aeson.object [
                 "type" .= ("list-derivations" :: Text),
-                "limit" .= limit
+                "limit" .= listDerivLimit
             ]
 
-        CollectGarbage force -> Aeson.object [
-                "type" .= ("collect-garbage" :: Text),
-                "force" .= force
+        GCRequest{..} -> Aeson.object [
+                "type" .= ("gc" :: Text),
+                "force" .= gcForce
             ]
 
-        AddGCRoot path name permanent -> Aeson.object [
+        GCStatusRequest req -> Aeson.object [
+                "type" .= ("gc-status" :: Text),
+                "request" .= req
+            ]
+
+        AddGCRootRequest{..} -> Aeson.object [
                 "type" .= ("add-gc-root" :: Text),
-                "path" .= encodePath path,
-                "name" .= name,
-                "permanent" .= permanent
+                "path" .= encodePath rootPath,
+                "name" .= rootName,
+                "permanent" .= rootPermanent
             ]
 
-        RemoveGCRoot name -> Aeson.object [
+        RemoveGCRootRequest{..} -> Aeson.object [
                 "type" .= ("remove-gc-root" :: Text),
-                "name" .= name
+                "name" .= rootNameToRemove
             ]
 
-        ListGCRoots -> Aeson.object [
+        ListGCRootsRequest -> Aeson.object [
                 "type" .= ("list-gc-roots" :: Text)
             ]
 
-        Ping -> Aeson.object [
+        PingRequest -> Aeson.object [
                 "type" .= ("ping" :: Text)
             ]
 
-        Shutdown -> Aeson.object [
+        ShutdownRequest -> Aeson.object [
                 "type" .= ("shutdown" :: Text)
             ]
 
-        QueryDaemonStatus -> Aeson.object [
-                "type" .= ("query-daemon-status" :: Text)
+        StatusRequest -> Aeson.object [
+                "type" .= ("status" :: Text)
             ]
 
-        DetectCycle drvs -> Aeson.object [
-                "type" .= ("detect-cycle" :: Text),
-                "derivations" .= map encodeDrv drvs
-            ]
-
-        ComputeBuildGraph drv -> Aeson.object [
-                "type" .= ("compute-build-graph" :: Text),
-                "derivation" .= encodeDrv drv
-            ]
-
-        JoinDerivation drv -> Aeson.object [
-                "type" .= ("join-derivation" :: Text),
-                "derivation" .= encodeDrv drv
+        ConfigRequest -> Aeson.object [
+                "type" .= ("config" :: Text)
             ]
       where
-        encodeDrv drv = Aeson.String $ TE.decodeUtf8 $ serializeDerivation drv
         encodePath (StorePath hash name) = Aeson.object [
                 "hash" .= hash,
                 "name" .= name
@@ -674,64 +741,69 @@ instance Aeson.FromJSON DaemonRequest where
                 creds <- v .: "credentials"
                 return $ AuthRequest ver creds
 
+            "build" -> do
+                path <- v .: "path"
+                content <- v .: "content"
+                options <- v .: "options"
+                let bsContent = case content of
+                        Aeson.String s -> Just $ TE.encodeUtf8 s
+                        _ -> Nothing
+                return $ BuildRequest path bsContent options
+
+            "eval" -> do
+                path <- v .: "path"
+                content <- v .: "content"
+                options <- v .: "options"
+                let bsContent = case content of
+                        Aeson.String s -> Just $ TE.encodeUtf8 s
+                        _ -> Nothing
+                return $ EvalRequest path bsContent options
+
             "build-derivation" -> do
-                drvText <- v .: "derivation"
-                case deserializeDerivation $ TE.encodeUtf8 $ extractString drvText of
+                derivText <- v .: "derivation" :: Aeson.Parser Text
+                case deserializeDerivation (TE.encodeUtf8 derivText) of
                     Left err -> fail $ "Invalid derivation: " ++ T.unpack err
                     Right drv -> do
-                        info <- v .: "info"
-                        return $ BuildDerivation drv info
+                        options <- v .: "options"
+                        return $ BuildDerivationRequest drv options
 
-            "build-file" -> do
-                path <- v .: "path"
-                info <- v .: "info"
-                return $ BuildFile path info
+            "build-status" -> do
+                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
+                case parseBuildId buildIdStr of
+                    Left err -> fail $ T.unpack err
+                    Right buildId -> return $ BuildStatusRequest buildId
 
             "cancel-build" -> do
                 buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 case parseBuildId buildIdStr of
                     Left err -> fail $ T.unpack err
-                    Right buildId -> return $ CancelBuild buildId
+                    Right buildId -> return $ CancelBuildRequest buildId
 
-            "query-build-status" -> do
+            "build-output" -> do
                 buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 case parseBuildId buildIdStr of
                     Left err -> fail $ T.unpack err
-                    Right buildId -> return $ QueryBuildStatus buildId
-
-            "query-build-output" -> do
-                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
-                case parseBuildId buildIdStr of
-                    Left err -> fail $ T.unpack err
-                    Right buildId -> return $ QueryBuildOutput buildId
+                    Right buildId -> return $ QueryBuildOutputRequest buildId
 
             "list-builds" -> do
                 limit <- v .: "limit"
-                return $ ListBuilds limit
+                return $ ListBuildsRequest limit
 
-            "query-path" -> do
-                pathObj <- v .: "path"
-                path <- decodePath pathObj
-                return $ QueryPath path
-
-            "add-to-store" -> do
-                name <- v .: "name"
-                contentText <- v .: "content"
-                return $ AddToStore name (TE.encodeUtf8 $ extractString contentText)
-
-            "ensure-in-store" -> do
-                name <- v .: "name"
+            "store-add" -> do
                 path <- v .: "path"
-                return $ EnsureInStore name path
+                content <- v .: "content" :: Aeson.Parser Text
+                return $ StoreAddRequest path (TE.encodeUtf8 content)
 
-            "verify-path" -> do
-                pathObj <- v .: "path"
-                path <- decodePath pathObj
-                return $ VerifyPath path
+            "store-verify" -> do
+                path <- v .: "path"
+                return $ StoreVerifyRequest path
 
-            "list-store" -> do
-                prefix <- v .: "prefix"
-                return $ ListStoreContents prefix
+            "store-path" -> do
+                path <- v .: "path"
+                content <- v .: "content" :: Aeson.Parser Text
+                return $ StorePathRequest path (TE.encodeUtf8 content)
+
+            "store-list" -> return StoreListRequest
 
             "store-derivation" -> do
                 req <- v .: "request"
@@ -745,64 +817,45 @@ instance Aeson.FromJSON DaemonRequest where
                 req <- v .: "request"
                 return $ QueryDerivationRequest req
 
-            "query-deriver-for-output" -> do
-                pathObj <- v .: "output"
-                path <- decodePath pathObj
-                return $ QueryDeriverForOutput path
+            "get-derivation-for-output" -> do
+                path <- v .: "path"
+                return $ GetDerivationForOutputRequest path
 
             "list-derivations" -> do
                 limit <- v .: "limit"
-                return $ ListDerivations limit
+                return $ ListDerivationsRequest limit
 
-            "collect-garbage" -> do
+            "gc" -> do
                 force <- v .: "force"
-                return $ CollectGarbage force
+                return $ GCRequest force
+
+            "gc-status" -> do
+                req <- v .: "request"
+                return $ GCStatusRequest req
 
             "add-gc-root" -> do
                 pathObj <- v .: "path"
                 path <- decodePath pathObj
                 name <- v .: "name"
                 permanent <- v .: "permanent"
-                return $ AddGCRoot path name permanent
+                return $ AddGCRootRequest path name permanent
 
             "remove-gc-root" -> do
                 name <- v .: "name"
-                return $ RemoveGCRoot name
+                return $ RemoveGCRootRequest name
 
-            "list-gc-roots" -> return ListGCRoots
+            "list-gc-roots" -> return ListGCRootsRequest
 
-            "ping" -> return Ping
+            "ping" -> return PingRequest
 
-            "shutdown" -> return Shutdown
+            "shutdown" -> return ShutdownRequest
 
-            "query-daemon-status" -> return QueryDaemonStatus
+            "status" -> return StatusRequest
 
-            "detect-cycle" -> do
-                drvTexts <- v .: "derivations"
-                drvs <- mapM (\drvText ->
-                    case deserializeDerivation $ TE.encodeUtf8 $ extractString drvText of
-                        Left err -> fail $ "Invalid derivation: " ++ T.unpack err
-                        Right drv -> return drv
-                    ) drvTexts
-                return $ DetectCycle drvs
-
-            "compute-build-graph" -> do
-                drvText <- v .: "derivation"
-                case deserializeDerivation $ TE.encodeUtf8 $ extractString drvText of
-                    Left err -> fail $ "Invalid derivation: " ++ T.unpack err
-                    Right drv -> return $ ComputeBuildGraph drv
-
-            "join-derivation" -> do
-                drvText <- v .: "derivation"
-                case deserializeDerivation $ TE.encodeUtf8 $ extractString drvText of
-                    Left err -> fail $ "Invalid derivation: " ++ T.unpack err
-                    Right drv -> return $ JoinDerivation drv
+            "config" -> return ConfigRequest
 
             _ -> fail $ "Unknown request type: " ++ T.unpack requestType
       where
-        extractString (Aeson.String s) = s
-        extractString _ = T.empty
-
         decodePath = Aeson.withObject "StorePath" $ \p -> do
             hash <- p .: "hash"
             name <- p .: "name"
@@ -814,92 +867,165 @@ data DaemonResponse
     = AuthResponse AuthResult
 
     -- Build responses
-    | BuildStarted BuildId
+    | BuildStartedResponse BuildId
+    | BuildResponse BuildResult
     | BuildStatusResponse BuildStatusUpdate
-    | BuildFinished BuildId (Either BuildError (Set StorePath))
-    | BuildOutputResponse BuildId Text  -- Build log
-    | BuildListResponse [(BuildId, BuildStatus, Float)]  -- BuildId, status, progress
+    | BuildOutputResponse Text
+    | BuildListResponse [(BuildId, BuildStatus, Float)]
 
     -- Store responses
-    | PathInfoResponse StorePath Bool Text  -- StorePath, exists, info
-    | PathAddedResponse StorePath
-    | PathVerifiedResponse StorePath Bool  -- Path, isValid
-    | StoreContentsResponse [StorePath]
+    | StoreAddResponse StorePath
+    | StoreVerifyResponse Bool
+    | StorePathResponse StorePath
+    | StoreListResponse [StorePath]
 
     -- Derivation responses
-    | DerivationStoredResponse StorePath  -- Path where the derivation was stored
-    | DerivationRetrievedResponse DerivationInfoResponse
-    | DerivationQueryResponse [DerivationInfoResponse]
-    | DerivationOutputResponse DerivationOutputMappingResponse
+    | DerivationResponse Derivation
+    | DerivationStoredResponse StorePath
+    | DerivationRetrievedResponse (Maybe Derivation)
+    | DerivationQueryResponse [Derivation]
+    | DerivationOutputResponse (Set StorePath)
     | DerivationListResponse [StorePath]
 
     -- Garbage collection responses
-    | GCCompleted Int Int Integer Double  -- paths collected, paths kept, bytes freed, time taken
-    | GCRootAdded Text
-    | GCRootRemoved Text
-    | GCRootsListResponse [(StorePath, Text, Bool)]  -- path, name, permanent
+    | GCResponse GCStats
+    | GCStatusResponse GCStatusResponse
+    | GCRootAddedResponse Text
+    | GCRootRemovedResponse Text
+    | GCRootsListResponse [(StorePath, Text, Bool)]
 
-    -- General responses
-    | Pong
+    -- Daemon management responses
+    | PongResponse
     | ShutdownResponse
-    | DaemonStatusResponse DaemonStatusInfo
+    | StatusResponse DaemonStatus
+    | ConfigResponse DaemonConfig
+
+    -- Error response
     | ErrorResponse BuildError
-
-    -- Graph responses
-    | CycleDetectionResponse Bool  -- Whether cycle exists
-    | BuildGraphResponse Text  -- Serialized graph
-
-    -- Return-continuation specific
-    | JoinedDerivation Derivation
     deriving (Show, Eq, Generic)
 
 -- | Daemon status information
-data DaemonStatusInfo = DaemonStatusInfo {
-    daemonUptime :: Double,  -- Uptime in seconds
-    daemonVersion :: Text,   -- Ten version
-    daemonBuildsActive :: Int,  -- Number of active builds
-    daemonBuildsQueued :: Int,  -- Number of queued builds
-    daemonBuildsCompleted :: Int,  -- Number of completed builds since startup
-    daemonBuildsFailed :: Int,  -- Number of failed builds since startup
-    daemonStorePaths :: Int,  -- Number of paths in store
-    daemonStoreSize :: Integer,  -- Store size in bytes
-    daemonLastGC :: Maybe UTCTime,  -- Last GC time
-    daemonCPUUsage :: Double,  -- CPU usage (0-100%)
-    daemonMemoryUsage :: Integer,  -- Memory usage in bytes
-    daemonLoad :: [Double]  -- Load averages (1, 5, 15 min)
+data DaemonStatus = DaemonStatus {
+    daemonStatus :: Text,           -- "running", "starting", etc.
+    daemonUptime :: Double,         -- Uptime in seconds
+    daemonActiveBuilds :: Int,      -- Number of active builds
+    daemonCompletedBuilds :: Int,   -- Number of completed builds since startup
+    daemonFailedBuilds :: Int,      -- Number of failed builds since startup
+    daemonGcRoots :: Int,           -- Number of GC roots
+    daemonStoreSize :: Integer,     -- Store size in bytes
+    daemonStorePaths :: Int         -- Number of paths in store
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON DaemonStatusInfo where
-    toJSON DaemonStatusInfo{..} = Aeson.object [
+instance Aeson.ToJSON DaemonStatus where
+    toJSON DaemonStatus{..} = Aeson.object [
+            "status" .= daemonStatus,
             "uptime" .= daemonUptime,
-            "version" .= daemonVersion,
-            "buildsActive" .= daemonBuildsActive,
-            "buildsQueued" .= daemonBuildsQueued,
-            "buildsCompleted" .= daemonBuildsCompleted,
-            "buildsFailed" .= daemonBuildsFailed,
-            "storePaths" .= daemonStorePaths,
+            "activeBuilds" .= daemonActiveBuilds,
+            "completedBuilds" .= daemonCompletedBuilds,
+            "failedBuilds" .= daemonFailedBuilds,
+            "gcRoots" .= daemonGcRoots,
             "storeSize" .= daemonStoreSize,
-            "lastGC" .= daemonLastGC,
-            "cpuUsage" .= daemonCPUUsage,
-            "memoryUsage" .= daemonMemoryUsage,
-            "load" .= daemonLoad
+            "storePaths" .= daemonStorePaths
         ]
 
-instance Aeson.FromJSON DaemonStatusInfo where
-    parseJSON = Aeson.withObject "DaemonStatusInfo" $ \v -> do
+instance Aeson.FromJSON DaemonStatus where
+    parseJSON = Aeson.withObject "DaemonStatus" $ \v -> do
+        daemonStatus <- v .: "status"
         daemonUptime <- v .: "uptime"
-        daemonVersion <- v .: "version"
-        daemonBuildsActive <- v .: "buildsActive"
-        daemonBuildsQueued <- v .: "buildsQueued"
-        daemonBuildsCompleted <- v .: "buildsCompleted"
-        daemonBuildsFailed <- v .: "buildsFailed"
-        daemonStorePaths <- v .: "storePaths"
+        daemonActiveBuilds <- v .: "activeBuilds"
+        daemonCompletedBuilds <- v .: "completedBuilds"
+        daemonFailedBuilds <- v .: "failedBuilds"
+        daemonGcRoots <- v .: "gcRoots"
         daemonStoreSize <- v .: "storeSize"
-        daemonLastGC <- v .: "lastGC"
-        daemonCPUUsage <- v .: "cpuUsage"
-        daemonMemoryUsage <- v .: "memoryUsage"
-        daemonLoad <- v .: "load"
-        return DaemonStatusInfo{..}
+        daemonStorePaths <- v .: "storePaths"
+        return DaemonStatus{..}
+
+-- | Build result
+data BuildResult = BuildResult {
+    resultOutputs :: Set StorePath,
+    resultExitCode :: ExitCode,
+    resultLog :: Text,
+    resultMetadata :: Map Text Text
+} deriving (Show, Eq)
+
+instance Aeson.ToJSON BuildResult where
+    toJSON BuildResult{..} = Aeson.object [
+            "outputs" .= map encodePath (Set.toList resultOutputs),
+            "exitCode" .= exitCodeToJSON resultExitCode,
+            "log" .= resultLog,
+            "metadata" .= resultMetadata
+        ]
+      where
+        encodePath (StorePath hash name) = Aeson.object [
+                "hash" .= hash,
+                "name" .= name
+            ]
+        exitCodeToJSON ExitSuccess = Aeson.object [
+                "type" .= ("success" :: Text),
+                "code" .= (0 :: Int)
+            ]
+        exitCodeToJSON (ExitFailure code) = Aeson.object [
+                "type" .= ("failure" :: Text),
+                "code" .= code
+            ]
+
+instance Aeson.FromJSON BuildResult where
+    parseJSON = Aeson.withObject "BuildResult" $ \v -> do
+        outputsJson <- v .: "outputs"
+        outputs <- mapM decodePath outputsJson
+        exitCodeJson <- v .: "exitCode"
+        exitCode <- decodeExitCode exitCodeJson
+        resultLog <- v .: "log"
+        resultMetadata <- v .: "metadata"
+        return BuildResult {
+            resultOutputs = Set.fromList outputs,
+            resultExitCode = exitCode,
+            resultLog = resultLog,
+            resultMetadata = resultMetadata
+        }
+      where
+        decodePath = Aeson.withObject "StorePath" $ \p -> do
+            hash <- p .: "hash"
+            name <- p .: "name"
+            return $ StorePath hash name
+        decodeExitCode = Aeson.withObject "ExitCode" $ \e -> do
+            exitType <- e .: "type" :: Aeson.Parser Text
+            case exitType of
+                "success" -> return ExitSuccess
+                "failure" -> do
+                    code <- e .: "code"
+                    return $ ExitFailure code
+                _ -> fail $ "Unknown exit code type: " ++ T.unpack exitType
+
+-- | Daemon configuration
+data DaemonConfig = DaemonConfig {
+    daemonVersion :: Text,
+    daemonSocketPath :: FilePath,
+    daemonStorePath :: FilePath,
+    daemonMaxJobs :: Int,
+    daemonGcInterval :: Maybe Int,
+    daemonAllowedUsers :: [Text]
+} deriving (Show, Eq, Generic)
+
+instance Aeson.ToJSON DaemonConfig where
+    toJSON DaemonConfig{..} = Aeson.object [
+            "version" .= daemonVersion,
+            "socketPath" .= daemonSocketPath,
+            "storePath" .= daemonStorePath,
+            "maxJobs" .= daemonMaxJobs,
+            "gcInterval" .= daemonGcInterval,
+            "allowedUsers" .= daemonAllowedUsers
+        ]
+
+instance Aeson.FromJSON DaemonConfig where
+    parseJSON = Aeson.withObject "DaemonConfig" $ \v -> do
+        daemonVersion <- v .: "version"
+        daemonSocketPath <- v .: "socketPath"
+        daemonStorePath <- v .: "storePath"
+        daemonMaxJobs <- v .: "maxJobs"
+        daemonGcInterval <- v .: "gcInterval"
+        daemonAllowedUsers <- v .: "allowedUsers"
+        return DaemonConfig{..}
 
 instance Aeson.ToJSON DaemonResponse where
     toJSON resp = case resp of
@@ -908,9 +1034,14 @@ instance Aeson.ToJSON DaemonResponse where
                 "result" .= result
             ]
 
-        BuildStarted buildId -> Aeson.object [
+        BuildStartedResponse buildId -> Aeson.object [
                 "type" .= ("build-started" :: Text),
                 "buildId" .= renderBuildId buildId
+            ]
+
+        BuildResponse result -> Aeson.object [
+                "type" .= ("build-result" :: Text),
+                "result" .= result
             ]
 
         BuildStatusResponse update -> Aeson.object [
@@ -918,15 +1049,8 @@ instance Aeson.ToJSON DaemonResponse where
                 "update" .= update
             ]
 
-        BuildFinished buildId result -> Aeson.object [
-                "type" .= ("build-finished" :: Text),
-                "buildId" .= renderBuildId buildId,
-                "result" .= encodeResult result
-            ]
-
-        BuildOutputResponse buildId output -> Aeson.object [
+        BuildOutputResponse output -> Aeson.object [
                 "type" .= ("build-output" :: Text),
-                "buildId" .= renderBuildId buildId,
                 "output" .= output
             ]
 
@@ -939,27 +1063,29 @@ instance Aeson.ToJSON DaemonResponse where
                     ]) builds
             ]
 
-        PathInfoResponse path exists info -> Aeson.object [
-                "type" .= ("path-info" :: Text),
-                "path" .= encodePath path,
-                "exists" .= exists,
-                "info" .= info
-            ]
-
-        PathAddedResponse path -> Aeson.object [
-                "type" .= ("path-added" :: Text),
+        StoreAddResponse path -> Aeson.object [
+                "type" .= ("store-add" :: Text),
                 "path" .= encodePath path
             ]
 
-        PathVerifiedResponse path isValid -> Aeson.object [
-                "type" .= ("path-verified" :: Text),
-                "path" .= encodePath path,
-                "valid" .= isValid
+        StoreVerifyResponse valid -> Aeson.object [
+                "type" .= ("store-verify" :: Text),
+                "valid" .= valid
             ]
 
-        StoreContentsResponse paths -> Aeson.object [
-                "type" .= ("store-contents" :: Text),
+        StorePathResponse path -> Aeson.object [
+                "type" .= ("store-path" :: Text),
+                "path" .= encodePath path
+            ]
+
+        StoreListResponse paths -> Aeson.object [
+                "type" .= ("store-list" :: Text),
                 "paths" .= map encodePath paths
+            ]
+
+        DerivationResponse drv -> Aeson.object [
+                "type" .= ("derivation" :: Text),
+                "derivation" .= TE.decodeUtf8 (serializeDerivation drv)
             ]
 
         DerivationStoredResponse path -> Aeson.object [
@@ -967,19 +1093,21 @@ instance Aeson.ToJSON DaemonResponse where
                 "path" .= encodePath path
             ]
 
-        DerivationRetrievedResponse info -> Aeson.object [
+        DerivationRetrievedResponse mDrv -> Aeson.object [
                 "type" .= ("derivation-retrieved" :: Text),
-                "info" .= info
+                "derivation" .= maybe Aeson.Null
+                                    (\drv -> Aeson.String $ TE.decodeUtf8 $ serializeDerivation drv)
+                                    mDrv
             ]
 
-        DerivationQueryResponse results -> Aeson.object [
+        DerivationQueryResponse drvs -> Aeson.object [
                 "type" .= ("derivation-query" :: Text),
-                "results" .= results
+                "derivations" .= map (\drv -> TE.decodeUtf8 $ serializeDerivation drv) drvs
             ]
 
-        DerivationOutputResponse mapping -> Aeson.object [
-                "type" .= ("derivation-output" :: Text),
-                "mapping" .= mapping
+        DerivationOutputResponse paths -> Aeson.object [
+                "type" .= ("derivation-outputs" :: Text),
+                "outputs" .= map encodePath (Set.toList paths)
             ]
 
         DerivationListResponse paths -> Aeson.object [
@@ -987,20 +1115,22 @@ instance Aeson.ToJSON DaemonResponse where
                 "paths" .= map encodePath paths
             ]
 
-        GCCompleted collected kept bytes time -> Aeson.object [
-                "type" .= ("gc-completed" :: Text),
-                "collected" .= collected,
-                "kept" .= kept,
-                "bytes" .= bytes,
-                "time" .= time
+        GCResponse stats -> Aeson.object [
+                "type" .= ("gc" :: Text),
+                "stats" .= gcStatsToJSON stats
             ]
 
-        GCRootAdded name -> Aeson.object [
+        GCStatusResponse status -> Aeson.object [
+                "type" .= ("gc-status" :: Text),
+                "status" .= status
+            ]
+
+        GCRootAddedResponse name -> Aeson.object [
                 "type" .= ("gc-root-added" :: Text),
                 "name" .= name
             ]
 
-        GCRootRemoved name -> Aeson.object [
+        GCRootRemovedResponse name -> Aeson.object [
                 "type" .= ("gc-root-removed" :: Text),
                 "name" .= name
             ]
@@ -1014,7 +1144,7 @@ instance Aeson.ToJSON DaemonResponse where
                     ]) roots
             ]
 
-        Pong -> Aeson.object [
+        PongResponse -> Aeson.object [
                 "type" .= ("pong" :: Text)
             ]
 
@@ -1022,29 +1152,19 @@ instance Aeson.ToJSON DaemonResponse where
                 "type" .= ("shutdown" :: Text)
             ]
 
-        DaemonStatusResponse info -> Aeson.object [
-                "type" .= ("daemon-status" :: Text),
-                "info" .= info
+        StatusResponse status -> Aeson.object [
+                "type" .= ("status" :: Text),
+                "status" .= status
+            ]
+
+        ConfigResponse config -> Aeson.object [
+                "type" .= ("config" :: Text),
+                "config" .= config
             ]
 
         ErrorResponse err -> Aeson.object [
                 "type" .= ("error" :: Text),
-                "error" .= showBuildError err
-            ]
-
-        CycleDetectionResponse hasCycle -> Aeson.object [
-                "type" .= ("cycle-detection" :: Text),
-                "hasCycle" .= hasCycle
-            ]
-
-        BuildGraphResponse graph -> Aeson.object [
-                "type" .= ("build-graph" :: Text),
-                "graph" .= graph
-            ]
-
-        JoinedDerivation drv -> Aeson.object [
-                "type" .= ("joined-derivation" :: Text),
-                "derivation" .= Aeson.String (TE.decodeUtf8 $ serializeDerivation drv)
+                "error" .= errorToJSON err
             ]
       where
         encodePath (StorePath hash name) = Aeson.object [
@@ -1052,39 +1172,61 @@ instance Aeson.ToJSON DaemonResponse where
                 "name" .= name
             ]
 
-        encodeResult :: Either BuildError (Set StorePath) -> Aeson.Value
-        encodeResult (Left err) = Aeson.object [
-                "success" .= False,
-                "error" .= showBuildError err
-            ]
-        encodeResult (Right paths) = Aeson.object [
-                "success" .= True,
-                "outputs" .= map encodePath (Set.toList paths)
-            ]
-
-        showBuildError :: BuildError -> Text
-        showBuildError err = case err of
-            EvalError msg -> T.pack $ "Evaluation error: " ++ T.unpack msg
-            BuildFailed msg -> T.pack $ "Build failed: " ++ T.unpack msg
-            StoreError msg -> T.pack $ "Store error: " ++ T.unpack msg
-            SandboxError msg -> T.pack $ "Sandbox error: " ++ T.unpack msg
-            InputNotFound path -> T.pack $ "Input not found: " ++ path
-            HashError msg -> T.pack $ "Hash error: " ++ T.unpack msg
-            GraphError msg -> T.pack $ "Graph error: " ++ T.unpack msg
-            ResourceError msg -> T.pack $ "Resource error: " ++ T.unpack msg
-            DaemonError msg -> T.pack $ "Daemon error: " ++ T.unpack msg
-            AuthError msg -> T.pack $ "Authentication error: " ++ T.unpack msg
-            CyclicDependency msg -> T.pack $ "Cyclic dependency: " ++ T.unpack msg
-            SerializationError msg -> T.pack $ "Serialization error: " ++ T.unpack msg
-            RecursionLimit msg -> T.pack $ "Recursion limit exceeded: " ++ T.unpack msg
-            NetworkError msg -> T.pack $ "Network error: " ++ T.unpack msg
-
         showStatus :: BuildStatus -> Text
         showStatus BuildPending = "pending"
         showStatus (BuildRunning _) = "running"
         showStatus (BuildRecursing _) = "recursing"
         showStatus BuildCompleted = "completed"
         showStatus BuildFailed' = "failed"
+
+        gcStatsToJSON :: GCStats -> Aeson.Value
+        gcStatsToJSON stats = Aeson.object [
+                "total" .= gcTotal stats,
+                "live" .= gcLive stats,
+                "collected" .= gcCollected stats,
+                "bytes" .= gcBytes stats,
+                "elapsedTime" .= gcElapsedTime stats
+            ]
+
+        errorToJSON :: BuildError -> Aeson.Value
+        errorToJSON err = Aeson.object [
+                "type" .= errorType err,
+                "message" .= errorMessage err
+            ]
+
+        errorType :: BuildError -> Text
+        errorType (EvalError _) = "eval"
+        errorType (BuildFailed _) = "build"
+        errorType (StoreError _) = "store"
+        errorType (SandboxError _) = "sandbox"
+        errorType (InputNotFound _) = "input"
+        errorType (HashError _) = "hash"
+        errorType (GraphError _) = "graph"
+        errorType (ResourceError _) = "resource"
+        errorType (DaemonError _) = "daemon"
+        errorType (AuthError _) = "auth"
+        errorType (CyclicDependency _) = "cycle"
+        errorType (SerializationError _) = "serialization"
+        errorType (RecursionLimit _) = "recursion"
+        errorType (NetworkError _) = "network"
+        errorType _ = "unknown"
+
+        errorMessage :: BuildError -> Text
+        errorMessage (EvalError msg) = msg
+        errorMessage (BuildFailed msg) = msg
+        errorMessage (StoreError msg) = msg
+        errorMessage (SandboxError msg) = msg
+        errorMessage (InputNotFound path) = T.pack path
+        errorMessage (HashError msg) = msg
+        errorMessage (GraphError msg) = msg
+        errorMessage (ResourceError msg) = msg
+        errorMessage (DaemonError msg) = msg
+        errorMessage (AuthError msg) = msg
+        errorMessage (CyclicDependency msg) = msg
+        errorMessage (SerializationError msg) = msg
+        errorMessage (RecursionLimit msg) = msg
+        errorMessage (NetworkError msg) = msg
+        errorMessage _ = "Unknown error"
 
 instance Aeson.FromJSON DaemonResponse where
     parseJSON = Aeson.withObject "DaemonResponse" $ \v -> do
@@ -1098,34 +1240,19 @@ instance Aeson.FromJSON DaemonResponse where
                 buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 case parseBuildId buildIdStr of
                     Left err -> fail $ T.unpack err
-                    Right buildId -> return $ BuildStarted buildId
+                    Right buildId -> return $ BuildStartedResponse buildId
+
+            "build-result" -> do
+                result <- v .: "result"
+                return $ BuildResponse result
 
             "build-status" -> do
                 update <- v .: "update"
                 return $ BuildStatusResponse update
 
-            "build-finished" -> do
-                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
-                resultObj <- v .: "result"
-                success <- resultObj .: "success"
-                result <- if success
-                    then do
-                        outputsJson <- resultObj .: "outputs"
-                        outputs <- mapM decodePath outputsJson
-                        return $ Right $ Set.fromList outputs
-                    else do
-                        errorMsg <- resultObj .: "error"
-                        return $ Left $ BuildFailed errorMsg
-                case parseBuildId buildIdStr of
-                    Left err -> fail $ T.unpack err
-                    Right buildId -> return $ BuildFinished buildId result
-
             "build-output" -> do
-                buildIdStr <- v .: "buildId" :: Aeson.Parser Text
                 output <- v .: "output"
-                case parseBuildId buildIdStr of
-                    Left err -> fail $ T.unpack err
-                    Right buildId -> return $ BuildOutputResponse buildId output
+                return $ BuildOutputResponse output
 
             "build-list" -> do
                 buildsJson <- v .: "builds"
@@ -1139,7 +1266,7 @@ instance Aeson.FromJSON DaemonResponse where
                             let status = case statusStr of
                                     "pending" -> BuildPending
                                     "running" -> BuildRunning progress
-                                    "recursing" -> BuildRecursing (BuildIdFromInt 0)  -- Temporary ID, will be replaced
+                                    "recursing" -> BuildRecursing (BuildIdFromInt 0)  -- Temporary ID
                                     "completed" -> BuildCompleted
                                     "failed" -> BuildFailed'
                                     _ -> BuildPending  -- Default
@@ -1147,28 +1274,30 @@ instance Aeson.FromJSON DaemonResponse where
                     ) buildsJson
                 return $ BuildListResponse builds
 
-            "path-info" -> do
+            "store-add" -> do
                 pathObj <- v .: "path"
                 path <- decodePath pathObj
-                exists <- v .: "exists"
-                info <- v .: "info"
-                return $ PathInfoResponse path exists info
+                return $ StoreAddResponse path
 
-            "path-added" -> do
+            "store-verify" -> do
+                valid <- v .: "valid"
+                return $ StoreVerifyResponse valid
+
+            "store-path" -> do
                 pathObj <- v .: "path"
                 path <- decodePath pathObj
-                return $ PathAddedResponse path
+                return $ StorePathResponse path
 
-            "path-verified" -> do
-                pathObj <- v .: "path"
-                path <- decodePath pathObj
-                isValid <- v .: "valid"
-                return $ PathVerifiedResponse path isValid
-
-            "store-contents" -> do
+            "store-list" -> do
                 pathsJson <- v .: "paths"
                 paths <- mapM decodePath pathsJson
-                return $ StoreContentsResponse paths
+                return $ StoreListResponse paths
+
+            "derivation" -> do
+                derivText <- v .: "derivation" :: Aeson.Parser Text
+                case deserializeDerivation (TE.encodeUtf8 derivText) of
+                    Left err -> fail $ "Invalid derivation: " ++ T.unpack err
+                    Right drv -> return $ DerivationResponse drv
 
             "derivation-stored" -> do
                 pathObj <- v .: "path"
@@ -1176,36 +1305,50 @@ instance Aeson.FromJSON DaemonResponse where
                 return $ DerivationStoredResponse path
 
             "derivation-retrieved" -> do
-                info <- v .: "info"
-                return $ DerivationRetrievedResponse info
+                derivValue <- v .: "derivation"
+                case derivValue of
+                    Aeson.Null -> return $ DerivationRetrievedResponse Nothing
+                    Aeson.String derivText ->
+                        case deserializeDerivation (TE.encodeUtf8 derivText) of
+                            Left err -> fail $ "Invalid derivation: " ++ T.unpack err
+                            Right drv -> return $ DerivationRetrievedResponse (Just drv)
+                    _ -> fail "Invalid derivation value"
 
             "derivation-query" -> do
-                results <- v .: "results"
-                return $ DerivationQueryResponse results
+                derivTexts <- v .: "derivations" :: Aeson.Parser [Text]
+                drvs <- mapM (\derivText ->
+                    case deserializeDerivation (TE.encodeUtf8 derivText) of
+                        Left err -> fail $ "Invalid derivation: " ++ T.unpack err
+                        Right drv -> return drv
+                    ) derivTexts
+                return $ DerivationQueryResponse drvs
 
-            "derivation-output" -> do
-                mapping <- v .: "mapping"
-                return $ DerivationOutputResponse mapping
+            "derivation-outputs" -> do
+                outputsJson <- v .: "outputs"
+                outputs <- mapM decodePath outputsJson
+                return $ DerivationOutputResponse (Set.fromList outputs)
 
             "derivation-list" -> do
                 pathsJson <- v .: "paths"
                 paths <- mapM decodePath pathsJson
                 return $ DerivationListResponse paths
 
-            "gc-completed" -> do
-                collected <- v .: "collected"
-                kept <- v .: "kept"
-                bytes <- v .: "bytes"
-                time <- v .: "time"
-                return $ GCCompleted collected kept bytes time
+            "gc" -> do
+                statsJson <- v .: "stats"
+                stats <- parseGCStats statsJson
+                return $ GCResponse stats
+
+            "gc-status" -> do
+                status <- v .: "status"
+                return $ GCStatusResponse status
 
             "gc-root-added" -> do
                 name <- v .: "name"
-                return $ GCRootAdded name
+                return $ GCRootAddedResponse name
 
             "gc-root-removed" -> do
                 name <- v .: "name"
-                return $ GCRootRemoved name
+                return $ GCRootRemovedResponse name
 
             "gc-roots-list" -> do
                 rootsJson <- v .: "roots"
@@ -1218,63 +1361,120 @@ instance Aeson.FromJSON DaemonResponse where
                     ) rootsJson
                 return $ GCRootsListResponse roots
 
-            "pong" -> return Pong
+            "pong" -> return PongResponse
 
             "shutdown" -> return ShutdownResponse
 
-            "daemon-status" -> do
-                info <- v .: "info"
-                return $ DaemonStatusResponse info
+            "status" -> do
+                status <- v .: "status"
+                return $ StatusResponse status
+
+            "config" -> do
+                config <- v .: "config"
+                return $ ConfigResponse config
 
             "error" -> do
-                errorMsg <- v .: "error"
-                return $ ErrorResponse (BuildFailed errorMsg)
-
-            "cycle-detection" -> do
-                hasCycle <- v .: "hasCycle"
-                return $ CycleDetectionResponse hasCycle
-
-            "build-graph" -> do
-                graph <- v .: "graph"
-                return $ BuildGraphResponse graph
-
-            "joined-derivation" -> do
-                drvText <- v .: "derivation"
-                case deserializeDerivation $ TE.encodeUtf8 $ extractString drvText of
-                    Left err -> fail $ "Invalid derivation: " ++ T.unpack err
-                    Right drv -> return $ JoinedDerivation drv
+                errorJson <- v .: "error"
+                err <- parseError errorJson
+                return $ ErrorResponse err
 
             _ -> fail $ "Unknown response type: " ++ T.unpack responseType
       where
-        extractString (Aeson.String s) = s
-        extractString _ = T.empty
-
         decodePath = Aeson.withObject "StorePath" $ \p -> do
             hash <- p .: "hash"
             name <- p .: "name"
             return $ StorePath hash name
 
--- | Serialize a request to JSON
-serializeRequest :: DaemonRequest -> BS.ByteString
-serializeRequest = LBS.toStrict . Aeson.encode
+        parseGCStats = Aeson.withObject "GCStats" $ \s -> do
+            total <- s .: "total"
+            live <- s .: "live"
+            collected <- s .: "collected"
+            bytes <- s .: "bytes"
+            elapsedTime <- s .: "elapsedTime"
+            return $ GCStats total live collected bytes elapsedTime
 
--- | Deserialize a request from JSON
-deserializeRequest :: BS.ByteString -> Either Text DaemonRequest
-deserializeRequest bs =
+        parseError = Aeson.withObject "BuildError" $ \e -> do
+            errorType <- e .: "type" :: Aeson.Parser Text
+            message <- e .: "message"
+            case errorType of
+                "eval" -> return $ EvalError message
+                "build" -> return $ BuildFailed message
+                "store" -> return $ StoreError message
+                "sandbox" -> return $ SandboxError message
+                "input" -> return $ InputNotFound (T.unpack message)
+                "hash" -> return $ HashError message
+                "graph" -> return $ GraphError message
+                "resource" -> return $ ResourceError message
+                "daemon" -> return $ DaemonError message
+                "auth" -> return $ AuthError message
+                "cycle" -> return $ CyclicDependency message
+                "serialization" -> return $ SerializationError message
+                "recursion" -> return $ RecursionLimit message
+                "network" -> return $ NetworkError message
+                _ -> return $ BuildFailed $ "Unknown error: " <> message
+
+-- | Protocol message type
+data Message
+    = AuthRequestMsg AuthRequest
+    | AuthResponseMsg AuthResult
+    | RequestMsg Int DaemonRequest
+    | ResponseMsg Int DaemonResponse
+    deriving (Show, Eq)
+
+instance Aeson.ToJSON Message where
+    toJSON (AuthRequestMsg req) = Aeson.object [
+            "messageType" .= ("authRequest" :: Text),
+            "request" .= req
+        ]
+    toJSON (AuthResponseMsg resp) = Aeson.object [
+            "messageType" .= ("authResponse" :: Text),
+            "response" .= resp
+        ]
+    toJSON (RequestMsg reqId req) = Aeson.object [
+            "messageType" .= ("request" :: Text),
+            "requestId" .= reqId,
+            "request" .= req
+        ]
+    toJSON (ResponseMsg reqId resp) = Aeson.object [
+            "messageType" .= ("response" :: Text),
+            "requestId" .= reqId,
+            "response" .= resp
+        ]
+
+instance Aeson.FromJSON Message where
+    parseJSON = Aeson.withObject "Message" $ \v -> do
+        messageType <- v .: "messageType" :: Aeson.Parser Text
+        case messageType of
+            "authRequest" -> do
+                req <- v .: "request"
+                return $ AuthRequestMsg req
+            "authResponse" -> do
+                resp <- v .: "response"
+                return $ AuthResponseMsg resp
+            "request" -> do
+                reqId <- v .: "requestId"
+                req <- v .: "request"
+                return $ RequestMsg reqId req
+            "response" -> do
+                reqId <- v .: "requestId"
+                resp <- v .: "response"
+                return $ ResponseMsg reqId resp
+            _ -> fail $ "Unknown message type: " ++ T.unpack messageType
+
+-- | Serialize a message with length prefix
+serializeMessage :: Message -> BS.ByteString
+serializeMessage msg =
+    let body = LBS.toStrict $ Aeson.encode msg
+        len = fromIntegral $ BS.length body
+        lenBytes = LBS.toStrict $ Builder.toLazyByteString $ Builder.word32BE len
+    in lenBytes <> body
+
+-- | Deserialize a message
+deserializeMessage :: BS.ByteString -> Either Text Message
+deserializeMessage bs =
     case Aeson.eitherDecodeStrict bs of
-        Left err -> Left $ T.pack $ "Failed to parse request: " ++ err
-        Right req -> Right req
-
--- | Serialize a response to JSON
-serializeResponse :: DaemonResponse -> BS.ByteString
-serializeResponse = LBS.toStrict . Aeson.encode
-
--- | Deserialize a response from JSON
-deserializeResponse :: BS.ByteString -> Either Text DaemonResponse
-deserializeResponse bs =
-    case Aeson.eitherDecodeStrict bs of
-        Left err -> Left $ T.pack $ "Failed to parse response: " ++ err
-        Right resp -> Right resp
+        Left err -> Left $ "Failed to parse message: " <> T.pack err
+        Right msg -> Right msg
 
 -- | Protocol handle type for managing connections
 data ProtocolHandle = ProtocolHandle {
@@ -1331,86 +1531,78 @@ parseResponseFrame :: BS.ByteString -> Either Text (BS.ByteString, BS.ByteString
 parseResponseFrame = parseRequestFrame  -- Same format
 
 -- | Send a request over a protocol handle
-sendRequest :: ProtocolHandle -> DaemonRequest -> IO ()
+sendRequest :: ProtocolHandle -> DaemonRequest -> IO Int
 sendRequest handle req = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
-        let content = serializeRequest req
-        let frame = createRequestFrame content
-        NByte.sendAll (protocolSocket handle) frame
+        -- Generate request ID
+        reqId <- (`mod` 1000000) <$> getCurrentMillis
+
+        -- Create message with request ID
+        let msg = RequestMsg reqId req
+
+        -- Send message
+        let serialized = serializeMessage msg
+        NByte.sendAll (protocolSocket handle) serialized
+
+        -- Return request ID for tracking
+        return reqId
 
 -- | Receive a response from a protocol handle
-receiveResponse :: ProtocolHandle -> IO (Either ProtocolError DaemonResponse)
-receiveResponse handle = do
+receiveResponse :: ProtocolHandle -> Int -> Int -> IO (Either ProtocolError DaemonResponse)
+receiveResponse handle reqId timeoutMicros = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
-        -- Read the 4-byte length prefix
-        lenBytes <- try $ NByte.recv (protocolSocket handle) 4
-        case lenBytes of
-            Left (_ :: SomeException) ->
-                return $ Left ConnectionClosed
-            Right bytes
-                | BS.length bytes < 4 ->
-                    return $ Left ConnectionClosed
-                | otherwise -> do
-                    let len = fromIntegral $
-                              (fromIntegral (BS.index bytes 0) `shiftL` 24) .|.
-                              (fromIntegral (BS.index bytes 1) `shiftL` 16) .|.
-                              (fromIntegral (BS.index bytes 2) `shiftL` 8) .|.
-                              (fromIntegral (BS.index bytes 3))
+        -- Read a message
+        msgBytes <- try $ readMessageWithTimeout (protocolSocket handle) timeoutMicros
+        case msgBytes of
+            Left (e :: SomeException) ->
+                return $ Left $ ConnectionClosed
 
-                    -- Check for unreasonable message sizes
-                    when (len > 100 * 1024 * 1024) $  -- 100 MB limit
-                        throwIO $ MessageTooLarge (fromIntegral len)
+            Right bytes -> case deserializeMessage bytes of
+                Left err ->
+                    return $ Left $ ProtocolParseError err
 
-                    -- Read the message content
-                    content <- recvExactly (protocolSocket handle) len
-                    if BS.length content < len
-                        then return $ Left ConnectionClosed
-                        else case deserializeResponse content of
-                            Left err -> return $ Left $ ProtocolParseError err
-                            Right resp -> return $ Right resp
+                Right (ResponseMsg respId resp) ->
+                    if respId == reqId
+                        then return $ Right resp
+                        else return $ Left $ InvalidRequest $ "Response ID mismatch: expected " <> T.pack (show reqId) <> ", got " <> T.pack (show respId)
+
+                Right _ ->
+                    return $ Left $ InvalidRequest "Expected response message"
 
 -- | Send a response over a protocol handle
-sendResponse :: ProtocolHandle -> DaemonResponse -> IO ()
-sendResponse handle resp = do
+sendResponse :: ProtocolHandle -> Int -> DaemonResponse -> IO ()
+sendResponse handle reqId resp = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
-        let content = serializeResponse resp
-        let frame = createResponseFrame content
-        NByte.sendAll (protocolSocket handle) frame
+        -- Create message with request ID
+        let msg = ResponseMsg reqId resp
+
+        -- Send message
+        let serialized = serializeMessage msg
+        NByte.sendAll (protocolSocket handle) serialized
 
 -- | Receive a request from a protocol handle
-receiveRequest :: ProtocolHandle -> IO (Either ProtocolError DaemonRequest)
+receiveRequest :: ProtocolHandle -> IO (Either ProtocolError (Int, DaemonRequest))
 receiveRequest handle = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
-        -- Read the 4-byte length prefix
-        lenBytes <- try $ NByte.recv (protocolSocket handle) 4
-        case lenBytes of
-            Left (_ :: SomeException) ->
+        -- Read a message
+        msgBytes <- try $ readMessage (protocolSocket handle)
+        case msgBytes of
+            Left (e :: SomeException) ->
                 return $ Left ConnectionClosed
-            Right bytes
-                | BS.length bytes < 4 ->
-                    return $ Left ConnectionClosed
-                | otherwise -> do
-                    let len = fromIntegral $
-                              (fromIntegral (BS.index bytes 0) `shiftL` 24) .|.
-                              (fromIntegral (BS.index bytes 1) `shiftL` 16) .|.
-                              (fromIntegral (BS.index bytes 2) `shiftL` 8) .|.
-                              (fromIntegral (BS.index bytes 3))
 
-                    -- Check for unreasonable message sizes
-                    when (len > 100 * 1024 * 1024) $  -- 100 MB limit
-                        throwIO $ MessageTooLarge (fromIntegral len)
+            Right bytes -> case deserializeMessage bytes of
+                Left err ->
+                    return $ Left $ ProtocolParseError err
 
-                    -- Read the message content
-                    content <- recvExactly (protocolSocket handle) len
-                    if BS.length content < len
-                        then return $ Left ConnectionClosed
-                        else case deserializeRequest content of
-                            Left err -> return $ Left $ ProtocolParseError err
-                            Right req -> return $ Right req
+                Right (RequestMsg reqId req) ->
+                    return $ Right (reqId, req)
+
+                Right _ ->
+                    return $ Left $ InvalidRequest "Expected request message"
 
 -- | Execute an action with a protocol handle and clean up after
 withProtocolHandle :: Socket -> (ProtocolHandle -> IO a) -> IO a
@@ -1420,13 +1612,68 @@ withProtocolHandle socket action =
         closeHandle
         action
 
+-- | Read a message from a socket with timeout
+readMessageWithTimeout :: Socket -> Int -> IO BS.ByteString
+readMessageWithTimeout sock timeoutMicros = do
+    -- Read length header with timeout
+    lenBytes <- timeout timeoutMicros $ NByte.recv sock 4
+    case lenBytes of
+        Nothing -> throwIO $ ProtocolError $ MessageTooLarge 0
+        Just bytes
+            | BS.length bytes /= 4 -> throwIO $ ProtocolError ConnectionClosed
+            | otherwise -> do
+                -- Decode message length
+                let len = fromIntegral $
+                          (fromIntegral (BS.index bytes 0) `shiftL` 24) .|.
+                          (fromIntegral (BS.index bytes 1) `shiftL` 16) .|.
+                          (fromIntegral (BS.index bytes 2) `shiftL` 8) .|.
+                          (fromIntegral (BS.index bytes 3))
+
+                -- Check if message is too large
+                when (len > 100 * 1024 * 1024) $ -- 100 MB limit
+                    throwIO $ ProtocolError $ MessageTooLarge (fromIntegral len)
+
+                -- Read message body with timeout
+                body <- timeout timeoutMicros $ recvExactly sock len
+                case body of
+                    Nothing -> throwIO $ ProtocolError ConnectionClosed
+                    Just bytes
+                        | BS.length bytes /= len -> throwIO $ ProtocolError ConnectionClosed
+                        | otherwise -> return bytes
+
+-- | Read a message from a socket
+readMessage :: Socket -> IO BS.ByteString
+readMessage sock = do
+    -- Read length header
+    lenBytes <- NByte.recv sock 4
+    when (BS.length lenBytes /= 4) $
+        throwIO $ ProtocolError ConnectionClosed
+
+    -- Decode message length
+    let len = fromIntegral $
+              (fromIntegral (BS.index lenBytes 0) `shiftL` 24) .|.
+              (fromIntegral (BS.index lenBytes 1) `shiftL` 16) .|.
+              (fromIntegral (BS.index lenBytes 2) `shiftL` 8) .|.
+              (fromIntegral (BS.index lenBytes 3))
+
+    -- Check if message is too large
+    when (len > 100 * 1024 * 1024) $ -- 100 MB limit
+        throwIO $ ProtocolError $ MessageTooLarge (fromIntegral len)
+
+    -- Read message body
+    body <- recvExactly sock len
+    when (BS.length body /= len) $
+        throwIO $ ProtocolError ConnectionClosed
+
+    return body
+
 -- | Read exactly n bytes from a socket
 recvExactly :: Socket -> Int -> IO BS.ByteString
-recvExactly socket n = go n []
+recvExactly sock n = go n []
   where
     go 0 chunks = return $ BS.concat $ reverse chunks
     go remaining chunks = do
-        chunk <- NByte.recv socket remaining
+        chunk <- NByte.recv sock remaining
         let chunkSize = BS.length chunk
         if chunkSize == 0
             then return $ BS.concat $ reverse chunks  -- Connection closed
@@ -1438,214 +1685,266 @@ requestToText req = case req of
     AuthRequest ver _ ->
         T.pack $ "Auth request (protocol version " ++ show ver ++ ")"
 
-    BuildDerivation drv _ ->
-        T.pack $ "Build derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+    BuildRequest{..} ->
+        "Build file: " <> buildFilePath
 
-    BuildFile path _ ->
-        T.pack $ "Build file: " ++ path
+    EvalRequest{..} ->
+        "Evaluate file: " <> evalFilePath
 
-    CancelBuild buildId ->
-        T.pack $ "Cancel build: " ++ show buildId
+    BuildDerivationRequest{..} ->
+        "Build derivation: " <> T.take 40 (hashDerivation buildDerivation) <> "..."
 
-    QueryBuildStatus buildId ->
-        T.pack $ "Query build status: " ++ show buildId
+    BuildStatusRequest{..} ->
+        "Query build status: " <> renderBuildId statusBuildId
 
-    QueryBuildOutput buildId ->
-        T.pack $ "Query build output: " ++ show buildId
+    CancelBuildRequest{..} ->
+        "Cancel build: " <> renderBuildId cancelBuildId
 
-    ListBuilds limit ->
-        T.pack $ "List builds" ++ maybe "" (\n -> " (limit: " ++ show n ++ ")") limit
+    QueryBuildOutputRequest{..} ->
+        "Query build output: " <> renderBuildId outputBuildId
 
-    QueryPath path ->
-        T.pack $ "Query path: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+    ListBuildsRequest{..} ->
+        "List builds" <> maybe "" (\n -> " (limit: " <> T.pack (show n) <> ")") listLimit
 
-    AddToStore name _ ->
-        T.pack $ "Add to store: " ++ T.unpack name
+    StoreAddRequest{..} ->
+        "Add to store: " <> storeAddPath
 
-    EnsureInStore name path ->
-        T.pack $ "Ensure in store: " ++ T.unpack name ++ " (from " ++ path ++ ")"
+    StoreVerifyRequest{..} ->
+        "Verify path: " <> storeVerifyPath
 
-    VerifyPath path ->
-        T.pack $ "Verify path: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+    StorePathRequest{..} ->
+        "Get store path for: " <> storePathForFile
 
-    ListStoreContents prefix ->
-        T.pack $ "List store" ++ maybe "" (\p -> " (prefix: " ++ T.unpack p ++ ")") prefix
+    StoreListRequest ->
+        "List store contents"
 
-    StoreDerivationRequest req ->
-        T.pack $ "Store derivation: " ++ T.unpack (T.take 40 (hashDerivation (storeDerivation req))) ++ "..."
+    StoreDerivationRequest _ ->
+        "Store derivation"
 
-    RetrieveDerivationRequest req ->
-        T.pack $ "Retrieve derivation: " ++ T.unpack (storeHash (derivationPath req)) ++ "-" ++ T.unpack (storeName (derivationPath req))
+    RetrieveDerivationRequest _ ->
+        "Retrieve derivation"
 
-    QueryDerivationRequest req ->
-        T.pack $ "Query derivation: " ++ T.unpack (queryType req) ++ " = " ++ T.unpack (queryValue req)
+    QueryDerivationRequest _ ->
+        "Query derivation"
 
-    QueryDeriverForOutput path ->
-        T.pack $ "Query deriver for output: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+    GetDerivationForOutputRequest{..} ->
+        "Get derivation for output: " <> getDerivationForPath
 
-    ListDerivations limit ->
-        T.pack $ "List derivations" ++ maybe "" (\n -> " (limit: " ++ show n ++ ")") limit
+    ListDerivationsRequest{..} ->
+        "List derivations" <> maybe "" (\n -> " (limit: " <> T.pack (show n) <> ")") listDerivLimit
 
-    CollectGarbage force ->
-        T.pack $ "Collect garbage" ++ if force then " (force)" else ""
+    GCRequest{..} ->
+        "Collect garbage" <> if gcForce then " (force)" else ""
 
-    AddGCRoot path name permanent ->
-        T.pack $ "Add GC root: " ++ T.unpack name ++ " -> " ++
-        T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path) ++
-        if permanent then " (permanent)" else ""
+    GCStatusRequest req ->
+        "Check GC status" <> if forceCheck req then " (force check)" else ""
 
-    RemoveGCRoot name ->
-        T.pack $ "Remove GC root: " ++ T.unpack name
+    AddGCRootRequest{..} ->
+        "Add GC root: " <> rootName <> " -> " <> storeHash rootPath <> "-" <> storeName rootPath
 
-    ListGCRoots ->
-        T.pack "List GC roots"
+    RemoveGCRootRequest{..} ->
+        "Remove GC root: " <> rootNameToRemove
 
-    Ping ->
-        T.pack "Ping"
+    ListGCRootsRequest ->
+        "List GC roots"
 
-    Shutdown ->
-        T.pack "Shutdown"
+    PingRequest ->
+        "Ping"
 
-    QueryDaemonStatus ->
-        T.pack "Query daemon status"
+    ShutdownRequest ->
+        "Shutdown"
 
-    DetectCycle drvs ->
-        T.pack $ "Detect cycle in " ++ show (length drvs) ++ " derivations"
+    StatusRequest ->
+        "Get daemon status"
 
-    ComputeBuildGraph drv ->
-        T.pack $ "Compute build graph for: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
-
-    JoinDerivation drv ->
-        T.pack $ "Join derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+    ConfigRequest ->
+        "Get daemon configuration"
 
 -- | Convert a response to human-readable text
 responseToText :: DaemonResponse -> Text
 responseToText resp = case resp of
     AuthResponse (AuthAccepted uid _) ->
-        T.pack $ "Auth accepted for user: " ++ show uid
+        "Auth accepted: " <> case uid of UserId u -> u
 
     AuthResponse (AuthRejected reason) ->
-        T.pack $ "Auth rejected: " ++ T.unpack reason
+        "Auth rejected: " <> reason
 
-    BuildStarted buildId ->
-        T.pack $ "Build started: " ++ show buildId
+    BuildStartedResponse buildId ->
+        "Build started: " <> renderBuildId buildId
+
+    BuildResponse _ ->
+        "Build completed"
 
     BuildStatusResponse update ->
-        T.pack $ "Build status update for " ++ show (buildId update) ++
-                 ": " ++ showStatus (buildStatus update) ++
-                 " (" ++ show (round (buildTimeElapsed update)) ++ "s)"
+        "Build status: " <> showStatus (buildStatus update)
 
-    BuildFinished buildId (Right outputs) ->
-        T.pack $ "Build finished: " ++ show buildId ++ " with " ++
-                 show (Set.size outputs) ++ " outputs"
-
-    BuildFinished buildId (Left err) ->
-        T.pack $ "Build failed: " ++ show buildId ++ " - " ++ showError err
-
-    BuildOutputResponse buildId _ ->
-        T.pack $ "Build output for: " ++ show buildId
+    BuildOutputResponse _ ->
+        "Build output"
 
     BuildListResponse builds ->
-        T.pack $ "Build list: " ++ show (length builds) ++ " builds"
+        "Build list: " <> T.pack (show (length builds)) <> " builds"
 
-    PathInfoResponse path exists _ ->
-        T.pack $ "Path info: " ++ T.unpack (storeHash path) ++ "-" ++
-                 T.unpack (storeName path) ++ (if exists then " (exists)" else " (missing)")
+    StoreAddResponse path ->
+        "Added to store: " <> storeHash path <> "-" <> storeName path
 
-    PathAddedResponse path ->
-        T.pack $ "Path added: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+    StoreVerifyResponse valid ->
+        "Path verification: " <> if valid then "valid" else "invalid"
 
-    PathVerifiedResponse path isValid ->
-        T.pack $ "Path verified: " ++ T.unpack (storeHash path) ++ "-" ++
-                 T.unpack (storeName path) ++ (if isValid then " (valid)" else " (invalid)")
+    StorePathResponse path ->
+        "Store path: " <> storeHash path <> "-" <> storeName path
 
-    StoreContentsResponse paths ->
-        T.pack $ "Store contents: " ++ show (length paths) ++ " paths"
+    StoreListResponse paths ->
+        "Store contents: " <> T.pack (show (length paths)) <> " paths"
+
+    DerivationResponse _ ->
+        "Derivation"
 
     DerivationStoredResponse path ->
-        T.pack $ "Derivation stored at: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+        "Derivation stored: " <> storeHash path <> "-" <> storeName path
 
-    DerivationRetrievedResponse info ->
-        T.pack $ "Derivation retrieved: " ++ T.unpack (derivName (derivationResponseDrv info))
+    DerivationRetrievedResponse Nothing ->
+        "Derivation not found"
 
-    DerivationQueryResponse results ->
-        T.pack $ "Derivation query results: " ++ show (length results) ++ " derivations"
+    DerivationRetrievedResponse (Just _) ->
+        "Derivation retrieved"
 
-    DerivationOutputResponse mapping ->
-        T.pack $ "Derivation output mappings: " ++ show (outputMappingCount mapping) ++ " mappings"
+    DerivationQueryResponse drvs ->
+        "Derivation query results: " <> T.pack (show (length drvs)) <> " derivations"
+
+    DerivationOutputResponse paths ->
+        "Derivation outputs: " <> T.pack (show (Set.size paths)) <> " paths"
 
     DerivationListResponse paths ->
-        T.pack $ "Derivation list: " ++ show (length paths) ++ " derivations"
+        "Derivation list: " <> T.pack (show (length paths)) <> " derivations"
 
-    GCCompleted collected kept bytes time ->
-        T.pack $ "GC completed: " ++ show collected ++ " paths collected, " ++
-                 show kept ++ " paths kept, " ++ formatBytes bytes ++ " freed in " ++
-                 show (round time) ++ "s"
+    GCResponse stats ->
+        "GC completed: " <> T.pack (show (gcCollected stats)) <> " paths collected"
 
-    GCRootAdded name ->
-        T.pack $ "GC root added: " ++ T.unpack name
+    GCStatusResponse status ->
+        "GC status: " <> if gcRunning status then "running" else "not running" <>
+        maybe "" (\owner -> " (owned by " <> owner <> ")") (gcOwner status)
 
-    GCRootRemoved name ->
-        T.pack $ "GC root removed: " ++ T.unpack name
+    GCRootAddedResponse name ->
+        "GC root added: " <> name
+
+    GCRootRemovedResponse name ->
+        "GC root removed: " <> name
 
     GCRootsListResponse roots ->
-        T.pack $ "GC roots: " ++ show (length roots) ++ " roots"
+        "GC roots: " <> T.pack (show (length roots)) <> " roots"
 
-    Pong ->
-        T.pack "Pong"
+    PongResponse ->
+        "Pong"
 
     ShutdownResponse ->
-        T.pack "Shutdown acknowledged"
+        "Shutdown acknowledged"
 
-    DaemonStatusResponse info ->
-        T.pack $ "Daemon status: " ++ show (daemonBuildsActive info) ++ " active builds, " ++
-                 show (daemonBuildsQueued info) ++ " queued"
+    StatusResponse _ ->
+        "Daemon status"
+
+    ConfigResponse _ ->
+        "Daemon configuration"
 
     ErrorResponse err ->
-        T.pack $ "Error: " ++ showError err
-
-    CycleDetectionResponse hasCycle ->
-        T.pack $ "Cycle detection: " ++ if hasCycle then "cycle found" else "no cycles"
-
-    BuildGraphResponse _ ->
-        T.pack "Build graph"
-
-    JoinedDerivation drv ->
-        T.pack $ "Joined derivation: " ++ T.unpack (T.take 40 (hashDerivation drv)) ++ "..."
+        "Error: " <> errorToText err
   where
-    showStatus :: BuildStatus -> String
+    showStatus :: BuildStatus -> Text
     showStatus BuildPending = "pending"
-    showStatus (BuildRunning progress) =
-        "running (" ++ show (round (progress * 100)) ++ "%)"
-    showStatus (BuildRecursing innerBuildId) =
-        "recursing to " ++ show innerBuildId
+    showStatus (BuildRunning progress) = "running (" <> T.pack (show (round (progress * 100))) <> "%)"
+    showStatus (BuildRecursing innerBuildId) = "recursing to " <> renderBuildId innerBuildId
     showStatus BuildCompleted = "completed"
     showStatus BuildFailed' = "failed"
 
-    showError :: BuildError -> String
-    showError (EvalError msg) = "Evaluation error: " ++ T.unpack msg
-    showError (BuildFailed msg) = "Build failed: " ++ T.unpack msg
-    showError (StoreError msg) = "Store error: " ++ T.unpack msg
-    showError (SandboxError msg) = "Sandbox error: " ++ T.unpack msg
-    showError (InputNotFound path) = "Input not found: " ++ path
-    showError (HashError msg) = "Hash error: " ++ T.unpack msg
-    showError (GraphError msg) = "Graph error: " ++ T.unpack msg
-    showError (ResourceError msg) = "Resource error: " ++ T.unpack msg
-    showError (DaemonError msg) = "Daemon error: " ++ T.unpack msg
-    showError (AuthError msg) = "Authentication error: " ++ T.unpack msg
-    showError (CyclicDependency msg) = "Cyclic dependency: " ++ T.unpack msg
-    showError (SerializationError msg) = "Serialization error: " ++ T.unpack msg
-    showError (RecursionLimit msg) = "Recursion limit exceeded: " ++ T.unpack msg
-    showError (NetworkError msg) = "Network error: " ++ T.unpack msg
+    errorToText :: BuildError -> Text
+    errorToText (EvalError msg) = "Evaluation error: " <> msg
+    errorToText (BuildFailed msg) = "Build failed: " <> msg
+    errorToText (StoreError msg) = "Store error: " <> msg
+    errorToText (SandboxError msg) = "Sandbox error: " <> msg
+    errorToText (InputNotFound path) = "Input not found: " <> T.pack path
+    errorToText (HashError msg) = "Hash error: " <> msg
+    errorToText (GraphError msg) = "Graph error: " <> msg
+    errorToText (ResourceError msg) = "Resource error: " <> msg
+    errorToText (DaemonError msg) = "Daemon error: " <> msg
+    errorToText (AuthError msg) = "Authentication error: " <> msg
+    errorToText (CyclicDependency msg) = "Cyclic dependency: " <> msg
+    errorToText (SerializationError msg) = "Serialization error: " <> msg
+    errorToText (RecursionLimit msg) = "Recursion limit exceeded: " <> msg
+    errorToText (NetworkError msg) = "Network error: " <> msg
+    errorToText _ = "Unknown error"
 
-    formatBytes :: Integer -> String
-    formatBytes bytes
-        | bytes < 1024 = show bytes ++ " B"
-        | bytes < 1024 * 1024 = show (bytes `div` 1024) ++ " KB"
-        | bytes < 1024 * 1024 * 1024 = show (bytes `div` (1024 * 1024)) ++ " MB"
-        | otherwise = show (bytes `div` (1024 * 1024 * 1024)) ++ " GB"
+-- | Serialize a request
+serializeRequest :: DaemonRequest -> BS.ByteString
+serializeRequest = LBS.toStrict . Aeson.encode
 
--- Bit manipulation helpers
+-- | Deserialize a request
+deserializeRequest :: BS.ByteString -> Either Text DaemonRequest
+deserializeRequest bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "Failed to deserialize request: " <> T.pack err
+        Right req -> Right req
+
+-- | Serialize a response
+serializeResponse :: DaemonResponse -> BS.ByteString
+serializeResponse = LBS.toStrict . Aeson.encode
+
+-- | Deserialize a response
+deserializeResponse :: BS.ByteString -> Either Text DaemonResponse
+deserializeResponse bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "Failed to deserialize response: " <> T.pack err
+        Right resp -> Right resp
+
+-- | Get current time in milliseconds
+getCurrentMillis :: IO Int
+getCurrentMillis = do
+    time <- getCurrentTime
+    return $ round $ 1000 * realToFrac (diffUTCTime time (read "1970-01-01 00:00:00 UTC"))
+
+-- | Timeout implementation
+timeout :: Int -> IO a -> IO (Maybe a)
+timeout micros action = do
+    result <- newEmptyMVar
+    tid <- forkIO $ do
+        r <- try action
+        putMVar result r
+    threadDelay micros
+    filled <- isJust <$> tryTakeMVar result
+    unless filled $ killThread tid
+    if filled
+        then do
+            r <- readMVar result
+            case r of
+                Left (e :: SomeException) -> throwIO e
+                Right x -> return (Just x)
+        else return Nothing
+
+-- | Try to take a value from an MVar without blocking
+tryTakeMVar :: MVar a -> IO (Maybe a)
+tryTakeMVar mvar = do
+    empty <- isEmptyMVar mvar
+    if empty
+        then return Nothing
+        else Just <$> takeMVar mvar
+
+-- | Check if an MVar is empty
+isEmptyMVar :: MVar a -> IO Bool
+isEmptyMVar mvar = do
+    full <- newEmptyMVar
+    tryPutMVar full ()
+    isEmpty <- isJust <$> tryTakeMVar full
+    return isEmpty
+
+-- | Try to put a value in an MVar without blocking
+tryPutMVar :: MVar a -> a -> IO Bool
+tryPutMVar mvar x = do
+    empty <- isEmptyMVar mvar
+    if empty
+        then do
+            putMVar mvar x
+            return True
+        else return False
+
+-- | Bitwise operations for message length encoding/decoding
 shiftL :: Int -> Int -> Int
 shiftL x n = x * (2 ^ n)
 
