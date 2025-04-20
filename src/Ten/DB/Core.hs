@@ -28,9 +28,6 @@ module Ten.DB.Core (
     getSchemaVersion,
     updateSchemaVersion,
 
-    -- Path for database
-    defaultDBPath,
-
     -- Utility functions
     runDBAction,
     retryOnBusy
@@ -47,6 +44,8 @@ import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), On
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import System.Posix.Files (setFileMode)
+
+import Ten.Core (defaultDBPath)
 
 -- | Database error types
 data DBError
@@ -77,10 +76,6 @@ data Database = Database {
     dbBusyTimeout :: Int,         -- ^ Busy timeout in milliseconds
     dbMaxRetries :: Int           -- ^ Maximum number of retries for busy operations
 }
-
--- | Default path for the database
-defaultDBPath :: FilePath -> FilePath
-defaultDBPath storeDir = storeDir </> "var/ten/db/ten.db"
 
 -- | Initialize the database
 initDatabase :: FilePath -> Int -> IO Database

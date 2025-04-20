@@ -1,0 +1,86 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[10 of 21] Compiling Ten.Derivation   ( src/Ten/Derivation.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Derivation.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Derivation.dyn_o )
+
+src/Ten/Derivation.hs:223:34: error: [GHC-87543]
+    Ambiguous occurrence ‘defaultDBPath’.
+    It could refer to
+       either ‘Ten.Core.defaultDBPath’,
+              imported from ‘Ten.Core’ at src/Ten/Derivation.hs:85:1-15,
+           or ‘Ten.DB.Core.defaultDBPath’,
+              imported from ‘Ten.DB.Core’ at src/Ten/Derivation.hs:89:1-18.
+    |
+223 |     db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    |                                  ^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:306:34: error: [GHC-87543]
+    Ambiguous occurrence ‘defaultDBPath’.
+    It could refer to
+       either ‘Ten.Core.defaultDBPath’,
+              imported from ‘Ten.Core’ at src/Ten/Derivation.hs:85:1-15,
+           or ‘Ten.DB.Core.defaultDBPath’,
+              imported from ‘Ten.DB.Core’ at src/Ten/Derivation.hs:89:1-18.
+    |
+306 |     db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    |                                  ^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:404:24: error: [GHC-87543]
+    Ambiguous occurrence ‘prepareSandboxEnvironment’.
+    It could refer to
+       either ‘Ten.Sandbox.prepareSandboxEnvironment’,
+              imported from ‘Ten.Sandbox’ at src/Ten/Derivation.hs:88:1-18,
+           or ‘Ten.Derivation.prepareSandboxEnvironment’,
+              defined at src/Ten/Derivation.hs:599:1.
+    |
+404 |         let buildEnv = prepareSandboxEnvironment env sandboxDir (derivEnv drv)
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:415:48: error: [GHC-87543]
+    Ambiguous occurrence ‘readCreateProcessWithExitCode’.
+    It could refer to
+       either ‘System.Process.readCreateProcessWithExitCode’,
+              imported from ‘System.Process’ at src/Ten/Derivation.hs:80:1-21,
+           or ‘Ten.Derivation.readCreateProcessWithExitCode’,
+              defined at src/Ten/Derivation.hs:619:1.
+    |
+415 |         (exitCode, stdout, stderr) <- liftIO $ readCreateProcessWithExitCode processConfig ""
+    |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:418:26: error: [GHC-87543]
+    Ambiguous occurrence ‘returnDerivationPath’.
+    It could refer to
+       either ‘Ten.Sandbox.returnDerivationPath’,
+              imported from ‘Ten.Sandbox’ at src/Ten/Derivation.hs:88:1-18,
+           or ‘Ten.Derivation.returnDerivationPath’,
+              defined at src/Ten/Derivation.hs:615:1.
+    |
+418 |         let returnPath = returnDerivationPath sandboxDir
+    |                          ^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:606:44: error: [GHC-87543]
+    Ambiguous occurrence ‘returnDerivationPath’.
+    It could refer to
+       either ‘Ten.Sandbox.returnDerivationPath’,
+              imported from ‘Ten.Sandbox’ at src/Ten/Derivation.hs:88:1-18,
+           or ‘Ten.Derivation.returnDerivationPath’,
+              defined at src/Ten/Derivation.hs:615:1.
+    |
+606 |             , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath sandboxDir)
+    |                                            ^^^^^^^^^^^^^^^^^^^^
+
+src/Ten/Derivation.hs:620:5: error: [GHC-76037]
+    Not in scope: ‘Process.readCreateProcessWithExitCode’
+    NB: no module named ‘Process’ is imported.
+    Suggested fix:
+      Perhaps use ‘System.Process.readCreateProcessWithExitCode’ (imported from System.Process)
+    |
+620 |     Process.readCreateProcessWithExitCode process input
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+

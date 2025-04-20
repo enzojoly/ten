@@ -414,7 +414,7 @@ newtype TenM (p :: Phase) a = TenM
 
 -- | Get the default path for the Ten database
 defaultDBPath :: FilePath -> FilePath
-defaultDBPath store = takeDirectory store </> "var/ten/db/ten.db"
+defaultDBPath storeDir = storeDir </> "var/ten/db/ten.db"
 
 -- | Ensure database directories exist
 ensureDBDirectories :: FilePath -> IO ()

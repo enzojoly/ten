@@ -44,7 +44,7 @@ import Control.Monad.Reader (ask)
 import Control.Monad.State (get, gets)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
-import Data.List (isPrefixOf, isInfixOf)
+import Data.List (isPrefixOf, isInfixOf, sort)
 import Control.Exception (bracket, try, tryJust, throwIO, catch, finally, handle, SomeException, IOException)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -68,10 +68,10 @@ import qualified System.Posix.IO as PosixIO
 import Foreign.C.Error (throwErrno, throwErrnoIfMinus1_, throwErrnoIfMinus1, getErrno, Errno(..), errnoToIOError)
 import Foreign.C.String (CString, withCString, peekCString, newCString)
 import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
-import Foreign.Ptr (Ptr, nullPtr, castPtr)
+import Foreign.Ptr (Ptr, nullPtr, castPtr, plusPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
-import Foreign.Storable (peek, poke)
+import Foreign.Storable (Storable(..), peek, poke)
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)
 
@@ -89,6 +89,20 @@ data RLimit = RLimit {
     rlim_cur :: CULong,  -- Current limit (soft limit)
     rlim_max :: CULong   -- Maximum limit (hard limit)
 }
+
+-- Implementation of Storable for RLimit
+instance Storable RLimit where
+    sizeOf _ = 16  -- Size of two CULong values (8 bytes each on 64-bit systems)
+    alignment _ = alignment (undefined :: CULong)
+
+    peek ptr = do
+        cur <- peek (castPtr ptr)
+        max <- peek (plusPtr (castPtr ptr) 8)
+        return (RLimit cur max)
+
+    poke ptr (RLimit cur max) = do
+        poke (castPtr ptr) cur
+        poke (plusPtr (castPtr ptr) 8) max
 
 -- Linux capability set structure
 newtype CapSet = CapSet (Ptr ())
@@ -523,7 +537,7 @@ mountProc procDir = do
         withCString "proc" $ \fsTypePtr ->
             withCString "none" $ \sourcePtr ->
                 withCString "" $ \dataPtr -> do
-                    ret <- c_mount sourcePtr destPtr fsTypePtr 0 nullPtr
+                    ret <- c_mount sourcePtr destPtr fsTypePtr 0 (castPtr dataPtr)
                     when (ret /= 0) $ do
                         errno <- getErrno
                         throwErrno $ "Failed to mount proc in " ++ procDir
@@ -588,10 +602,10 @@ setupNamespaces config sandboxDir = do
             withCString "none" $ \fsTypePtr ->
                 withCString "none" $ \sourcePtr ->
                     withCString "" $ \dataPtr -> do
-                        ret <- c_mount sourcePtr rootPtr fsTypePtr (mS_REC .|. mS_PRIVATE) nullPtr
+                        ret <- c_mount sourcePtr rootPtr fsTypePtr (mS_REC .|. mS_PRIVATE) (castPtr dataPtr)
                         when (ret /= 0) $ do
                             errno <- getErrno
-                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show errno
+                            hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show (case errno of Errno n -> n)
 
 -- POSIX constants
 eOPNOTSUPP :: Errno
@@ -875,7 +889,7 @@ bindMount source dest writable = do
         withCString dest' $ \destPtr ->
             withCString "none" $ \fsTypePtr ->
                 withCString "" $ \dataPtr -> do
-                    ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND dataPtr
+                    ret <- c_mount sourcePtr destPtr fsTypePtr mS_BIND (castPtr dataPtr)
                     when (ret /= 0) $ do
                         errno <- getErrno
                         throwErrno $ "Failed to bind mount " ++ source' ++ " to " ++ dest' ++
@@ -888,7 +902,7 @@ bindMount source dest writable = do
                 withCString "none" $ \fsTypePtr ->
                     withCString "" $ \dataPtr -> do
                         let flags = mS_BIND .|. mS_REMOUNT .|. mS_RDONLY
-                        ret <- c_mount sourcePtr destPtr fsTypePtr flags dataPtr
+                        ret <- c_mount sourcePtr destPtr fsTypePtr flags (castPtr dataPtr)
                         when (ret /= 0) $ do
                             errno <- getErrno
                             -- Don't fail, just warn - the mount is already established
