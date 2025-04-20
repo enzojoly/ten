@@ -116,7 +116,7 @@ ensureSchema db = do
 -- | Create all database tables
 createTables :: DBCore.Database -> IO ()
 createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
-    -- Create Derivations table
+    -- Create schema version tracking table
     execute_ (DBCore.dbConn db) derivationsTableDef
 
     -- Create Outputs table
@@ -209,9 +209,9 @@ ensureColumnExists db tableName columnName = do
 -- | Check if a table exists
 tableExists :: DBCore.Database -> Text -> IO Bool
 tableExists db tableName = do
-    results <- query (DBCore.dbConn db) "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName]
+    results <- query (DBCore.dbConn db) "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName] :: IO [Only Int]
     case results of
-        [(count :: Int)] -> return $ count > 0
+        [Only count] -> return $ count > 0
         _ -> return False
 
 -- | Check if a column exists in a table
@@ -233,9 +233,9 @@ columnExists db tableName columnName = do
 -- | Check if an index exists
 indexExists :: DBCore.Database -> Text -> IO Bool
 indexExists db indexName = do
-    results <- query (DBCore.dbConn db) "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName]
+    results <- query (DBCore.dbConn db) "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName] :: IO [Only Int]
     case results of
-        [(count :: Int)] -> return $ count > 0
+        [Only count] -> return $ count > 0
         _ -> return False
 
 -- | Get all schema elements (tables, indices, etc.)

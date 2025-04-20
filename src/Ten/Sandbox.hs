@@ -61,7 +61,8 @@ import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
-import System.Posix.Types (ProcessID, Fd, FileMode)
+import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
+import System.Posix.User (UserEntry, GroupEntry)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO
@@ -477,7 +478,7 @@ setupSandbox sandboxDir config = do
     logMsg 2 $ "Sandbox setup completed: " <> T.pack sandboxDir
 
 -- | Safe wrapper for getting user entry with fallback
-safeGetUserEntry :: String -> IO User.UserEntry
+safeGetUserEntry :: String -> IO UserEntry
 safeGetUserEntry username = do
     result <- try $ User.getUserEntryForName username
     case result of
@@ -490,7 +491,7 @@ safeGetUserEntry username = do
         Right entry -> return entry
 
 -- | Safe wrapper for getting group entry with fallback
-safeGetGroupEntry :: String -> IO User.GroupEntry
+safeGetGroupEntry :: String -> IO GroupEntry
 safeGetGroupEntry groupname = do
     result <- try $ User.getGroupEntryForName groupname
     case result of
@@ -1214,7 +1215,7 @@ runBuilderAsUser program args user group env = do
         readCreateProcessWithExitCode process ""
 
 -- | Helper to set ownership of a file or directory
-setOwnerAndGroup :: FilePath -> User.UserID -> User.GroupID -> IO ()
+setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
 setOwnerAndGroup path uid gid = do
     -- Check if path exists
     exists <- doesPathExist path

@@ -1,0 +1,29 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[ 9 of 21] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o ) [Source file changed]
+
+src/Ten/Sandbox.hs:480:34: error: [GHC-10969]
+    • Pattern synonym ‘User.UserEntry’ used as a type
+    • In the first argument of ‘IO’, namely ‘User.UserEntry’
+      In the type signature:
+        safeGetUserEntry :: String -> IO User.UserEntry
+    |
+480 | safeGetUserEntry :: String -> IO User.UserEntry
+    |                                  ^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:493:35: error: [GHC-10969]
+    • Pattern synonym ‘User.GroupEntry’ used as a type
+    • In the first argument of ‘IO’, namely ‘User.GroupEntry’
+      In the type signature:
+        safeGetGroupEntry :: String -> IO User.GroupEntry
+    |
+493 | safeGetGroupEntry :: String -> IO User.GroupEntry
+    |                                   ^^^^^^^^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+

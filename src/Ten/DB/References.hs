@@ -66,6 +66,7 @@ import System.Posix.Files (getSymbolicLinkStatus, isSymbolicLink, isRegularFile,
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.FromField
+import Database.SQLite.Simple (Query(..), Only(..))
 
 import Ten.DB.Core
 
@@ -424,30 +425,29 @@ validStorePathFormat text =
 -- | Compute all paths reachable from a set of roots
 computeReachablePaths :: Database -> [Text] -> IO (Set Text)
 computeReachablePaths db roots = do
-    -- Use a recursive CTE to find all reachable paths
-    let cteQuery = "WITH RECURSIVE\
-                   \  reachable(path) AS (\
-                   \    VALUES " ++ placeholders (length roots) ++ "\
-                   \    UNION\
-                   \    SELECT reference FROM References JOIN reachable ON referrer = path\
-                   \  )\
-                   \SELECT path FROM reachable;"
+    -- If no roots, return empty set
+    if null roots
+        then return Set.empty
+        else do
+            -- Use a recursive CTE to find all reachable paths
+            let placeholders = "(" <> T.intercalate "," (replicate (length roots) "?") <> ")"
+            let cteQuery = T.unlines [
+                    "WITH RECURSIVE",
+                    "  reachable(path) AS (",
+                    "    SELECT value FROM (",
+                    "      VALUES " <> placeholders,
+                    "    )",
+                    "    UNION",
+                    "    SELECT reference FROM References JOIN reachable ON referrer = path",
+                    "  )",
+                    "SELECT path FROM reachable;"
+                  ]
 
-    -- Convert roots to the format needed for query
-    let rootParams = map SQLite.Only roots
+            -- Execute the query passing roots as separate parameters
+            paths <- SQLite.query (dbConn db) (Query cteQuery) roots
 
-    -- Execute the query
-    paths <- SQLite.query (dbConn db) (SQLite.Query $ T.pack cteQuery) rootParams
-
-    -- Convert result to a set
-    return $ Set.fromList $ map SQLite.fromOnly paths
-  where
-    -- Generate SQL placeholders like (?,?,...,?)
-    placeholders :: Int -> String
-    placeholders n
-        | n <= 0    = ""
-        | n == 1    = "(?)"
-        | otherwise = "(?)" ++ concat (replicate (n-1) ",(?)")
+            -- Convert result to a set
+            return $ Set.fromList $ map SQLite.fromOnly paths
 
 -- | Check if a path is reachable from the given roots
 isReachableFrom :: Database -> [Text] -> Text -> IO Bool
@@ -505,7 +505,7 @@ doesPathExist db storeDir path = do
     results <- SQLite.query (dbConn db) q [path]
 
     case results of
-        [SQLite.Only (count :: Int)] | count > 0 -> return True
+        [Only (count :: Int)] | count > 0 -> return True
         _ -> do
             -- Fallback to filesystem check
             let fullPath = storeDir </> T.unpack path
