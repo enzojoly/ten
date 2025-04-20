@@ -44,7 +44,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBC
-import Data.Char (isAscii, isPrint, isDigit, isHexDigit)
+import Data.Word (Word8)
 import Data.Int (Int64)
 import Data.List (nub, isInfixOf, isPrefixOf)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
@@ -76,6 +76,19 @@ elfMagic = BS.pack [0x7F, 0x45, 0x4C, 0x46] -- ".ELF"
 -- | Magic number for script files (shebang)
 scriptMagic :: ByteString
 scriptMagic = BS.pack [0x23, 0x21] -- "#!"
+
+-- Byte values for control characters
+tabByte, newlineByte :: Word8
+tabByte = 9     -- '\t'
+newlineByte = 10 -- '\n'
+
+-- | Check if Word8 is an ASCII character
+isAsciiWord8 :: Word8 -> Bool
+isAsciiWord8 w = w < 128
+
+-- | Check if Word8 is a printable character
+isPrintWord8 :: Word8 -> Bool
+isPrintWord8 w = w >= 32 && w < 127
 
 -- | Register a single reference
 registerReference :: Database -> Text -> Text -> IO ()
@@ -154,36 +167,37 @@ detectFileTypeAndScan :: FilePath -> IO [Text]
 detectFileTypeAndScan path = do
     -- Check if file exists
     exists <- doesFileExist path
-    unless exists $ return []
-
-    -- Get file size
-    size <- getFileSize path
-
-    -- Skip empty or very small files
-    if size < 4
+    if not exists
         then return []
         else do
-            -- Read magic bytes to determine file type
-            magic <- BS.take 4 <$> BS.readFile path
+            -- Get file size
+            size <- getFileSize path
 
-            -- Check file type based on magic bytes and extension
-            let ext = takeExtension path
+            -- Skip empty or very small files
+            if size < 4
+                then return []
+                else do
+                    -- Read magic bytes to determine file type
+                    magic <- BS.take 4 <$> BS.readFile path
 
-            if magic == elfMagic then
-                -- ELF binary
-                scanElfBinary path
-            else if BS.take 2 magic == scriptMagic then
-                -- Script file
-                scanScriptFile path
-            else if ext `elem` [".xml", ".html", ".json", ".js", ".conf", ".cfg", ".yaml", ".yml"] then
-                -- Text-based configuration file
-                scanTextFile path
-            else if ext `elem` [".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hs", ".py", ".sh", ".bash"] then
-                -- Source code file
-                scanTextFile path
-            else
-                -- Fallback - scan as binary
-                scanBinaryFile path
+                    -- Check file type based on magic bytes and extension
+                    let ext = takeExtension path
+
+                    if magic == elfMagic then
+                        -- ELF binary
+                        scanElfBinary path
+                    else if BS.take 2 magic == scriptMagic then
+                        -- Script file
+                        scanScriptFile path
+                    else if ext `elem` [".xml", ".html", ".json", ".js", ".conf", ".cfg", ".yaml", ".yml"] then
+                        -- Text-based configuration file
+                        scanTextFile path
+                    else if ext `elem` [".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hs", ".py", ".sh", ".bash"] then
+                        -- Source code file
+                        scanTextFile path
+                    else
+                        -- Fallback - scan as binary
+                        scanBinaryFile path
 
 -- | Get file size safely
 getFileSize :: FilePath -> IO Integer
@@ -201,8 +215,7 @@ scanSymlink linkPath = do
         Right target -> do
             -- Check if target is in the store
             let tPath = T.pack $ takeFileName target
-            let isStorePath = validStorePathFormat tPath
-            if isStorePath
+            if validStorePathFormat tPath
                 then return [tPath]
                 else return []
 
@@ -237,7 +250,7 @@ extractElfStrings elfData = do
     isValidStringCandidate :: ByteString -> Bool
     isValidStringCandidate bs =
         BS.length bs >= 8 && -- Store path hash is at least 8 chars
-        BS.all (\c -> isAscii c && (isPrint c || c == '\t' || c == '\n')) bs
+        BS.all (\c -> isAsciiWord8 c && (isPrintWord8 c || c == tabByte || c == newlineByte)) bs
 
 -- | Process ELF strings to find potential store paths
 processElfStrings :: [ByteString] -> [Text]
@@ -308,7 +321,7 @@ extractStorePathsFromText text =
         let hashNamePattern path =
                 case T.breakOn "-" path of
                     (hash, name) | not (T.null name) && T.length hash >= 8 &&
-                                   T.all isHexDigit hash ->
+                                   T.all isHexDigitChar hash ->
                         Just $ hash <> name
                     _ -> Nothing
 
@@ -317,6 +330,10 @@ extractStorePathsFromText text =
         in
             -- Return as singleton list if valid
             maybe [] (:[]) extracted
+
+-- | Check if a character is a hexadecimal digit
+isHexDigitChar :: Char -> Bool
+isHexDigitChar c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
 -- | Scan a binary file for references
 scanBinaryFile :: FilePath -> IO [Text]
@@ -368,20 +385,20 @@ extractTextFromBinary chunks =
         let nullSplit = BC.split '\0' chunk
 
             -- Keep only valid ASCII strings of reasonable length
-            validStrings = filter isValidAsciiString nullSplit
+            validStrings = filter isValidBinaryString nullSplit
 
             -- Convert to Text
             textStrings = map (TE.decodeUtf8With TEE.lenientDecode) validStrings
         in
             textStrings
 
-    isValidAsciiString :: ByteString -> Bool
-    isValidAsciiString bs =
+    isValidBinaryString :: ByteString -> Bool
+    isValidBinaryString bs =
         -- Must be a reasonable length to be a path
         BS.length bs >= 8 &&
 
         -- Must contain only ASCII printable chars
-        BS.all (\c -> isAscii c && (isPrint c || c == '\t' || c == '\n')) bs &&
+        BS.all (\c -> isAsciiWord8 c && (isPrintWord8 c || c == tabByte || c == newlineByte)) bs &&
 
         -- Must contain a dash (common in store paths)
         BC.elem '-' bs
@@ -393,14 +410,16 @@ validStorePathFormat text =
     case T.breakOn "-" text of
         (hash, name) | not (T.null name) ->
             let nameNoPrefix = T.drop 1 name -- Skip the dash
-                validHash = T.length hash >= 8 && T.all isHexDigit hash
+                validHash = T.length hash >= 8 && T.all isHexDigitChar hash
                 validName = not (T.null nameNoPrefix) && T.all validNameChar nameNoPrefix
             in validHash && validName
         _ -> False
   where
     validNameChar :: Char -> Bool
-    validNameChar c = isAscii c && (isDigit c || isHexDigit c ||
-                                   c == '-' || c == '_' || c == '.' || c == '+')
+    validNameChar c = (c >= '0' && c <= '9') ||
+                      (c >= 'a' && c <= 'z') ||
+                      (c >= 'A' && c <= 'Z') ||
+                      c == '-' || c == '_' || c == '.' || c == '+'
 
 -- | Compute all paths reachable from a set of roots
 computeReachablePaths :: Database -> [Text] -> IO (Set Text)

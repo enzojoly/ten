@@ -61,7 +61,7 @@ import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
-import System.Posix.Types (ProcessID, UserID, GroupID, CPid(..), Fd(..), FileMode)
+import System.Posix.Types (ProcessID, Fd, FileMode)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO
@@ -1214,7 +1214,7 @@ runBuilderAsUser program args user group env = do
         readCreateProcessWithExitCode process ""
 
 -- | Helper to set ownership of a file or directory
-setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
+setOwnerAndGroup :: FilePath -> User.UserID -> User.GroupID -> IO ()
 setOwnerAndGroup path uid gid = do
     -- Check if path exists
     exists <- doesPathExist path

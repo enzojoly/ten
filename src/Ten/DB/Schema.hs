@@ -223,8 +223,9 @@ columnExists db tableName columnName = do
         then return False
         else do
             -- Query table schema and look for column
-            results <- try $ query (DBCore.dbConn db) ("PRAGMA table_info(" <> tableName <> ")") ()
-                      :: IO (Either SomeException [(Int, Text, Text, Int, Maybe Text, Int)])
+            results <- try $ query (DBCore.dbConn db)
+                      (Query $ "PRAGMA table_info(" <> T.pack (T.unpack tableName) <> ")")
+                      () :: IO (Either SomeException [(Int, Text, Text, Int, Maybe Text, Int)])
             case results of
                 Left _ -> return False
                 Right rows -> return $ any (\(_, name, _, _, _, _) -> name == columnName) rows
@@ -263,8 +264,9 @@ getSchemaElements db = do
   where
     getTableColumns :: Text -> IO [SchemaElement]
     getTableColumns tableName = do
-        columns <- try $ query (DBCore.dbConn db) ("PRAGMA table_info(" <> tableName <> ")") ()
-                   :: IO (Either SomeException [(Int, Text, Text, Int, Maybe Text, Int)])
+        columns <- try $ query (DBCore.dbConn db)
+                   (Query $ "PRAGMA table_info(" <> T.pack (T.unpack tableName) <> ")")
+                   () :: IO (Either SomeException [(Int, Text, Text, Int, Maybe Text, Int)])
         case columns of
             Left _ -> return []
             Right cols -> return $ map (\(_, name, _, _, _, _) -> Column tableName name) cols
