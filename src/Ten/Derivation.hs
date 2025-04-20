@@ -81,13 +81,15 @@ import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode, S
 import System.Exit
 import Control.Exception (try, SomeException, finally)
 import Database.SQLite.Simple (Only(..))
+import Data.Int (Int64)
 
 import Ten.Core
 import qualified Ten.Hash as Hash  -- Use qualified import to avoid name conflicts
 import Ten.Store
 import Ten.Sandbox (returnDerivationPath, prepareSandboxEnvironment,
                    SandboxConfig, withSandbox, defaultSandboxConfig)
-import Ten.DB.Core (initDatabase, closeDatabase, dbQuery, dbQuery_, dbExecute)
+import Ten.DB.Core (initDatabase, closeDatabase)
+import Ten.DB.Derivations (registerDerivationFile, registerValidPath, storeDerivation)
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -219,58 +221,12 @@ storeDerivationFile drv = do
     -- Store the derivation in the content store
     derivPath <- storeDerivation drv
 
-    -- Register the derivation in the database
+    -- Register the derivation in the database using the proper DB module function
     env <- ask
     db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
 
-    -- Check if derivation already exists
-    existing <- liftIO $ dbQuery db
-        "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only (derivHash drv))
-
-    derivId <- liftIO $ if not (null existing)
-        then do
-            -- Get the ID if it exists
-            [Only derivId] <- dbQuery db
-                "SELECT id FROM Derivations WHERE hash = ?"
-                (Only (derivHash drv))
-            return derivId
-        else do
-            -- Insert new derivation
-            dbExecute db
-                "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
-                (derivHash drv, storePathToText derivPath)
-
-            -- Get the last inserted ID
-            [Only derivId] <- dbQuery_ db "SELECT last_insert_rowid()"
-
-            -- Register the derivation path as valid
-            dbExecute db
-                "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
-                \VALUES (?, ?, strftime('%s','now'), ?, 1)"
-                (storePathToText derivPath, storeHash derivPath, Just (storePathToText derivPath) :: Maybe Text)
-
-            return derivId
-
-    -- Register outputs
-    liftIO $ forM_ (Set.toList $ derivOutputs drv) $ \output -> do
-        -- Insert output record
-        dbExecute db
-            "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
-            (derivId, outputName output, storePathToText (outputPath output))
-
-        -- Register the output path as valid
-        dbExecute db
-            "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
-            \VALUES (?, ?, strftime('%s','now'), ?, 1)"
-            (storePathToText (outputPath output), storeHash (outputPath output),
-             Just (storePathToText derivPath) :: Maybe Text)
-
-    -- Register input references
-    liftIO $ forM_ (Set.toList $ derivInputs drv) $ \input -> do
-        dbExecute db
-            "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
-            (storePathToText derivPath, storePathToText (inputPath input))
+    -- Use the dedicated function from Ten.DB.Derivations for this operation
+    liftIO $ registerDerivationFile db drv derivPath
 
     -- Close the database
     liftIO $ closeDatabase db
@@ -307,9 +263,9 @@ retrieveDerivationByHash hash = do
     db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
 
     -- Query for store path
-    storePaths <- liftIO $ dbQuery db
+    storePaths <- liftIO $ Ten.DB.Core.dbQuery db
         "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only hash)
+        (Only hash) :: IO [Only Text]
 
     -- Parse store path and retrieve derivation
     derivResult <- case storePaths of
