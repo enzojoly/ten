@@ -37,24 +37,16 @@ module Ten.DB.Core (
 ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket, catch, finally, throwIO, Exception, SomeException)
-import Control.Monad (when, unless, void, forM_)
-import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Exception (bracket, catch, throwIO, Exception, SomeException)
+import Control.Monad (when, void)
 import Data.Int (Int64)
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), Only(..))
-import qualified Database.SQLite.Simple.ToField as SQLite
-import qualified Database.SQLite.Simple.FromField as SQLite
-import qualified Database.SQLite.Simple.Types as SQLite
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
-import System.IO.Error (catchIOError)
 import System.Posix.Files (setFileMode)
-import System.Posix.Types (FileMode)
 
 -- | Database error types
 data DBError
@@ -213,9 +205,8 @@ dbQuery_ db q = retryOnBusy db $
 -- | Execute a raw SQL statement (for pragmas)
 executeRaw :: Connection -> Text -> IO ()
 executeRaw conn sql = do
-    -- Using SQLite.withStatement to properly manage statement lifecycle
-    SQLite.withStatement conn (Query sql) $ \stmt -> do
-        void $ SQLite.execute_ conn (Query sql)
+    -- Using SQLite.execute_ directly instead of withStatement to avoid unused variable
+    void $ SQLite.execute_ conn (Query sql)
 
 -- | Run a database action with proper error handling
 runDBAction :: Database -> IO a -> IO a
