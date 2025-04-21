@@ -203,27 +203,27 @@ registerDerivationFile db derivation storePath = dbWithTransaction db ReadWrite 
 
     -- Register outputs
     outputPaths <- forM (Set.toList $ derivOutputs derivation) $ \output -> do
-        let outputPath = outputPath output
-        registerDerivationOutput txn derivId (outputName output) outputPath
+        let outPath = outputPath output
+        registerDerivationOutput txn derivId (outputName output) outPath
 
         -- Register this output path as valid
-        registerValidPath txn outputPath (Just storePath)
+        registerValidPath txn outPath (Just storePath)
 
         -- Return the output path for reference tracking
-        return outputPath
+        return outPath
 
     -- Register references from derivation to inputs
     forM_ (Set.toList $ derivInputs derivation) $ \input -> do
         addDerivationReference txn storePath (inputPath input)
 
     -- Register references from outputs to derivation (metadata)
-    forM_ outputPaths $ \output -> do
-        addDerivationReference txn output storePath
+    forM_ outputPaths $ \outPath -> do
+        addDerivationReference txn outPath storePath
 
     -- Register references from outputs to inputs (direct dependencies)
-    forM_ outputPaths $ \output -> do
+    forM_ outputPaths $ \outPath -> do
         forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-            addDerivationReference txn output (inputPath input)
+            addDerivationReference txn outPath (inputPath input)
 
     return derivId
 
@@ -375,17 +375,16 @@ readDerivationFile path = do
         else do
             -- Read the file
             content <- BS.readFile filePath
-
-            -- Deserialize
-            deserializeDerivation content
+            -- Return the result of deserialization
+            return $ deserializeDerivation content
 
 -- | Register an output for a derivation
 registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> IO ()
-registerDerivationOutput db derivId outputName outputPath = do
+registerDerivationOutput db derivId outputName outPath = do
     -- Insert output record
     void $ dbExecute db
         "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
-        (derivId, outputName, storePathToText outputPath)
+        (derivId, outputName, storePathToText outPath)
 
 -- | Get all outputs for a derivation
 getOutputsForDerivation :: Database -> Int64 -> IO [OutputInfo]
@@ -588,23 +587,23 @@ registerDerivationWithOutputs db derivation storePath = dbWithTransaction db Rea
 
     -- Register all outputs
     forM_ (Set.toList $ derivOutputs derivation) $ \output -> do
-        let outputPath = outputPath output
-        registerDerivationOutput txn derivId (outputName output) outputPath
+        let outPath = outputPath output
+        registerDerivationOutput txn derivId (outputName output) outPath
 
         -- Register this as a valid path
-        registerValidPath txn outputPath (Just storePath)
+        registerValidPath txn outPath (Just storePath)
 
     -- Register all input references
     forM_ (Set.toList $ derivInputs derivation) $ \input -> do
         addDerivationReference txn storePath (inputPath input)
 
     -- Register references from outputs to inputs (direct dependencies)
-    forM_ (Set.toList outputs) $ \output -> do
+    forM_ (Set.toList outputs) $ \outPath -> do
         -- Reference from output to derivation
-        addDerivationReference txn output storePath
+        addDerivationReference txn outPath storePath
 
         -- References from output to each input
         forM_ (Set.toList inputs) $ \input -> do
-            addDerivationReference txn output input
+            addDerivationReference txn outPath input
 
     return derivId
