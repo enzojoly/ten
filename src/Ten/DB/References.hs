@@ -116,7 +116,7 @@ registerReference :: Database -> StorePath -> StorePath -> IO ()
 registerReference db from to = do
     -- Avoid self-references
     when (from /= to) $ do
-        dbExecute db
+        void $ dbExecute db
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText from, storePathToText to)
 
@@ -129,7 +129,7 @@ registerReferences db referrer references = do
         forM_ (Set.toList references) $ \ref ->
             -- Avoid self-references
             when (referrer /= ref) $
-                registerReference db' referrer ref
+                void $ registerReference db' referrer ref
 
 -- | Register references for a path after scanning the file for references
 registerPathReferences :: Database -> FilePath -> StorePath -> IO Int
@@ -277,15 +277,17 @@ computeReachablePathsFromRoots db roots = do
             -- Create temporary table for roots
             withTransaction db ReadWrite $ \db' -> do
                 -- Create temp table
-                dbExecute_ db' "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
+                void $ dbExecute db'
+                    "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
 
                 -- Clear previous roots
-                dbExecute_ db' "DELETE FROM temp_roots"
+                void $ dbExecute db' "DELETE FROM temp_roots"
 
                 -- Insert all roots
                 forM_ (Set.toList roots) $ \root ->
-                    dbExecute db' "INSERT INTO temp_roots VALUES (?)"
-                             (Only (storePathToText root))
+                    void $ dbExecute db'
+                           "INSERT INTO temp_roots VALUES (?)"
+                           (Only (storePathToText root))
 
                 -- Use recursive CTE to find all reachable paths
                 let query = "WITH RECURSIVE\n\
@@ -318,14 +320,16 @@ findPathsClosureWithLimit db startingPaths depthLimit = do
             -- Create temporary table for the starting set
             withTransaction db ReadWrite $ \db' -> do
                 -- Create temp table
-                dbExecute_ db' "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
+                void $ dbExecute db'
+                    "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
 
                 -- Clear previous data
-                dbExecute_ db' "DELETE FROM temp_closure_start"
+                void $ dbExecute db' "DELETE FROM temp_closure_start"
 
                 -- Insert all starting paths
                 forM_ (Set.toList startingPaths) $ \path ->
-                    dbExecute db' "INSERT INTO temp_closure_start VALUES (?)"
+                    void $ dbExecute db'
+                              "INSERT INTO temp_closure_start VALUES (?)"
                               (Only (storePathToText path))
 
                 -- Use recursive CTE to find the closure
@@ -361,9 +365,10 @@ isPathReachable db roots path = do
         then return True
         else do
             -- Use SQL to efficiently check reachability
+            let rootValues = rootsToSqlValues (Set.toList roots)
             let query = "WITH RECURSIVE\n\
                         \  reachable(path) AS (\n\
-                        \    VALUES " ++ rootsValues (Set.toList roots) ++ "\n\
+                        \    VALUES " ++ rootValues ++ "\n\
                         \    UNION\n\
                         \    SELECT reference FROM References, reachable \n\
                         \    WHERE referrer = reachable.path\n\
@@ -377,16 +382,16 @@ isPathReachable db roots path = do
                 _ -> return False
   where
     -- Helper to create SQL values clause
-    rootsValues [] = "(NULL)"  -- Avoid empty VALUES clause
-    rootsValues [r] = "('" ++ T.unpack (storePathToText r) ++ "')"
-    rootsValues (r:rs) = "('" ++ T.unpack (storePathToText r) ++ "'), " ++ rootsValues rs
+    rootsToSqlValues [] = "(NULL)"  -- Avoid empty VALUES clause
+    rootsToSqlValues [r] = "('" ++ T.unpack (storePathToText r) ++ "')"
+    rootsToSqlValues (r:rs) = "('" ++ T.unpack (storePathToText r) ++ "'), " ++ rootsToSqlValues rs
 
 -- | Mark a set of paths as valid in the ValidPaths table
 markPathsAsValid :: Database -> Set StorePath -> IO ()
 markPathsAsValid db paths =
     withTransaction db ReadWrite $ \db' -> do
         forM_ (Set.toList paths) $ \path ->
-            dbExecute db'
+            void $ dbExecute db'
                 "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?"
                 (Only (storePathToText path))
 
@@ -395,7 +400,7 @@ markPathsAsInvalid :: Database -> Set StorePath -> IO ()
 markPathsAsInvalid db paths =
     withTransaction db ReadWrite $ \db' -> do
         forM_ (Set.toList paths) $ \path ->
-            dbExecute db'
+            void $ dbExecute db'
                 "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
                 (Only (storePathToText path))
 
@@ -406,10 +411,10 @@ vacuumReferenceDb db = do
     cleanupDanglingReferences db
 
     -- Analyze tables
-    dbExecute_ db "ANALYZE References"
+    void $ dbExecute db "ANALYZE References"
 
     -- Vacuum database
-    dbExecute_ db "VACUUM"
+    void $ dbExecute db "VACUUM"
 
 -- | Validate and repair the reference database
 validateReferenceDb :: Database -> FilePath -> IO (Int, Int)
@@ -434,7 +439,7 @@ cleanupDanglingReferences db = withTransaction db ReadWrite $ \db' -> do
 
     -- Delete these references
     forM_ dangling $ \(from, to) ->
-        dbExecute db'
+        void $ dbExecute db'
             "DELETE FROM References WHERE referrer = ? AND reference = ?"
             (from, to)
 
@@ -498,8 +503,8 @@ scanElfBinary filePath storeDir = do
     let textFragments = extractTextFromBinary content
 
     -- Scan each fragment for store path references
-    let storeRoot = storeDir ++ "/"
-    let references = concatMap (findStoreReferences storeRoot) textFragments
+    let storeRoot = T.pack storeDir
+    let references = concatMap (findStoreReferences (T.unpack storeRoot)) textFragments
 
     -- Return unique valid references
     return $ Set.fromList $ catMaybes $
@@ -516,7 +521,7 @@ scanTextFile filePath storeDir = do
     let text = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
 
     -- Scan for store path references
-    let storeRoot = T.pack storeDir ++ "/"
+    let storeRoot = T.pack storeDir
     let references = findStoreRefsInText storeRoot text
 
     -- Return unique valid references
@@ -533,8 +538,8 @@ scanBinaryFile filePath storeDir = do
     let textFragments = extractTextFromBinary content
 
     -- Scan each fragment for store path references
-    let storeRoot = storeDir ++ "/"
-    let references = concatMap (findStoreReferences storeRoot) textFragments
+    let storeRoot = T.pack storeDir
+    let references = concatMap (findStoreReferences (T.unpack storeRoot)) textFragments
 
     -- Return unique valid references
     return $ Set.fromList $ catMaybes $

@@ -76,6 +76,8 @@ import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
+import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Vector as Vector
 
 import Ten.DB.Core
 import Ten.Core
@@ -338,7 +340,7 @@ derivationFromJSON value = case Aeson.parseEither parseDerivation value of
         return $ StorePath hash name
 
     parseInputs = Aeson.withArray "Inputs" $ \arr ->
-        mapM parseInput (Aeson.toList arr)
+        mapM parseInput (Vector.toList arr)
 
     parseInput = Aeson.withObject "DerivationInput" $ \o -> do
         pathObj <- o Aeson..: "path"
@@ -347,7 +349,7 @@ derivationFromJSON value = case Aeson.parseEither parseDerivation value of
         return $ DerivationInput path name
 
     parseOutputs = Aeson.withArray "Outputs" $ \arr ->
-        mapM parseOutput (Aeson.toList arr)
+        mapM parseOutput (Vector.toList arr)
 
     parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
         name <- o Aeson..: "name"
@@ -356,7 +358,7 @@ derivationFromJSON value = case Aeson.parseEither parseDerivation value of
         return $ DerivationOutput name path
 
     parseEnv = Aeson.withObject "Environment" $ \o ->
-        return $ Map.fromList [(k, v) | (k, Aeson.String v) <- Aeson.toList o]
+        return $ Map.fromList [(k, v) | (k, Aeson.String v) <- KeyMap.toList o]
 
 -- | Read and deserialize a derivation file
 readDerivationFile :: StorePath -> IO (Either Text Derivation)
@@ -379,7 +381,7 @@ readDerivationFile path = do
 registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> IO ()
 registerDerivationOutput db derivId outputName outputPath = do
     -- Insert output record
-    dbExecute db
+    void $ dbExecute db
         "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
         (derivId, outputName, storePathToText outputPath)
 
@@ -437,7 +439,7 @@ addDerivationReference :: Database -> StorePath -> StorePath -> IO ()
 addDerivationReference db referrer reference = do
     when (referrer /= reference) $ do
         -- Skip self-references
-        dbExecute db
+        void $ dbExecute db
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText referrer, storePathToText reference)
 
@@ -450,7 +452,7 @@ bulkRegisterReferences db references = dbWithTransaction db ReadWrite $ \txn -> 
 
     -- Insert each reference
     count <- foldM (\acc (from, to) -> do
-        dbExecute txn
+        void $ dbExecute txn
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText from, storePathToText to)
         return $! acc + 1) 0 validRefs
@@ -540,7 +542,7 @@ registerValidPath db path mDeriver = do
             Just deriver -> Just (storePathToText deriver)
             Nothing -> Nothing
 
-    dbExecute db
+    void $ dbExecute db
         "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
         \VALUES (?, ?, strftime('%s','now'), ?, 1)"
         (storePathToText path, storeHash path, deriverText)
@@ -548,7 +550,7 @@ registerValidPath db path mDeriver = do
 -- | Mark a path as invalid
 invalidatePath :: Database -> StorePath -> IO ()
 invalidatePath db path = do
-    dbExecute db
+    void $ dbExecute db
         "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
         (Only (storePathToText path))
 

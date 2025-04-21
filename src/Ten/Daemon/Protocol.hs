@@ -91,11 +91,12 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Data.Time.Clock (UTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Word (Word32, Word64)
 import GHC.Generics (Generic)
 import Network.Socket (Socket, close)
 import qualified Network.Socket.ByteString as NByte
+import System.Exit (ExitCode(..), ExitSuccess, ExitFailure)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush)
 import System.IO.Error (isEOFError)
 import Text.Read (readMaybe)
@@ -1662,7 +1663,7 @@ receiveResponse handle reqId timeoutMicros = do
         msgBytes <- try $ readMessageWithTimeout (protocolSocket handle) timeoutMicros
         case msgBytes of
             Left (e :: SomeException) ->
-                return $ Left $ ConnectionClosed
+                return $ Left ConnectionClosed
 
             Right bytes -> case deserializeMessage bytes of
                 Left err ->
@@ -2028,32 +2029,6 @@ timeout micros action = do
                 Left (e :: SomeException) -> throwIO e
                 Right x -> return (Just x)
         else return Nothing
-
--- | Try to take a value from an MVar without blocking
-tryTakeMVar :: MVar a -> IO (Maybe a)
-tryTakeMVar mvar = do
-    empty <- isEmptyMVar mvar
-    if empty
-        then return Nothing
-        else Just <$> takeMVar mvar
-
--- | Check if an MVar is empty
-isEmptyMVar :: MVar a -> IO Bool
-isEmptyMVar mvar = do
-    full <- newEmptyMVar
-    tryPutMVar full ()
-    isEmpty <- isJust <$> tryTakeMVar full
-    return isEmpty
-
--- | Try to put a value in an MVar without blocking
-tryPutMVar :: MVar a -> a -> IO Bool
-tryPutMVar mvar x = do
-    empty <- isEmptyMVar mvar
-    if empty
-        then do
-            putMVar mvar x
-            return True
-        else return False
 
 -- | Bitwise operations for message length encoding/decoding
 shiftL :: Int -> Int -> Int
