@@ -698,10 +698,6 @@ listStoreContents storeDir = do
             let validPaths = catMaybes $ map (\entry -> parseStorePath $ T.pack entry) entries
             return $ Set.fromList validPaths
 
--- Helper function to convert a StorePath to its filesystem path
-storePathToFilePath :: StorePath -> BuildEnv -> FilePath
-storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
-
 -- Helper function for Maybe mapping
 mapMaybe :: (a -> Maybe b) -> [a] -> [b]
 mapMaybe _ [] = []

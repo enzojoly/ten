@@ -107,9 +107,10 @@ module Ten.Core (
     getGCLockPath,
     ensureLockDirExists,
 
-    -- Path handling utilities
+    -- Path handling utilities (adding explicit exports)
     storePathToFilePath,
-    filePathToStorePath
+    filePathToStorePath,
+    makeStorePath
 ) where
 
 import Control.Concurrent.STM
@@ -257,6 +258,10 @@ filePathToStorePath path =
         (hashPart, '-':namePart) ->
             Just $ StorePath (T.pack hashPart) (T.pack namePart)
         _ -> Nothing
+
+-- | Create a store path from hash and name components
+makeStorePath :: Text -> Text -> StorePath
+makeStorePath hash name = StorePath hash name
 
 -- | Reference between store paths
 data StoreReference = StoreReference

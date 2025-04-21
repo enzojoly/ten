@@ -659,7 +659,3 @@ registerDerivationWithOutputs db derivation storePath = liftIO $ dbWithTransacti
                 registerValidPath txn storePath (Just storePath)
 
                 return derivId
-
--- | Helper function to get the filesystem path for a StorePath
-storePathToFilePath :: StorePath -> BuildEnv -> FilePath
-storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)

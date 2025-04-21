@@ -91,11 +91,11 @@ addToStore name content = do
         logMsg 2 $ "Adding to store: " <> contentHash <> ":" <> name
 
         -- Create store directory if needed
-        liftIO $ createDirectoryIfMissing True (storePath env)
+        liftIO $ createDirectoryIfMissing True (storeDir env)
 
         -- Create temporary file
         tempPath <- liftIO $ do
-            let tempDir = storePath env </> "tmp"
+            let tempDir = storeDir env </> "tmp"
             createDirectoryIfMissing True tempDir
             let tempFile = tempDir </> (T.unpack contentHash ++ "-" ++ T.unpack name ++ ".tmp")
             BS.writeFile tempFile content
@@ -180,22 +180,6 @@ storePathExists :: StorePath -> TenM p Bool
 storePathExists path = do
     env <- ask
     liftIO $ doesFileExist $ storePathToFilePath path env
-
--- | Convert a store path to a filesystem path
-storePathToFilePath :: StorePath -> BuildEnv -> FilePath
-storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
-
--- | Try to parse a store path from a file path
-filePathToStorePath :: FilePath -> Maybe StorePath
-filePathToStorePath path =
-    case break (== '-') (takeFileName path) of
-        (hashPart, '-':namePart) ->
-            Just $ StorePath (T.pack hashPart) (T.pack namePart)
-        _ -> Nothing
-
--- | Create a store path from hash and name
-makeStorePath :: Text -> Text -> StorePath
-makeStorePath hash name = StorePath hash name
 
 -- | Lock a store path to prevent concurrent modification
 lockStorePath :: StorePath -> TenM p ()
