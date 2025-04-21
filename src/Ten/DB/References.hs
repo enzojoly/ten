@@ -4,39 +4,49 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE GADTs #-}
 
 module Ten.DB.References (
-    -- Reference registration
+    -- Reference registration for privileged context
     registerReference,
     registerReferences,
     registerPathReferences,
 
-    -- Reference queries
+    -- Reference queries (available in both contexts)
     getReferences,
     getReferrers,
     getDirectReferences,
     getDirectReferrers,
 
-    -- Reference graph operations
+    -- Reference graph operations for privileged context
     computeReachablePathsFromRoots,
     findPathsClosure,
     findPathsClosureWithLimit,
 
-    -- Garbage collection support
+    -- Garbage collection support for privileged context
     findGCRoots,
     markPathsAsValid,
     markPathsAsInvalid,
 
-    -- Path reachability
+    -- Path reachability (available in both contexts via appropriate implementation)
     isPathReachable,
 
-    -- Reference scanning (for initial import only)
+    -- Reference scanning (for initial import only, privileged)
     scanFileForReferences,
     scanStoreForReferences,
 
-    -- Database operations
+    -- Database operations (privileged)
     vacuumReferenceDb,
     validateReferenceDb,
+
+    -- Protocol-based operations for unprivileged context
+    requestRegisterReference,
+    requestRegisterReferences,
+    requestComputeReachablePaths,
+    requestFindPathsClosure,
+    requestIsPathReachable,
 
     -- Types
     ReferenceEntry(..),
@@ -74,6 +84,8 @@ import Data.Char (isHexDigit)
 
 import Ten.Core
 import Ten.DB.Core
+import Ten.Daemon.Protocol
+import Ten.Daemon.Client
 
 -- | A reference from one path to another
 data ReferenceEntry = ReferenceEntry {
@@ -107,8 +119,8 @@ instance FromRow ReferenceEntry where
 instance ToRow ReferenceEntry where
     toRow (ReferenceEntry from to) = SQLite.toRow (storePathToText from, storePathToText to)
 
--- | Register a single reference between two store paths
-registerReference :: Database -> StorePath -> StorePath -> TenM p ()
+-- | Register a single reference between two store paths (privileged operation)
+registerReference :: Database -> StorePath -> StorePath -> TenM p 'Privileged ()
 registerReference db from to =
     -- Avoid self-references
     when (from /= to) $
@@ -116,8 +128,8 @@ registerReference db from to =
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText from, storePathToText to)
 
--- | Register multiple references from one referrer
-registerReferences :: Database -> StorePath -> Set StorePath -> TenM p ()
+-- | Register multiple references from one referrer (privileged operation)
+registerReferences :: Database -> StorePath -> Set StorePath -> TenM p 'Privileged ()
 registerReferences db referrer references = withTenTransaction db ReadWrite $ \_ -> do
     -- Insert each valid reference
     forM_ (Set.toList references) $ \ref ->
@@ -127,8 +139,8 @@ registerReferences db referrer references = withTenTransaction db ReadWrite $ \_
                    "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
                    (storePathToText referrer, storePathToText ref)
 
--- | Register references for a path after scanning the file for references
-registerPathReferences :: Database -> FilePath -> StorePath -> TenM p Int
+-- | Register references for a path after scanning the file for references (privileged operation)
+registerPathReferences :: Database -> FilePath -> StorePath -> TenM p 'Privileged Int
 registerPathReferences db storeDir path = do
     env <- ask
 
@@ -150,68 +162,96 @@ registerPathReferences db storeDir path = do
                     registerReferences db path references
                     return $ Set.size references
 
--- | Get direct references from a store path
-getDirectReferences :: Database -> StorePath -> TenM p (Set StorePath)
+-- | Get direct references from a store path (available in both contexts)
+getDirectReferences :: Database -> StorePath -> TenM p ctx (Set StorePath)
 getDirectReferences db path = do
-    results <- tenQuery db
-        "SELECT reference FROM References WHERE referrer = ?"
-        (Only (storePathToText path))
+    env <- ask
+    case runMode env of
+        -- In privileged context, directly query the database
+        DaemonMode -> do
+            results <- tenQuery db
+                "SELECT reference FROM References WHERE referrer = ?"
+                (Only (storePathToText path))
 
-    -- Parse each store path and return as a set
-    return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePath p) results
+            -- Parse each store path and return as a set
+            return $ Set.fromList $ catMaybes $
+                map (\(Only p) -> parseStorePath p) results
 
--- | Get all references from a path (direct and indirect)
-getReferences :: Database -> StorePath -> TenM p (Set StorePath)
+        -- In unprivileged context, request via protocol
+        _ -> requestDirectReferences path
+
+-- | Get all references from a path (direct and indirect) (available in both contexts)
+getReferences :: Database -> StorePath -> TenM p ctx (Set StorePath)
 getReferences db path = do
-    -- Use recursive CTE to efficiently query the closure
-    let query = "WITH RECURSIVE\n\
-                \  closure(path) AS (\n\
-                \    VALUES(?)\n\
-                \    UNION\n\
-                \    SELECT reference FROM References, closure \n\
-                \    WHERE referrer = closure.path\n\
-                \  )\n\
-                \SELECT path FROM closure WHERE path != ?"
+    env <- ask
+    case runMode env of
+        -- In privileged context, use recursive CTE
+        DaemonMode -> do
+            -- Use recursive CTE to efficiently query the closure
+            let query = "WITH RECURSIVE\n\
+                        \  closure(path) AS (\n\
+                        \    VALUES(?)\n\
+                        \    UNION\n\
+                        \    SELECT reference FROM References, closure \n\
+                        \    WHERE referrer = closure.path\n\
+                        \  )\n\
+                        \SELECT path FROM closure WHERE path != ?"
 
-    results <- tenQuery db query (storePathToText path, storePathToText path)
+            results <- tenQuery db query (storePathToText path, storePathToText path)
 
-    -- Parse each store path and return as a set
-    return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePath p) results
+            -- Parse each store path and return as a set
+            return $ Set.fromList $ catMaybes $
+                map (\(Only p) -> parseStorePath p) results
 
--- | Get direct referrers to a store path
-getDirectReferrers :: Database -> StorePath -> TenM p (Set StorePath)
+        -- In unprivileged context, request via protocol
+        _ -> requestReferences path
+
+-- | Get direct referrers to a store path (available in both contexts)
+getDirectReferrers :: Database -> StorePath -> TenM p ctx (Set StorePath)
 getDirectReferrers db path = do
-    results <- tenQuery db
-        "SELECT referrer FROM References WHERE reference = ?"
-        (Only (storePathToText path))
+    env <- ask
+    case runMode env of
+        -- In privileged context, directly query the database
+        DaemonMode -> do
+            results <- tenQuery db
+                "SELECT referrer FROM References WHERE reference = ?"
+                (Only (storePathToText path))
 
-    -- Parse each store path and return as a set
-    return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePath p) results
+            -- Parse each store path and return as a set
+            return $ Set.fromList $ catMaybes $
+                map (\(Only p) -> parseStorePath p) results
 
--- | Get all referrers to a path (direct and indirect)
-getReferrers :: Database -> StorePath -> TenM p (Set StorePath)
+        -- In unprivileged context, request via protocol
+        _ -> requestDirectReferrers path
+
+-- | Get all referrers to a path (direct and indirect) (available in both contexts)
+getReferrers :: Database -> StorePath -> TenM p ctx (Set StorePath)
 getReferrers db path = do
-    -- Use recursive CTE to efficiently query the closure
-    let query = "WITH RECURSIVE\n\
-                \  closure(path) AS (\n\
-                \    VALUES(?)\n\
-                \    UNION\n\
-                \    SELECT referrer FROM References, closure \n\
-                \    WHERE reference = closure.path\n\
-                \  )\n\
-                \SELECT path FROM closure WHERE path != ?"
+    env <- ask
+    case runMode env of
+        -- In privileged context, use recursive CTE
+        DaemonMode -> do
+            -- Use recursive CTE to efficiently query the closure
+            let query = "WITH RECURSIVE\n\
+                        \  closure(path) AS (\n\
+                        \    VALUES(?)\n\
+                        \    UNION\n\
+                        \    SELECT referrer FROM References, closure \n\
+                        \    WHERE reference = closure.path\n\
+                        \  )\n\
+                        \SELECT path FROM closure WHERE path != ?"
 
-    results <- tenQuery db query (storePathToText path, storePathToText path)
+            results <- tenQuery db query (storePathToText path, storePathToText path)
 
-    -- Parse each store path and return as a set
-    return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePath p) results
+            -- Parse each store path and return as a set
+            return $ Set.fromList $ catMaybes $
+                map (\(Only p) -> parseStorePath p) results
 
--- | Find all GC roots
-findGCRoots :: Database -> FilePath -> TenM p (Set StorePath)
+        -- In unprivileged context, request via protocol
+        _ -> requestReferrers path
+
+-- | Find all GC roots (privileged operation)
+findGCRoots :: Database -> FilePath -> TenM p 'Privileged (Set StorePath)
 findGCRoots db storeDir = do
     -- Get roots from the file system (symlinks in gc-roots directory)
     let rootsDir = storeDir </> "gc-roots"
@@ -255,8 +295,8 @@ getGCRootsFromFS rootsDir = do
             -- Return the set of valid roots
             return $ Set.fromList $ catMaybes roots
 
--- | Get roots from database
-getRegisteredRoots :: Database -> TenM p (Set StorePath)
+-- | Get roots from database (privileged operation)
+getRegisteredRoots :: Database -> TenM p 'Privileged (Set StorePath)
 getRegisteredRoots db = do
     results <- tenQuery_ db
         "SELECT path FROM GCRoots WHERE active = 1"
@@ -265,8 +305,8 @@ getRegisteredRoots db = do
     return $ Set.fromList $ catMaybes $
         map (\(Only p) -> parseStorePath p) results
 
--- | Compute all paths reachable from a set of roots
-computeReachablePathsFromRoots :: Database -> Set StorePath -> TenM p (Set StorePath)
+-- | Compute all paths reachable from a set of roots (privileged operation)
+computeReachablePathsFromRoots :: Database -> Set StorePath -> TenM p 'Privileged (Set StorePath)
 computeReachablePathsFromRoots db roots = do
     -- If no roots, return empty set
     if Set.null roots
@@ -301,13 +341,13 @@ computeReachablePathsFromRoots db roots = do
             return $ Set.fromList $ catMaybes $
                 map (\(Only p) -> parseStorePath p) results
 
--- | Find the transitive closure of paths
-findPathsClosure :: Database -> Set StorePath -> TenM p (Set StorePath)
+-- | Find the transitive closure of paths (privileged operation)
+findPathsClosure :: Database -> Set StorePath -> TenM p 'Privileged (Set StorePath)
 findPathsClosure db startingPaths =
     findPathsClosureWithLimit db startingPaths (-1)  -- No limit
 
--- | Find the transitive closure of paths with depth limit
-findPathsClosureWithLimit :: Database -> Set StorePath -> Int -> TenM p (Set StorePath)
+-- | Find the transitive closure of paths with depth limit (privileged operation)
+findPathsClosureWithLimit :: Database -> Set StorePath -> Int -> TenM p 'Privileged (Set StorePath)
 findPathsClosureWithLimit db startingPaths depthLimit = do
     -- If no starting paths, return empty set
     if Set.null startingPaths
@@ -351,53 +391,60 @@ findPathsClosureWithLimit db startingPaths depthLimit = do
             return $ Set.fromList $ catMaybes $
                 map (\(Only p) -> parseStorePath p) results
 
--- | Check if a path is reachable from any of the GC roots
-isPathReachable :: Database -> Set StorePath -> StorePath -> TenM p Bool
+-- | Check if a path is reachable from any of the GC roots (available in both contexts)
+isPathReachable :: Database -> Set StorePath -> StorePath -> TenM p ctx Bool
 isPathReachable db roots path = do
-    -- First check if the path is itself a root
-    if path `Set.member` roots
-        then return True
-        else do
-            -- Use SQL to efficiently check reachability
-            let rootValues = rootsToSqlValues (Set.toList roots)
-            let query = "WITH RECURSIVE\n\
-                        \  reachable(path) AS (\n\
-                        \    VALUES " ++ rootValues ++ "\n\
-                        \    UNION\n\
-                        \    SELECT reference FROM References, reachable \n\
-                        \    WHERE referrer = reachable.path\n\
-                        \  )\n\
-                        \SELECT COUNT(*) FROM reachable WHERE path = ?"
+    env <- ask
+    case runMode env of
+        -- In privileged context, direct database query
+        DaemonMode -> do
+            -- First check if the path is itself a root
+            if path `Set.member` roots
+                then return True
+                else do
+                    -- Use SQL to efficiently check reachability
+                    let rootValues = rootsToSqlValues (Set.toList roots)
+                    let query = "WITH RECURSIVE\n\
+                                \  reachable(path) AS (\n\
+                                \    VALUES " ++ rootValues ++ "\n\
+                                \    UNION\n\
+                                \    SELECT reference FROM References, reachable \n\
+                                \    WHERE referrer = reachable.path\n\
+                                \  )\n\
+                                \SELECT COUNT(*) FROM reachable WHERE path = ?"
 
-            results <- tenQuery db (Query $ T.pack query) (Only (storePathToText path)) :: TenM p [Only Int]
+                    results <- tenQuery db (Query $ T.pack query) (Only (storePathToText path)) :: TenM p 'Privileged [Only Int]
 
-            case results of
-                [Only count] -> return (count > 0)
-                _ -> return False
+                    case results of
+                        [Only count] -> return (count > 0)
+                        _ -> return False
+
+        -- In unprivileged context, request via protocol
+        _ -> requestIsPathReachable roots path
   where
     -- Helper to create SQL values clause
     rootsToSqlValues [] = "(NULL)"  -- Avoid empty VALUES clause
     rootsToSqlValues [r] = "('" ++ T.unpack (storePathToText r) ++ "')"
     rootsToSqlValues (r:rs) = "('" ++ T.unpack (storePathToText r) ++ "'), " ++ rootsToSqlValues rs
 
--- | Mark a set of paths as valid in the ValidPaths table
-markPathsAsValid :: Database -> Set StorePath -> TenM p ()
+-- | Mark a set of paths as valid in the ValidPaths table (privileged operation)
+markPathsAsValid :: Database -> Set StorePath -> TenM p 'Privileged ()
 markPathsAsValid db paths = withTenTransaction db ReadWrite $ \_ -> do
     forM_ (Set.toList paths) $ \path ->
         tenExecute_ db
             "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?"
             (Only (storePathToText path))
 
--- | Mark a set of paths as invalid in the ValidPaths table
-markPathsAsInvalid :: Database -> Set StorePath -> TenM p ()
+-- | Mark a set of paths as invalid in the ValidPaths table (privileged operation)
+markPathsAsInvalid :: Database -> Set StorePath -> TenM p 'Privileged ()
 markPathsAsInvalid db paths = withTenTransaction db ReadWrite $ \_ -> do
     forM_ (Set.toList paths) $ \path ->
         tenExecute_ db
             "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
             (Only (storePathToText path))
 
--- | Vacuum the reference database to optimize performance
-vacuumReferenceDb :: Database -> TenM p ()
+-- | Vacuum the reference database to optimize performance (privileged operation)
+vacuumReferenceDb :: Database -> TenM p 'Privileged ()
 vacuumReferenceDb db = do
     -- Remove dangling references
     cleanupDanglingReferences db
@@ -408,11 +455,11 @@ vacuumReferenceDb db = do
     -- Vacuum database
     tenExecuteSimple_ db "VACUUM"
 
--- | Validate and repair the reference database
-validateReferenceDb :: Database -> FilePath -> TenM p (Int, Int)
+-- | Validate and repair the reference database (privileged operation)
+validateReferenceDb :: Database -> FilePath -> TenM p 'Privileged (Int, Int)
 validateReferenceDb db storeDir = do
     -- Count existing references
-    [Only totalRefs] <- tenQuery_ db "SELECT COUNT(*) FROM References" :: TenM p [Only Int]
+    [Only totalRefs] <- tenQuery_ db "SELECT COUNT(*) FROM References" :: TenM p 'Privileged [Only Int]
 
     -- Remove references to non-existent paths
     invalid <- cleanupDanglingReferences db
@@ -420,13 +467,13 @@ validateReferenceDb db storeDir = do
     -- Return statistics
     return (totalRefs, invalid)
 
--- | Cleanup dangling references
-cleanupDanglingReferences :: Database -> TenM p Int
+-- | Cleanup dangling references (privileged operation)
+cleanupDanglingReferences :: Database -> TenM p 'Privileged Int
 cleanupDanglingReferences db = withTenTransaction db ReadWrite $ \db' -> do
     -- Find references to paths that don't exist in ValidPaths
     dangling <- tenQuery_ db'
         "SELECT referrer, reference FROM References \
-        \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)" :: TenM p [(Text, Text)]
+        \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)" :: TenM p 'Privileged [(Text, Text)]
 
     -- Delete these references
     count <- foldM (\acc (from, to) -> do
@@ -437,8 +484,8 @@ cleanupDanglingReferences db = withTenTransaction db ReadWrite $ \db' -> do
 
     return count
 
--- | Scan a file for references to store paths
-scanFileForReferences :: FilePath -> FilePath -> TenM p (Set StorePath)
+-- | Scan a file for references to store paths (available in both contexts)
+scanFileForReferences :: FilePath -> FilePath -> TenM p ctx (Set StorePath)
 scanFileForReferences storeDir filePath = do
     -- Check if the file exists
     exists <- liftIO $ doesFileExist filePath
@@ -634,8 +681,8 @@ findStoreReferences storeRoot s =
                    (c >= 'a' && c <= 'f') ||
                    (c >= 'A' && c <= 'F')
 
--- | Scan the entire store for references between paths
-scanStoreForReferences :: FilePath -> TenM p (Set StorePathReference)
+-- | Scan the entire store for references between paths (privileged operation)
+scanStoreForReferences :: FilePath -> TenM p 'Privileged (Set StorePathReference)
 scanStoreForReferences storeDir = do
     -- Get all store paths
     paths <- liftIO $ listStoreContents storeDir
@@ -699,3 +746,190 @@ mapMaybe f (x:xs) =
     case f x of
         Nothing -> mapMaybe f xs
         Just y -> y : mapMaybe f xs
+
+-- | Request to register a reference (unprivileged operation)
+requestRegisterReference :: StorePath -> StorePath -> TenM p 'Unprivileged ()
+requestRegisterReference from to = do
+    -- Build request
+    let req = StoreReferenceRequest {
+        referenceSource = from,
+        referenceTarget = to,
+        referenceType = DirectReference
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ RegisterReferenceReq req
+
+    -- Handle response
+    case resp of
+        RegisterReferenceResp success -> return ()
+        _ -> throwError $ DaemonError "Unexpected response from daemon when registering reference"
+
+-- | Request to register multiple references (unprivileged operation)
+requestRegisterReferences :: StorePath -> Set StorePath -> TenM p 'Unprivileged ()
+requestRegisterReferences from refs = do
+    -- Build request
+    let req = StoreReferencesRequest {
+        referencesSource = from,
+        referencesTargets = refs
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ RegisterReferencesReq req
+
+    -- Handle response
+    case resp of
+        RegisterReferencesResp success -> return ()
+        _ -> throwError $ DaemonError "Unexpected response from daemon when registering references"
+
+-- | Request direct references (unprivileged operation)
+requestDirectReferences :: StorePath -> TenM p 'Unprivileged (Set StorePath)
+requestDirectReferences path = do
+    -- Build request
+    let req = GetReferencesRequest {
+        getReferencesPath = path,
+        getReferencesDepth = Just 1  -- Direct references only
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ GetReferencesReq req
+
+    -- Handle response
+    case resp of
+        GetReferencesResp paths -> return paths
+        _ -> throwError $ DaemonError "Unexpected response from daemon when fetching references"
+
+-- | Request all references (unprivileged operation)
+requestReferences :: StorePath -> TenM p 'Unprivileged (Set StorePath)
+requestReferences path = do
+    -- Build request
+    let req = GetReferencesRequest {
+        getReferencesPath = path,
+        getReferencesDepth = Nothing  -- All references (transitive)
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ GetReferencesReq req
+
+    -- Handle response
+    case resp of
+        GetReferencesResp paths -> return paths
+        _ -> throwError $ DaemonError "Unexpected response from daemon when fetching references"
+
+-- | Request direct referrers (unprivileged operation)
+requestDirectReferrers :: StorePath -> TenM p 'Unprivileged (Set StorePath)
+requestDirectReferrers path = do
+    -- Build request
+    let req = GetReferrersRequest {
+        getReferrersPath = path,
+        getReferrersDepth = Just 1  -- Direct referrers only
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ GetReferrersReq req
+
+    -- Handle response
+    case resp of
+        GetReferrersResp paths -> return paths
+        _ -> throwError $ DaemonError "Unexpected response from daemon when fetching referrers"
+
+-- | Request all referrers (unprivileged operation)
+requestReferrers :: StorePath -> TenM p 'Unprivileged (Set StorePath)
+requestReferrers path = do
+    -- Build request
+    let req = GetReferrersRequest {
+        getReferrersPath = path,
+        getReferrersDepth = Nothing  -- All referrers (transitive)
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ GetReferrersReq req
+
+    -- Handle response
+    case resp of
+        GetReferrersResp paths -> return paths
+        _ -> throwError $ DaemonError "Unexpected response from daemon when fetching referrers"
+
+-- | Request computation of reachable paths (unprivileged operation)
+requestComputeReachablePaths :: Set StorePath -> TenM p 'Unprivileged (Set StorePath)
+requestComputeReachablePaths roots = do
+    -- Build request
+    let req = ComputeReachablePathsRequest {
+        computeReachableRoots = roots
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ ComputeReachablePathsReq req
+
+    -- Handle response
+    case resp of
+        ComputeReachablePathsResp paths -> return paths
+        _ -> throwError $ DaemonError "Unexpected response from daemon when computing reachable paths"
+
+-- | Request path closure with limit (unprivileged operation)
+requestFindPathsClosure :: Set StorePath -> Maybe Int -> TenM p 'Unprivileged (Set StorePath)
+requestFindPathsClosure paths depthLimit = do
+    -- Build request
+    let req = FindPathsClosureRequest {
+        findPathsClosurePaths = paths,
+        findPathsClosureDepthLimit = depthLimit
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ FindPathsClosureReq req
+
+    -- Handle response
+    case resp of
+        FindPathsClosureResp resultPaths -> return resultPaths
+        _ -> throwError $ DaemonError "Unexpected response from daemon when finding path closure"
+
+-- | Request path reachability check (unprivileged operation)
+requestIsPathReachable :: Set StorePath -> StorePath -> TenM p 'Unprivileged Bool
+requestIsPathReachable roots path = do
+    -- Build request
+    let req = IsPathReachableRequest {
+        isPathReachableRoots = roots,
+        isPathReachablePath = path
+    }
+
+    -- Send request to daemon
+    resp <- sendStoreRequest $ IsPathReachableReq req
+
+    -- Handle response
+    case resp of
+        IsPathReachableResp isReachable -> return isReachable
+        _ -> throwError $ DaemonError "Unexpected response from daemon when checking path reachability"
+
+-- | Helper function to send store requests to daemon
+sendStoreRequest :: StoreOperation -> TenM p 'Unprivileged StoreResponse
+sendStoreRequest op = do
+    -- Get daemon connection
+    conn <- getDaemonConnection
+
+    -- Create request
+    let req = DaemonRequest {
+        requestId = generateRequestId op,
+        requestAuth = getAuthToken,
+        requestOperation = StoreOp op
+    }
+
+    -- Send request and get response
+    resp <- sendRequest conn req
+
+    -- Extract store response
+    case responseOperation resp of
+        StoreOpResp storeResp -> return storeResp
+        ErrorResp err -> throwError $ DaemonError $ "Error from daemon: " <> err
+        _ -> throwError $ DaemonError "Unexpected response type from daemon"
+
+-- | Helper function to generate a request ID
+generateRequestId :: StoreOperation -> RequestId
+generateRequestId = undefined  -- Implementation would depend on specific protocol details
+
+-- | Helper function to get the current auth token
+getAuthToken :: Maybe AuthToken
+getAuthToken = undefined  -- Implementation would retrieve token from environment
+
+-- | Helper function to get daemon connection
+getDaemonConnection :: TenM p 'Unprivileged DaemonConnection
+getDaemonConnection = undefined  -- Implementation would retrieve or establish connection

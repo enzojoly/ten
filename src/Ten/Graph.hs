@@ -3,6 +3,9 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Ten.Graph (
     -- Graph construction
@@ -25,7 +28,7 @@ module Ten.Graph (
 
     -- Recursive derivation handling
     detectRecursionCycle,
-    Ten.Core.addToDerivationChain,
+    addToDerivationChain,
 
     -- Graph queries
     findAffected,
@@ -71,7 +74,6 @@ import qualified Data.Text.Encoding as TE
 import System.IO (withFile, IOMode(..))
 
 import Ten.Core
-import Ten.Derivation (hashDerivation, deserializeDerivation)
 
 -- | Create a unique ID for a store path
 pathNodeId :: StorePath -> Text
@@ -95,7 +97,8 @@ emptyGraph = BuildGraph
     }
 
 -- | Create a build graph from a set of derivations
-createBuildGraph :: Set StorePath -> Set Derivation -> TenM 'Eval BuildGraph
+-- Works in both privileged and unprivileged contexts
+createBuildGraph :: PrivCtxConstraint ctx => Set StorePath -> Set Derivation -> TenM 'Eval ctx BuildGraph
 createBuildGraph requestedOutputs derivations = do
     -- Start with an empty graph
     let graph = emptyGraph
@@ -113,11 +116,13 @@ createBuildGraph requestedOutputs derivations = do
     return $ graph'' { graphProof = Just proof }
 
 -- | Add a node to the graph
+-- Pure operation, no context constraints
 addNode :: BuildGraph -> Text -> BuildNode -> BuildGraph
 addNode graph nodeId node =
     graph { graphNodes = Map.insert nodeId node (graphNodes graph) }
 
 -- | Add an edge to the graph (dependency relationship)
+-- Pure operation, no context constraints
 addEdge :: BuildGraph -> Text -> Text -> BuildGraph
 addEdge graph fromId toId =
     let
@@ -127,7 +132,8 @@ addEdge graph fromId toId =
         graph { graphEdges = Map.insert fromId newDeps (graphEdges graph) }
 
 -- | Add a derivation to the graph
-addDerivation :: BuildGraph -> Derivation -> TenM 'Eval BuildGraph
+-- Works in both privileged and unprivileged contexts
+addDerivation :: PrivCtxConstraint ctx => BuildGraph -> Derivation -> TenM 'Eval ctx BuildGraph
 addDerivation graph drv = do
     -- Add the derivation node
     let nodeId = derivNodeId drv
@@ -162,7 +168,8 @@ addDerivation graph drv = do
       ) graph'' (Set.toList $ derivOutputs drv)
 
 -- | Validate a build graph
-validateGraph :: BuildGraph -> TenM 'Eval GraphProof
+-- Works in both privileged and unprivileged contexts
+validateGraph :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx GraphProof
 validateGraph graph = do
     -- Check for cycles
     hasCycles <- detectCycles graph
@@ -181,7 +188,8 @@ validateGraph graph = do
     return ValidProof
 
 -- | Detect cycles in the graph using depth-first search
-detectCycles :: BuildGraph -> TenM 'Eval Bool
+-- Works in both privileged and unprivileged contexts
+detectCycles :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx Bool
 detectCycles graph = do
     -- Check each node that hasn't been visited yet
     result <- foldM checkNode (False, Set.empty, Set.empty) (Map.keys $ graphNodes graph)
@@ -189,7 +197,7 @@ detectCycles graph = do
         (True, _, _) -> True
         _ -> False
   where
-    checkNode :: (Bool, Set Text, Set Text) -> Text -> TenM 'Eval (Bool, Set Text, Set Text)
+    checkNode :: PrivCtxConstraint ctx => (Bool, Set Text, Set Text) -> Text -> TenM 'Eval ctx (Bool, Set Text, Set Text)
     checkNode state@(True, _, _) _ = return state  -- Short-circuit if cycle already found
     checkNode (False, visited, recStack) nodeId =
         if nodeId `Set.member` visited
@@ -197,7 +205,8 @@ detectCycles graph = do
             else detectCyclesFrom graph nodeId visited recStack
 
 -- | Detect cycles starting from a specific node
-detectCyclesFrom :: BuildGraph -> Text -> Set Text -> Set Text -> TenM 'Eval (Bool, Set Text, Set Text)
+-- Works in both privileged and unprivileged contexts
+detectCyclesFrom :: PrivCtxConstraint ctx => BuildGraph -> Text -> Set Text -> Set Text -> TenM 'Eval ctx (Bool, Set Text, Set Text)
 detectCyclesFrom graph nodeId visited recStack = do
     -- Mark current node as visited and add to recursion stack
     let visited' = Set.insert nodeId visited
@@ -209,7 +218,7 @@ detectCyclesFrom graph nodeId visited recStack = do
     -- Check each dependency
     foldM checkDep (False, visited', recStack') (Set.toList deps)
   where
-    checkDep :: (Bool, Set Text, Set Text) -> Text -> TenM 'Eval (Bool, Set Text, Set Text)
+    checkDep :: PrivCtxConstraint ctx => (Bool, Set Text, Set Text) -> Text -> TenM 'Eval ctx (Bool, Set Text, Set Text)
     checkDep state@(True, _, _) _ = return state  -- Short-circuit if cycle already found
     checkDep (False, visited, recStack) depId =
         if depId `Set.member` recStack
@@ -219,7 +228,8 @@ detectCyclesFrom graph nodeId visited recStack = do
                 else detectCyclesFrom graph depId visited recStack
 
 -- | Check graph completeness (all dependencies exist as nodes)
-checkCompleteness :: BuildGraph -> TenM 'Eval Bool
+-- Works in both privileged and unprivileged contexts
+checkCompleteness :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx Bool
 checkCompleteness graph = do
     -- Check each edge to make sure its target exists
     let allNodes = Map.keysSet $ graphNodes graph
@@ -227,7 +237,8 @@ checkCompleteness graph = do
     return $ allDeps `Set.isSubsetOf` allNodes
 
 -- | Topologically sort the graph (return build order)
-topologicalSort :: BuildGraph -> TenM 'Eval [BuildNode]
+-- Works in both privileged and unprivileged contexts
+topologicalSort :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx [BuildNode]
 topologicalSort graph = do
     -- Verify the graph is acyclic
     case graphProof graph of
@@ -246,7 +257,8 @@ topologicalSort graph = do
     return $ catMaybes $ map (\nodeId -> Map.lookup nodeId (graphNodes graph)) sorted
 
 -- | Internal topological sort implementation
-topologicalSortInternal :: BuildGraph -> [Text] -> Set Text -> [Text] -> TenM 'Eval [Text]
+-- Works in both privileged and unprivileged contexts
+topologicalSortInternal :: PrivCtxConstraint ctx => BuildGraph -> [Text] -> Set Text -> [Text] -> TenM 'Eval ctx [Text]
 topologicalSortInternal _ [] _ result = return $ reverse result
 topologicalSortInternal graph (nodeId:rest) visited result =
     if nodeId `Set.member` visited
@@ -260,12 +272,14 @@ topologicalSortInternal graph (nodeId:rest) visited result =
             topologicalSortInternal graph rest (Set.insert nodeId visited) (nodeId:result')
 
 -- | Get direct dependencies of a node
+-- Pure operation, no context constraints
 getDependencies :: BuildGraph -> Text -> Set Text
 getDependencies graph nodeId =
     Map.findWithDefault Set.empty nodeId (graphEdges graph)
 
 -- | Get all transitive dependencies of a node
-getTransitiveDependencies :: BuildGraph -> Text -> TenM 'Eval (Set Text)
+-- Works in both privileged and unprivileged contexts
+getTransitiveDependencies :: PrivCtxConstraint ctx => BuildGraph -> Text -> TenM 'Eval ctx (Set Text)
 getTransitiveDependencies graph nodeId = do
     -- Start with direct dependencies
     let directDeps = getDependencies graph nodeId
@@ -280,7 +294,8 @@ getTransitiveDependencies graph nodeId = do
     return $ Set.union directDeps transDeps
 
 -- | Find nodes affected by a change
-findAffected :: BuildGraph -> Set StorePath -> TenM 'Eval (Set Text)
+-- Works in both privileged and unprivileged contexts
+findAffected :: PrivCtxConstraint ctx => BuildGraph -> Set StorePath -> TenM 'Eval ctx (Set Text)
 findAffected graph changedPaths = do
     -- Convert paths to node IDs
     let changedIds = Set.map pathNodeId changedPaths
@@ -293,7 +308,8 @@ findAffected graph changedPaths = do
       ) changedIds (Set.toList changedIds)
 
 -- | Find all nodes that depend on a given node (reverse edges)
-findReverseDependent :: BuildGraph -> Text -> TenM 'Eval (Set Text)
+-- Works in both privileged and unprivileged contexts
+findReverseDependent :: PrivCtxConstraint ctx => BuildGraph -> Text -> TenM 'Eval ctx (Set Text)
 findReverseDependent graph nodeId = do
     -- Find all edges that point to this node
     let reverseEdges = Map.filter (Set.member nodeId) (graphEdges graph)
@@ -306,7 +322,8 @@ findReverseDependent graph nodeId = do
       ) dependentNodes (Set.toList dependentNodes)
 
 -- | Compute the transitive closure of a set of nodes
-transitiveClosure :: BuildGraph -> Set Text -> TenM 'Eval (Set Text)
+-- Works in both privileged and unprivileged contexts
+transitiveClosure :: PrivCtxConstraint ctx => BuildGraph -> Set Text -> TenM 'Eval ctx (Set Text)
 transitiveClosure graph startNodes = do
     -- For each starting node, get all transitive dependencies
     foldM (\closure nodeId -> do
@@ -315,17 +332,20 @@ transitiveClosure graph startNodes = do
       ) Set.empty (Set.toList startNodes)
 
 -- | Generic fold over a graph
+-- Pure operation, no context constraints
 foldGraph :: (a -> BuildNode -> a) -> a -> BuildGraph -> a
 foldGraph f initial graph =
     Map.foldl' (\acc node -> f acc node) initial (graphNodes graph)
 
 -- | Map a function over all nodes in a graph
+-- Pure operation, no context constraints
 mapGraph :: (BuildNode -> BuildNode) -> BuildGraph -> BuildGraph
 mapGraph f graph =
     graph { graphNodes = Map.map f (graphNodes graph) }
 
 -- | Get a subgraph containing only specified nodes and their dependencies
-getSubgraph :: BuildGraph -> Set Text -> TenM 'Eval BuildGraph
+-- Works in both privileged and unprivileged contexts
+getSubgraph :: PrivCtxConstraint ctx => BuildGraph -> Set Text -> TenM 'Eval ctx BuildGraph
 getSubgraph graph nodeIds = do
     -- Get transitive closure of specified nodes
     closure <- transitiveClosure graph nodeIds
@@ -343,11 +363,13 @@ getSubgraph graph nodeIds = do
         }
 
 -- | Find a path between two nodes (if exists)
+-- Pure operation, no context constraints
 findPath :: BuildGraph -> Text -> Text -> Maybe [Text]
 findPath graph start end =
     findPathDFS graph start end Set.empty []
 
 -- | Depth-first search to find a path
+-- Pure operation, no context constraints
 findPathDFS :: BuildGraph -> Text -> Text -> Set Text -> [Text] -> Maybe [Text]
 findPathDFS graph current target visited path
     | current == target = Just (reverse (current:path))
@@ -368,11 +390,13 @@ findPathDFS graph current target visited path
     findFirstPath (Nothing:rest) = findFirstPath rest
 
 -- | Find all paths between two nodes
+-- Pure operation, no context constraints
 findAllPaths :: BuildGraph -> Text -> Text -> [[Text]]
 findAllPaths graph start end =
     findAllPathsDFS graph start end Set.empty []
 
 -- | Depth-first search to find all paths
+-- Pure operation, no context constraints
 findAllPathsDFS :: BuildGraph -> Text -> Text -> Set Text -> [Text] -> [[Text]]
 findAllPathsDFS graph current target visited path
     | current == target = [reverse (current:path)]
@@ -389,7 +413,8 @@ findAllPathsDFS graph current target visited path
               ) (Set.toList validNeighbors)
 
 -- | Check for a recursion cycle in a derivation chain
-detectRecursionCycle :: [Derivation] -> TenM p Bool
+-- Works in both privileged and unprivileged contexts
+detectRecursionCycle :: PrivCtxConstraint ctx => [Derivation] -> TenM p ctx Bool
 detectRecursionCycle derivations = do
     -- Use a more efficient algorithm that handles structural equality properly
     -- and is optimized for potentially long chains
@@ -402,10 +427,17 @@ detectRecursionCycle derivations = do
             return $ length (List.nub hashes) < length hashes
 
 -- | Add a derivation to the chain for cycle detection
-addToDerivationChain :: Derivation -> [Derivation] -> [Derivation]
-addToDerivationChain drv chain = drv:chain
+-- Pure operation, no context constraints
+addToDerivationChain :: Derivation -> TenM p ctx ()
+addToDerivationChain drv = do
+    depth <- gets recursionDepth
+    maxDepth <- asks maxRecursionDepth
+    when (depth >= maxDepth) $
+        throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show maxDepth)
+    modify $ \s -> s { buildChain = drv : buildChain s, recursionDepth = depth + 1 }
 
 -- | Serialize a build graph to JSON
+-- Pure operation, no context constraints
 serializeGraph :: BuildGraph -> LBS.ByteString
 serializeGraph graph = Aeson.encode $ Aeson.object
     [ "nodes" .= serializeNodes (graphNodes graph)
@@ -445,6 +477,7 @@ serializeGraph graph = Aeson.encode $ Aeson.object
         Map.toList $ Map.map Set.toList edges
 
 -- | Deserialize a build graph from JSON
+-- Pure operation, no context constraints
 deserializeGraph :: LBS.ByteString -> Either Text BuildGraph
 deserializeGraph json =
     case Aeson.eitherDecode json of
@@ -560,3 +593,12 @@ deserializeGraph json =
     parseText :: Aeson.Value -> Either Text Text
     parseText (Aeson.String txt) = Right txt
     parseText _ = Left "Expected string value"
+
+-- | Constraint for operations that can work in any privilege context
+class PrivCtxConstraint (ctx :: PrivCtx) where
+
+-- | Instance for Privileged context
+instance PrivCtxConstraint 'Privileged where
+
+-- | Instance for Unprivileged context
+instance PrivCtxConstraint 'Unprivileged where

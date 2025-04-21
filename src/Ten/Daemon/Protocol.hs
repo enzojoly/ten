@@ -13,10 +13,10 @@ module Ten.Daemon.Protocol (
 
     -- Message types
     Message(..),
-    Request(..),
-    Response(..),
-    RequestMsg(..),
-    ResponseMsg(..),
+    RequestTag(..),
+    ResponseTag(..),
+    RequestMessage(..),
+    ResponseMessage(..),
 
     -- Request/response types
     DaemonRequest(..),
@@ -26,8 +26,6 @@ module Ten.Daemon.Protocol (
     UserCredentials(..),
     AuthRequest(..),
     AuthResult(..),
-    AuthRequestMsg(..),
-    AuthResponseMsg(..),
 
     -- Build tracking
     BuildRequestInfo(..),
@@ -53,15 +51,6 @@ module Ten.Daemon.Protocol (
     GCStats(..),
     GCStatusRequestData(..),
     GCStatusResponseData(..),
-
-    -- Request & response type tags
-    RequestTag(..),
-    ResponseTag(..),
-    TagAuthRequest(..),
-    TagAuthResponse(..),
-    TagStatus(..),
-    TagGCStatus(..),
-    TagConfig(..),
 
     -- Serialization functions
     serializeMessage,
@@ -180,6 +169,7 @@ data ProtocolError
     | OperationFailed Text
     | InvalidRequest Text
     | InternalError Text
+    | PrivilegeViolation Text  -- New error type for privilege violations
     deriving (Show, Eq)
 
 instance Exception ProtocolError
@@ -227,8 +217,6 @@ instance Aeson.FromJSON AuthRequest where
 data AuthResult
     = AuthAccepted UserId AuthToken
     | AuthRejected Text
-    | AuthSuccess UserId AuthToken  -- For backwards compatibility
-    | AuthFailure Text              -- For backwards compatibility
     deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON AuthResult where
@@ -239,15 +227,6 @@ instance Aeson.ToJSON AuthResult where
         ]
     toJSON (AuthRejected reason) = Aeson.object [
             "status" .= ("rejected" :: Text),
-            "reason" .= reason
-        ]
-    toJSON (AuthSuccess (UserId uid) (AuthToken token)) = Aeson.object [
-            "status" .= ("success" :: Text),
-            "userId" .= uid,
-            "token" .= token
-        ]
-    toJSON (AuthFailure reason) = Aeson.object [
-            "status" .= ("failure" :: Text),
             "reason" .= reason
         ]
 
@@ -262,13 +241,6 @@ instance Aeson.FromJSON AuthResult where
             "rejected" -> do
                 reason <- v .: "reason"
                 return $ AuthRejected reason
-            "success" -> do
-                uid <- v .: "userId"
-                token <- v .: "token"
-                return $ AuthSuccess (UserId uid) (AuthToken token)
-            "failure" -> do
-                reason <- v .: "reason"
-                return $ AuthFailure reason
             _ -> fail $ "Unknown auth status: " ++ T.unpack status
 
 -- | Request to store a derivation
@@ -619,210 +591,157 @@ instance Aeson.FromJSON GCStatusResponseData where
         return GCStatusResponseData{..}
 
 -- | Request tags to distinguish different types of requests
-data RequestTag =
-      TagAuth
-    | TagBuild
-    | TagEval
-    | TagBuildDerivation
-    | TagBuildStatus
-    | TagCancelBuild
-    | TagQueryBuildOutput
-    | TagListBuilds
-    | TagStoreAdd
-    | TagStoreVerify
-    | TagStorePath
-    | TagStoreList
-    | TagStoreDerivation
-    | TagRetrieveDerivation
-    | TagQueryDerivation
-    | TagGetDerivationForOutput
-    | TagListDerivations
-    | TagGC
-    | TagGCStatus
-    | TagAddGCRoot
-    | TagRemoveGCRoot
-    | TagListGCRoots
-    | TagPing
-    | TagShutdown
-    | TagStatus
-    | TagConfig
+data RequestTag
+    = AuthTag
+    | BuildTag
+    | EvalTag
+    | BuildDerivationTag
+    | BuildStatusTag
+    | CancelBuildTag
+    | QueryBuildOutputTag
+    | ListBuildsTag
+    | StoreAddTag
+    | StoreVerifyTag
+    | StorePathTag
+    | StoreListTag
+    | StoreDerivationTag
+    | RetrieveDerivationTag
+    | QueryDerivationTag
+    | GetDerivationForOutputTag
+    | ListDerivationsTag
+    | GCTag
+    | GCStatusTag
+    | AddGCRootTag
+    | RemoveGCRootTag
+    | ListGCRootsTag
+    | PingTag
+    | ShutdownTag
+    | StatusTag
+    | ConfigTag
     deriving (Show, Eq, Generic)
 
 -- | Response tags to distinguish different types of responses
-data ResponseTag =
-      TagAuthResponse
-    | TagBuildStartedResponse
-    | TagBuildResponse
-    | TagBuildStatusResponse
-    | TagBuildOutputResponse
-    | TagBuildListResponse
-    | TagStoreAddResponse
-    | TagStoreVerifyResponse
-    | TagStorePathResponse
-    | TagStoreListResponse
-    | TagDerivationResponse
-    | TagDerivationStoredResponse
-    | TagDerivationRetrievedResponse
-    | TagDerivationQueryResponse
-    | TagDerivationOutputResponse
-    | TagDerivationListResponse
-    | TagGCResponse
-    | TagGCStatusResponse
-    | TagGCRootAddedResponse
-    | TagGCRootRemovedResponse
-    | TagGCRootsListResponse
-    | TagPongResponse
-    | TagShutdownResponse
-    | TagStatusResponse
-    | TagConfigResponse
-    | TagErrorResponse
+data ResponseTag
+    = AuthResponseTag
+    | BuildStartedResponseTag
+    | BuildResponseTag
+    | BuildStatusResponseTag
+    | BuildOutputResponseTag
+    | BuildListResponseTag
+    | StoreAddResponseTag
+    | StoreVerifyResponseTag
+    | StorePathResponseTag
+    | StoreListResponseTag
+    | DerivationResponseTag
+    | DerivationStoredResponseTag
+    | DerivationRetrievedResponseTag
+    | DerivationQueryResponseTag
+    | DerivationOutputResponseTag
+    | DerivationListResponseTag
+    | GCResponseTag
+    | GCStatusResponseTag
+    | GCRootAddedResponseTag
+    | GCRootRemovedResponseTag
+    | GCRootsListResponseTag
+    | PongResponseTag
+    | ShutdownResponseTag
+    | StatusResponseTag
+    | ConfigResponseTag
+    | ErrorResponseTag
     deriving (Show, Eq, Generic)
 
--- | Authentication request/response tags
-data TagAuthRequest = TagAuthRequest deriving (Show, Eq, Generic)
-data TagAuthResponse = TagAuthResponse deriving (Show, Eq, Generic)
-
--- | Status and config tags
-data TagStatus = TagStatus deriving (Show, Eq, Generic)
-data TagGCStatus = TagGCStatus deriving (Show, Eq, Generic)
-data TagConfig = TagConfig deriving (Show, Eq, Generic)
-
 -- | Request type for daemon communication
-data Request = Request {
+data RequestMessage = RequestMessage {
     reqTag :: RequestTag,
-    reqPayload :: Aeson.Value
+    reqPayload :: Aeson.Value,
+    reqAuth :: Maybe AuthToken  -- Authentication token for privileged operations
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON Request where
-    toJSON Request{..} = Aeson.object [
-            "tag" .= show reqTag,
-            "payload" .= reqPayload
-        ]
+instance Aeson.ToJSON RequestMessage where
+    toJSON RequestMessage{..} = Aeson.object $
+        [ "tag" .= show reqTag
+        , "payload" .= reqPayload
+        ] ++
+        [ "auth" .= token | Just (AuthToken token) <- [reqAuth] ]
 
-instance Aeson.FromJSON Request where
-    parseJSON = Aeson.withObject "Request" $ \v -> do
+instance Aeson.FromJSON RequestMessage where
+    parseJSON = Aeson.withObject "RequestMessage" $ \v -> do
         tagStr <- v .: "tag" :: Aeson.Parser String
         payload <- v .: "payload"
-        return $ Request {
+        authToken <- v .:? "auth"
+        return $ RequestMessage {
             reqTag = read tagStr,
-            reqPayload = payload
+            reqPayload = payload,
+            reqAuth = AuthToken <$> authToken
         }
 
 -- | Response type for daemon communication
-data Response = Response {
+data ResponseMessage = ResponseMessage {
     respTag :: ResponseTag,
-    respPayload :: Aeson.Value
+    respPayload :: Aeson.Value,
+    respRequiresAuth :: Bool  -- Whether this type of response is for authenticated requests
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON Response where
-    toJSON Response{..} = Aeson.object [
+instance Aeson.ToJSON ResponseMessage where
+    toJSON ResponseMessage{..} = Aeson.object [
             "tag" .= show respTag,
-            "payload" .= respPayload
+            "payload" .= respPayload,
+            "requiresAuth" .= respRequiresAuth
         ]
 
-instance Aeson.FromJSON Response where
-    parseJSON = Aeson.withObject "Response" $ \v -> do
+instance Aeson.FromJSON ResponseMessage where
+    parseJSON = Aeson.withObject "ResponseMessage" $ \v -> do
         tagStr <- v .: "tag" :: Aeson.Parser String
         payload <- v .: "payload"
-        return $ Response {
+        requiresAuth <- v .: "requiresAuth"
+        return $ ResponseMessage {
             respTag = read tagStr,
-            respPayload = payload
+            respPayload = payload,
+            respRequiresAuth = requiresAuth
         }
-
--- | Auth request message type
-data AuthRequestMsg = AuthRequestMsg AuthRequest deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON AuthRequestMsg where
-    toJSON (AuthRequestMsg req) = Aeson.object [
-            "type" .= ("authRequest" :: Text),
-            "request" .= req
-        ]
-
-instance Aeson.FromJSON AuthRequestMsg where
-    parseJSON = Aeson.withObject "AuthRequestMsg" $ \v -> do
-        reqType <- v .: "type" :: Aeson.Parser Text
-        if reqType == "authRequest"
-            then AuthRequestMsg <$> v .: "request"
-            else fail $ "Expected authRequest, got " ++ T.unpack reqType
-
--- | Auth response message type
-data AuthResponseMsg = AuthResponseMsg AuthResult deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON AuthResponseMsg where
-    toJSON (AuthResponseMsg resp) = Aeson.object [
-            "type" .= ("authResponse" :: Text),
-            "response" .= resp
-        ]
-
-instance Aeson.FromJSON AuthResponseMsg where
-    parseJSON = Aeson.withObject "AuthResponseMsg" $ \v -> do
-        respType <- v .: "type" :: Aeson.Parser Text
-        if respType == "authResponse"
-            then AuthResponseMsg <$> v .: "response"
-            else fail $ "Expected authResponse, got " ++ T.unpack respType
-
--- | Request message type (with ID)
-data RequestMsg = RequestMsg Int Request deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON RequestMsg where
-    toJSON (RequestMsg reqId req) = Aeson.object [
-            "type" .= ("request" :: Text),
-            "requestId" .= reqId,
-            "request" .= req
-        ]
-
-instance Aeson.FromJSON RequestMsg where
-    parseJSON = Aeson.withObject "RequestMsg" $ \v -> do
-        msgType <- v .: "type" :: Aeson.Parser Text
-        if msgType == "request"
-            then do
-                reqId <- v .: "requestId"
-                req <- v .: "request"
-                return $ RequestMsg reqId req
-            else fail $ "Expected request, got " ++ T.unpack msgType
-
--- | Response message type (with ID)
-data ResponseMsg = ResponseMsg Int Response deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON ResponseMsg where
-    toJSON (ResponseMsg reqId resp) = Aeson.object [
-            "type" .= ("response" :: Text),
-            "requestId" .= reqId,
-            "response" .= resp
-        ]
-
-instance Aeson.FromJSON ResponseMsg where
-    parseJSON = Aeson.withObject "ResponseMsg" $ \v -> do
-        msgType <- v .: "type" :: Aeson.Parser Text
-        if msgType == "response"
-            then do
-                reqId <- v .: "requestId"
-                resp <- v .: "response"
-                return $ ResponseMsg reqId resp
-            else fail $ "Expected response, got " ++ T.unpack msgType
 
 -- | Protocol message type
 data Message
-    = AuthRequestMsgWrapper AuthRequestMsg
-    | AuthResponseMsgWrapper AuthResponseMsg
-    | RequestMsgWrapper RequestMsg
-    | ResponseMsgWrapper ResponseMsg
+    = AuthRequestWrapper AuthRequest
+    | AuthResponseWrapper AuthResult
+    | RequestWrapper RequestMessage
+    | ResponseWrapper ResponseMessage
     deriving (Show, Eq)
 
 instance Aeson.ToJSON Message where
-    toJSON (AuthRequestMsgWrapper msg) = Aeson.toJSON msg
-    toJSON (AuthResponseMsgWrapper msg) = Aeson.toJSON msg
-    toJSON (RequestMsgWrapper msg) = Aeson.toJSON msg
-    toJSON (ResponseMsgWrapper msg) = Aeson.toJSON msg
+    toJSON (AuthRequestWrapper msg) = Aeson.object [
+            "type" .= ("authRequest" :: Text),
+            "request" .= msg
+        ]
+    toJSON (AuthResponseWrapper msg) = Aeson.object [
+            "type" .= ("authResponse" :: Text),
+            "response" .= msg
+        ]
+    toJSON (RequestWrapper msg) = Aeson.object [
+            "type" .= ("request" :: Text),
+            "message" .= msg
+        ]
+    toJSON (ResponseWrapper msg) = Aeson.object [
+            "type" .= ("response" :: Text),
+            "message" .= msg
+        ]
 
 instance Aeson.FromJSON Message where
     parseJSON v@(Aeson.Object obj) = do
         msgType <- obj Aeson..: "type" :: Aeson.Parser Text
         case msgType of
-            "authRequest" -> AuthRequestMsgWrapper <$> Aeson.parseJSON v
-            "authResponse" -> AuthResponseMsgWrapper <$> Aeson.parseJSON v
-            "request" -> RequestMsgWrapper <$> Aeson.parseJSON v
-            "response" -> ResponseMsgWrapper <$> Aeson.parseJSON v
+            "authRequest" -> do
+                req <- obj Aeson..: "request"
+                return $ AuthRequestWrapper req
+            "authResponse" -> do
+                resp <- obj Aeson..: "response"
+                return $ AuthResponseWrapper resp
+            "request" -> do
+                msg <- obj Aeson..: "message"
+                return $ RequestWrapper msg
+            "response" -> do
+                msg <- obj Aeson..: "message"
+                return $ ResponseWrapper msg
             _ -> fail $ "Unknown message type: " ++ T.unpack msgType
     parseJSON _ = fail "Expected object for Message"
 
@@ -1838,19 +1757,20 @@ parseResponseFrame :: BS.ByteString -> Either Text (BS.ByteString, BS.ByteString
 parseResponseFrame = parseRequestFrame  -- Same format
 
 -- | Send a request over a protocol handle
-sendRequest :: ProtocolHandle -> DaemonRequest -> IO Int
-sendRequest handle req = do
+sendRequest :: ProtocolHandle -> DaemonRequest -> AuthToken -> IO Int
+sendRequest handle req authToken = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
         -- Generate request ID
         reqId <- (`mod` 1000000) <$> getCurrentMillis
 
         -- Create message with request ID
-        let reqObj = Request {
+        let reqMsg = RequestMessage {
                 reqTag = requestTypeToTag req,
-                reqPayload = Aeson.toJSON req
+                reqPayload = Aeson.toJSON req,
+                reqAuth = Just authToken
             }
-        let msg = RequestMsgWrapper (RequestMsg reqId reqObj)
+        let msg = RequestWrapper reqMsg
 
         -- Send message
         let serialized = serializeMessage msg
@@ -1861,32 +1781,32 @@ sendRequest handle req = do
 
 -- | Convert request type to tag
 requestTypeToTag :: DaemonRequest -> RequestTag
-requestTypeToTag (AuthCmd _ _) = TagAuth
-requestTypeToTag (BuildRequest _ _ _) = TagBuild
-requestTypeToTag (EvalRequest _ _ _) = TagEval
-requestTypeToTag (BuildDerivationRequest _ _) = TagBuildDerivation
-requestTypeToTag (BuildStatusRequest _) = TagBuildStatus
-requestTypeToTag (CancelBuildRequest _) = TagCancelBuild
-requestTypeToTag (QueryBuildOutputRequest _) = TagQueryBuildOutput
-requestTypeToTag (ListBuildsRequest _) = TagListBuilds
-requestTypeToTag (StoreAddRequest _ _) = TagStoreAdd
-requestTypeToTag (StoreVerifyRequest _) = TagStoreVerify
-requestTypeToTag (StorePathRequest _ _) = TagStorePath
-requestTypeToTag StoreListRequest = TagStoreList
-requestTypeToTag (StoreDerivationCmd _) = TagStoreDerivation
-requestTypeToTag (RetrieveDerivationCmd _) = TagRetrieveDerivation
-requestTypeToTag (QueryDerivationCmd _) = TagQueryDerivation
-requestTypeToTag (GetDerivationForOutputRequest _) = TagGetDerivationForOutput
-requestTypeToTag (ListDerivationsRequest _) = TagListDerivations
-requestTypeToTag (GCRequest _) = TagGC
-requestTypeToTag (GCStatusCmd _) = TagGCStatus
-requestTypeToTag (AddGCRootRequest _ _ _) = TagAddGCRoot
-requestTypeToTag (RemoveGCRootRequest _) = TagRemoveGCRoot
-requestTypeToTag ListGCRootsRequest = TagListGCRoots
-requestTypeToTag PingRequest = TagPing
-requestTypeToTag ShutdownRequest = TagShutdown
-requestTypeToTag StatusRequest = TagStatus
-requestTypeToTag ConfigRequest = TagConfig
+requestTypeToTag (AuthCmd _ _) = AuthTag
+requestTypeToTag (BuildRequest _ _ _) = BuildTag
+requestTypeToTag (EvalRequest _ _ _) = EvalTag
+requestTypeToTag (BuildDerivationRequest _ _) = BuildDerivationTag
+requestTypeToTag (BuildStatusRequest _) = BuildStatusTag
+requestTypeToTag (CancelBuildRequest _) = CancelBuildTag
+requestTypeToTag (QueryBuildOutputRequest _) = QueryBuildOutputTag
+requestTypeToTag (ListBuildsRequest _) = ListBuildsTag
+requestTypeToTag (StoreAddRequest _ _) = StoreAddTag
+requestTypeToTag (StoreVerifyRequest _) = StoreVerifyTag
+requestTypeToTag (StorePathRequest _ _) = StorePathTag
+requestTypeToTag StoreListRequest = StoreListTag
+requestTypeToTag (StoreDerivationCmd _) = StoreDerivationTag
+requestTypeToTag (RetrieveDerivationCmd _) = RetrieveDerivationTag
+requestTypeToTag (QueryDerivationCmd _) = QueryDerivationTag
+requestTypeToTag (GetDerivationForOutputRequest _) = GetDerivationForOutputTag
+requestTypeToTag (ListDerivationsRequest _) = ListDerivationsTag
+requestTypeToTag (GCRequest _) = GCTag
+requestTypeToTag (GCStatusCmd _) = GCStatusTag
+requestTypeToTag (AddGCRootRequest _ _ _) = AddGCRootTag
+requestTypeToTag (RemoveGCRootRequest _) = RemoveGCRootTag
+requestTypeToTag ListGCRootsRequest = ListGCRootsTag
+requestTypeToTag PingRequest = PingTag
+requestTypeToTag ShutdownRequest = ShutdownTag
+requestTypeToTag StatusRequest = StatusTag
+requestTypeToTag ConfigRequest = ConfigTag
 
 -- | Receive a response from a protocol handle
 receiveResponse :: ProtocolHandle -> Int -> Int -> IO (Either ProtocolError DaemonResponse)
@@ -1903,21 +1823,17 @@ receiveResponse handle reqId timeoutMicros = do
                 Left err ->
                     return $ Left (ProtocolParseError err)
 
-                Right (ResponseMsgWrapper (ResponseMsg respId resp)) ->
-                    if respId == reqId
-                        then case responseToResponseData resp of
-                            Right respData -> return $ Right respData
-                            Left err -> return $ Left (ProtocolParseError err)
-                        else return $ Left (InvalidRequest $ "Response ID mismatch: expected " <> T.pack (show reqId) <> ", got " <> T.pack (show respId))
+                Right (ResponseWrapper (ResponseMessage respTag respPayload _)) ->
+                    case responseToResponseData respPayload of
+                        Right respData -> return $ Right respData
+                        Left err -> return $ Left (ProtocolParseError err)
 
                 Right _ ->
                     return $ Left (InvalidRequest "Expected response message")
 
--- | Convert from Response to DaemonResponse
-responseToResponseData :: Response -> Either Text DaemonResponse
-responseToResponseData resp = do
-    let tag = respTag resp
-    let payload = respPayload resp
+-- | Convert from Response payload to DaemonResponse
+responseToResponseData :: Aeson.Value -> Either Text DaemonResponse
+responseToResponseData payload =
     case Aeson.fromJSON payload of
         Aeson.Success respData -> Right respData
         Aeson.Error err -> Left $ "Failed to decode response payload: " <> T.pack err
@@ -1927,48 +1843,61 @@ sendResponse :: ProtocolHandle -> Int -> DaemonResponse -> IO ()
 sendResponse handle reqId resp = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
+        -- Check if this response requires authentication
+        let requiresAuth = responseRequiresAuth resp
+
         -- Create message with request ID
-        let respObj = Response {
+        let respMsg = ResponseMessage {
                 respTag = responseTypeToTag resp,
-                respPayload = Aeson.toJSON resp
+                respPayload = Aeson.toJSON resp,
+                respRequiresAuth = requiresAuth
             }
-        let msg = ResponseMsgWrapper (ResponseMsg reqId respObj)
+        let msg = ResponseWrapper respMsg
 
         -- Send message
         let serialized = serializeMessage msg
         NByte.sendAll (protocolSocket handle) serialized
 
+-- | Check if a response type requires authentication
+responseRequiresAuth :: DaemonResponse -> Bool
+responseRequiresAuth (AuthResponse _) = False
+responseRequiresAuth (StatusResponse _) = False
+responseRequiresAuth (PongResponse) = False
+responseRequiresAuth (ErrorResponse _) = False
+responseRequiresAuth (ConfigResponse _) = False
+responseRequiresAuth _ = True  -- Most operations require authentication
+
 -- | Convert response type to tag
 responseTypeToTag :: DaemonResponse -> ResponseTag
-responseTypeToTag (AuthResponse _) = TagAuthResponse
-responseTypeToTag (BuildStartedResponse _) = TagBuildStartedResponse
-responseTypeToTag (BuildResponse _) = TagBuildResponse
-responseTypeToTag (BuildStatusResponse _) = TagBuildStatusResponse
-responseTypeToTag (BuildOutputResponse _) = TagBuildOutputResponse
-responseTypeToTag (BuildListResponse _) = TagBuildListResponse
-responseTypeToTag (StoreAddResponse _) = TagStoreAddResponse
-responseTypeToTag (StoreVerifyResponse _) = TagStoreVerifyResponse
-responseTypeToTag (StorePathResponse _) = TagStorePathResponse
-responseTypeToTag (StoreListResponse _) = TagStoreListResponse
-responseTypeToTag (DerivationResponse _) = TagDerivationResponse
-responseTypeToTag (DerivationStoredResponse _) = TagDerivationStoredResponse
-responseTypeToTag (DerivationRetrievedResponse _) = TagDerivationRetrievedResponse
-responseTypeToTag (DerivationQueryResponse _) = TagDerivationQueryResponse
-responseTypeToTag (DerivationOutputResponse _) = TagDerivationOutputResponse
-responseTypeToTag (DerivationListResponse _) = TagDerivationListResponse
-responseTypeToTag (GCResponse _) = TagGCResponse
-responseTypeToTag (GCStatusResponse _) = TagGCStatusResponse
-responseTypeToTag (GCRootAddedResponse _) = TagGCRootAddedResponse
-responseTypeToTag (GCRootRemovedResponse _) = TagGCRootRemovedResponse
-responseTypeToTag (GCRootsListResponse _) = TagGCRootsListResponse
-responseTypeToTag PongResponse = TagPongResponse
-responseTypeToTag ShutdownResponse = TagShutdownResponse
-responseTypeToTag (StatusResponse _) = TagStatusResponse
-responseTypeToTag (ConfigResponse _) = TagConfigResponse
-responseTypeToTag (ErrorResponse _) = TagErrorResponse
+responseTypeToTag (AuthResponse _) = AuthResponseTag
+responseTypeToTag (BuildStartedResponse _) = BuildStartedResponseTag
+responseTypeToTag (BuildResponse _) = BuildResponseTag
+responseTypeToTag (BuildStatusResponse _) = BuildStatusResponseTag
+responseTypeToTag (BuildOutputResponse _) = BuildOutputResponseTag
+responseTypeToTag (BuildListResponse _) = BuildListResponseTag
+responseTypeToTag (StoreAddResponse _) = StoreAddResponseTag
+responseTypeToTag (StoreVerifyResponse _) = StoreVerifyResponseTag
+responseTypeToTag (StorePathResponse _) = StorePathResponseTag
+responseTypeToTag (StoreListResponse _) = StoreListResponseTag
+responseTypeToTag (DerivationResponse _) = DerivationResponseTag
+responseTypeToTag (DerivationStoredResponse _) = DerivationStoredResponseTag
+responseTypeToTag (DerivationRetrievedResponse _) = DerivationRetrievedResponseTag
+responseTypeToTag (DerivationQueryResponse _) = DerivationQueryResponseTag
+responseTypeToTag (DerivationOutputResponse _) = DerivationOutputResponseTag
+responseTypeToTag (DerivationListResponse _) = DerivationListResponseTag
+responseTypeToTag (GCResponse _) = GCResponseTag
+responseTypeToTag (GCStatusResponse _) = GCStatusResponseTag
+responseTypeToTag (GCRootAddedResponse _) = GCRootAddedResponseTag
+responseTypeToTag (GCRootRemovedResponse _) = GCRootRemovedResponseTag
+responseTypeToTag (GCRootsListResponse _) = GCRootsListResponseTag
+responseTypeToTag PongResponse = PongResponseTag
+responseTypeToTag ShutdownResponse = ShutdownResponseTag
+responseTypeToTag (StatusResponse _) = StatusResponseTag
+responseTypeToTag (ConfigResponse _) = ConfigResponseTag
+responseTypeToTag (ErrorResponse _) = ErrorResponseTag
 
 -- | Receive a request from a protocol handle
-receiveRequest :: ProtocolHandle -> IO (Either ProtocolError (Int, DaemonRequest))
+receiveRequest :: ProtocolHandle -> IO (Either ProtocolError (Int, DaemonRequest, Maybe AuthToken))
 receiveRequest handle = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
@@ -1982,22 +1911,13 @@ receiveRequest handle = do
                 Left err ->
                     return $ Left (ProtocolParseError err)
 
-                Right (RequestMsgWrapper (RequestMsg reqId req)) ->
-                    case requestToRequestData req of
-                        Right reqData -> return $ Right (reqId, reqData)
-                        Left err -> return $ Left (ProtocolParseError err)
+                Right (RequestWrapper (RequestMessage reqTag reqPayload authToken)) ->
+                    case Aeson.fromJSON reqPayload of
+                        Aeson.Success reqData -> return $ Right (0, reqData, authToken)  -- Use ID 0 as placeholder
+                        Aeson.Error err -> return $ Left (ProtocolParseError (T.pack err))
 
                 Right _ ->
                     return $ Left (InvalidRequest "Expected request message")
-
--- | Convert from Request to DaemonRequest
-requestToRequestData :: Request -> Either Text DaemonRequest
-requestToRequestData req = do
-    let tag = reqTag req
-    let payload = reqPayload req
-    case Aeson.fromJSON payload of
-        Aeson.Success reqData -> Right reqData
-        Aeson.Error err -> Left $ "Failed to decode request payload: " <> T.pack err
 
 -- | Execute an action with a protocol handle and clean up after
 withProtocolHandle :: Socket -> (ProtocolHandle -> IO a) -> IO a
@@ -2162,12 +2082,6 @@ responseToText resp = case resp of
         "Auth accepted: " <> case uid of UserId u -> u
 
     AuthResponse (AuthRejected reason) ->
-        "Auth rejected: " <> reason
-
-    AuthResponse (AuthSuccess uid _) ->
-        "Auth accepted: " <> case uid of UserId u -> u
-
-    AuthResponse (AuthFailure reason) ->
         "Auth rejected: " <> reason
 
     BuildStartedResponse buildId ->

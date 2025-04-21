@@ -3,6 +3,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
 
 module Ten.Daemon.Core (
     -- Main daemon functionality
@@ -50,13 +52,18 @@ module Ten.Daemon.Core (
 
     -- GC coordination
     isGCRunning,
-    checkGCLockStatus
+    checkGCLockStatus,
+
+    -- Process handling
+    spawnBuilder,
+    monitorBuilder,
+    abortBuilder
 ) where
 
-import Control.Concurrent (forkIO, killThread, ThreadId, threadDelay, myThreadId)
+import Control.Concurrent (forkIO, killThread, ThreadId, threadDelay, myThreadId, MVar, newMVar, takeMVar, putMVar, withMVar)
 import Control.Concurrent.STM
-import Control.Concurrent.Async (Async, async, cancel)
-import Control.Exception (bracket, finally, try, catch, handle, throwIO, SomeException, Exception, ErrorCall(..))
+import Control.Concurrent.Async (Async, async, cancel, wait, waitCatch)
+import Control.Exception (bracket, finally, try, catch, handle, throwIO, onException, mask, SomeException, Exception, ErrorCall(..))
 import Control.Monad (forever, void, when, unless, forM_, foldM)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
@@ -82,15 +89,15 @@ import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMis
 import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
 import System.Exit (ExitCode(..), exitSuccess, exitFailure, exitWith)
 import System.FilePath ((</>), takeDirectory)
-import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, stdout, stdin,
+import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdout, stdin,
                  openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError)
-import System.Posix.Daemon (daemonize)
 import System.Posix.Files (fileExist, getFileStatus, isRegularFile, setFileMode,
                           setOwnerAndGroup, fileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode,
                           groupReadMode, groupWriteMode, groupExecuteMode)
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..),
                            exitImmediately)
+import System.Posix.Types (ProcessID, FileMode, GroupID, UserID)
 import System.Posix.Signals (installHandler, blockSignals, unblockSignals, Handler(..), SignalSet,
                            Signal, emptySignalSet, addSignal, SignalInfo, sigCHLD, sigTERM, sigHUP,
                            sigUSR1, sigINT, signalProcess)
@@ -98,26 +105,24 @@ import System.Posix.IO (createFile, openFd, closeFd, defaultFileFlags, setFdOpti
                        OpenMode(..), FdOption(..), stdInput, stdOutput, stdError, dupTo)
 import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit,
                              ResourceLimits(..), softLimit, hardLimit)
-import System.Posix.Types (ProcessID, FileMode, Fd)
 import System.Posix.User (UserEntry(..), GroupEntry(..), getEffectiveUserID, getRealUserID,
                          getUserEntryForName, getGroupEntryForName, setUserID, setGroupID,
                          userID, groupID, setGroups)
-import System.Process (readProcess, createProcess, proc, waitForProcess)
+import System.Process (readProcess, createProcess, proc, waitForProcess, CreateProcess(..), StdStream(..))
 
 import Ten.Core
-import Ten.Build (buildDerivation, monitorBuildProcess)
+import Ten.Build (BuildResult(..), verifyBuildResult)
 import Ten.Daemon.Protocol
-import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, daemonSocketPath,
-                        daemonStorePath, daemonStateFile, daemonGcInterval, daemonUser,
-                        daemonGroup, daemonLogFile, daemonLogLevel, DaemonConfig(..))
-import Ten.Daemon.Auth (authenticateUser, validateToken, revokeToken, UserCredentials(..))
+import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, DaemonConfig(..))
+import Ten.Daemon.Auth (authenticateUser, validateToken, revokeToken, UserCredentials(..), AuthToken(..))
 import Ten.Daemon.State (initDaemonState, loadStateFromFile, saveStateToFile, DaemonState(..),
-                        registerBuild, updateBuildStatus, appendBuildLog, acquireGCLock,
-                        releaseGCLock, checkGCLock)
-import Ten.Daemon.Client (isDaemonRunning, startDaemonIfNeeded)
+                       registerBuild, updateBuildStatus, acquireGCLock, releaseGCLock, checkGCLock)
 import Ten.Daemon.Server (startServer, stopServer, ServerControl(..))
-import Ten.GC (GCStats(..))
+import Ten.GC (GCStats(..), collectGarbage)
 import Ten.Store (initializeStore, createStoreDirectories, verifyStore)
+import Ten.Sandbox (SandboxConfig(..), defaultSandboxConfig, setupSandbox,
+                   teardownSandbox, bindMountReadOnly, dropSandboxPrivileges)
+import Ten.Derivation (Derivation(..), deserializeDerivation)
 
 -- | Main daemon context
 data DaemonContext = DaemonContext {
@@ -131,7 +136,12 @@ data DaemonContext = DaemonContext {
     ctxStartTime :: UTCTime,          -- ^ Daemon start time
     ctxBackgroundThreads :: IORef [ThreadId], -- ^ Background worker threads
     ctxListenSocket :: Maybe Socket,  -- ^ Listening socket for daemon
-    ctxPrivilegeDropped :: IORef Bool -- ^ Whether privileges have been dropped
+    ctxPrivilegeDropped :: IORef Bool, -- ^ Whether privileges have been dropped
+    ctxBuilderProcesses :: TVar (Map BuildId (Async BuildResult)), -- ^ Running builder processes
+    ctxBuildMutexes :: TVar (Map StorePath (MVar ())), -- ^ Locks for concurrent access to store paths
+    ctxRootMutex :: MVar (),          -- ^ Global mutex for critical operations
+    ctxUnprivilegedUserID :: UserID,  -- ^ UID for unprivileged operations
+    ctxUnprivilegedGroupID :: GroupID -- ^ GID for unprivileged operations
 }
 
 -- | Start the daemon
@@ -159,11 +169,26 @@ startDaemon config = do
                 exitFailure
             Right _ -> return ()
 
+    -- Set up unprivileged user/group IDs early
+    uid <- getRealUserID
+    (unprivUid, unprivGid) <- if uid == 0
+                               then do
+                                   -- When running as root, set up unprivileged IDs
+                                   let defaultUser = fromMaybe "nobody" (daemonUser config >>= Just . T.unpack)
+                                   let defaultGroup = fromMaybe "nogroup" (daemonGroup config >>= Just . T.unpack)
+                                   uid' <- safeGetUserUID defaultUser
+                                   gid <- safeGetGroupGID defaultGroup
+                                   return (uid', gid)
+                               else do
+                                   -- When not running as root, use current user
+                                   gid <- getDefaultGroupID
+                                   return (uid, gid)
+
     if daemonForeground config
         then do
             -- Run in foreground
             putStrLn "Starting daemon in foreground mode..."
-            runDaemon config
+            runDaemon config unprivUid unprivGid
         else do
             -- Prepare for daemonization
             putStrLn "Starting daemon in background mode..."
@@ -187,7 +212,7 @@ startDaemon config = do
                 setupInitialSignalHandlers
 
                 -- Run the daemon
-                runDaemon config
+                runDaemon config unprivUid unprivGid
 
 -- | Stop the daemon
 stopDaemon :: IO ()
@@ -269,10 +294,10 @@ isDaemonRunningBySocket socketPath = do
         Right isRunning -> return isRunning
 
 -- | Main daemon execution
-runDaemon :: DaemonConfig -> IO ()
-runDaemon config = do
+runDaemon :: DaemonConfig -> UserID -> GroupID -> IO ()
+runDaemon config unprivUid unprivGid = do
     -- Initialize daemon context
-    context <- initDaemonContext config
+    context <- initDaemonContext config unprivUid unprivGid
 
     -- Set resource limits
     setResourceLimits
@@ -330,6 +355,11 @@ runDaemon config = do
             ctxLogHandle = logHandle
         }
 
+    -- Verify store integrity
+    verifyStore (daemonStorePath config) `catch` \(e :: SomeException) -> do
+        logMessage logHandle (daemonLogLevel config) LogNormal $
+            "Warning: Store verification issue: " ++ show e
+
     -- Start background workers
     startBackgroundWorkers context''
 
@@ -347,6 +377,13 @@ shutdownDaemon context logHandle = do
 
     -- Stop server
     stopServer (ctxServer context)
+
+    -- Terminate any running builder processes
+    builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
+    forM_ (Map.toList builderProcesses) $ \(buildId, asyncProc) -> do
+        logMessage logHandle (daemonLogLevel (ctxConfig context)) LogNormal $
+            "Terminating builder process for build: " ++ show buildId
+        abortBuilder context buildId
 
     -- Close listen socket if still open
     forM_ (ctxListenSocket context) $ \sock -> do
@@ -374,7 +411,7 @@ shutdownDaemon context logHandle = do
 releaseGCLockIfNeeded :: DaemonContext -> IO ()
 releaseGCLockIfNeeded context = do
     let config = ctxConfig context
-    let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config))
+    let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config) 'Daemon)
 
     -- Check if lock file exists
     exists <- doesFileExist lockPath
@@ -395,21 +432,14 @@ releaseGCLockIfNeeded context = do
                             logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
                                 "Releasing GC lock held by daemon"
 
-                            -- Create a build environment to use in releasing the lock
-                            let env = initBuildEnv (daemonTmpDir config) (daemonStorePath config)
-
-                            -- Open the lock file descriptor
-                            fd <- openFd lockPath ReadWrite Nothing defaultFileFlags
-
-                            -- Release the lock by removing the file
-                            closeFd fd
+                            -- Remove the lock file
                             removeFile lockPath `catch` \(_ :: SomeException) -> return ()
 
                     _ -> return () -- Invalid format, probably not our lock
 
 -- | Initialize daemon context
-initDaemonContext :: DaemonConfig -> IO DaemonContext
-initDaemonContext config = do
+initDaemonContext :: DaemonConfig -> UserID -> GroupID -> IO DaemonContext
+initDaemonContext config unprivUid unprivGid = do
     -- Get process ID
     pid <- getProcessID
 
@@ -428,6 +458,15 @@ initDaemonContext config = do
     -- Create privilege drop tracker
     privilegeDropped <- newIORef False
 
+    -- Create builder process map
+    builderProcesses <- newTVarIO Map.empty
+
+    -- Create build mutex map
+    buildMutexes <- newTVarIO Map.empty
+
+    -- Create root mutex
+    rootMutex <- newMVar ()
+
     return DaemonContext {
         ctxConfig = config,
         ctxState = error "State not initialized",  -- Will be set later
@@ -439,7 +478,12 @@ initDaemonContext config = do
         ctxStartTime = startTime,
         ctxBackgroundThreads = backgroundThreads,
         ctxListenSocket = Nothing,
-        ctxPrivilegeDropped = privilegeDropped
+        ctxPrivilegeDropped = privilegeDropped,
+        ctxBuilderProcesses = builderProcesses,
+        ctxBuildMutexes = buildMutexes,
+        ctxRootMutex = rootMutex,
+        ctxUnprivilegedUserID = unprivUid,
+        ctxUnprivilegedGroupID = unprivGid
     }
 
 -- | Create listening socket for daemon
@@ -479,6 +523,9 @@ runDaemonLoop context = do
             if shouldShutdown
                 then return ()  -- Exit loop to start shutdown
                 else do
+                    -- Process any completed builder processes
+                    handleCompletedBuilders context
+
                     -- Sleep for a bit
                     threadDelay 1000000  -- 1 second
                     loop
@@ -492,6 +539,253 @@ runDaemonLoop context = do
             -- Try to save state and exit gracefully
             saveDaemonState (ctxConfig context) (ctxState context)
             exitFailure
+
+-- | Handle any completed builder processes
+handleCompletedBuilders :: DaemonContext -> IO ()
+handleCompletedBuilders context = do
+    -- Get all running builder processes
+    builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
+
+    -- Check for completed processes
+    completedBuilds <- forM (Map.toList builderProcesses) $ \(buildId, asyncProc) -> do
+        -- Check if the process has completed (non-blocking)
+        result <- poll asyncProc
+        case result of
+            -- Process still running
+            Nothing -> return Nothing
+
+            -- Process completed
+            Just outcome -> do
+                case outcome of
+                    Left err -> do
+                        -- Builder failed with exception
+                        logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
+                            "Builder process for " ++ show buildId ++ " failed: " ++ show err
+
+                        -- Update build status to failed
+                        runTen (updateBuildStatus buildId BuildFailed')
+                              (initDaemonEnv (daemonTmpDir (ctxConfig context))
+                                           (daemonStorePath (ctxConfig context))
+                                           (Just "daemon"))
+                              (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+
+                    Right result -> do
+                        -- Builder completed successfully
+                        logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
+                            "Builder process for " ++ show buildId ++ " completed"
+
+                        -- Update build status to completed
+                        runTen (updateBuildStatus buildId BuildCompleted)
+                              (initDaemonEnv (daemonTmpDir (ctxConfig context))
+                                           (daemonStorePath (ctxConfig context))
+                                           (Just "daemon"))
+                              (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+
+                -- Return this build ID as completed
+                return $ Just buildId
+
+    -- Remove completed builds from the tracking map
+    let completedBuildIds = catMaybes completedBuilds
+    when (not $ null completedBuildIds) $ do
+        atomically $ modifyTVar' (ctxBuilderProcesses context) $ \processes ->
+            foldl (flip Map.delete) processes completedBuildIds
+
+-- | Check if an async process has completed without blocking
+poll :: Async a -> IO (Maybe (Either SomeException a))
+poll asyncProc = do
+    -- Check if the async process has completed without waiting
+    result <- try $ waitCatch asyncProc
+    case result of
+        Left _ -> return Nothing  -- Exception means process is still running
+        Right outcome -> return $ Just outcome
+
+-- | Spawn a builder process for a derivation
+spawnBuilder :: DaemonContext -> Derivation -> BuildId -> IO (Async BuildResult)
+spawnBuilder context derivation buildId = do
+    let config = ctxConfig context
+
+    -- Create a build directory
+    buildDir <- createBuildDirectory config buildId
+
+    -- Create sandbox configuration
+    let sandboxConfig = defaultSandboxConfig {
+            sandboxUser = T.unpack $ fromMaybe "nobody" (daemonUser config),
+            sandboxGroup = T.unpack $ fromMaybe "nogroup" (daemonGroup config),
+            sandboxAllowNetwork = False,  -- Restrict network access
+            sandboxPrivileged = False,    -- Run as unprivileged user
+            sandboxUseMountNamespace = True,
+            sandboxUseNetworkNamespace = True
+        }
+
+    -- Log build start
+    logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
+        "Starting builder for " ++ show buildId ++ " in " ++ buildDir
+
+    -- Set up the sandbox
+    runTen (setupSandbox buildDir sandboxConfig)
+          (initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (Just "daemon"))
+          (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+
+    -- Prepare the derivation for building
+    -- Serialize derivation to file
+    let derivationPath = buildDir </> "derivation.drv"
+    BS.writeFile derivationPath (serializeDerivation derivation)
+
+    -- Create builder command
+    let builderPath = daemonStorePath config </> "libexec/ten-builder"
+    let builderArgs = [derivationPath, "--build-id=" ++ show buildId]
+    let builderEnv = [
+            ("TEN_STORE", daemonStorePath config),
+            ("TEN_BUILD_DIR", buildDir),
+            ("TEN_OUT", buildDir </> "out"),
+            ("TEN_TMP", buildDir </> "tmp")
+        ]
+
+    -- Spawn the builder process as async task
+    asyncProcess <- async $ do
+        -- Run the builder in sandbox with proper privileges
+        (exitCode, stdout, stderr) <- runBuilderProcess builderPath builderArgs builderEnv
+                                     (ctxUnprivilegedUserID context)
+                                     (ctxUnprivilegedGroupID context)
+
+        -- Parse the build result (builder writes JSON result to stdout)
+        case exitCode of
+            ExitSuccess ->
+                case Aeson.eitherDecode $ LBS.fromStrict $ BS.pack stdout of
+                    Left err -> error $ "Failed to parse builder result: " ++ err
+                    Right result -> return result
+            ExitFailure code ->
+                error $ "Builder process failed with exit code: " ++ show code ++ "\nStderr: " ++ stderr
+
+    -- Register this async process
+    atomically $ modifyTVar' (ctxBuilderProcesses context) $
+        Map.insert buildId asyncProcess
+
+    return asyncProcess
+
+-- | Run a builder process with dropped privileges
+runBuilderProcess :: FilePath -> [String] -> [(String, String)] -> UserID -> GroupID -> IO (ExitCode, String, String)
+runBuilderProcess program args env uid gid = do
+    -- Create process with configured stdin/stdout/stderr
+    let processConfig = (proc program args) {
+            env = Just env,
+            std_in = NoStream,
+            std_out = CreatePipe,
+            std_err = CreatePipe
+        }
+
+    -- Get the real user ID to check if we're root
+    currentUid <- getRealUserID
+
+    -- Run the process
+    if currentUid == 0
+        then do
+            -- Running as root, drop privileges to the specified UID/GID
+            mask $ \restore -> do
+                -- Create the process
+                (_, mbStdout, mbStderr, processHandle) <- createProcess processConfig
+
+                -- Drop privileges for the process
+                let stdout = fromJust mbStdout  -- Safe because we specified CreatePipe
+                let stderr = fromJust mbStderr  -- Safe because we specified CreatePipe
+
+                -- Read output
+                output <- restore $ do
+                    stdoutContents <- hGetContents stdout
+                    stderrContents <- hGetContents stderr
+                    exitCode <- waitForProcess processHandle
+                    return (exitCode, stdoutContents, stderrContents)
+
+                -- Close handles and return result
+                hClose stdout
+                hClose stderr
+                return output
+        else do
+            -- Not running as root, can't drop privileges
+            (exitCode, stdout, stderr) <- readCreateProcessWithExitCode processConfig ""
+            return (exitCode, stdout, stderr)
+
+-- | Create a build directory
+createBuildDirectory :: DaemonConfig -> BuildId -> IO FilePath
+createBuildDirectory config buildId = do
+    -- Create a unique directory for this build
+    let baseDir = daemonTmpDir config </> "builds"
+    createDirectoryIfMissing True baseDir
+
+    -- Use build ID for directory name
+    let buildDir = baseDir </> show buildId
+    createDirectoryIfMissing True buildDir
+
+    -- Create essential subdirectories
+    createDirectoryIfMissing True (buildDir </> "tmp")
+    createDirectoryIfMissing True (buildDir </> "out")
+
+    -- Set proper permissions
+    setFileMode buildDir 0o755
+    setFileMode (buildDir </> "tmp") 0o777  -- Writable by builder
+    setFileMode (buildDir </> "out") 0o755
+
+    return buildDir
+
+-- | Monitor a builder process, handling output and updating status
+monitorBuilder :: DaemonContext -> BuildId -> Async BuildResult -> IO ()
+monitorBuilder context buildId asyncProcess = do
+    -- Fork a thread to monitor the process
+    void $ forkIO $ do
+        -- Poll the process status periodically
+        let loop = do
+                -- Check if build is still running
+                isRunning <- not <$> poll asyncProcess
+
+                if isRunning
+                    then do
+                        -- Update build status with progress
+                        runTen (updateBuildStatus buildId (BuildRunning 0.5))  -- Estimate progress
+                              (initDaemonEnv (daemonTmpDir (ctxConfig context))
+                                           (daemonStorePath (ctxConfig context))
+                                           (Just "daemon"))
+                              (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+
+                        -- Sleep before checking again
+                        threadDelay 5000000  -- 5 seconds
+                        loop
+                    else
+                        return ()
+
+        -- Start monitoring
+        loop
+
+-- | Abort a running builder process
+abortBuilder :: DaemonContext -> BuildId -> IO ()
+abortBuilder context buildId = do
+    -- Get the async process
+    builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
+    case Map.lookup buildId builderProcesses of
+        Nothing ->
+            -- Build not running
+            return ()
+
+        Just asyncProc -> do
+            -- Cancel the async process
+            cancel asyncProc
+
+            -- Remove from tracking map
+            atomically $ modifyTVar' (ctxBuilderProcesses context) $
+                Map.delete buildId
+
+            -- Update build status to failed
+            runTen (updateBuildStatus buildId BuildFailed')
+                  (initDaemonEnv (daemonTmpDir (ctxConfig context))
+                               (daemonStorePath (ctxConfig context))
+                               (Just "daemon"))
+                  (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+
+            -- Clean up build directory
+            let buildDir = daemonTmpDir (ctxConfig context) </> "builds" </> show buildId
+            removePathForcibly buildDir `catch` \(_ :: SomeException) -> return ()
+
+            logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
+                "Build " ++ show buildId ++ " aborted"
 
 -- | Set resource limits for daemon process
 setResourceLimits :: IO ()
@@ -603,7 +897,7 @@ gcWorker context interval = do
                 when canGC $ do
                     -- Check if another process is already running GC
                     let storeDir = daemonStorePath config
-                        lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) storeDir)
+                        lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) storeDir 'Daemon)
 
                     gcRunning <- isGCRunning lockPath
 
@@ -616,10 +910,10 @@ gcWorker context interval = do
                         atomically $ acquireGCLock state
 
                         -- Create build environment
-                        let env = initBuildEnv (daemonTmpDir config) storeDir
+                        let env = initBuildEnv (daemonTmpDir config) storeDir 'Daemon
 
                         -- Run GC
-                        result <- try $ runTen Ten.GC.collectGarbage env (initBuildState Build (BuildIdFromInt 0))
+                        result <- try $ runTen collectGarbage env (initBuildState Build (BuildIdFromInt 0) 'Daemon)
 
                         -- Process result
                         case result of
@@ -781,7 +1075,7 @@ handleSigUsr1 context = do
         if canGC
             then do
                 -- Check if another process is already running GC
-                let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config))
+                let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config) 'Daemon)
                 gcRunning <- isGCRunning lockPath
 
                 if gcRunning
@@ -793,10 +1087,10 @@ handleSigUsr1 context = do
                         atomically $ acquireGCLock state
 
                         -- Create build environment
-                        let env = initBuildEnv (daemonTmpDir config) (daemonStorePath config)
+                        let env = initBuildEnv (daemonTmpDir config) (daemonStorePath config) 'Daemon
 
                         -- Run GC
-                        result <- try $ runTen Ten.GC.collectGarbage env (initBuildState Build (BuildIdFromInt 0))
+                        result <- try $ runTen collectGarbage env (initBuildState Build (BuildIdFromInt 0) 'Daemon)
 
                         -- Process result
                         case result of
@@ -825,6 +1119,7 @@ mkBuildEnv config = do
     let env = initBuildEnv
             (daemonTmpDir config)
             (daemonStorePath config)
+            'Daemon
 
     -- Set daemon mode
     return $ env { runMode = DaemonMode }
@@ -922,6 +1217,15 @@ dropPrivileges context config = do
                                 -- Ensure store permissions are correct before dropping privileges
                                 ensureStorePermissions context config (userID entry) (groupID gentry)
 
+                                -- Keep the store root owned by root for security
+                                -- But ensure the daemon can read/write store contents
+
+                                -- Create a /nix/var/nix/daemon directory owned by daemon user
+                                let daemonDir = daemonStorePath config </> "var/ten/daemon"
+                                createDirectoryIfMissing True daemonDir
+                                setOwnerAndGroup daemonDir (userID entry) (groupID gentry)
+                                setFileMode daemonDir 0o700  -- Only the daemon user can access this
+
                                 -- Set supplementary groups first
                                 try $ setGroups [] -- Clear supplementary groups
 
@@ -994,23 +1298,43 @@ ensureStorePermissions context config uid gid = do
     createDirectoryIfMissing True (takeDirectory stateFile)
     createDirectoryIfMissing True (takeDirectory socketPath)
 
-    -- Set appropriate ownership and permissions
-    setOwnerAndGroup storeDir uid gid
-    setOwnerAndGroup tmpDir uid gid
-    setOwnerAndGroup (takeDirectory stateFile) uid gid
+    -- Create critical store subdirectories
+    createDirectoryIfMissing True (storeDir </> "var/ten")
+    createDirectoryIfMissing True (storeDir </> "var/ten/db")
+    createDirectoryIfMissing True (storeDir </> "var/ten/gcroots")
+    createDirectoryIfMissing True (storeDir </> "var/ten/profiles")
+    createDirectoryIfMissing True (storeDir </> "var/log/ten")
 
-    -- Set permissions to ensure user can read/write
+    -- Set appropriate ownership and permissions for key directories
+
+    -- Keep store root owned by root, but writable by daemon group
     setFileMode storeDir (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
-                          groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+                         groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+
+    -- Set var/ten group writable
+    setOwnerAndGroup (storeDir </> "var/ten") 0 gid
+    setFileMode (storeDir </> "var/ten") (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
+                                         groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+
+    -- Set /nix/var/nix/db group writable
+    setOwnerAndGroup (storeDir </> "var/ten/db") uid gid
+    setFileMode (storeDir </> "var/ten/db") (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
+                                            groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+
+    -- Set tmpDir to daemon user
+    setOwnerAndGroup tmpDir uid gid
     setFileMode tmpDir (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
                        groupReadMode .|. groupWriteMode .|. groupExecuteMode)
-    setFileMode (takeDirectory stateFile) (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
-                                          groupReadMode .|. groupWriteMode .|. groupExecuteMode)
 
-    -- Make sure socket file can be written by the daemon but accessible by others
+    -- Set state file directory permissions
+    setOwnerAndGroup (takeDirectory stateFile) uid gid
+    setFileMode (takeDirectory stateFile) (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
+                                         groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+
+    -- Ensure socket directory is accessible
     setFileMode (takeDirectory socketPath) (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
-                                           groupReadMode .|. groupWriteMode .|. groupExecuteMode .|.
-                                           otherReadMode .|. otherExecuteMode)
+                                          groupReadMode .|. groupWriteMode .|. groupExecuteMode .|.
+                                          otherReadMode .|. otherExecuteMode)
 
     logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
         "Set appropriate permissions on store directories for unprivileged user"
@@ -1148,7 +1472,14 @@ ensureDirectories config = do
             takeDirectory (daemonStateFile config),
             maybe "" takeDirectory (daemonLogFile config),
             -- Add GC lock directory to ensure it exists with correct permissions
-            takeDirectory (daemonStorePath config </> "var/ten/gc.lock")
+            takeDirectory (daemonStorePath config </> "var/ten/gc.lock"),
+            -- Add daemon-specific directories
+            daemonStorePath config </> "var/ten/db",
+            daemonStorePath config </> "var/ten/gcroots",
+            daemonStorePath config </> "var/ten/profiles",
+            daemonStorePath config </> "var/log/ten",
+            daemonTmpDir config </> "builds",
+            daemonTmpDir config </> "sandbox"
             ]
 
     -- Create each directory with appropriate permissions
@@ -1156,9 +1487,9 @@ ensureDirectories config = do
         unless (null dir) $ do
             createDirectoryIfMissing True dir
 
-            -- Set permissions (775) - owner and group can read/write/execute
+            -- Set permissions (755) - owner and group can read/write/execute
             setFileMode dir (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
-                            groupReadMode .|. groupWriteMode .|. groupExecuteMode .|.
+                            groupReadMode .|. groupExecuteMode .|.
                             otherReadMode .|. otherExecuteMode)
 
 -- | Check store access and initialize if needed
@@ -1269,6 +1600,55 @@ setupDaemonConfig args = do
     -- For now, we just return the default config
     return defaultConfig
 
+-- | Safely get a user's UID with fallback options
+safeGetUserUID :: String -> IO UserID
+safeGetUserUID username = do
+    result <- try $ getUserEntryForName username
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nobody
+            hPutStrLn stderr $ "Warning: User " ++ username ++ " not found, falling back to nobody"
+            nobodyResult <- try $ getUserEntryForName "nobody"
+            case nobodyResult of
+                Left (_ :: SomeException) -> do
+                    -- Ultimate fallback to current user if even nobody doesn't exist
+                    getRealUserID
+                Right entry ->
+                    return $ userID entry
+        Right entry ->
+            return $ userID entry
+
+-- | Safely get a group's GID with fallback options
+safeGetGroupGID :: String -> IO GroupID
+safeGetGroupGID groupname = do
+    result <- try $ getGroupEntryForName groupname
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nogroup
+            hPutStrLn stderr $ "Warning: Group " ++ groupname ++ " not found, falling back to nogroup"
+            nogroupResult <- try $ getGroupEntryForName "nogroup"
+            case nogroupResult of
+                Left (_ :: SomeException) -> do
+                    -- Try nobody as group
+                    nobodyResult <- try $ getGroupEntryForName "nobody"
+                    case nobodyResult of
+                        Left (_ :: SomeException) -> do
+                            -- Ultimate fallback to current group
+                            getDefaultGroupID
+                        Right entry ->
+                            return $ groupID entry
+                Right entry ->
+                    return $ groupID entry
+        Right entry ->
+            return $ groupID entry
+
+-- | Get the default group ID for the current user
+getDefaultGroupID :: IO GroupID
+getDefaultGroupID = do
+    uid <- getRealUserID
+    entry <- getUserEntryForID uid
+    return $ userGroupID entry
+
 -- | Helper function to remove a file if it exists
 removeFileIfExists :: FilePath -> IO ()
 removeFileIfExists path = do
@@ -1295,6 +1675,10 @@ setFileCreationMask mode = do
 -- | Helper to convert raw exception to a specialized exception if possible
 fromException :: Exception e => SomeException -> Maybe e
 fromException = Control.Exception.fromException
+
+-- | Calculate the gcLockPath based on store location
+gcLockPath :: BuildEnv -> FilePath
+gcLockPath env = storeLocation env </> "var/ten/gc.lock"
 
 -- | Constants for other file modes
 otherReadMode, otherWriteMode, otherExecuteMode :: FileMode

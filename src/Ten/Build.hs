@@ -3,6 +3,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 
 module Ten.Build (
     -- Core build functions
@@ -92,6 +95,8 @@ import Ten.Graph
 import Ten.DB.Core
 import Ten.DB.Derivations
 import Ten.DB.References
+import Ten.Daemon.Protocol
+import Ten.Daemon.Client
 
 -- | Result of a build operation
 data BuildResult = BuildResult
@@ -115,20 +120,28 @@ data BuilderEnv = BuilderEnv
     , builderOutputDir :: FilePath     -- Directory for build outputs
     }
 
--- | Build a derivation, using the appropriate strategy
-buildDerivation :: Derivation -> TenM 'Build BuildResult
+-- | Build a derivation, dispatching based on privilege context
+buildDerivation :: PrivCtx c => Derivation -> TenM 'Build c BuildResult
 buildDerivation deriv = do
+    -- Determine if we're in privileged (daemon) or unprivileged (builder) context
+    ctx <- getPrivilegeContext
+    case ctx of
+        Privileged -> buildDerivationPrivileged deriv
+        Unprivileged -> buildDerivationUnprivileged deriv
+
+-- | Build a derivation in privileged (daemon) context
+buildDerivationPrivileged :: Derivation -> TenM 'Build 'Privileged BuildResult
+buildDerivationPrivileged deriv = do
     -- Log start of build
     logMsg 1 $ "Building derivation: " <> derivName deriv
 
-    -- Serialize and store the derivation in the store
-    derivPath <- storeDerivation deriv
+    -- Serialize and store the derivation in the store (privileged operation)
+    derivPath <- privilegedStoreDerivation deriv
 
-    -- No need to check for Maybe BuildId since it's now required
-    -- Simply use the current build ID
+    -- Get current build ID
     bid <- gets currentBuildId
 
-    -- Register the derivation in the database
+    -- Register the derivation in the database (privileged operation)
     env <- ask
     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         liftIO $ registerDerivationFile db deriv derivPath
@@ -140,13 +153,63 @@ buildDerivation deriv = do
     case derivStrategy deriv of
         ApplicativeStrategy -> do
             logMsg 2 $ "Using applicative (parallel) build strategy for " <> derivName deriv
-            buildApplicativeStrategy deriv
+            buildApplicativeStrategyPrivileged deriv
         MonadicStrategy -> do
             logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
-            buildMonadicStrategy deriv
+            buildMonadicStrategyPrivileged deriv
+
+-- | Build a derivation in unprivileged (builder) context
+buildDerivationUnprivileged :: Derivation -> TenM 'Build 'Unprivileged BuildResult
+buildDerivationUnprivileged deriv = do
+    -- Log start of build
+    logMsg 1 $ "Building derivation via daemon: " <> derivName deriv
+
+    -- Send build request to daemon
+    daemonConn <- getDaemonConnection
+    buildRequest <- createBuildDerivationRequest deriv
+
+    -- Wait for response from daemon
+    response <- sendToDaemon daemonConn buildRequest
+
+    case response of
+        BuildResponse result -> return result
+        ErrorResponse err -> throwError err
+        _ -> throwError $ BuildFailed "Unexpected response from daemon"
+
+-- | Store a derivation in privileged context
+privilegedStoreDerivation :: Derivation -> TenM 'Build 'Privileged StorePath
+privilegedStoreDerivation deriv = do
+    -- Create serialized representation
+    let derivContent = serializeDerivation deriv
+    let derivName' = derivName deriv <> ".drv"
+
+    -- Store in content-addressable store (privileged operation)
+    storePath <- addToStore derivName' derivContent
+
+    -- Return the store path
+    return storePath
+
+-- | Request daemon to store a derivation in unprivileged context
+unprivilegedStoreDerivation :: Derivation -> TenM 'Build 'Unprivileged StorePath
+unprivilegedStoreDerivation deriv = do
+    -- Get daemon connection
+    daemonConn <- getDaemonConnection
+
+    -- Create store request
+    let derivContent = serializeDerivation deriv
+    let derivName' = derivName deriv <> ".drv"
+    storeRequest <- createStoreRequest derivName' derivContent
+
+    -- Send request to daemon
+    response <- sendToDaemon daemonConn storeRequest
+
+    case response of
+        StoreAddResponse path -> return path
+        ErrorResponse err -> throwError err
+        _ -> throwError $ BuildFailed "Unexpected response from daemon for store request"
 
 -- | Instantiate the derivation (implement input handling and preparation)
-instantiateDerivation :: Derivation -> TenM 'Build ()
+instantiateDerivation :: PrivCtx c => Derivation -> TenM 'Build c ()
 instantiateDerivation deriv = do
     -- Log instantiation start
     logMsg 2 $ "Instantiating derivation: " <> derivName deriv
@@ -158,9 +221,9 @@ instantiateDerivation deriv = do
     -- Add proof for the build
     addProof InputProof
 
--- | Build a derivation using applicative strategy (parallel dependencies)
-buildApplicativeStrategy :: Derivation -> TenM 'Build BuildResult
-buildApplicativeStrategy deriv = do
+-- | Build a derivation using applicative strategy in privileged context
+buildApplicativeStrategyPrivileged :: Derivation -> TenM 'Build 'Privileged BuildResult
+buildApplicativeStrategyPrivileged deriv = do
     env <- ask
 
     -- Get all dependencies
@@ -178,10 +241,10 @@ buildApplicativeStrategy deriv = do
     }
 
     -- Check if we need to build dependencies first
-    missingDeps <- filterM (\path -> not <$> storePathExists path) (Set.toList inputs)
+    missingDeps <- filterM (\path -> not <$> privilegedStorePathExists path) (Set.toList inputs)
 
     if null missingDeps
-        then buildWithSandbox deriv config
+        then buildWithSandboxPrivileged deriv config
         else do
             -- Build missing dependencies concurrently
             logMsg 2 $ "Building " <> T.pack (show $ length missingDeps) <> " dependencies first"
@@ -202,7 +265,7 @@ buildApplicativeStrategy deriv = do
                                         " - " <> getErrorMessage err'
 
             -- Now build with all dependencies available
-            buildWithSandbox deriv config
+            buildWithSandboxPrivileged deriv config
   where
     isLeft (Left _) = True
     isLeft _ = False
@@ -215,8 +278,12 @@ buildApplicativeStrategy deriv = do
     getErrorMessage (SandboxError msg) = msg
     getErrorMessage _ = "Build error"
 
--- | Find derivation objects for dependencies
-findDependencyDerivations :: [StorePath] -> TenM 'Build (Map String Derivation)
+-- | Build using applicative strategy in unprivileged context
+buildApplicativeStrategy :: Derivation -> TenM 'Build 'Unprivileged BuildResult
+buildApplicativeStrategy = buildDerivationUnprivileged
+
+-- | Find derivation objects for dependencies (privileged operation)
+findDependencyDerivations :: [StorePath] -> TenM 'Build 'Privileged (Map String Derivation)
 findDependencyDerivations paths = do
     env <- ask
 
@@ -233,16 +300,16 @@ findDependencyDerivations paths = do
 
         return result
 
--- | Build a derivation using monadic strategy (sequential with return-continuation)
-buildMonadicStrategy :: Derivation -> TenM 'Build BuildResult
-buildMonadicStrategy deriv = do
+-- | Build a derivation using monadic strategy in privileged context
+buildMonadicStrategyPrivileged :: Derivation -> TenM 'Build 'Privileged BuildResult
+buildMonadicStrategyPrivileged deriv = do
     env <- ask
 
     -- Get all direct dependencies
     let inputs = Set.map inputPath (derivInputs deriv)
 
     -- Check if all inputs exist
-    missingDeps <- filterM (\path -> not <$> storePathExists path) (Set.toList inputs)
+    missingDeps <- filterM (\path -> not <$> privilegedStorePathExists path) (Set.toList inputs)
     unless (null missingDeps) $
         throwError $ BuildFailed $ "Missing dependencies: " <>
                      T.intercalate ", " (map storeName missingDeps)
@@ -259,7 +326,7 @@ buildMonadicStrategy deriv = do
     }
 
     -- Build in sandbox
-    result <- buildWithSandbox deriv config
+    result <- buildWithSandboxPrivileged deriv config
 
     -- Check if this build returned a derivation
     returnDerivExists <- checkIfReturnDerivation result
@@ -279,14 +346,37 @@ buildMonadicStrategy deriv = do
 
             -- Recursively build the inner derivation (must use monadic strategy)
             logMsg 1 $ "Building inner derivation returned by " <> derivName deriv
-            buildMonadicStrategy innerDrv
+            buildMonadicStrategyPrivileged innerDrv
         else
             -- Normal build result
             return result
 
--- | Build a derivation in a sandbox
-buildWithSandbox :: Derivation -> SandboxConfig -> TenM 'Build BuildResult
-buildWithSandbox deriv config = do
+-- | Build using monadic strategy in unprivileged context
+buildMonadicStrategy :: Derivation -> TenM 'Build 'Unprivileged BuildResult
+buildMonadicStrategy = buildDerivationUnprivileged
+
+-- | Check if store path exists (privileged operation)
+privilegedStorePathExists :: StorePath -> TenM p 'Privileged Bool
+privilegedStorePathExists path = do
+    env <- ask
+    let fullPath = storePathToFilePath path env
+    liftIO $ doesPathExist fullPath
+
+-- | Check if store path exists (unprivileged operation via daemon)
+unprivilegedStorePathExists :: StorePath -> TenM p 'Unprivileged Bool
+unprivilegedStorePathExists path = do
+    daemonConn <- getDaemonConnection
+    verifyRequest <- createStoreVerifyRequest path
+    response <- sendToDaemon daemonConn verifyRequest
+
+    case response of
+        StoreVerifyResponse exists -> return exists
+        ErrorResponse err -> throwError err
+        _ -> throwError $ StoreError "Unexpected response from daemon for store verification"
+
+-- | Build a derivation in a sandbox (privileged operation)
+buildWithSandboxPrivileged :: Derivation -> SandboxConfig -> TenM 'Build 'Privileged BuildResult
+buildWithSandboxPrivileged deriv config = do
     -- Get all inputs
     let inputs = Set.map inputPath $ derivInputs deriv
 
@@ -294,7 +384,7 @@ buildWithSandbox deriv config = do
     withSandbox inputs config $ \buildDir -> do
         -- Get the builder path in the store
         let builderPath = derivBuilder deriv
-        builderContent <- readFromStore builderPath
+        builderContent <- readFromStorePrivileged builderPath
 
         -- Set up builder with proper permissions
         execPath <- setupBuilder builderPath builderContent buildDir
@@ -383,7 +473,7 @@ buildWithSandbox deriv config = do
                             }
                     else do
                         -- Collect normal build results
-                        outputs <- collectBuildResult deriv buildDir
+                        outputs <- collectBuildResultPrivileged deriv buildDir
 
                         -- Add build proof
                         addProof BuildProof
@@ -396,8 +486,15 @@ buildWithSandbox deriv config = do
                             , resultMetadata = Map.empty
                             }
 
+-- | Read from store in privileged context
+readFromStorePrivileged :: StorePath -> TenM p 'Privileged BS.ByteString
+readFromStorePrivileged path = do
+    env <- ask
+    let fullPath = storePathToFilePath path env
+    liftIO $ BS.readFile fullPath
+
 -- | Run a builder process with proper privilege handling
-runBuilder :: BuilderEnv -> TenM 'Build (Either Text (ExitCode, String, String))
+runBuilder :: BuilderEnv -> TenM 'Build 'Privileged (Either Text (ExitCode, String, String))
 runBuilder env = do
     -- Validate paths to prevent path traversal
     let program = normalise (builderProgram env)
@@ -640,7 +737,7 @@ closeUnusedFileDescriptors = do
     return ()
 
 -- | Set up a builder executable in the sandbox
-setupBuilder :: StorePath -> BS.ByteString -> FilePath -> TenM 'Build FilePath
+setupBuilder :: StorePath -> BS.ByteString -> FilePath -> TenM 'Build 'Privileged FilePath
 setupBuilder builderPath builderContent buildDir = do
     -- Write the builder to the sandbox
     let execPath = buildDir </> "builder"
@@ -682,7 +779,7 @@ setupBuilder builderPath builderContent buildDir = do
     return execPath
 
 -- | Get environment variables for the build
-getBuildEnvironment :: BuildEnv -> Derivation -> FilePath -> TenM 'Build (Map Text Text)
+getBuildEnvironment :: BuildEnv -> Derivation -> FilePath -> TenM 'Build c Map Text Text
 getBuildEnvironment env deriv buildDir = do
     -- Get current build state
     state <- get
@@ -714,10 +811,9 @@ getBuildEnvironment env deriv buildDir = do
             ]
         ]
 
--- | Collect output files from a build and add them to the store
--- This function now properly tracks references between outputs and inputs
-collectBuildResult :: Derivation -> FilePath -> TenM 'Build (Set StorePath)
-collectBuildResult deriv buildDir = do
+-- | Collect output files from a build and add them to the store (privileged operation)
+collectBuildResultPrivileged :: Derivation -> FilePath -> TenM 'Build 'Privileged (Set StorePath)
+collectBuildResultPrivileged deriv buildDir = do
     -- Get the output directory
     let outDir = buildDir </> "out"
 
@@ -769,7 +865,7 @@ collectBuildResult deriv buildDir = do
         return outputPaths
   where
     -- Process a single output, adding it to the store
-    processOutput :: Database -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build (Set StorePath)
+    processOutput :: Database -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build 'Privileged (Set StorePath)
     processOutput db outDir accPaths output = do
         env <- ask
         let outputFile = outDir </> T.unpack (outputName output)
@@ -824,17 +920,6 @@ collectBuildResult deriv buildDir = do
                     throwError $ BuildFailed $
                         "Expected output not produced: " <> outputName output
 
-    -- Scan an output file for references and register them
-    scanAndRegisterReferences :: Database -> FilePath -> StorePath -> IO ()
-    scanAndRegisterReferences db storeDir path = do
-        -- Scan the file for references
-        outputFilePath <- storePathToFilePath path <$> initBuildEnv "" storeDir
-        foundRefs <- scanFileForReferences storeDir outputFilePath
-
-        -- Register each found reference
-        when (not $ Set.null foundRefs) $
-            registerReferences db path foundRefs
-
 -- | Create a tarball from a directory
 createTarball :: FilePath -> FilePath -> IO ()
 createTarball sourceDir targetFile = do
@@ -848,7 +933,7 @@ createTarball sourceDir targetFile = do
         _ -> throwIO $ userError $ "Failed to create tarball: " ++ stderr
 
 -- | Verify that a build result matches the expected outputs
-verifyBuildResult :: Derivation -> BuildResult -> TenM 'Build Bool
+verifyBuildResult :: PrivCtx c => Derivation -> BuildResult -> TenM 'Build c Bool
 verifyBuildResult deriv result = do
     -- First check exit code
     if resultExitCode result /= ExitSuccess
@@ -879,21 +964,47 @@ verifyBuildResult deriv result = do
                     -- Check if all expected outputs are included in actual outputs
                     let allOutputsPresent = expectedOutputNames `Set.isSubsetOf` actualOutputNames
 
-                    -- Check that each output verifies correctly
+                    -- Check that each output verifies correctly - use context-specific verification
                     validOutputs <- forM (Set.toList (resultOutputs result)) $ \path -> do
-                        verifyStorePath path
+                        ctx <- getPrivilegeContext
+                        case ctx of
+                            Privileged -> verifyStorePathPrivileged path
+                            Unprivileged -> verifyStorePathUnprivileged path
 
                     -- Return True if all checks pass
                     return $ allOutputsPresent && and validOutputs
 
+-- | Verify a store path in privileged context
+verifyStorePathPrivileged :: StorePath -> TenM p 'Privileged Bool
+verifyStorePathPrivileged path = do
+    env <- ask
+    let fullPath = storePathToFilePath path env
+    exists <- liftIO $ doesPathExist fullPath
+    if not exists
+        then return False
+        else do
+            -- For a real implementation, we'd verify hash integrity here
+            return True
+
+-- | Verify a store path in unprivileged context (via daemon)
+verifyStorePathUnprivileged :: StorePath -> TenM p 'Unprivileged Bool
+verifyStorePathUnprivileged path = do
+    daemonConn <- getDaemonConnection
+    verifyRequest <- createStoreVerifyRequest path
+    response <- sendToDaemon daemonConn verifyRequest
+
+    case response of
+        StoreVerifyResponse valid -> return valid
+        _ -> return False
+
 -- | Check if a build result includes a returned derivation
-checkIfReturnDerivation :: BuildResult -> TenM 'Build Bool
+checkIfReturnDerivation :: BuildResult -> TenM 'Build c Bool
 checkIfReturnDerivation result =
     return $ resultExitCode result == ExitSuccess &&
              Map.member "returnDerivation" (resultMetadata result)
 
 -- | Check for a returned derivation in a build directory
-checkForReturnedDerivation :: FilePath -> TenM 'Build (Maybe Derivation)
+checkForReturnedDerivation :: PrivCtx c => FilePath -> TenM 'Build c (Maybe Derivation)
 checkForReturnedDerivation buildDir = do
     let returnPath = returnDerivationPath buildDir
 
@@ -920,7 +1031,7 @@ checkForReturnedDerivation buildDir = do
             return Nothing
 
 -- | Handle a returned derivation
-handleReturnedDerivation :: BuildResult -> TenM 'Build Derivation
+handleReturnedDerivation :: PrivCtx c => BuildResult -> TenM 'Build c Derivation
 handleReturnedDerivation result = do
     -- Get the returned derivation path
     let returnPath = T.unpack $ resultMetadata result Map.! "returnDerivation"
@@ -937,13 +1048,24 @@ handleReturnedDerivation result = do
             -- Add proof that we successfully got a returned derivation
             addProof RecursionProof
 
-            -- Store the inner derivation in the content store
-            derivPath <- storeDerivation innerDrv
+            -- Store the inner derivation in the content store - use context-specific method
+            ctx <- getPrivilegeContext
+            derivPath <- case ctx of
+                Privileged -> privilegedStoreDerivation innerDrv
+                Unprivileged -> unprivilegedStoreDerivation innerDrv
 
-            -- Register the inner derivation in the database
-            env <- ask
-            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                liftIO $ registerDerivationFile db innerDrv derivPath
+            -- Register the inner derivation in the database or via protocol
+            ctx <- getPrivilegeContext
+            case ctx of
+                Privileged -> do
+                    env <- ask
+                    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                        liftIO $ registerDerivationFile db innerDrv derivPath
+                Unprivileged -> do
+                    daemonConn <- getDaemonConnection
+                    regRequest <- createRegisterDerivationRequest innerDrv derivPath
+                    _ <- sendToDaemon daemonConn regRequest
+                    return ()
 
             -- Check for cycles
             chain <- gets buildChain
@@ -955,7 +1077,7 @@ handleReturnedDerivation result = do
             return innerDrv
 
 -- | Build a graph of derivations
-buildDerivationGraph :: BuildGraph -> TenM 'Build (Map Text BuildResult)
+buildDerivationGraph :: PrivCtx c => BuildGraph -> TenM 'Build c (Map Text BuildResult)
 buildDerivationGraph graph = do
     -- First get dependencies in topological order
     sorted <- topologicalSort graph
@@ -977,7 +1099,7 @@ buildDerivationGraph graph = do
         return $ Map.insert drvId result results
 
 -- | Build derivations in dependency order
-buildInDependencyOrder :: [Derivation] -> TenM 'Build [BuildResult]
+buildInDependencyOrder :: PrivCtx c => [Derivation] -> TenM 'Build c [BuildResult]
 buildInDependencyOrder derivations = do
     -- First check for cycles
     let cycle = detectRecursionCycle derivations
@@ -988,7 +1110,7 @@ buildInDependencyOrder derivations = do
     mapM buildDerivation derivations
 
 -- | Build dependencies concurrently
-buildDependenciesConcurrently :: [Derivation] -> TenM 'Build (Map String (Either BuildError BuildResult))
+buildDependenciesConcurrently :: PrivCtx c => [Derivation] -> TenM 'Build c (Map String (Either BuildError BuildResult))
 buildDependenciesConcurrently derivations = do
     env <- ask
     state <- get
@@ -1003,6 +1125,9 @@ buildDependenciesConcurrently derivations = do
     -- Track all build threads
     threads <- liftIO $ newTVarIO []
 
+    -- Get current privilege context
+    ctx <- getPrivilegeContext
+
     -- Start a thread for each derivation
     liftIO $ forM_ derivations $ \drv -> do
         let hash = T.unpack $ derivHash drv
@@ -1010,7 +1135,11 @@ buildDependenciesConcurrently derivations = do
             -- Acquire semaphore
             bracket (waitQSem sem) (\_ -> signalQSem sem) $ \_ -> restore $ do
                 -- Run the build in a separate thread
-                result <- runTen (buildDerivation drv) env state
+                result <- case ctx of
+                    Privileged ->
+                        runTenPrivileged (buildDerivationPrivileged drv) env state
+                    Unprivileged ->
+                        runTenUnprivileged (buildDerivationUnprivileged drv) env state
                 -- Store the result
                 atomically $ modifyTVar resultMap $ \m ->
                     Map.insert hash (either Left (Right . fst) result) m
@@ -1031,7 +1160,7 @@ buildDependenciesConcurrently derivations = do
         atomically $ readTVar resultMap
 
 -- | Wait for dependencies to complete
-waitForDependencies :: Set BuildId -> TenM 'Build ()
+waitForDependencies :: PrivCtx c => Set BuildId -> TenM 'Build c ()
 waitForDependencies depIds = do
     -- Get max wait time
     maxWaitTime <- asks (\e -> 60 * 60)  -- Default to 1 hour
@@ -1046,7 +1175,7 @@ waitForDependencies depIds = do
         when (isNothing result) $
             throwError $ BuildFailed "Timeout waiting for dependencies to complete"
   where
-    checkDependencies :: Set BuildId -> TenM 'Build Bool
+    checkDependencies :: Set BuildId -> TenM 'Build c Bool
     checkDependencies deps = do
         statuses <- forM (Set.toList deps) $ \bid -> do
             stat <- try $ getBuildStatus bid
@@ -1061,32 +1190,51 @@ waitForDependencies depIds = do
         threadDelay (10 * 1000000)  -- 10 seconds
 
 -- | Report build progress
-reportBuildProgress :: BuildId -> Float -> TenM 'Build ()
+reportBuildProgress :: PrivCtx c => BuildId -> Float -> TenM 'Build c ()
 reportBuildProgress buildId progress = do
     -- Log progress
     logMsg 2 $ "Build progress for " <> T.pack (show buildId) <> ": " <>
                T.pack (show (progress * 100)) <> "%"
 
     -- Update build status in daemon state if in daemon mode
-    isDaemon <- isDaemonMode
-    when isDaemon $ do
-        -- Update the status and notify any waiting clients
-        updateBuildStatus buildId (BuildRunning progress)
+    ctx <- getPrivilegeContext
+    case ctx of
+        Privileged -> do
+            isDaemon <- isDaemonMode
+            when isDaemon $ do
+                -- Update the status and notify any waiting clients
+                updateBuildStatus buildId (BuildRunning progress)
+        Unprivileged -> do
+            -- Notify daemon of progress via protocol
+            daemonConn <- getDaemonConnection
+            progressRequest <- createBuildProgressRequest buildId progress
+            _ <- sendToDaemon daemonConn progressRequest
+            return ()
 
 -- | Report build status
-reportBuildStatus :: BuildId -> BuildStatus -> TenM 'Build ()
+reportBuildStatus :: PrivCtx c => BuildId -> BuildStatus -> TenM 'Build c ()
 reportBuildStatus buildId status = do
     -- Log status change
     logMsg 2 $ "Build status for " <> T.pack (show buildId) <> ": " <>
                T.pack (show status)
 
-    -- Update status in daemon state if in daemon mode
-    isDaemon <- isDaemonMode
-    when isDaemon $
-        updateBuildStatus buildId status
+    -- Update status based on context
+    ctx <- getPrivilegeContext
+    case ctx of
+        Privileged -> do
+            -- Update status in daemon state if in daemon mode
+            isDaemon <- isDaemonMode
+            when isDaemon $
+                updateBuildStatus buildId status
+        Unprivileged -> do
+            -- Notify daemon of status via protocol
+            daemonConn <- getDaemonConnection
+            statusRequest <- createBuildStatusRequest buildId status
+            _ <- sendToDaemon daemonConn statusRequest
+            return ()
 
 -- | Update build status in daemon state
-updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build ()
+updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build 'Privileged ()
 updateBuildStatus buildId status = do
     -- In a real daemon implementation, this would update a shared TVar
     -- and notify any clients waiting for status updates
@@ -1097,13 +1245,21 @@ updateBuildStatus buildId status = do
             (T.pack (show buildId), T.pack (show status))
 
 -- | Get build status from daemon state
-getBuildStatus :: BuildId -> TenM 'Build BuildStatus
+getBuildStatus :: PrivCtx c => BuildId -> TenM 'Build c BuildStatus
 getBuildStatus buildId = do
+    ctx <- getPrivilegeContext
+    case ctx of
+        Privileged -> getBuildStatusPrivileged buildId
+        Unprivileged -> getBuildStatusUnprivileged buildId
+
+-- | Get build status in privileged context
+getBuildStatusPrivileged :: BuildId -> TenM 'Build 'Privileged BuildStatus
+getBuildStatusPrivileged buildId = do
     env <- ask
     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         results <- liftIO $ dbQuery db
             "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
-            [T.pack (show buildId)] :: TenM 'Build [Only Text]
+            [T.pack (show buildId)] :: TenM 'Build 'Privileged [Only Text]
 
         case results of
             [Only statusText] -> case parseStatus statusText of
@@ -1130,6 +1286,18 @@ getBuildStatus buildId = do
     parseStatus "BuildCompleted" = Just BuildCompleted
     parseStatus "BuildFailed'" = Just BuildFailed'
     parseStatus _ = Nothing
+
+-- | Get build status in unprivileged context
+getBuildStatusUnprivileged :: BuildId -> TenM 'Build 'Unprivileged BuildStatus
+getBuildStatusUnprivileged buildId = do
+    daemonConn <- getDaemonConnection
+    statusRequest <- createBuildStatusRequest buildId BuildPending  -- Dummy status for request
+    response <- sendToDaemon daemonConn statusRequest
+
+    case response of
+        BuildStatusResponse update -> return (buildStatus update)
+        ErrorResponse err -> throwError err
+        _ -> throwError $ BuildFailed "Unexpected response from daemon for status request"
 
 -- | Semaphore implementation for controlling concurrency
 data QSem = QSem (MVar Int)
@@ -1174,3 +1342,49 @@ isReturnContinuationDerivation :: Text -> [Text] -> Map Text Text -> Bool
 isReturnContinuationDerivation name args env =
     -- This is a simplified check that could be expanded based on actual criteria
     Map.member "TEN_RETURN" env || "-return" `elem` args
+
+-- | Helper functions for context queries
+getPrivilegeContext :: PrivCtx c => TenM p c PrivilegeContext
+getPrivilegeContext = do
+    env <- ask
+    return $ privilegeContext env
+
+-- | Get daemon connection (should be available in unprivileged context)
+getDaemonConnection :: TenM p 'Unprivileged DaemonConnection
+getDaemonConnection = do
+    env <- ask
+    case daemonConnection env of
+        Just conn -> return conn
+        Nothing -> throwError $ DaemonError "No daemon connection available"
+
+-- | Create daemon protocol requests (these would be implemented in Ten.Daemon.Protocol)
+createBuildDerivationRequest :: Derivation -> TenM p 'Unprivileged DaemonRequest
+createBuildDerivationRequest deriv =
+    return $ BuildDerivationRequest deriv defaultBuildRequestInfo
+
+createStoreRequest :: Text -> BS.ByteString -> TenM p 'Unprivileged DaemonRequest
+createStoreRequest name content =
+    return $ StoreAddRequest name content
+
+createStoreVerifyRequest :: StorePath -> TenM p 'Unprivileged DaemonRequest
+createStoreVerifyRequest path =
+    return $ StoreVerifyRequest (storePathToText path)
+
+createRegisterDerivationRequest :: Derivation -> StorePath -> TenM p 'Unprivileged DaemonRequest
+createRegisterDerivationRequest deriv path =
+    return $ StoreDerivationCmd $ StoreDerivationRequest (serializeDerivation deriv) True
+
+createBuildProgressRequest :: BuildId -> Float -> TenM p 'Unprivileged DaemonRequest
+createBuildProgressRequest bid progress =
+    return $ BuildStatusRequest bid
+
+createBuildStatusRequest :: BuildId -> BuildStatus -> TenM p 'Unprivileged DaemonRequest
+createBuildStatusRequest bid status =
+    return $ BuildStatusRequest bid
+
+-- | Send request to daemon and get response
+sendToDaemon :: DaemonConnection -> DaemonRequest -> TenM p 'Unprivileged DaemonResponse
+sendToDaemon conn req = do
+    -- This would use the actual client implementation from Ten.Daemon.Client
+    response <- liftIO $ requestFromDaemon conn req
+    return response

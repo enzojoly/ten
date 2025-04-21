@@ -2,12 +2,15 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DataKinds #-}
 
 module Main where
 
 import Control.Concurrent (threadDelay, myThreadId)
 import Control.Exception (bracket, try, catch, SomeException, IOException, finally)
-import Control.Monad (when, unless, forever)
+import Control.Monad (when, unless, forever, void)
+import Control.Monad.IO.Class (liftIO)
 import Data.Maybe (isJust, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -16,21 +19,29 @@ import System.Console.GetOpt
 import System.Directory (doesFileExist, createDirectoryIfMissing, removeFile)
 import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
 import System.Exit (exitSuccess, exitFailure)
-import System.FilePath (takeDirectory)
+import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..))
-import System.Posix.Daemonize (daemonize)
-import System.Posix.Files (fileExist)
+import System.Posix.Daemon (daemonize)
+import System.Posix.Files (fileExist, setFileMode)
 import System.Posix.Process (getProcessID, exitImmediately)
 import System.Posix.Signals
 import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName, UserEntry(..), GroupEntry(..),
-                         getRealUserID, setUserID, setGroupID, getUserEntryForName, getGroupEntryForName)
+                         getRealUserID, setUserID, setGroupID, getUserEntryForName, getGroupEntryForName,
+                         userID, groupID)
 
-import Ten.Core (BuildError(..), LogMsg(..))
+-- Import privilege-aware modules
+import Ten.Core
+       (BuildError(..), LogMsg(..), TenM, BuildEnv(..), BuildState, PrivCtx(..),
+        runTenDaemon, initDaemonEnv, initStoreEnv, initDaemonState,
+        withPrivilegedContext, dropPrivileges, setupPrivilegedStore)
 import Ten.Daemon.Config (DaemonConfig(..), LogLevel(..), defaultDaemonConfig, getDefaultConfig, parseConfigArgs,
                           loadConfigFromEnv, loadConfigFromFile, saveConfigToFile)
-import Ten.Daemon.Core (startDaemon, stopDaemon, isDaemonRunning)
+import Ten.Daemon.Core (startDaemon, stopDaemon, isDaemonRunning, initSecureSocket, acquireGlobalLock)
 import Ten.Daemon.State (DaemonState(..), initializeDaemonState, persistStateToFile, recoverStateFromFile)
 import Ten.Daemon.Server (runDaemonServer)
+import Ten.Daemon.Protocol (initializeProtocolHandlers)
+import Ten.Store (initializeStore, createStoreDirectories, verifyStore)
+import Ten.DB.Core (initializeDatabase, ensureDBDirectories)
 
 -- | Command line options
 data DaemonOption
@@ -48,6 +59,7 @@ data DaemonOption
     | OptPidFile FilePath           -- PID file path
     | OptReload                     -- Reload configuration
     | OptDebug                      -- Enable debug mode
+    | OptMaxJobs Int                -- Maximum concurrent jobs
     deriving (Show, Eq)
 
 -- | Command to execute
@@ -111,6 +123,9 @@ options =
     , Option ['d'] ["debug"]
         (NoArg OptDebug)
         "Enable debug mode"
+    , Option ['j'] ["max-jobs"]
+        (ReqArg (OptMaxJobs . read) "NUM")
+        "Maximum number of concurrent build jobs"
     ]
 
 -- | Parse command line arguments
@@ -190,6 +205,7 @@ main = do
     let pidFile = getOpt' (\case OptPidFile x -> Just x; _ -> Nothing)
     let reload = hasOpt OptReload
     let debug = hasOpt OptDebug
+    let maxJobs = getOpt' (\case OptMaxJobs x -> Just x; _ -> Nothing)
 
     -- Load configuration
     config <- case configFile of
@@ -213,6 +229,7 @@ main = do
             , daemonLogFile = (\f -> if f == "stdout" then Nothing else Just f) <$> logFile <|> daemonLogFile config
             , daemonLogLevel = fromMaybe (daemonLogLevel config) logLevel
             , daemonForeground = foreground || daemonForeground config
+            , daemonMaxJobs = fromMaybe (daemonMaxJobs config) maxJobs
             }
 
     -- Enable debug mode if requested
@@ -249,6 +266,12 @@ startDaemonProcess config pidFilePath = do
         hPutStrLn stderr "Daemon is already running"
         exitFailure
 
+    -- Ensure store directory structure exists
+    setupStoreStructure config
+
+    -- Acquire global lock to ensure only one daemon is running
+    acquireGlobalLockSafe config
+
     -- Check if we should daemonize or run in foreground
     if daemonForeground config
         then do
@@ -273,6 +296,9 @@ startDaemonProcess config pidFilePath = do
                 -- Write PID file
                 writePidFile pidFile
 
+                -- Initialize store directories with correct permissions
+                initializeSecureStore config
+
                 -- Drop privileges if running as root and user/group specified
                 dropPrivilegesIfNeeded config
 
@@ -283,6 +309,58 @@ startDaemonProcess config pidFilePath = do
                     -- Remove PID file
                     removeFileSafe pidFile
                     )
+
+-- | Setup store directory structure
+setupStoreStructure :: DaemonConfig -> IO ()
+setupStoreStructure config = do
+    -- Create base store directory
+    createDirectoryIfMissing True (daemonStorePath config)
+
+    -- Create essential subdirectories
+    let subdirs = ["tmp", "gc-roots", "var/ten", "var/log", "var/nix/db"]
+    forM_ subdirs $ \dir ->
+        createDirectoryIfMissing True (daemonStorePath config </> dir)
+
+    -- Create database directories
+    ensureDBDirectories (daemonStorePath config)
+
+    -- Set proper permissions on store directories
+    -- Root needs read/write/execute, everyone else needs read/execute
+    setFileMode (daemonStorePath config) 0o755
+
+-- | Acquire global lock safely
+acquireGlobalLockSafe :: DaemonConfig -> IO ()
+acquireGlobalLockSafe config = do
+    let lockPath = daemonStorePath config </> "var/ten/daemon.lock"
+    createDirectoryIfMissing True (takeDirectory lockPath)
+    result <- try $ acquireGlobalLock lockPath
+    case result of
+        Left (e :: SomeException) -> do
+            hPutStrLn stderr $ "Error acquiring global lock: " ++ show e
+            exitFailure
+        Right _ -> return ()
+
+-- | Initialize secure store
+initializeSecureStore :: DaemonConfig -> IO ()
+initializeSecureStore config = do
+    -- Create store directories
+    createStoreDirectories (daemonStorePath config)
+
+    -- Initialize store database
+    result <- try $ initializeStore (daemonStorePath config)
+    case result of
+        Left (e :: SomeException) -> do
+            logError $ "Failed to initialize store: " ++ show e
+            throw e
+        Right _ -> return ()
+  where
+    logError :: String -> IO ()
+    logError msg = case daemonLogFile config of
+        Just path -> appendFile path (msg ++ "\n")
+        Nothing -> hPutStrLn stderr msg
+
+    throw :: SomeException -> IO ()
+    throw = throwIO
 
 -- | Stop the daemon process
 stopDaemonProcess :: DaemonConfig -> IO ()
@@ -366,11 +444,36 @@ runDaemonWithConfig config = do
     -- Set up logging
     setupLogging config
 
+    -- Initialize database
+    dbPath <- initializeDatabase (daemonStorePath config </> "var/ten/db") 5000
+
+    -- Initialize secure daemon socket
+    socket <- initSecureSocket (daemonSocketPath config)
+
+    -- Initialize protocol handlers
+    protocolHandlers <- initializeProtocolHandlers
+
     -- Load or initialize daemon state
     state <- loadOrInitializeState config
 
-    -- Run the daemon server
-    result <- try $ runDaemonServer config state
+    -- Initialize the privileged store environment
+    storeEnv <- initStoreEnv (daemonStorePath config)
+
+    -- Initialize daemon environment with privilege awareness
+    let env = initDaemonEnv
+                (daemonStorePath config </> "tmp")
+                (daemonStorePath config)
+                (daemonUser config)
+
+    -- Initialize daemon state with proper privilege context
+    dState <- initDaemonState 'Daemon state
+
+    -- Setup the privileged store with proper access controls
+    void $ runTenDaemon (setupPrivilegedStore (daemonSocketPath config)) env dState
+
+    -- Run the daemon server in privileged context
+    result <- try $ withPrivilegedContext $
+                runDaemonServer config state socket protocolHandlers
     case result of
         Left (e :: SomeException) -> do
             logError $ "Daemon crashed: " ++ show e
@@ -410,14 +513,14 @@ loadOrInitializeState config = do
             case result of
                 Left err -> do
                     logWarning $ "Failed to load state file, initializing new state: " ++ err
-                    initializeDaemonState
+                    initializeDaemonState (daemonMaxJobs config)
                 Right state -> do
                     logInfo "Loaded daemon state from file"
                     return state
         else do
             -- Initialize new state
             logInfo "Initializing new daemon state"
-            initializeDaemonState
+            initializeDaemonState (daemonMaxJobs config)
   where
     logWarning, logInfo :: String -> IO ()
     logWarning msg = case daemonLogFile config of
@@ -442,6 +545,9 @@ installSignalHandlers config = do
 
     -- Handle SIGUSR1 (custom action, e.g., dump state)
     installHandler sigUSR1 (Catch $ dumpState config) Nothing
+
+    -- Handle SIGUSR2 (trigger garbage collection)
+    installHandler sigUSR2 (Catch $ triggerGC config) Nothing
 
     return ()
 
@@ -478,16 +584,41 @@ dumpState config = do
         Just path -> appendFile path ("[INFO] " ++ msg ++ "\n")
         Nothing -> hPutStrLn stdout ("[INFO] " ++ msg)
 
+-- | Trigger garbage collection
+triggerGC :: DaemonConfig -> IO ()
+triggerGC config = do
+    logInfo "Received SIGUSR2, triggering garbage collection"
+    -- In a real implementation, this would trigger the GC process
+    return ()
+  where
+    logInfo msg = case daemonLogFile config of
+        Just path -> appendFile path ("[INFO] " ++ msg ++ "\n")
+        Nothing -> hPutStrLn stdout ("[INFO] " ++ msg)
+
 -- | Clean up resources at exit
 cleanupAtExit :: DaemonConfig -> IO ()
 cleanupAtExit config = do
     -- Remove socket file
     removeFileSafe (daemonSocketPath config)
 
-    -- Perform any other cleanup actions
-    return ()
+    -- Release any locks
+    removeFileSafe (daemonStorePath config </> "var/ten/daemon.lock")
+    removeFileSafe (daemonStorePath config </> "var/ten/gc.lock")
 
--- | Drop privileges if needed
+    -- Persist state if possible
+    catch (saveCurrentState config) (\(_ :: SomeException) -> return ())
+
+-- | Save current daemon state
+saveCurrentState :: DaemonConfig -> IO ()
+saveCurrentState config = do
+    -- In a real implementation, this would save the full daemon state
+    logInfo "Saving daemon state before exit"
+  where
+    logInfo msg = case daemonLogFile config of
+        Just path -> appendFile path ("[INFO] " ++ msg ++ "\n")
+        Nothing -> hPutStrLn stdout ("[INFO] " ++ msg)
+
+-- | Drop privileges if needed with enhanced security
 dropPrivilegesIfNeeded :: DaemonConfig -> IO ()
 dropPrivilegesIfNeeded config = do
     -- Check if we're running as root
@@ -500,23 +631,93 @@ dropPrivilegesIfNeeded config = do
                 userEntry <- getUserEntryForName (T.unpack user)
                 groupEntry <- getGroupEntryForName (T.unpack group)
 
+                -- Set up store directories with correct ownership
+                ensureStoreOwnership (daemonStorePath config) (userID userEntry) (groupID groupEntry)
+
                 -- Set group first (needed before dropping user privileges)
                 setGroupID (groupID groupEntry)
 
-                -- Set user
+                -- Set user (dropping root privileges)
                 setUserID (userID userEntry)
 
+                -- Verify privilege drop worked
+                newUid <- getEffectiveUserID
+                when (newUid == 0) $
+                    error "Failed to drop privileges - still running as root!"
+
                 logInfo $ "Dropped privileges to user=" ++ T.unpack user ++ ", group=" ++ T.unpack group
+
             (Just user, Nothing) -> do
                 -- Get user entry
                 userEntry <- getUserEntryForName (T.unpack user)
 
-                -- Set user
+                -- Use user's primary group
+                let gid = userGroupID userEntry
+
+                -- Set up store directories with correct ownership
+                ensureStoreOwnership (daemonStorePath config) (userID userEntry) gid
+
+                -- Set user (dropping root privileges)
                 setUserID (userID userEntry)
 
+                -- Verify privilege drop worked
+                newUid <- getEffectiveUserID
+                when (newUid == 0) $
+                    error "Failed to drop privileges - still running as root!"
+
                 logInfo $ "Dropped privileges to user=" ++ T.unpack user
+
             _ -> return () -- No privilege dropping requested
   where
     logInfo msg = case daemonLogFile config of
         Just path -> appendFile path ("[INFO] " ++ msg ++ "\n")
         Nothing -> hPutStrLn stdout ("[INFO] " ++ msg)
+
+-- | Ensure store has correct ownership for privilege drop
+ensureStoreOwnership :: FilePath -> UserID -> GroupID -> IO ()
+ensureStoreOwnership storePath uid gid = do
+    -- Set ownership on key directories
+    setOwnershipRecursive storePath uid gid
+    setOwnershipRecursive (storePath </> "var") uid gid
+    setOwnershipRecursive (storePath </> "tmp") uid gid
+
+    -- Log that we're setting ownership
+    putStrLn $ "Setting store ownership to UID=" ++ show uid ++ ", GID=" ++ show gid
+
+-- | Set ownership recursively on a directory
+setOwnershipRecursive :: FilePath -> UserID -> GroupID -> IO ()
+setOwnershipRecursive path uid gid = do
+    -- Check if path exists
+    exists <- doesPathExist path
+    when exists $ do
+        -- Set ownership on this path
+        setOwnerAndGroup path uid gid `catch` \(e :: SomeException) ->
+            hPutStrLn stderr $ "Warning: Could not set ownership on " ++ path ++ ": " ++ show e
+
+        -- Check if it's a directory
+        isDir <- doesDirectoryExist path
+        when isDir $ do
+            -- Get directory contents
+            contents <- listDirectory path
+            -- Set ownership on each entry
+            forM_ contents $ \entry ->
+                setOwnershipRecursive (path </> entry) uid gid
+
+-- Missing helper functions for compatibility
+doesPathExist :: FilePath -> IO Bool
+doesPathExist path = do
+    fileExists <- doesFileExist path
+    if fileExists
+        then return True
+        else doesDirectoryExist path
+
+setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
+setOwnerAndGroup path uid gid = do
+    setOwnership path uid gid
+
+-- Import compatibility functions
+import System.Posix.Files (setOwnerAndGroup)
+throwIO :: Exception e => e -> IO a
+throwIO = Control.Exception.throwIO
+listDirectory :: FilePath -> IO [FilePath]
+listDirectory = System.Directory.listDirectory

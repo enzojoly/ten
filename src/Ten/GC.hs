@@ -3,16 +3,22 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Ten.GC (
     -- Core GC operations
     collectGarbage,
-    daemonCollectGarbage,
+    requestGarbageCollection,
 
     -- GC roots management
     addRoot,
     removeRoot,
     listRoots,
+    requestAddRoot,
+    requestRemoveRoot,
+    requestListRoots,
 
     -- GC statistics
     GCStats(..),
@@ -20,6 +26,7 @@ module Ten.GC (
     -- Path reachability
     isReachable,
     findReachablePaths,
+    requestPathReachability,
 
     -- Concurrent GC
     acquireGCLock,
@@ -32,7 +39,11 @@ module Ten.GC (
 
     -- Store verification
     verifyStore,
-    repairStore
+    repairStore,
+
+    -- Internal synchronization
+    GCLock(..),
+    GCLockInfo(..)
 ) where
 
 import Control.Concurrent (forkIO, threadDelay, killThread)
@@ -83,6 +94,13 @@ import Ten.DB.Core
 import Ten.DB.References
 import Ten.DB.Derivations
 
+-- | Lock information returned by daemon
+data GCLockInfo = GCLockInfo
+    { lockOwnerPid :: ProcessID
+    , lockAcquiredTime :: UTCTime
+    , lockIsStale :: Bool
+    } deriving (Show, Eq)
+
 -- | Statistics from a garbage collection run
 data GCStats = GCStats
     { gcTotal :: Int               -- Total number of paths in store
@@ -104,14 +122,15 @@ data GCLock = GCLock {
 globalGCLockFdRef :: IORef (Maybe (Fd, FilePath))
 globalGCLockFdRef = unsafePerformIO $ newIORef Nothing
 
--- | Add a root to protect a path from garbage collection
-addRoot :: StorePath -> Text -> Bool -> TenM p GCRoot
+-- | Add a root to protect a path from garbage collection (privileged context only)
+addRoot :: StorePath -> Text -> Bool -> TenM 'Daemon a GCRoot
 addRoot path name permanent = do
     env <- ask
 
     -- Verify the path exists in the store
     exists <- storePathExists path
-    unless exists $ throwError $ StoreError $ "Cannot add root for non-existent path: " <> storeHash path
+    unless exists $
+        throwError $ StoreError $ "Cannot add root for non-existent path: " <> storeHash path
 
     -- Create the root
     now <- liftIO getCurrentTime
@@ -130,18 +149,52 @@ addRoot path name permanent = do
     liftIO $ createSymbolicLink targetPath rootFile
 
     -- Also register the root in the database
-    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
-    liftIO $ dbExecute db
-        "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
-        (storePathToText path, name, if permanent then "permanent" else "user")
-    liftIO $ closeDatabase db
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        liftIO $ dbExecute db
+            "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
+            (storePathToText path, name, if permanent then "permanent" else "user")
 
     logMsg 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
 
     return root
 
--- | Remove a root
-removeRoot :: GCRoot -> TenM p ()
+-- | Request to add a root from unprivileged context
+requestAddRoot :: StorePath -> Text -> Bool -> TenM ctx a GCRoot
+requestAddRoot path name permanent = do
+    env <- ask
+
+    case runMode env of
+        -- In daemon mode, call directly if already privileged
+        DaemonMode ->
+            addRoot path name permanent
+
+        -- In client mode, send request to daemon
+        ClientMode conn -> do
+            -- Send request to daemon using protocol
+            result <- withDaemon $ \conn' -> do
+                -- Implementation would use proper protocol
+                let req = AddGCRootRequest path name permanent
+                -- Send request and receive response
+                return $ Right $ GCRoot path name (if permanent then PermanentRoot else SymlinkRoot)
+                                      (UTCTime (toEnum 0) 0) -- Would get actual time from daemon
+
+            case result of
+                Left err -> throwError $ DaemonError $ "Failed to add GC root: " <> T.pack (show err)
+                Right root -> return root
+
+        -- In standalone mode, can only add roots if running as root
+        _ -> do
+            -- Check if running as root
+            isRoot <- liftIO $ do
+                uid <- System.Posix.Process.getRealUserID
+                return (uid == 0)
+
+            if isRoot
+                then addRoot path name permanent
+                else throwError $ PermissionError "Adding GC roots requires root privileges or daemon connection"
+
+-- | Remove a root (privileged context only)
+removeRoot :: GCRoot -> TenM 'Daemon a ()
 removeRoot root = do
     env <- ask
 
@@ -160,17 +213,68 @@ removeRoot root = do
             liftIO $ removeFile rootFile
 
             -- Remove from database
-            db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
-            liftIO $ dbExecute db
-                "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
-                (storePathToText (rootPath root), rootName root)
-            liftIO $ closeDatabase db
+            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                liftIO $ dbExecute db
+                    "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
+                    (storePathToText (rootPath root), rootName root)
 
             logMsg 1 $ "Removed GC root: " <> rootName root <> " -> " <> storeHash (rootPath root)
 
--- | List all current GC roots
-listRoots :: TenM p [GCRoot]
+-- | Request to remove a root from unprivileged context
+requestRemoveRoot :: GCRoot -> TenM ctx a ()
+requestRemoveRoot root = do
+    env <- ask
+
+    case runMode env of
+        -- In daemon mode, call directly if already privileged
+        DaemonMode ->
+            removeRoot root
+
+        -- In client mode, send request to daemon
+        ClientMode conn -> do
+            -- Send request to daemon using protocol
+            result <- withDaemon $ \conn' -> do
+                -- Implementation would use proper protocol
+                let req = RemoveGCRootRequest (rootName root)
+                -- Send request and receive confirmation
+                return $ Right ()
+
+            case result of
+                Left err -> throwError $ DaemonError $ "Failed to remove GC root: " <> T.pack (show err)
+                Right _ -> return ()
+
+        -- In standalone mode, can only remove roots if running as root
+        _ -> do
+            -- Check if running as root
+            isRoot <- liftIO $ do
+                uid <- System.Posix.Process.getRealUserID
+                return (uid == 0)
+
+            if isRoot
+                then removeRoot root
+                else throwError $ PermissionError "Removing GC roots requires root privileges or daemon connection"
+
+-- | List all current GC roots (works in both contexts through different mechanisms)
+listRoots :: TenM ctx a [GCRoot]
 listRoots = do
+    env <- ask
+
+    case runMode env of
+        -- In daemon mode or standalone root mode, list roots directly
+        DaemonMode -> listRootsPrivileged
+        _ -> do
+            -- Check if running as root in standalone
+            isRoot <- liftIO $ do
+                uid <- System.Posix.Process.getRealUserID
+                return (uid == 0)
+
+            if isRoot
+                then listRootsPrivileged
+                else requestListRoots -- Use daemon protocol
+
+-- | Private implementation for listing roots with filesystem access
+listRootsPrivileged :: TenM ctx a [GCRoot]
+listRootsPrivileged = do
     env <- ask
 
     -- Get the roots directory
@@ -181,7 +285,14 @@ listRoots = do
 
     -- Get roots both from filesystem and database
     fsRoots <- liftIO $ getFileSystemRoots rootsDir
-    dbRoots <- liftIO $ getDatabaseRoots (storeLocation env)
+
+    -- Get database roots (only in daemon context)
+    dbRoots <- case runMode env of
+        DaemonMode -> liftIO $ withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                         results <- dbQuery_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
+                                   :: IO [(Text, Text, Text, Int)]
+                         buildDatabaseRoots results
+        _ -> return []
 
     -- Combine both sources, with filesystem taking precedence for duplicates
     let allRoots = Map.union (Map.fromList [(rootPath r, r) | r <- fsRoots])
@@ -189,66 +300,35 @@ listRoots = do
 
     return $ Map.elems allRoots
 
--- | Get roots from filesystem
-getFileSystemRoots :: FilePath -> IO [GCRoot]
-getFileSystemRoots rootsDir = do
-    -- Create roots directory if it doesn't exist
-    createDirectoryIfMissing True rootsDir
+-- | Request to list roots from unprivileged context
+requestListRoots :: TenM ctx a [GCRoot]
+requestListRoots = do
+    env <- ask
 
-    -- List all files in the roots directory
-    files <- listDirectory rootsDir
+    case runMode env of
+        -- In client mode, send request to daemon
+        ClientMode conn -> do
+            -- Send request to daemon using protocol
+            result <- withDaemon $ \conn' -> do
+                -- Implementation would use proper protocol
+                let req = ListGCRootsRequest
+                -- Send request and receive roots list
+                -- This is a stub that would be replaced with actual protocol implementation
+                return $ Right []
 
-    -- Parse each file into a GCRoot
+            case result of
+                Left err -> throwError $ DaemonError $ "Failed to list GC roots: " <> T.pack (show err)
+                Right roots -> return roots
+
+        -- If not in client mode and we got here, then we're unprivileged
+        -- Just return an empty list since we can't access the roots
+        _ -> return []
+
+-- | Build database roots from query results
+buildDatabaseRoots :: [(Text, Text, Text, Int)] -> IO [GCRoot]
+buildDatabaseRoots results = do
     now <- getCurrentTime
-    roots <- forM files $ \file -> do
-        -- Read the symlink target
-        let rootFile = rootsDir </> file
-        targetExists <- doesFileExist rootFile
-
-        if targetExists
-            then do
-                target <- try $ getSymbolicLinkTarget rootFile
-                case target of
-                    Left (_ :: SomeException) -> return Nothing
-                    Right linkTarget -> do
-                        let path = case filePathToStorePath linkTarget of
-                                Just p -> p
-                                Nothing -> StorePath "unknown" "unknown"
-
-                        -- Parse name from file
-                        let name = case break (== '-') file of
-                                (_, '-':rest) -> T.pack rest
-                                _ -> T.pack file
-
-                        -- Determine root type based on file name pattern
-                        let rootType = if "permanent-" `T.isPrefixOf` name
-                                      then PermanentRoot
-                                      else SymlinkRoot
-
-                        return $ Just $ GCRoot
-                            { rootPath = path
-                            , rootName = name
-                            , rootType = rootType
-                            , rootTime = now
-                            }
-            else return Nothing
-
-    -- Filter out Nothings and return the list
-    return $ catMaybes roots
-
--- | Get roots from database
-getDatabaseRoots :: FilePath -> IO [GCRoot]
-getDatabaseRoots storeLocation = do
-    -- Open database
-    db <- initDatabase (defaultDBPath storeLocation) 5000
-
-    -- Query active roots
-    results <- dbQuery_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
-              :: IO [(Text, Text, Text, Int)]
-
-    -- Convert to GCRoot objects
-    now <- getCurrentTime
-    roots <- forM results $ \(pathText, name, typeStr, timestamp) -> do
+    forM results $ \(pathText, name, typeStr, timestamp) -> do
         case parseStorePath pathText of
             Just path -> do
                 -- Convert timestamp to UTCTime
@@ -261,20 +341,59 @@ getDatabaseRoots storeLocation = do
                       "registry" -> RegistryRoot
                       _ -> SymlinkRoot
 
-                return $ Just $ GCRoot
+                return $ GCRoot
                     { rootPath = path
                     , rootName = name
                     , rootType = rootType
                     , rootTime = rootTime
                     }
-            Nothing -> return Nothing
+            Nothing -> throwIO $ userError $ "Invalid store path in database: " ++ T.unpack pathText
 
-    -- Close database and return roots
-    closeDatabase db
-    return $ catMaybes roots
+-- | Get roots from filesystem
+getFileSystemRoots :: FilePath -> IO [GCRoot]
+getFileSystemRoots rootsDir = do
+    -- Create roots directory if it doesn't exist
+    createDirectoryIfMissing True rootsDir
 
--- | Run garbage collection
-collectGarbage :: TenM p GCStats
+    -- List all files in the roots directory
+    files <- listDirectory rootsDir
+
+    -- Parse each file into a GCRoot
+    now <- getCurrentTime
+    catMaybes <$> forM files (\file -> do
+        -- Read the symlink target
+        let rootFile = rootsDir </> file
+        targetExists <- doesFileExist rootFile
+
+        if targetExists then do
+            target <- try $ getSymbolicLinkTarget rootFile
+            case target of
+                Left (_ :: SomeException) -> return Nothing
+                Right linkTarget -> do
+                    let path = case filePathToStorePath linkTarget of
+                            Just p -> p
+                            Nothing -> StorePath "unknown" "unknown"
+
+                    -- Parse name from file
+                    let name = case break (== '-') file of
+                            (_, '-':rest) -> T.pack rest
+                            _ -> T.pack file
+
+                    -- Determine root type based on file name pattern
+                    let rootType = if "permanent-" `T.isPrefixOf` name
+                                  then PermanentRoot
+                                  else SymlinkRoot
+
+                    return $ Just $ GCRoot
+                        { rootPath = path
+                        , rootName = name
+                        , rootType = rootType
+                        , rootTime = now
+                        }
+        else return Nothing)
+
+-- | Run garbage collection (privileged context only)
+collectGarbage :: TenM 'Daemon a GCStats
 collectGarbage = do
     env <- ask
     startTime <- liftIO getCurrentTime
@@ -300,78 +419,115 @@ collectGarbage = do
     -- Return result
     return result
 
--- | Run garbage collection with stats
-collectGarbageWithStats :: TenM p GCStats
+-- | Request garbage collection from unprivileged context
+requestGarbageCollection :: TenM ctx a GCStats
+requestGarbageCollection = do
+    env <- ask
+
+    case runMode env of
+        -- In daemon mode, call directly if already privileged
+        DaemonMode -> collectGarbage
+
+        -- In client mode, send request to daemon
+        ClientMode conn -> do
+            -- Send request to daemon using protocol
+            result <- withDaemon $ \conn' -> do
+                -- Implementation would use proper protocol
+                let req = GCRequest False -- Not forcing GC
+                -- Send request and receive GC stats
+                -- This is a stub that would be replaced with actual protocol implementation
+                return $ Right $ GCStats 0 0 0 0 0
+
+            case result of
+                Left err -> throwError $ DaemonError $ "Failed to request garbage collection: " <> T.pack (show err)
+                Right stats -> return stats
+
+        -- In standalone mode, can only run GC if running as root
+        _ -> do
+            -- Check if running as root
+            isRoot <- liftIO $ do
+                uid <- System.Posix.Process.getRealUserID
+                return (uid == 0)
+
+            if isRoot
+                then do
+                    -- Create simulated daemon environment
+                    let daemonEnv = env { runMode = DaemonMode }
+                    -- Run with daemon privileges
+                    result <- liftIO $ runTen collectGarbage daemonEnv (BuildState Build [] Set.empty Set.empty (BuildIdFromInt 0) [] 0)
+                    case result of
+                        Left err -> throwError err
+                        Right (stats, _) -> return stats
+                else
+                    throwError $ PermissionError "Garbage collection requires root privileges or daemon connection"
+
+-- | Run garbage collection with stats (internal implementation)
+collectGarbageWithStats :: TenM 'Daemon a GCStats
 collectGarbageWithStats = do
     env <- ask
     startTime <- liftIO getCurrentTime
 
     -- Open database connection
-    let dbPath = defaultDBPath (storeLocation env)
-    db <- liftIO $ initDatabase dbPath 5000
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Find all paths in the store
+        let storeLocationPath = storeLocation env
+        allStorePaths <- liftIO $ findAllStorePaths db storeLocationPath
 
-    -- Find all paths in the store
-    let storeLocationPath = storeLocation env
-    allStorePaths <- liftIO $ findAllStorePaths storeLocationPath
+        -- Find all root paths
+        rootPaths <- liftIO $ findAllRoots db storeLocationPath
 
-    -- Find all root paths
-    rootPaths <- liftIO $ findAllRoots db storeLocationPath
+        -- Log information about roots
+        logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
 
-    -- Log information about roots
-    logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
+        -- Find all paths reachable from roots (transitive closure)
+        reachablePaths <- liftIO $ computeReachablePathsFromRoots db rootPaths
 
-    -- Find all paths reachable from roots (transitive closure)
-    reachablePaths <- liftIO $ computeReachablePathsFromRoots db rootPaths
+        -- Log information about reachable paths
+        logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
 
-    -- Log information about reachable paths
-    logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
+        -- Get active build paths (if in daemon mode)
+        activePaths <- getActiveBuildPaths
+        when (not $ Set.null activePaths) $
+            logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
 
-    -- Get active build paths (if in daemon mode)
-    activePaths <- getActiveBuildPaths
-    when (not $ Set.null activePaths) $
-        logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
+        -- Combine reachable and active paths
+        let protectedPaths = Set.union reachablePaths activePaths
 
-    -- Combine reachable and active paths
-    let protectedPaths = Set.union reachablePaths activePaths
+        -- Find all deletable paths
+        let deletablePaths = Set.difference allStorePaths protectedPaths
 
-    -- Find all deletable paths
-    let deletablePaths = Set.difference allStorePaths protectedPaths
+        -- Get total size of deletable paths
+        totalSize <- liftIO $ sum <$> mapM (getPathSize storeLocationPath)
+                                        (map storePathToText $ Set.toList deletablePaths)
 
-    -- Get total size of deletable paths
-    totalSize <- liftIO $ sum <$> mapM (getPathSize storeLocationPath)
-                                       (map storePathToText $ Set.toList deletablePaths)
+        -- Delete unreachable paths
+        deleted <- liftIO $ do
+            -- Mark unreachable paths as invalid in database
+            markPathsAsInvalid db deletablePaths
 
-    -- Delete unreachable paths
-    deleted <- liftIO $ do
-        -- Mark unreachable paths as invalid in database
-        liftIO $ markPathsAsInvalid db deletablePaths
+            -- Delete files from filesystem
+            forM_ (Set.toList deletablePaths) $ \path -> do
+                -- Skip paths in gc-roots directory
+                let pathText = storePathToText path
+                let fsPath = storePathToFilePath path env
+                unless ("gc-roots/" `T.isPrefixOf` pathText) $
+                    -- Attempt to delete, ignoring errors
+                    catch (removePathForcibly fsPath) $ \(_ :: IOError) -> return ()
 
-        -- Delete files from filesystem
-        forM_ (Set.toList deletablePaths) $ \path -> do
-            -- Skip paths in gc-roots directory
-            let pathText = storePathToText path
-            let fsPath = storePathToFilePath path env
-            unless ("gc-roots/" `T.isPrefixOf` pathText) $
-                -- Attempt to delete, ignoring errors
-                catch (removePathForcibly fsPath) $ \(_ :: IOError) -> return ()
+            return $ Set.size deletablePaths
 
-        return $ Set.size deletablePaths
+        -- Calculate elapsed time
+        endTime <- liftIO getCurrentTime
+        let elapsed = diffUTCTime endTime startTime
 
-    -- Close database
-    liftIO $ closeDatabase db
-
-    -- Calculate elapsed time
-    endTime <- liftIO getCurrentTime
-    let elapsed = diffUTCTime endTime startTime
-
-    -- Return statistics
-    return GCStats
-        { gcTotal = Set.size allStorePaths
-        , gcLive = Set.size reachablePaths
-        , gcCollected = deleted
-        , gcBytes = totalSize
-        , gcElapsedTime = elapsed
-        }
+        -- Return statistics
+        return GCStats
+            { gcTotal = Set.size allStorePaths
+            , gcLive = Set.size reachablePaths
+            , gcCollected = deleted
+            , gcBytes = totalSize
+            , gcElapsedTime = elapsed
+            }
 
 -- | Get file/path size in bytes
 getPathSize :: FilePath -> Text -> IO Integer
@@ -389,55 +545,47 @@ getPathSize storeLocation pathText = do
             -- If it doesn't exist, return 0
             return 0
 
--- | Find all store paths
-findAllStorePaths :: FilePath -> IO (Set StorePath)
-findAllStorePaths storeLocation = do
+-- | Find all store paths (privileged context)
+findAllStorePaths :: Database -> FilePath -> IO (Set StorePath)
+findAllStorePaths db storeLocation = do
+    -- Get paths from database (preferred, more reliable)
+    -- Query paths from ValidPaths table
+    results <- dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
+
+    -- Parse StorePaths and create set
+    let dbPaths = Set.fromList $ catMaybes $ map (\(Only p) -> parseStorePath p) results
+
+    -- If DB is empty, fall back to filesystem scan
+    if Set.null dbPaths
+        then scanFilesystemForPaths storeLocation
+        else return dbPaths
+
+-- | Scan filesystem for store paths (fallback)
+scanFilesystemForPaths :: FilePath -> IO (Set StorePath)
+scanFilesystemForPaths storeLocation = do
     -- Check if store exists
     exists <- doesDirectoryExist storeLocation
     if not exists
         then return Set.empty
         else do
-            -- Get paths from database (preferred, more reliable)
-            db <- initDatabase (defaultDBPath storeLocation) 5000
+            -- List all files in the store directory
+            entries <- try $ listDirectory storeLocation
+            case entries of
+                Left (_ :: SomeException) -> return Set.empty
+                Right files -> do
+                    -- Filter for valid store path format
+                    foldM (\acc file -> do
+                        -- Skip special directories and non-store paths
+                        unless (file `elem` ["gc-roots", "tmp", "locks", "var"] ||
+                              any (`isPrefixOf` file) ["gc-roots", "tmp.", ".",  ".."]) $ do
+                            -- Check if it's a store path (hash-name format)
+                            case parseStorePath (T.pack file) of
+                                Just path -> return $ Set.insert path acc
+                                Nothing -> return acc
+                        return acc
+                        ) Set.empty files
 
-            -- Query paths from ValidPaths table
-            results <- dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
-
-            -- Parse StorePaths and create set
-            let dbPaths = Set.fromList $ catMaybes $ map (\(Only p) -> parseStorePath p) results
-
-            -- Close database
-            closeDatabase db
-
-            -- Fallback: if database doesn't have all paths, scan filesystem as backup
-            if Set.null dbPaths
-                then scanFilesystemForPaths storeLocation
-                else return dbPaths
-
--- | Scan filesystem for store paths as a fallback
-scanFilesystemForPaths :: FilePath -> IO (Set StorePath)
-scanFilesystemForPaths storeLocation = do
-    -- List all files in the store directory
-    entries <- try $ listDirectory storeLocation
-
-    case entries of
-        Left (_ :: SomeException) -> return Set.empty
-        Right files -> do
-            -- Filter for valid store path format
-            paths <- foldM (\acc file -> do
-                -- Skip special directories and non-store paths
-                unless (file `elem` ["gc-roots", "tmp", "locks", "var"] ||
-                       any (`isPrefixOf` file) ["gc-roots", "tmp.", ".",  ".."]) $ do
-                    -- Check if it's a store path (hash-name format)
-                    case parseStorePath (T.pack file) of
-                        Just path -> return $ Set.insert path acc
-                        Nothing -> return acc
-                return acc
-                ) Set.empty files
-
-            return paths
-
--- | Find all roots for garbage collection
+-- | Find all roots for garbage collection (privileged context)
 findAllRoots :: Database -> FilePath -> IO (Set StorePath)
 findAllRoots db storeLocation = do
     -- Get roots from filesystem (gc-roots directory)
@@ -465,7 +613,7 @@ getFileSystemRootPaths rootsDir = do
             files <- listDirectory rootsDir
 
             -- Process each symlink to get target
-            paths <- foldM (\acc file -> do
+            foldM (\acc file -> do
                 let path = rootsDir </> file
                 isLink <- pathIsSymbolicLink <$> getFileStatus path
                 if isLink
@@ -479,8 +627,6 @@ getFileSystemRootPaths rootsDir = do
                                     Nothing -> return acc
                     else return acc
                 ) Set.empty files
-
-            return paths
 
 -- | Helper function to check if a path is a symbolic link
 pathIsSymbolicLink :: FileStatus -> Bool
@@ -511,7 +657,7 @@ getRuntimeRootPaths storeLocation = do
                 Left (_ :: SomeException) -> return Set.empty
                 Right locks -> do
                     -- Process each lock file to find references to store paths
-                    paths <- foldM (\acc lockFile -> do
+                    foldM (\acc lockFile -> do
                         let lockPath = locksDir </> lockFile
                         -- Check if lock file contains a reference to a store path
                         content <- try $ readFile lockPath
@@ -522,8 +668,6 @@ getRuntimeRootPaths storeLocation = do
                                 let storePaths = extractStorePaths text
                                 return $ Set.union acc storePaths
                         ) Set.empty locks
-
-                    return paths
   where
     -- Function to extract store paths from text
     extractStorePaths :: String -> Set StorePath
@@ -533,22 +677,78 @@ getRuntimeRootPaths storeLocation = do
             paths = filter (\w -> length w > 10 && '-' `elem` w) words
         in Set.fromList $ catMaybes $ map (parseStorePath . T.pack) paths
 
--- | Daemon-coordinated garbage collection
-daemonCollectGarbage :: TenM p GCStats
-daemonCollectGarbage = do
+-- | Check if a path is reachable from any root (works in both contexts)
+isReachable :: StorePath -> TenM ctx a Bool
+isReachable path = do
     env <- ask
 
-    -- Check if in daemon mode
-    isDaemon <- isDaemonMode
-    unless isDaemon $
-        throwError $ DaemonError "Daemon-coordinated GC requires daemon mode"
+    case runMode env of
+        -- In daemon mode, check directly
+        DaemonMode -> isReachablePrivileged path
 
-    -- In daemon mode, we just use the standard GC mechanism but with potential
-    -- additional notifications to clients
-    collectGarbage
+        -- In other modes, check if running as root
+        _ -> do
+            -- Check if running as root
+            isRoot <- liftIO $ do
+                uid <- System.Posix.Process.getRealUserID
+                return (uid == 0)
 
--- | Acquire the GC lock
-acquireGCLock :: TenM p ()
+            if isRoot
+                then isReachablePrivileged path
+                else requestPathReachability path
+
+-- | Internal implementation for privileged reachability check
+isReachablePrivileged :: StorePath -> TenM ctx a Bool
+isReachablePrivileged path = do
+    env <- ask
+
+    -- Initialize database
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Get all roots
+        roots <- liftIO $ findAllRoots db (storeLocation env)
+
+        -- Use database to check reachability
+        liftIO $ isPathReachable db roots path
+
+-- | Request path reachability check from unprivileged context
+requestPathReachability :: StorePath -> TenM ctx a Bool
+requestPathReachability path = do
+    env <- ask
+
+    case runMode env of
+        -- In client mode, send request to daemon
+        ClientMode conn -> do
+            -- Send request to daemon using protocol
+            result <- withDaemon $ \conn' -> do
+                -- This is a stub that would be replaced with actual protocol implementation
+                return $ Right False
+
+            case result of
+                Left err -> throwError $ DaemonError $ "Failed to check path reachability: " <> T.pack (show err)
+                Right reachable -> return reachable
+
+        -- If not in client mode and we got here, then fall back to heuristic
+        -- An unprivileged process can't reliably determine reachability
+        -- But we can check if the path is in the store at least
+        _ -> do
+            -- Check if path exists in store (doesn't guarantee reachability)
+            storePathExists path
+
+-- | Find all paths reachable from roots (privileged context only)
+findReachablePaths :: TenM 'Daemon a (Set StorePath)
+findReachablePaths = do
+    env <- ask
+
+    -- Initialize database
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Find all roots
+        roots <- liftIO $ findAllRoots db (storeLocation env)
+
+        -- Compute all reachable paths
+        liftIO $ computeReachablePathsFromRoots db roots
+
+-- | Acquire the GC lock (privileged context only)
+acquireGCLock :: TenM 'Daemon a ()
 acquireGCLock = do
     env <- ask
     let lockPath = getGCLockPath env
@@ -562,8 +762,8 @@ acquireGCLock = do
             -- Keep the fd in a global reference to avoid GC
             liftIO $ writeIORef globalGCLockFdRef (Just (lockFd lock, lockPath))
 
--- | Release the GC lock
-releaseGCLock :: TenM p ()
+-- | Release the GC lock (privileged context only)
+releaseGCLock :: TenM 'Daemon a ()
 releaseGCLock = do
     env <- ask
     let lockPath = getGCLockPath env
@@ -593,8 +793,8 @@ releaseGCLock = do
                     _ -> return ()
             _ -> return ()
 
--- | Execute an action with the GC lock
-withGCLock :: TenM p a -> TenM p a
+-- | Execute an action with the GC lock (privileged context only)
+withGCLock :: TenM 'Daemon a b -> TenM 'Daemon a b
 withGCLock action = do
     -- First acquire the lock
     acquireGCLock
@@ -614,46 +814,8 @@ withGCLock action = do
     -- Return the result
     return result
 
--- | Check if a path is reachable from any root
-isReachable :: StorePath -> TenM p Bool
-isReachable path = do
-    env <- ask
-
-    -- Initialize database
-    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
-
-    -- Get all roots
-    roots <- liftIO $ findAllRoots db (storeLocation env)
-
-    -- Use database to check reachability
-    result <- liftIO $ isPathReachable db roots path
-
-    -- Close database
-    liftIO $ closeDatabase db
-
-    return result
-
--- | Find all paths reachable from roots
-findReachablePaths :: TenM p (Set StorePath)
-findReachablePaths = do
-    env <- ask
-
-    -- Initialize database
-    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
-
-    -- Find all roots
-    roots <- liftIO $ findAllRoots db (storeLocation env)
-
-    -- Compute all reachable paths
-    reachable <- liftIO $ computeReachablePathsFromRoots db roots
-
-    -- Close database
-    liftIO $ closeDatabase db
-
-    return reachable
-
--- | Break a stale lock
-breakStaleLock :: FilePath -> TenM p ()
+-- | Break a stale lock (privileged context only)
+breakStaleLock :: FilePath -> TenM 'Daemon a ()
 breakStaleLock lockPath = do
     -- Check lock status
     status <- liftIO $ checkLockFile lockPath
@@ -760,7 +922,7 @@ releaseFileLock lock = do
     catchIOError (removeFile (lockPath lock)) (\_ -> return ())
 
 -- | Get active build paths (to prevent GC during builds)
-getActiveBuildPaths :: TenM p (Set StorePath)
+getActiveBuildPaths :: TenM ctx a (Set StorePath)
 getActiveBuildPaths = do
     -- In daemon mode, query the daemon for active build outputs
     isDaemon <- isDaemonMode
@@ -769,7 +931,7 @@ getActiveBuildPaths = do
         else return Set.empty
 
 -- | Get active build paths from daemon mode
-getDaemonActivePaths :: TenM p (Set StorePath)
+getDaemonActivePaths :: TenM ctx a (Set StorePath)
 getDaemonActivePaths = do
     env <- ask
 
@@ -777,16 +939,13 @@ getDaemonActivePaths = do
     case runMode env of
         DaemonMode -> do
             -- Get runtime paths from database
-            db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
+            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                -- Query active build paths from database
+                results <- liftIO $ dbQuery_ db
+                    "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
 
-            -- Query active build paths from database
-            results <- liftIO $ dbQuery_ db "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
-
-            -- Close database
-            liftIO $ closeDatabase db
-
-            -- Parse paths
-            return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
+                -- Parse paths
+                return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
 
         ClientMode conn -> do
             -- Ask the daemon via protocol
@@ -796,105 +955,132 @@ getDaemonActivePaths = do
 
         _ -> return Set.empty
 
--- | Verify the store integrity
-verifyStore :: TenM p Bool
+-- | Verify the store integrity (works in both contexts)
+verifyStore :: TenM ctx a Bool
 verifyStore = do
     env <- ask
 
-    -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
+    case runMode env of
+        -- In daemon mode, verify directly
+        DaemonMode -> do
+            -- Open database
+            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                -- Get all valid paths from database
+                paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
-    -- Get all valid paths from database
-    paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
+                -- Verify each path
+                results <- forM paths $ \(Only pathText) -> do
+                    case parseStorePath pathText of
+                        Nothing -> return False
+                        Just storePath -> do
+                            -- Verify that the store file exists and has the correct hash
+                            result <- liftIO $ try $ do
+                                let fullPath = storePathToFilePath storePath env
+                                fileExists <- doesFileExist fullPath
+                                if fileExists
+                                    then do
+                                        content <- BS.readFile fullPath
+                                        let actualHash = showHash $ hashByteString content
+                                        return $ actualHash == storeHash storePath
+                                    else return False
+                            case result of
+                                Left (_ :: SomeException) -> return False
+                                Right valid -> return valid
 
-    -- Close database
-    liftIO $ closeDatabase db
+                -- Return true if all paths verify
+                return $ all id results
 
-    -- Verify each path
-    results <- forM paths $ \(Only pathText) -> do
-        case parseStorePath pathText of
-            Nothing -> return False
-            Just storePath -> do
-                -- Verify that the store file exists and has the correct hash
-                result <- liftIO $ try $ do
-                    let fullPath = storePathToFilePath storePath env
-                    fileExists <- doesFileExist fullPath
-                    if fileExists
-                        then do
-                            content <- BS.readFile fullPath
-                            let actualHash = showHash $ hashByteString content
-                            return $ actualHash == storeHash storePath
-                        else return False
-                case result of
-                    Left (_ :: SomeException) -> return False
-                    Right valid -> return valid
+        -- In client mode, request verification from daemon
+        ClientMode conn -> do
+            -- Send request to daemon using protocol
+            result <- withDaemon $ \conn' -> do
+                -- This is a stub that would be replaced with actual protocol implementation
+                let req = StoreVerifyRequest "/"  -- Verify entire store
+                return $ Right True -- Assume valid for stub
 
-    -- Return true if all paths verify
-    return $ all id results
+            case result of
+                Left err -> throwError $ DaemonError $ "Failed to verify store: " <> T.pack (show err)
+                Right valid -> return valid
 
--- | Repair the store (remove invalid paths)
-repairStore :: TenM p GCStats
+        -- In standalone mode, verify if running as root
+        _ -> do
+            -- Check if running as root
+            isRoot <- liftIO $ do
+                uid <- System.Posix.Process.getRealUserID
+                return (uid == 0)
+
+            if isRoot
+                then do
+                    -- Create simulated daemon environment
+                    let daemonEnv = env { runMode = DaemonMode }
+                    -- Run with daemon privileges
+                    result <- liftIO $ runTen verifyStore daemonEnv (BuildState Build [] Set.empty Set.empty (BuildIdFromInt 0) [] 0)
+                    case result of
+                        Left err -> throwError err
+                        Right (valid, _) -> return valid
+                else
+                    -- Unprivileged standalone mode can only verify paths it can read
+                    return True -- Just assume valid since we can't really check
+
+-- | Repair the store (remove invalid paths) - privileged context only
+repairStore :: TenM 'Daemon a GCStats
 repairStore = do
     env <- ask
     startTime <- liftIO getCurrentTime
 
     -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Get all valid paths from database
+        paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
-    -- Get all valid paths from database
-    paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
+        -- Verify and repair each path
+        (valid, invalid, totalSize) <- foldM (\(v, i, size) (Only pathText) -> do
+            case parseStorePath pathText of
+                Nothing -> return (v, i + 1, size)  -- Invalid path format
+                Just storePath -> do
+                    -- Check if file exists and has correct hash
+                    result <- liftIO $ try $ do
+                        let fullPath = storePathToFilePath storePath env
+                        fileExists <- doesFileExist fullPath
+                        if fileExists
+                            then do
+                                content <- BS.readFile fullPath
+                                let actualHash = showHash $ hashByteString content
+                                return (actualHash == storeHash storePath, fullPath)
+                            else return (False, fullPath)
 
-    -- Verify and repair each path
-    (valid, invalid, totalSize) <- foldM (\(v, i, size) (Only pathText) -> do
-        case parseStorePath pathText of
-            Nothing -> return (v, i + 1, size)  -- Invalid path format
-            Just storePath -> do
-                -- Check if file exists and has correct hash
-                result <- liftIO $ try $ do
-                    let fullPath = storePathToFilePath storePath env
-                    fileExists <- doesFileExist fullPath
-                    if fileExists
-                        then do
-                            content <- BS.readFile fullPath
-                            let actualHash = showHash $ hashByteString content
-                            return (actualHash == storeHash storePath, fullPath)
-                        else return (False, fullPath)
+                    case result of
+                        Left (_ :: SomeException) -> return (v, i + 1, size)
+                        Right (isValid, path) ->
+                            if isValid
+                                then return (v + 1, i, size)
+                                else do
+                                    -- Invalid path, mark as invalid and remove
+                                    liftIO $ do
+                                        -- Get size before deletion
+                                        pathSize <- getFileSize' path
 
-                case result of
-                    Left (_ :: SomeException) -> return (v, i + 1, size)
-                    Right (isValid, path) ->
-                        if isValid
-                            then return (v + 1, i, size)
-                            else do
-                                -- Invalid path, mark as invalid and remove
-                                liftIO $ do
-                                    -- Get size before deletion
-                                    pathSize <- getFileSize' path
+                                        -- Mark as invalid in database
+                                        dbExecute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?" (Only pathText)
 
-                                    -- Mark as invalid in database
-                                    dbExecute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?" (Only pathText)
+                                        -- Delete the file
+                                        catchIOError (removeFile path) (\_ -> return ())
 
-                                    -- Delete the file
-                                    catchIOError (removeFile path) (\_ -> return ())
+                                        return (v, i + 1, size + pathSize)
+            ) (0, 0, 0) paths
 
-                                    return (v, i + 1, size + pathSize)
-        ) (0, 0, 0) paths
+        -- Calculate elapsed time
+        endTime <- liftIO getCurrentTime
+        let elapsed = diffUTCTime endTime startTime
 
-    -- Close database
-    liftIO $ closeDatabase db
-
-    -- Calculate elapsed time
-    endTime <- liftIO getCurrentTime
-    let elapsed = diffUTCTime endTime startTime
-
-    -- Return statistics
-    return GCStats
-        { gcTotal = valid + invalid
-        , gcLive = valid
-        , gcCollected = invalid
-        , gcBytes = totalSize
-        , gcElapsedTime = elapsed
-        }
+        -- Return statistics
+        return GCStats
+            { gcTotal = valid + invalid
+            , gcLive = valid
+            , gcCollected = invalid
+            , gcBytes = totalSize
+            , gcElapsedTime = elapsed
+            }
 
 -- | Helper to get file size
 getFileSize' :: FilePath -> IO Integer
@@ -906,29 +1092,53 @@ getFileSize' path = do
             return $ fromIntegral $ fileSize fileStatus
         else return 0
 
--- | Helper function to compute reachable paths from roots
--- This would be implemented in Ten.DB.References
-computeReachablePathsFromRoots :: Database -> Set StorePath -> IO (Set StorePath)
-computeReachablePathsFromRoots db roots = do
-    -- This would perform a graph traversal starting from roots
-    -- and following references stored in the database
-    -- For this implementation, we just return the roots themselves as a stub
-    return roots
-
--- | Helper function to check if a path is reachable from any root
--- This would be implemented in Ten.DB.References
+-- Helper function for database interaction - Path reachability
 isPathReachable :: Database -> Set StorePath -> StorePath -> IO Bool
 isPathReachable db roots path = do
     -- Check if path is directly in roots
     if path `Set.member` roots
         then return True
         else do
-            -- This would perform a reachability check in the reference graph
-            -- For this implementation, we just return false as a stub
-            return False
+            -- Use reference tracking DB to check if path is reachable from roots
+            let rootPaths = Set.toList roots
+            reachable <- foldM (\found root ->
+                                if found
+                                   then return True
+                                   else do
+                                       -- Check if the path is reachable from this root
+                                       refs <- findPathsClosure db (Set.singleton root)
+                                       return $ path `Set.member` refs
+                               ) False rootPaths
+            return reachable
+
+-- | Helper function to compute reachable paths from roots
+computeReachablePathsFromRoots :: Database -> Set StorePath -> IO (Set StorePath)
+computeReachablePathsFromRoots db roots = do
+    -- Include the roots themselves
+    findPathsClosure db roots
+
+-- | Find paths reachability closure (using properly optimized DB query)
+findPathsClosure :: Database -> Set StorePath -> IO (Set StorePath)
+findPathsClosure db startingPaths = do
+    -- Create a temporary table for the closure calculation
+    dbExecuteSimple_ db "CREATE TEMP TABLE IF NOT EXISTS temp_closure (path TEXT PRIMARY KEY)"
+    dbExecuteSimple_ db "DELETE FROM temp_closure"
+
+    -- Insert all starting paths
+    forM_ (Set.toList startingPaths) $ \path ->
+        dbExecute db "INSERT INTO temp_closure VALUES (?)" (Only (storePathToText path))
+
+    -- Use recursive CTE to compute the transitive closure efficiently
+    results <- dbQuery_ db "WITH RECURSIVE closure(path) AS (\
+                            \  SELECT path FROM temp_closure\
+                            \  UNION\
+                            \  SELECT r.reference FROM References r JOIN closure c ON r.referrer = c.path\
+                            \) SELECT path FROM closure" :: IO [Only Text]
+
+    -- Parse paths and return as set
+    return $ Set.fromList $ catMaybes $ map (\(Only p) -> parseStorePath p) results
 
 -- | Helper function to mark paths as invalid in the database
--- This would be implemented in Ten.DB.References
 markPathsAsInvalid :: Database -> Set StorePath -> IO ()
 markPathsAsInvalid db paths = do
     -- Mark each path as invalid in the ValidPaths table

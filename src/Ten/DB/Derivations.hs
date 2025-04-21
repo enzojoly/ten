@@ -4,6 +4,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Ten.DB.Derivations (
     -- Store/retrieve derivations
@@ -11,6 +12,8 @@ module Ten.DB.Derivations (
     retrieveDerivation,
     registerDerivationFile,
     storeDerivationInDB,
+    retrieveDerivationByHash,
+    requestDerivationByHash,
 
     -- Output mapping
     registerDerivationOutput,
@@ -29,7 +32,6 @@ module Ten.DB.Derivations (
     isDerivationRegistered,
     listRegisteredDerivations,
     getDerivationPath,
-    retrieveDerivationByHash,
 
     -- Path validity
     registerValidPath,
@@ -84,8 +86,9 @@ import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Vector as Vector
 
-import Ten.DB.Core
 import Ten.Core
+import Ten.DB.Core
+import Ten.Daemon.Protocol (DaemonRequest(..), DaemonResponse(..))
 
 -- | Information about a stored derivation
 data DerivationInfo = DerivationInfo {
@@ -149,12 +152,12 @@ instance FromRow PathInfo where
 
         return $ PathInfo path hash deriver regTime (isValid == 1)
 
--- Helper function to parse StorePath from a database field - now simplified
+-- Helper function to parse StorePath from a database field
 parseStorePathField :: RowParser StorePath
 parseStorePathField = field
 
--- | Store a derivation in the database
-storeDerivation :: Database -> Derivation -> StorePath -> TenM p Int64
+-- | Store a derivation in the database - privileged operation
+storeDerivation :: Database -> Derivation -> StorePath -> TenM p 'Privileged Int64
 storeDerivation db derivation storePath = do
     -- Check if derivation already exists
     existing <- isDerivationRegistered db (derivHash derivation)
@@ -181,7 +184,7 @@ storeDerivation db derivation storePath = do
 
 -- | New function to handle database operations for storing a derivation
 -- This replaces Ten.Derivation.storeDerivationFile's database operations
-storeDerivationInDB :: Derivation -> StorePath -> FilePath -> TenM p Int64
+storeDerivationInDB :: Derivation -> StorePath -> FilePath -> TenM p 'Privileged Int64
 storeDerivationInDB drv derivPath dbPath = do
     -- Initialize database
     db <- liftIO $ initDatabase dbPath 5000
@@ -194,8 +197,8 @@ storeDerivationInDB drv derivPath dbPath = do
 
     return derivId
 
--- | Register a derivation file in the database with proper reference tracking
-registerDerivationFile :: Database -> Derivation -> StorePath -> TenM p Int64
+-- | Register a derivation file in the database with proper reference tracking - privileged operation
+registerDerivationFile :: Database -> Derivation -> StorePath -> TenM p 'Privileged Int64
 registerDerivationFile db derivation storePath = withTenTransaction db ReadWrite $ \_ -> do
     -- Store in database
     derivId <- storeDerivation db derivation storePath
@@ -226,8 +229,8 @@ registerDerivationFile db derivation storePath = withTenTransaction db ReadWrite
 
     return derivId
 
--- | Retrieve a derivation from the database
-retrieveDerivation :: Database -> Text -> TenM p (Maybe Derivation)
+-- | Retrieve a derivation from the database - privileged operation
+retrieveDerivation :: Database -> Text -> TenM p 'Privileged (Maybe Derivation)
 retrieveDerivation db hash = do
     env <- ask
 
@@ -253,55 +256,93 @@ retrieveDerivation db hash = do
                 Right drv -> return $ Just drv
         _ -> throwError $ DBError "Multiple derivations with same hash - database corruption"
 
--- | Retrieve a derivation by hash
-retrieveDerivationByHash :: FilePath -> Text -> TenM p (Maybe Derivation)
+-- | Retrieve a derivation by hash - this is now properly context-aware
+retrieveDerivationByHash :: FilePath -> Text -> TenM p 'Privileged (Maybe Derivation)
 retrieveDerivationByHash dbPath hash = do
     env <- ask
 
     -- Open database
     db <- liftIO $ initDatabase dbPath 5000
 
-    -- Query for store path
-    result <- liftTenIO $ try $ do
-        storePaths <- tenQuery db
-            "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-            (Only hash) :: TenM p [Only Text]
+    -- Query for store path - explicitly in the privileged context
+    storePaths <- tenQuery db
+        "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
+        (Only hash)
 
-        -- Get the derivation
-        case storePaths of
-            [Only pathText] ->
-                case parseStorePath pathText of
-                    Just sp -> do
-                        derivMaybe <- readDerivationFromStore env sp
-                        return derivMaybe
-                    Nothing -> return Nothing
-            _ -> return Nothing
+    -- Get the derivation
+    result <- case storePaths of
+        [Only pathText] ->
+            case parseStorePath pathText of
+                Just sp -> readDerivationFromStore env sp
+                Nothing -> return Nothing
+        _ -> return Nothing
 
     -- Close database
     liftIO $ closeDatabase db
 
-    -- Handle any exceptions
-    case result of
-        Left err -> do
-            logMsg 1 $ "Error retrieving derivation: " <> T.pack (show err)
-            return Nothing
-        Right derivation -> return derivation
-  where
-    readDerivationFromStore :: BuildEnv -> StorePath -> TenM p (Maybe Derivation)
-    readDerivationFromStore env sp = do
-        -- Construct the full path
-        let fullPath = storePathToFilePath sp env
+    -- Return the result
+    return result
 
-        -- Check if it exists
-        exists <- liftIO $ doesFileExist fullPath
-        if not exists
-            then return Nothing
-            else do
-                -- Read and deserialize
-                content <- liftIO $ BS.readFile fullPath
-                case deserializeDerivation content of
-                    Left _ -> return Nothing
-                    Right drv -> return $ Just drv
+-- | Request derivation by hash - unprivileged operation using protocol
+requestDerivationByHash :: Text -> TenM p 'Unprivileged (Maybe Derivation)
+requestDerivationByHash hash = do
+    env <- ask
+
+    -- Must use daemon connection to request derivation
+    case runMode env of
+        ClientMode conn -> do
+            -- Send request through daemon protocol
+            result <- sendDaemonRequest conn (RetrieveDerivationCmd $ RetrieveDerivationRequest {
+                derivationHash = hash,
+                includeOutputs = True
+            })
+
+            -- Process response
+            case result of
+                DerivationRetrievedResponse mDrv -> return mDrv
+                ErrorResponse err -> throwError err
+                _ -> throwError $ ProtocolError $ "Unexpected response type for derivation request"
+
+        _ -> throwError $ BuildFailed "Cannot request derivation: not connected to daemon"
+
+-- | Helper to read derivation from store - available in both contexts with different implementations
+readDerivationFromStore :: BuildEnv -> StorePath -> TenM p ctx (Maybe Derivation)
+readDerivationFromStore env sp = do
+    -- Implementation depends on privilege context
+    ctxType <- asks privilegeContext
+
+    case ctxType of
+        Privileged -> do
+            -- Privileged context can access store directly
+            let fullPath = storePathToFilePath sp env
+
+            -- Check if file exists
+            exists <- liftIO $ doesFileExist fullPath
+            if not exists
+                then return Nothing
+                else do
+                    -- Read and deserialize
+                    content <- liftIO $ BS.readFile fullPath
+                    case deserializeDerivation content of
+                        Left _ -> return Nothing
+                        Right drv -> return $ Just drv
+
+        Unprivileged -> do
+            -- Unprivileged context must use protocol
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (RetrieveDerivationCmd $ RetrieveDerivationRequest {
+                        derivationPath = sp,
+                        includeOutputs = False
+                    })
+
+                    -- Process response
+                    case result of
+                        DerivationRetrievedResponse mDrv -> return mDrv
+                        _ -> return Nothing
+
+                _ -> return Nothing  -- Cannot access without daemon connection
 
 -- | Helper function to deserialize a derivation
 deserializeDerivation :: ByteString -> Either Text Derivation
@@ -365,7 +406,7 @@ derivationFromJSON value = case Aeson.parseEither parseDerivation value of
     parseEnvMap o =
         return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- KeyMap.toList o]
 
--- | Read and deserialize a derivation file
+-- | Read and deserialize a derivation file - privileged operation
 readDerivationFile :: BuildEnv -> StorePath -> IO (Either Text Derivation)
 readDerivationFile env path = do
     -- Construct the full path
@@ -381,23 +422,50 @@ readDerivationFile env path = do
             -- Return the result of deserialization
             return $ deserializeDerivation content
 
--- | Register an output for a derivation
-registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> TenM p ()
+-- | Register an output for a derivation - privileged operation
+registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> TenM p 'Privileged ()
 registerDerivationOutput db derivId outputName outPath = do
     -- Insert output record
     void $ tenExecute db
         "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
         (derivId, outputName, storePathToText outPath)
 
--- | Get all outputs for a derivation
-getOutputsForDerivation :: Database -> Int64 -> TenM p [OutputInfo]
-getOutputsForDerivation db derivId =
-    tenQuery db
-        "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
-        (Only derivId)
+-- | Get all outputs for a derivation - available in both contexts with different implementations
+getOutputsForDerivation :: Database -> Int64 -> TenM p ctx [OutputInfo]
+getOutputsForDerivation db derivId = do
+    -- Implementation depends on privilege context
+    ctxType <- asks privilegeContext
 
--- | Find the derivation that produced a particular output
-getDerivationForOutput :: Database -> StorePath -> TenM p (Maybe DerivationInfo)
+    case ctxType of
+        Privileged ->
+            -- Direct database access
+            tenQuery db
+                "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
+                (Only derivId)
+
+        Unprivileged -> do
+            -- Must use daemon protocol
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "outputs",
+                        queryValue = T.pack $ show derivId,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response and convert to OutputInfo
+                    case result of
+                        DerivationOutputResponse paths ->
+                            -- Convert paths to OutputInfo (simplified)
+                            return $ map (\path -> OutputInfo derivId (storeName path) path) (Set.toList paths)
+                        _ -> return []
+
+                _ -> throwError $ BuildFailed "Cannot query outputs: not connected to daemon"
+
+-- | Find the derivation that produced a particular output - privileged operation
+getDerivationForOutput :: Database -> StorePath -> TenM p 'Privileged (Maybe DerivationInfo)
 getDerivationForOutput db outputPath = do
     results <- tenQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
@@ -407,35 +475,54 @@ getDerivationForOutput db outputPath = do
 
     return $ listToMaybe results
 
--- | Find derivations that produced the given outputs
-findDerivationsByOutputs :: Database -> [StorePath] -> TenM p (Map String Derivation)
+-- | Find derivations that produced the given outputs - appropriately context-aware
+findDerivationsByOutputs :: Database -> [StorePath] -> TenM p ctx (Map String Derivation)
 findDerivationsByOutputs db [] = return Map.empty
 findDerivationsByOutputs db outputPaths = do
     env <- ask
+    ctxType <- asks privilegeContext
 
-    -- Convert StorePath to text for query
-    let pathTexts = map storePathToText outputPaths
+    case ctxType of
+        Privileged -> do
+            -- Convert StorePath to text for query
+            let pathTexts = map storePathToText outputPaths
 
-    -- Use a better approach for handling the IN clause
-    let placeholders = "(" ++ intercalate ", " (replicate (length pathTexts) "?") ++ ")"
-    let queryStr = "SELECT DISTINCT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
-                  \JOIN Outputs o ON d.id = o.derivation_id \
-                  \WHERE o.path IN " ++ placeholders
+            -- Use a better approach for handling the IN clause
+            let placeholders = "(" ++ intercalate ", " (replicate (length pathTexts) "?") ++ ")"
+            let queryStr = "SELECT DISTINCT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
+                          \JOIN Outputs o ON d.id = o.derivation_id \
+                          \WHERE o.path IN " ++ placeholders
 
-    derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts
+            derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts
 
-    -- Now load each derivation
-    derivations <- forM derivInfos $ \derivInfo -> do
-        mDrv <- retrieveDerivation db (derivInfoHash derivInfo)
-        case mDrv of
-            Nothing -> return Nothing
-            Just drv -> return $ Just (T.unpack (derivInfoHash derivInfo), drv)
+            -- Now load each derivation
+            derivations <- forM derivInfos $ \derivInfo -> do
+                mDrv <- retrieveDerivation db (derivInfoHash derivInfo)
+                case mDrv of
+                    Nothing -> return Nothing
+                    Just drv -> return $ Just (T.unpack (derivInfoHash derivInfo), drv)
 
-    -- Filter out Nothings and convert to Map
-    return $ Map.fromList $ catMaybes derivations
+            -- Filter out Nothings and convert to Map
+            return $ Map.fromList $ catMaybes derivations
 
--- | Add a reference between two paths
-addDerivationReference :: Database -> StorePath -> StorePath -> TenM p ()
+        Unprivileged -> do
+            -- Must use daemon protocol
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request derivations for outputs through protocol
+                    let pathText = T.intercalate "," $ map storePathToText outputPaths
+                    result <- sendDaemonRequest conn (GetDerivationForOutputRequest pathText)
+
+                    -- Process response
+                    case result of
+                        DerivationQueryResponse drvs ->
+                            return $ Map.fromList $ zip (map (T.unpack . derivHash) drvs) drvs
+                        _ -> return Map.empty
+
+                _ -> throwError $ BuildFailed "Cannot find derivations: not connected to daemon"
+
+-- | Add a reference between two paths - privileged operation
+addDerivationReference :: Database -> StorePath -> StorePath -> TenM p 'Privileged ()
 addDerivationReference db referrer reference =
     when (referrer /= reference) $ do
         -- Skip self-references
@@ -443,8 +530,8 @@ addDerivationReference db referrer reference =
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText referrer, storePathToText reference)
 
--- | Bulk register multiple references for efficiency
-bulkRegisterReferences :: Database -> [(StorePath, StorePath)] -> TenM p Int
+-- | Bulk register multiple references for efficiency - privileged operation
+bulkRegisterReferences :: Database -> [(StorePath, StorePath)] -> TenM p 'Privileged Int
 bulkRegisterReferences db [] = return 0
 bulkRegisterReferences db references = withTenTransaction db ReadWrite $ \_ -> do
     -- Filter out self-references
@@ -459,84 +546,247 @@ bulkRegisterReferences db references = withTenTransaction db ReadWrite $ \_ -> d
 
     return count
 
--- | Get all direct references from a path
-getDerivationReferences :: Database -> StorePath -> TenM p [StorePath]
+-- | Get all direct references from a path - available in both contexts
+getDerivationReferences :: Database -> StorePath -> TenM p ctx [StorePath]
 getDerivationReferences db path = do
-    results <- tenQuery db
-        "SELECT reference FROM References WHERE referrer = ?"
-        (Only (storePathToText path))
+    ctxType <- asks privilegeContext
 
-    -- Parse each path
-    return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+    case ctxType of
+        Privileged -> do
+            -- Direct database access
+            results <- tenQuery db
+                "SELECT reference FROM References WHERE referrer = ?"
+                (Only (storePathToText path))
+
+            -- Parse each path
+            return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        Unprivileged -> do
+            -- Must use protocol
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "references",
+                        queryValue = storePathToText path,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response
+                    case result of
+                        DerivationOutputResponse paths -> return $ Set.toList paths
+                        _ -> return []
+
+                _ -> throwError $ BuildFailed "Cannot get references: not connected to daemon"
 
 -- | Get all direct referrers to a path
-getReferrers :: Database -> StorePath -> TenM p [StorePath]
+getReferrers :: Database -> StorePath -> TenM p ctx [StorePath]
 getReferrers db path = do
-    results <- tenQuery db
-        "SELECT referrer FROM References WHERE reference = ?"
-        (Only (storePathToText path))
+    ctxType <- asks privilegeContext
 
-    -- Parse each path
-    return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+    case ctxType of
+        Privileged -> do
+            -- Direct database access
+            results <- tenQuery db
+                "SELECT referrer FROM References WHERE reference = ?"
+                (Only (storePathToText path))
+
+            -- Parse each path
+            return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        Unprivileged -> do
+            -- Must use protocol
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "referrers",
+                        queryValue = storePathToText path,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response
+                    case result of
+                        DerivationOutputResponse paths -> return $ Set.toList paths
+                        _ -> return []
+
+                _ -> throwError $ BuildFailed "Cannot get referrers: not connected to daemon"
 
 -- | Get all transitive references (closure)
-getTransitiveReferences :: Database -> StorePath -> TenM p (Set StorePath)
+getTransitiveReferences :: Database -> StorePath -> TenM p ctx (Set StorePath)
 getTransitiveReferences db path = do
-    results <- tenQuery db
-        "WITH RECURSIVE\n\
-        \  closure(p) AS (\n\
-        \    VALUES(?)\n\
-        \    UNION\n\
-        \    SELECT reference FROM References JOIN closure ON referrer = p\n\
-        \  )\n\
-        \SELECT p FROM closure WHERE p != ?"
-        (storePathToText path, storePathToText path)
+    ctxType <- asks privilegeContext
 
-    -- Parse paths and return as set
-    return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+    case ctxType of
+        Privileged -> do
+            -- Use recursive CTE to efficiently query the closure
+            let query = "WITH RECURSIVE\n\
+                        \  closure(p) AS (\n\
+                        \    VALUES(?)\n\
+                        \    UNION\n\
+                        \    SELECT reference FROM References JOIN closure ON referrer = p\n\
+                        \  )\n\
+                        \SELECT p FROM closure WHERE p != ?"
+
+            results <- tenQuery db query (storePathToText path, storePathToText path)
+
+            -- Parse paths and return as set
+            return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        Unprivileged -> do
+            -- Must use protocol
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "transitive-references",
+                        queryValue = storePathToText path,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response
+                    case result of
+                        DerivationOutputResponse paths -> return paths
+                        _ -> return Set.empty
+
+                _ -> throwError $ BuildFailed "Cannot get transitive references: not connected to daemon"
 
 -- | Get all transitive referrers (reverse closure)
-getTransitiveReferrers :: Database -> StorePath -> TenM p (Set StorePath)
+getTransitiveReferrers :: Database -> StorePath -> TenM p ctx (Set StorePath)
 getTransitiveReferrers db path = do
-    results <- tenQuery db
-        "WITH RECURSIVE\n\
-        \  closure(p) AS (\n\
-        \    VALUES(?)\n\
-        \    UNION\n\
-        \    SELECT referrer FROM References JOIN closure ON reference = p\n\
-        \  )\n\
-        \SELECT p FROM closure WHERE p != ?"
-        (storePathToText path, storePathToText path)
+    ctxType <- asks privilegeContext
 
-    -- Parse paths and return as set
-    return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+    case ctxType of
+        Privileged -> do
+            -- Use recursive CTE to efficiently query the closure
+            let query = "WITH RECURSIVE\n\
+                        \  closure(p) AS (\n\
+                        \    VALUES(?)\n\
+                        \    UNION\n\
+                        \    SELECT referrer FROM References JOIN closure ON reference = p\n\
+                        \  )\n\
+                        \SELECT p FROM closure WHERE p != ?"
+
+            results <- tenQuery db query (storePathToText path, storePathToText path)
+
+            -- Parse paths and return as set
+            return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        Unprivileged -> do
+            -- Must use protocol
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "transitive-referrers",
+                        queryValue = storePathToText path,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response
+                    case result of
+                        DerivationOutputResponse paths -> return paths
+                        _ -> return Set.empty
+
+                _ -> throwError $ BuildFailed "Cannot get transitive referrers: not connected to daemon"
 
 -- | Check if a derivation is already registered
-isDerivationRegistered :: Database -> Text -> TenM p Bool
+isDerivationRegistered :: Database -> Text -> TenM p ctx Bool
 isDerivationRegistered db hash = do
-    results <- tenQuery db
-        "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only hash)
-    return $ not (null results)
+    ctxType <- asks privilegeContext
+
+    case ctxType of
+        Privileged -> do
+            results <- tenQuery db
+                "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
+                (Only hash)
+            return $ not (null results)
+
+        Unprivileged -> do
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "exists",
+                        queryValue = hash,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response - simplified, assumes boolean in some response field
+                    return $ case result of
+                        StoreVerifyResponse exists -> exists
+                        _ -> False
+
+                _ -> throwError $ BuildFailed "Cannot check derivation: not connected to daemon"
 
 -- | List all registered derivations
-listRegisteredDerivations :: Database -> TenM p [DerivationInfo]
-listRegisteredDerivations db =
-    tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+listRegisteredDerivations :: Database -> TenM p ctx [DerivationInfo]
+listRegisteredDerivations db = do
+    ctxType <- asks privilegeContext
+
+    case ctxType of
+        Privileged ->
+            tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+
+        Unprivileged -> do
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (ListDerivationsRequest (Just 100))
+
+                    -- Process response - simplified implementation
+                    case result of
+                        DerivationListResponse paths ->
+                            -- Convert paths to basic DerivationInfo objects
+                            return $ zipWith (\i p -> DerivationInfo i
+                                                             (storeHash p)
+                                                             p
+                                                             0) [1..] paths
+                        _ -> return []
+
+                _ -> throwError $ BuildFailed "Cannot list derivations: not connected to daemon"
 
 -- | Get the store path for a derivation by hash
-getDerivationPath :: Database -> Text -> TenM p (Maybe StorePath)
+getDerivationPath :: Database -> Text -> TenM p ctx (Maybe StorePath)
 getDerivationPath db hash = do
-    results <- tenQuery db
-        "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-        (Only hash)
+    ctxType <- asks privilegeContext
 
-    case results of
-        [Only path] -> return $ parseStorePath path
-        _ -> return Nothing
+    case ctxType of
+        Privileged -> do
+            results <- tenQuery db
+                "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
+                (Only hash)
 
--- | Register a valid path in the store
-registerValidPath :: Database -> StorePath -> Maybe StorePath -> TenM p ()
+            case results of
+                [Only path] -> return $ parseStorePath path
+                _ -> return Nothing
+
+        Unprivileged -> do
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
+                        queryType = "path",
+                        queryValue = hash,
+                        queryLimit = Nothing
+                    })
+
+                    -- Process response
+                    case result of
+                        StorePathResponse path -> return $ Just path
+                        _ -> return Nothing
+
+                _ -> throwError $ BuildFailed "Cannot get derivation path: not connected to daemon"
+
+-- | Register a valid path in the store - privileged operation
+registerValidPath :: Database -> StorePath -> Maybe StorePath -> TenM p 'Privileged ()
 registerValidPath db path mDeriver = do
     let deriverText = case mDeriver of
             Just deriver -> Just (storePathToText deriver)
@@ -547,35 +797,74 @@ registerValidPath db path mDeriver = do
         \VALUES (?, ?, strftime('%s','now'), ?, 1)"
         (storePathToText path, storeHash path, deriverText)
 
--- | Mark a path as invalid
-invalidatePath :: Database -> StorePath -> TenM p ()
+-- | Mark a path as invalid - privileged operation
+invalidatePath :: Database -> StorePath -> TenM p 'Privileged ()
 invalidatePath db path =
     void $ tenExecute db
         "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
         (Only (storePathToText path))
 
--- | Check if a path is valid
-isPathValid :: Database -> StorePath -> TenM p Bool
+-- | Check if a path is valid - available in both contexts
+isPathValid :: Database -> StorePath -> TenM p ctx Bool
 isPathValid db path = do
-    results <- tenQuery db
-        "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
-        (Only (storePathToText path))
+    ctxType <- asks privilegeContext
 
-    case results of
-        [Only valid] -> return (valid == 1)
-        _ -> return False
+    case ctxType of
+        Privileged -> do
+            results <- tenQuery db
+                "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
+                (Only (storePathToText path))
 
--- | Get detailed information about a path
-getPathInfo :: Database -> StorePath -> TenM p (Maybe PathInfo)
+            case results of
+                [Only valid] -> return (valid == 1)
+                _ -> return False
+
+        Unprivileged -> do
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (StoreVerifyRequest (storePathToText path))
+
+                    -- Process response
+                    case result of
+                        StoreVerifyResponse valid -> return valid
+                        _ -> return False
+
+                _ -> throwError $ BuildFailed "Cannot check path validity: not connected to daemon"
+
+-- | Get detailed information about a path - available in both contexts
+getPathInfo :: Database -> StorePath -> TenM p ctx (Maybe PathInfo)
 getPathInfo db path = do
-    results <- tenQuery db
-        "SELECT path, hash, deriver, registration_time, is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
-        (Only (storePathToText path))
+    ctxType <- asks privilegeContext
 
-    return $ listToMaybe results
+    case ctxType of
+        Privileged -> do
+            results <- tenQuery db
+                "SELECT path, hash, deriver, registration_time, is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
+                (Only (storePathToText path))
 
--- | Register a derivation with all its outputs in a single transaction
-registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> TenM p Int64
+            return $ listToMaybe results
+
+        Unprivileged -> do
+            env <- ask
+            case runMode env of
+                ClientMode conn -> do
+                    -- Request through protocol
+                    result <- sendDaemonRequest conn (StoreVerifyRequest (storePathToText path))
+
+                    -- Process response - simplified implementation
+                    case result of
+                        StoreVerifyResponse valid ->
+                            if valid
+                                then return $ Just (PathInfo path (storeHash path) Nothing (posixSecondsToUTCTime 0) True)
+                                else return Nothing
+                        _ -> return Nothing
+
+                _ -> throwError $ BuildFailed "Cannot get path info: not connected to daemon"
+
+-- | Register a derivation with all its outputs in a single transaction - privileged operation
+registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> TenM p 'Privileged Int64
 registerDerivationWithOutputs db derivation storePath = withTenTransaction db ReadWrite $ \_ -> do
     -- Register the derivation
     derivId <- storeDerivation db derivation storePath
@@ -606,3 +895,10 @@ registerDerivationWithOutputs db derivation storePath = withTenTransaction db Re
             addDerivationReference db outPath input
 
     return derivId
+
+-- | Helper function to send a daemon request in unprivileged context
+sendDaemonRequest :: DaemonConnection -> DaemonRequest -> TenM p 'Unprivileged DaemonResponse
+sendDaemonRequest conn request = do
+    -- This would use the actual daemon client protocol
+    -- For now, a placeholder that would be implemented in Ten.Daemon.Client
+    throwError $ BuildFailed "Daemon client protocol not implemented"

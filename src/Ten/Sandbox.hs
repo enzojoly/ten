@@ -3,6 +3,8 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Ten.Sandbox (
     -- Core sandbox functions
@@ -33,15 +35,14 @@ module Ten.Sandbox (
     prepareSandboxEnvironment,
 
     -- Privilege management
-    dropSandboxPrivileges,
-    regainPrivileges,
+    dropPrivileges,
     withDroppedPrivileges,
     runBuilderAsUser
 ) where
 
 import Control.Monad
-import Control.Monad.Reader (ask)
-import Control.Monad.State (get, gets)
+import Control.Monad.Reader (ask, asks)
+import Control.Monad.State (get, gets, modify)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.List (isPrefixOf, isInfixOf, sort)
@@ -77,7 +78,6 @@ import System.IO (hPutStrLn, stderr, hClose)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 
 import Ten.Core
-import qualified Ten.Store as Store
 
 -- Helper function to convert BuildId to String
 showBuildId :: BuildId -> String
@@ -290,7 +290,8 @@ sandboxOutputPath :: FilePath -> FilePath -> FilePath
 sandboxOutputPath sandboxDir outputName = sandboxDir </> "out" </> outputName
 
 -- | Run an action within a build sandbox
-withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build a) -> TenM 'Build a
+-- Only the daemon context can create sandboxes, but both contexts can use them
+withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build c a) -> TenM 'Build c a
 withSandbox inputs config action = do
     env <- ask
     state <- get
@@ -299,37 +300,49 @@ withSandbox inputs config action = do
     when (currentPhase state /= Build) $
         throwError $ BuildFailed "Sandbox can only be created in Build phase"
 
-    -- Check if running as root (daemon mode)
-    isRoot <- liftIO $ do
-        uid <- User.getRealUserID
-        return (uid == 0)
+    -- Handle differently based on context
+    case runMode env of
+        DaemonMode ->
+            -- Daemon can directly create and manage sandboxes
+            withSandboxDaemon inputs config action
 
-    -- Need root for proper sandbox isolation with most namespaces
-    unless isRoot $
-        if sandboxUseMountNamespace config || sandboxUseUserNamespace config
-            then logMsg 2 $ "Warning: Not running as root, some sandbox isolation features may be limited"
-            else return ()
+        ClientMode conn ->
+            -- Client must request sandbox from daemon via protocol
+            withSandboxViaProtocol conn inputs config action
+
+        StandaloneMode ->
+            -- Standalone mode needs to check current privileges
+            checkSandboxPrivileges inputs config action
+
+-- | Create a sandbox in daemon (privileged) context
+withSandboxDaemon :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
+withSandboxDaemon inputs config action = do
+    env <- ask
+    state <- get
+
+    -- Get sandbox directory and ensure cleanup
+    sandboxDir <- getSandboxDir env
 
     -- Create a sandbox function
-    let sandboxFunc sandboxDir = do
-            -- Setup the sandbox
-            setupSandbox sandboxDir config
+    let sandboxFunc dir = do
+            -- Setup the sandbox with namespaces and mounts
+            setupSandbox dir config
 
             -- Make inputs available
-            makeInputsAvailable sandboxDir inputs
+            makeInputsAvailable dir inputs
 
             -- Add read-only and writable paths
-            mapM_ (makePathAvailable sandboxDir False) (Set.toList $ sandboxReadOnlyPaths config)
-            mapM_ (makePathAvailable sandboxDir True) (Set.toList $ sandboxWritablePaths config)
+            mapM_ (makePathAvailable dir False) (Set.toList $ sandboxReadOnlyPaths config)
+            mapM_ (makePathAvailable dir True) (Set.toList $ sandboxWritablePaths config)
 
             -- Add system paths
-            mapM_ (makeSystemPathAvailable sandboxDir) (Set.toList $ sandboxExtraPaths config)
+            mapM_ (makeSystemPathAvailable dir) (Set.toList $ sandboxExtraPaths config)
 
             -- Log sandbox creation
-            logMsg 1 $ "Created sandbox at: " <> T.pack sandboxDir
+            logMsg 1 $ "Created sandbox at: " <> T.pack dir
 
             -- Run the action inside the sandbox
-            result <- action sandboxDir `catchError` \e -> do
+            result <- action dir `catchError` \e -> do
                 -- Log error before cleanup
                 logMsg 1 $ "Error in sandbox: " <> T.pack (show e)
                 -- Re-throw the error
@@ -337,13 +350,12 @@ withSandbox inputs config action = do
 
             -- Cleanup sandbox if we're in daemon mode
             isDaemonMode >>= \daemon -> when daemon $ do
-                logMsg 2 $ "Cleaning up daemon sandbox: " <> T.pack sandboxDir
-                teardownSandbox sandboxDir
+                logMsg 2 $ "Cleaning up daemon sandbox: " <> T.pack dir
+                teardownSandbox dir
 
             return result
 
-    -- Get sandbox directory and ensure cleanup
-    sandboxDir <- getSandboxDir env
+    -- Use bracket to ensure cleanup in case of exceptions
     liftIO (bracket
                 (return sandboxDir)
                 (\dir -> unless (runMode env == DaemonMode) $ do
@@ -367,6 +379,75 @@ withSandbox inputs config action = do
                 (runSandboxed env state sandboxFunc))
         >>= either throwError return
 
+-- | Create a sandbox via daemon protocol (for client context)
+withSandboxViaProtocol :: DaemonConnection -> Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Builder a) -> TenM 'Build 'Builder a
+withSandboxViaProtocol conn inputs config action = do
+    env <- ask
+    state <- get
+
+    -- Request a sandbox from the daemon via protocol
+    bid <- gets currentBuildId
+    sandboxId <- requestSandboxFromDaemon conn bid inputs config
+
+    -- Get the path to the sandbox
+    sandboxPath <- getSandboxPathFromId sandboxId
+
+    -- Run the action in the sandbox
+    result <- action sandboxPath `catchError` \e -> do
+        -- Notify daemon of error
+        notifyDaemonOfSandboxError conn sandboxId e
+        -- Re-throw the error
+        throwError e
+
+    -- Clean up via protocol (daemon will handle actual cleanup)
+    releaseSandboxToDaemon conn sandboxId
+
+    return result
+
+-- | Check if current process has privileges needed for sandbox creation
+checkSandboxPrivileges :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build c a) -> TenM 'Build c a
+checkSandboxPrivileges inputs config action = do
+    -- Check current user ID
+    uid <- liftIO User.getRealUserID
+
+    if uid == 0
+        then
+            -- Has root, can create sandbox directly
+            withSandboxDaemon inputs config (unsafeCoerceContext . action)
+        else
+            -- No root, can't create proper sandbox
+            throwError $ SandboxError "Cannot create secure sandbox: not running as root"
+
+-- | Unsafe coercion between contexts - only for internal use
+unsafeCoerceContext :: TenM p c1 a -> TenM p c2 a
+unsafeCoerceContext (TenM m) = TenM m
+
+-- | Request a sandbox from the daemon via protocol (stub for now)
+requestSandboxFromDaemon :: DaemonConnection -> BuildId -> Set StorePath -> SandboxConfig -> TenM 'Build 'Builder Text
+requestSandboxFromDaemon conn bid inputs config = do
+    -- Protocol implementation would go here
+    -- For now, throw an error as this needs full protocol implementation
+    throwError $ SandboxError "Protocol-based sandbox creation not yet implemented"
+
+-- | Get sandbox path from ID (stub for now)
+getSandboxPathFromId :: Text -> TenM 'Build 'Builder FilePath
+getSandboxPathFromId sid = do
+    -- Protocol implementation would go here
+    -- For now, throw an error as this needs full protocol implementation
+    throwError $ SandboxError "Protocol-based sandbox path resolution not yet implemented"
+
+-- | Notify daemon of sandbox error (stub for now)
+notifyDaemonOfSandboxError :: DaemonConnection -> Text -> BuildError -> TenM 'Build 'Builder ()
+notifyDaemonOfSandboxError conn sid err = do
+    -- Protocol implementation would go here
+    return ()
+
+-- | Release sandbox back to daemon (stub for now)
+releaseSandboxToDaemon :: DaemonConnection -> Text -> TenM 'Build 'Builder ()
+releaseSandboxToDaemon conn sid = do
+    -- Protocol implementation would go here
+    return ()
+
 -- | Set recursive write permissions to help with cleanup
 setRecursiveWritePermissions :: FilePath -> IO ()
 setRecursiveWritePermissions path = do
@@ -387,7 +468,7 @@ setRecursiveWritePermissions path = do
             setPermissions path (setOwnerWritable True perms)
 
 -- | Create and get a sandbox directory path
-getSandboxDir :: BuildEnv -> TenM 'Build FilePath
+getSandboxDir :: BuildEnv -> TenM 'Build 'Daemon FilePath
 getSandboxDir env = do
     bid <- gets currentBuildId  -- Now bid is a BuildId, not Maybe BuildId
     pid <- liftIO getProcessID
@@ -409,7 +490,8 @@ getSandboxDir env = do
     return uniqueDir
 
 -- | Setup a sandbox directory with the proper structure
-setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build ()
+-- Only available in the daemon context
+setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build 'Daemon ()
 setupSandbox sandboxDir config = do
     -- Create the basic directory structure with proper permissions
     liftIO $ createAndSetupDir sandboxDir 0o755
@@ -423,9 +505,9 @@ setupSandbox sandboxDir config = do
         let returnDir = takeDirectory $ returnDerivationPath sandboxDir
         liftIO $ createAndSetupDir returnDir 0o755
 
-    -- Set appropriate permissions
+    -- Set appropriate permissions for the sandbox user
     liftIO $ do
-        -- Make sure key directories are writable for the sandbox user
+        -- Check if we're running as root
         uid <- User.getRealUserID
         when (uid == 0 && not (sandboxPrivileged config)) $ do
             -- Get the user/group IDs for the sandbox user/group
@@ -611,15 +693,19 @@ createAndSetupDir dir mode = do
     Posix.setFileMode dir mode
 
 -- | Helper to run a sandbox action with the Ten monad context
-runSandboxed :: BuildEnv -> BuildState -> (FilePath -> TenM 'Build a) -> FilePath -> IO (Either BuildError a)
+runSandboxed :: BuildEnv -> BuildState -> (FilePath -> TenM 'Build 'Daemon a) -> FilePath -> IO (Either BuildError a)
 runSandboxed env state action sandboxDir = do
-    result <- runTen (action sandboxDir) env state
+    result <- runTenDaemon (action sandboxDir) env state
     return $ case result of
         Left err -> Left err
         Right (val, _) -> Right val
 
+-- | Run a privileged Ten operation in daemon mode
+runTenDaemon :: TenM p 'Daemon a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTenDaemon action env state = runTen action env state
+
 -- | Make a path available in the sandbox (read-only or writable)
-makePathAvailable :: FilePath -> Bool -> FilePath -> TenM 'Build ()
+makePathAvailable :: FilePath -> Bool -> FilePath -> TenM 'Build c ()
 makePathAvailable sandboxDir writable sourcePath = do
     -- Sanitize and normalize source path
     let sourcePath' = normalise sourcePath
@@ -715,14 +801,14 @@ copyDirectoryRecursive src dst = do
             else copyFile srcPath dstPath
 
 -- | Make inputs available in the sandbox
-makeInputsAvailable :: FilePath -> Set StorePath -> TenM 'Build ()
+makeInputsAvailable :: FilePath -> Set StorePath -> TenM 'Build c ()
 makeInputsAvailable sandboxDir inputs = do
     env <- ask
 
     -- Process each input
     forM_ (Set.toList inputs) $ \input -> do
         -- Get source path
-        let sourcePath = Store.storePathToFilePath input env
+        let sourcePath = storePathToFilePath input env
 
         -- Create two paths:
         -- 1. One with the full store path format
@@ -789,7 +875,7 @@ makeInputsAvailable sandboxDir inputs = do
     logMsg 2 $ "Made " <> T.pack (show $ Set.size inputs) <> " inputs available in sandbox"
 
 -- | Make a system path available in the sandbox
-makeSystemPathAvailable :: FilePath -> FilePath -> TenM 'Build ()
+makeSystemPathAvailable :: FilePath -> FilePath -> TenM 'Build c ()
 makeSystemPathAvailable sandboxDir systemPath = do
     -- Sanitize and normalize system path
     let systemPath' = normalise systemPath
@@ -979,7 +1065,7 @@ unmountAllBindMounts dir = do
         return paths
 
 -- | Tear down a sandbox, cleaning up resources
-teardownSandbox :: FilePath -> TenM 'Build ()
+teardownSandbox :: FilePath -> TenM 'Build c ()
 teardownSandbox sandboxDir = do
     logMsg 2 $ "Tearing down sandbox: " <> T.pack sandboxDir
 
@@ -1059,8 +1145,9 @@ prepareSandboxEnvironment env buildState sandboxDir extraEnv =
         ]
 
 -- | Drop privileges to run as unprivileged user
-dropSandboxPrivileges :: String -> String -> IO ()
-dropSandboxPrivileges userName groupName = do
+-- Only available in privileged context
+dropPrivileges :: String -> String -> TenM p 'Daemon ()
+dropPrivileges userName groupName = liftIO $ do
     -- Get the current (effective) user ID
     euid <- User.getEffectiveUserID
 
@@ -1155,24 +1242,6 @@ setRLimit resource softLimit hardLimit = do
             hPutStrLn stderr $ "Warning: Failed to set resource limit " ++
                              show resource ++ ": " ++ show (case errno of Errno n -> n)
 
--- | Regain privileges (back to root)
-regainPrivileges :: IO ()
-regainPrivileges = do
-    -- Set effective user ID back to 0 (root)
-    -- This only works if the real UID is root
-    ruid <- User.getRealUserID
-
-    if ruid == 0
-        then do
-            User.setEffectiveUserID 0
-
-            -- Verify
-            euid <- User.getEffectiveUserID
-            when (euid /= 0) $
-                error "Failed to regain privileges - not running as root"
-        else
-            error "Cannot regain privileges - real user is not root"
-
 -- | Execute action with dropped privileges
 withDroppedPrivileges :: String -> String -> IO a -> IO a
 withDroppedPrivileges user group action =
@@ -1187,7 +1256,12 @@ withDroppedPrivileges user group action =
                     egid <- User.getEffectiveGroupID
 
                     -- Drop privileges
-                    dropSandboxPrivileges user group
+                    uid' <- safeGetUserUID user
+                    gid' <- safeGetGroupGID group
+
+                    -- Change group first, then user
+                    User.setGroupID gid'
+                    User.setUserID uid'
 
                     -- Return the original IDs for restoration
                     return $ Just (euid, egid)

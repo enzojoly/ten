@@ -10,10 +10,12 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Ten.Core (
     -- Core types
     Phase(..),
+    PrivilegeContext(..),
     TenM(..),
     BuildEnv(..),
     BuildState(..),
@@ -31,18 +33,23 @@ module Ten.Core (
     PhaseTransition(..),
     transitionPhase,
 
+    -- Privilege context transitions
+    PrivilegeTransition(..),
+    transitionPrivilege,
+    withPrivilegeTransition,
+
     -- Store types
     StorePath(..),
     storePathToText,
     textToStorePath,
     parseStorePath,
-    parseStorePathText, -- Added alias for API consistency
+    parseStorePathText,
     validateStorePath,
 
     -- Reference tracking types
     StoreReference(..),
     ReferenceType(..),
-    StorePathReference(..),  -- Changed from DerivationReference
+    StorePathReference(..),
     GCRoot(..),
     RootType(..),
 
@@ -77,14 +84,20 @@ module Ten.Core (
     runTen,
     evalTen,
     buildTen,
+    runTenDaemon,
+    runTenBuilder,
     runTenIO,
     liftTenIO,
+    liftPrivilegedIO,
+    liftUnprivilegedIO,
     logMsg,
     assertTen,
 
     -- Type class constraints
     EvalPhase(..),
     BuildPhase(..),
+    DaemonContext(..),
+    BuilderContext(..),
 
     -- Build chain handling
     newBuildId,
@@ -112,7 +125,10 @@ module Ten.Core (
     -- Path handling utilities
     storePathToFilePath,
     filePathToStorePath,
-    makeStorePath
+    makeStorePath,
+
+    -- Error utilities
+    privilegeError
 ) where
 
 import Control.Concurrent.STM
@@ -159,6 +175,10 @@ import Data.Char (isHexDigit)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
+    deriving (Show, Eq)
+
+-- | Privilege context for type-level separation between daemon and builder
+data PrivilegeContext = Privileged | Unprivileged
     deriving (Show, Eq)
 
 -- | Build identifier type
@@ -210,6 +230,7 @@ data BuildError
     | DBError Text                       -- Database-related errors
     | GCError Text                       -- Garbage collection errors
     | PhaseError Text                    -- Error with phase transition/operation
+    | PrivilegeError Text                -- Error with privilege context violation
     deriving (Show, Eq)
 
 instance Exception BuildError
@@ -393,6 +414,14 @@ data PhaseTransition p q where
 deriving instance Show (PhaseTransition p q)
 deriving instance Eq (PhaseTransition p q)
 
+-- | Privilege transition type
+data PrivilegeTransition (p :: PrivilegeContext) (q :: PrivilegeContext) where
+    DropPrivilege :: PrivilegeTransition 'Privileged 'Unprivileged
+    -- No constructor for gaining privilege - can only drop
+
+deriving instance Show (PrivilegeTransition p q)
+deriving instance Eq (PrivilegeTransition p q)
+
 -- | User identifier
 newtype UserId = UserId Text
     deriving (Show, Eq, Ord)
@@ -492,6 +521,7 @@ data BuildEnv = BuildEnv
     , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
     , maxConcurrentBuilds :: Maybe Int   -- Maximum concurrent builds
     , gcLockPath :: FilePath             -- Path to GC lock file
+    , privilegeContext :: PrivilegeContext -- Current privilege context
     } deriving (Show, Eq)
 
 -- | State carried through build operations
@@ -500,13 +530,13 @@ data BuildState = BuildState
     , buildProofs :: [Proof 'Build]      -- Accumulated proofs
     , buildInputs :: Set StorePath       -- Input paths for current build
     , buildOutputs :: Set StorePath      -- Output paths for current build
-    , currentBuildId :: BuildId          -- Current build identifier (changed from Maybe BuildId)
+    , currentBuildId :: BuildId          -- Current build identifier
     , buildChain :: [Derivation]         -- Chain of return-continuation derivations
     , recursionDepth :: Int              -- Tracks recursion depth for cycles
     } deriving (Show)
 
 -- | The core monad for all Ten operations
-newtype TenM (p :: Phase) a = TenM
+newtype TenM (p :: Phase) (ctx :: PrivilegeContext) a = TenM
     { runTenM :: ReaderT BuildEnv (StateT BuildState (ExceptT BuildError IO)) a }
     deriving
         ( Functor
@@ -519,7 +549,7 @@ newtype TenM (p :: Phase) a = TenM
         )
 
 -- Add MonadFail instance for TenM - critical for pattern matching in do-notation
-instance MonadFail (TenM p) where
+instance MonadFail (TenM p ctx) where
     fail msg = throwError $ BuildFailed $ T.pack msg
 
 -- | Get the default path for the Ten database
@@ -546,12 +576,14 @@ initBuildEnv wd sp = BuildEnv
     , maxRecursionDepth = 100
     , maxConcurrentBuilds = Nothing
     , gcLockPath = sp </> "var/ten/gc.lock"
+    , privilegeContext = Unprivileged  -- Default to unprivileged for safety
     }
 
 -- | Initialize client build environment
 initClientEnv :: FilePath -> FilePath -> DaemonConnection -> BuildEnv
 initClientEnv wd sp conn = (initBuildEnv wd sp)
     { runMode = ClientMode conn
+    , privilegeContext = Unprivileged  -- Clients are always unprivileged
     }
 
 -- | Initialize daemon build environment
@@ -559,6 +591,7 @@ initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
 initDaemonEnv wd sp user = (initBuildEnv wd sp)
     { runMode = DaemonMode
     , userName = user
+    , privilegeContext = Privileged  -- Daemon runs in privileged context
     }
 
 -- | Initialize build state for a given phase with a BuildId
@@ -574,35 +607,89 @@ initBuildState phase bid = BuildState
     }
 
 -- | Execute a Ten monad in the given environment and state
-runTen :: TenM p a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
-runTen m env state = runExceptT $ runStateT (runReaderT (runTenM m) env) state
+runTen :: TenM p ctx a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTen m env state = do
+    -- Validate privilege context matches
+    if privilegeContext env == getContextFromType (Proxy :: Proxy ctx)
+        then runExceptT $ runStateT (runReaderT (runTenM m) env) state
+        else return $ Left $ PrivilegeError "Privilege context mismatch"
+  where
+    getContextFromType :: Proxy (ctx :: PrivilegeContext) -> PrivilegeContext
+    getContextFromType (_ :: Proxy 'Privileged) = Privileged
+    getContextFromType (_ :: Proxy 'Unprivileged) = Unprivileged
 
--- | Execute an evaluation-phase computation
-evalTen :: TenM 'Eval a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+-- | Execute an evaluation-phase computation in privileged mode
+evalTen :: TenM 'Eval 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 evalTen m env = do
-    bid <- BuildId <$> newUnique  -- Generate a new build ID
-    runTen m env (initBuildState Eval bid)
+    -- Ensure environment is privileged
+    let env' = env { privilegeContext = Privileged }
+    bid <- BuildId <$> newUnique
+    runTen m env' (initBuildState Eval bid)
 
--- | Execute a build-phase computation
-buildTen :: TenM 'Build a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+-- | Execute a build-phase computation in unprivileged mode
+buildTen :: TenM 'Build 'Unprivileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 buildTen m env = do
-    bid <- BuildId <$> newUnique  -- Generate a new build ID
-    runTen m env (initBuildState Build bid)
+    -- Ensure environment is unprivileged
+    let env' = env { privilegeContext = Unprivileged }
+    bid <- BuildId <$> newUnique
+    runTen m env' (initBuildState Build bid)
+
+-- | Execute a daemon operation (privileged)
+runTenDaemon :: TenM p 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+runTenDaemon m env = do
+    -- Verify we're in daemon mode
+    case runMode env of
+        DaemonMode -> do
+            -- Set privileged context
+            let env' = env { privilegeContext = Privileged }
+            bid <- BuildId <$> newUnique
+            runTen m env' (initBuildState (getPhaseFromType (Proxy :: Proxy p)) bid)
+        _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
+  where
+    getPhaseFromType :: Proxy (p :: Phase) -> Phase
+    getPhaseFromType (_ :: Proxy 'Eval) = Eval
+    getPhaseFromType (_ :: Proxy 'Build) = Build
+
+-- | Execute a builder operation (unprivileged)
+runTenBuilder :: TenM p 'Unprivileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+runTenBuilder m env = do
+    -- Set unprivileged context
+    let env' = env { privilegeContext = Unprivileged }
+    bid <- BuildId <$> newUnique
+    runTen m env' (initBuildState (getPhaseFromType (Proxy :: Proxy p)) bid)
+  where
+    getPhaseFromType :: Proxy (p :: Phase) -> Phase
+    getPhaseFromType (_ :: Proxy 'Eval) = Eval
+    getPhaseFromType (_ :: Proxy 'Build) = Build
 
 -- | Run an IO operation within the TenM monad
-runTenIO :: IO a -> TenM p a
+runTenIO :: IO a -> TenM p ctx a
 runTenIO = liftIO
 
 -- | Lift an IO action that returns (Either BuildError a) into TenM
-liftTenIO :: IO (Either BuildError a) -> TenM p a
+liftTenIO :: IO (Either BuildError a) -> TenM p ctx a
 liftTenIO action = do
     result <- liftIO action
     case result of
         Left err -> throwError err
         Right val -> return val
 
+-- | Lift an IO action into the privileged context
+-- This will fail at runtime if executed in an unprivileged context
+liftPrivilegedIO :: IO a -> TenM p 'Privileged a
+liftPrivilegedIO = liftIO
+
+-- | Lift an IO action into the unprivileged context
+-- This is safer since it works in both contexts
+liftUnprivilegedIO :: IO a -> TenM p ctx a
+liftUnprivilegedIO action = do
+    ctx <- asks privilegeContext
+    case ctx of
+        Privileged -> liftIO action
+        Unprivileged -> liftIO action
+
 -- | Safely transition between phases
-transitionPhase :: PhaseTransition p q -> TenM p a -> TenM q a
+transitionPhase :: PhaseTransition p q -> TenM p ctx a -> TenM q ctx a
 transitionPhase trans action = TenM $ do
     env <- ask
     state <- get
@@ -628,16 +715,39 @@ transitionPhase trans action = TenM $ do
                     put newState { currentPhase = Eval }
                     return val
 
+-- | Safely transition between privilege contexts
+-- Only allows dropping privileges, never gaining them
+transitionPrivilege :: PrivilegeTransition ctx ctx' -> TenM p ctx a -> TenM p ctx' a
+transitionPrivilege trans action = TenM $ do
+    env <- ask
+    state <- get
+
+    case trans of
+        DropPrivilege -> do
+            -- Run action in privileged context with original state
+            let env' = env { privilegeContext = Unprivileged }
+            result <- liftIO $ runTen action env state
+            case result of
+                Left err -> throwError err
+                Right (val, newState) -> do
+                    -- Update state with new values but keep privilege
+                    put newState
+                    return val
+
+-- | Execute an action with a privilege transition
+withPrivilegeTransition :: PrivilegeTransition ctx ctx' -> (TenM p ctx' a -> TenM p ctx' a) -> TenM p ctx a -> TenM p ctx' a
+withPrivilegeTransition trans wrapper action = wrapper (transitionPrivilege trans action)
+
 -- | Generate a new unique build ID
-newBuildId :: TenM p BuildId
+newBuildId :: TenM p ctx BuildId
 newBuildId = liftIO $ BuildId <$> newUnique
 
 -- | Set the current build ID
-setCurrentBuildId :: BuildId -> TenM p ()
+setCurrentBuildId :: BuildId -> TenM p ctx ()
 setCurrentBuildId bid = modify $ \s -> s { currentBuildId = bid }
 
 -- | Add a derivation to the build chain
-addToDerivationChain :: Derivation -> TenM p ()
+addToDerivationChain :: Derivation -> TenM p ctx ()
 addToDerivationChain drv = do
     depth <- gets recursionDepth
     maxDepth <- asks maxRecursionDepth
@@ -646,19 +756,19 @@ addToDerivationChain drv = do
     modify $ \s -> s { buildChain = drv : buildChain s, recursionDepth = depth + 1 }
 
 -- | Check if a derivation is in the build chain (cycle detection)
-isInDerivationChain :: Derivation -> TenM p Bool
+isInDerivationChain :: Derivation -> TenM p ctx Bool
 isInDerivationChain drv = do
     chain <- gets buildChain
     return $ any (derivationEquals drv) chain
 
 -- | Logging function
-logMsg :: Int -> Text -> TenM p ()
+logMsg :: Int -> Text -> TenM p ctx ()
 logMsg level msg = do
     v <- asks verbosity
     when (v >= level) $ liftIO $ putStrLn $ T.unpack msg
 
 -- | Record a proof in the build state
-addProof :: Proof p -> TenM p ()
+addProof :: Proof p -> TenM ph ctx ()
 addProof proof = case proof of
     p@BuildProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
     p@OutputProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
@@ -672,31 +782,50 @@ addProof proof = case proof of
     _ -> return () -- Other proofs don't affect build state
 
 -- | Assert that a condition holds, or throw an error
-assertTen :: Bool -> BuildError -> TenM p ()
+assertTen :: Bool -> BuildError -> TenM p ctx ()
 assertTen condition err = unless condition $ throwError err
 
 -- | Operations only allowed in evaluation phase
-class EvalPhase (p :: Phase) where
-    evalOnly :: TenM 'Eval a -> TenM p a
+class EvalPhase (p :: Phase) (ctx :: PrivilegeContext) where
+    evalOnly :: TenM 'Eval ctx a -> TenM p ctx a
 
 -- Only actual evaluation phase can run evaluation operations
-instance EvalPhase 'Eval where
+instance EvalPhase 'Eval ctx where
     evalOnly = id
 
 -- | Operations only allowed in build phase
-class BuildPhase (p :: Phase) where
-    buildOnly :: TenM 'Build a -> TenM p a
+class BuildPhase (p :: Phase) (ctx :: PrivilegeContext) where
+    buildOnly :: TenM 'Build ctx a -> TenM p ctx a
 
 -- Only actual build phase can run build operations
-instance BuildPhase 'Build where
+instance BuildPhase 'Build ctx where
     buildOnly = id
 
+-- | Operations only allowed in daemon context
+class DaemonContext (ctx :: PrivilegeContext) where
+    daemonOnly :: TenM p 'Privileged a -> TenM p ctx a
+
+-- Only daemon context can run privileged operations
+instance DaemonContext 'Privileged where
+    daemonOnly = id
+
+-- | Operations only allowed in builder context
+class BuilderContext (ctx :: PrivilegeContext) where
+    builderOnly :: TenM p 'Unprivileged a -> TenM p ctx a
+
+-- Both contexts can run unprivileged operations, but differently
+instance BuilderContext 'Unprivileged where
+    builderOnly = id
+
+instance BuilderContext 'Privileged where
+    builderOnly = transitionPrivilege DropPrivilege
+
 -- | Run an STM transaction from Ten monad
-atomicallyTen :: STM a -> TenM p a
+atomicallyTen :: STM a -> TenM p ctx a
 atomicallyTen = liftIO . atomically
 
 -- | Execute a build operation using the daemon (if in client mode)
-withDaemon :: (DaemonConnection -> IO (Either BuildError a)) -> TenM p a
+withDaemon :: (DaemonConnection -> IO (Either BuildError a)) -> TenM p ctx a
 withDaemon f = do
     mode <- asks runMode
     case mode of
@@ -708,11 +837,11 @@ withDaemon f = do
         _ -> throwError $ DaemonError "Operation requires daemon connection"
 
 -- | Check if running in daemon mode
-isDaemonMode :: TenM p Bool
+isDaemonMode :: TenM p ctx Bool
 isDaemonMode = (== DaemonMode) <$> asks runMode
 
 -- | Check if connected to daemon
-isClientMode :: TenM p Bool
+isClientMode :: TenM p ctx Bool
 isClientMode = do
     mode <- asks runMode
     case mode of
@@ -720,7 +849,7 @@ isClientMode = do
         _ -> return False
 
 -- | Linux-specific: Drop privileges to a specified user and group
-dropPrivileges :: Text -> Text -> TenM p ()
+dropPrivileges :: Text -> Text -> TenM p 'Privileged ()
 dropPrivileges user group = liftIO $ do
     -- Get the current (effective) user ID
     euid <- getEffectiveUserID
@@ -738,13 +867,13 @@ dropPrivileges user group = liftIO $ do
         setUserID (userID userEntry)
 
 -- | Linux-specific: Get a system user ID
-getSystemUser :: Text -> TenM p UserID
+getSystemUser :: Text -> TenM p 'Privileged UserID
 getSystemUser username = liftIO $ do
     userEntry <- getUserEntryForName (T.unpack username)
     return $ userID userEntry
 
 -- | Linux-specific: Get a system group ID
-getSystemGroup :: Text -> TenM p GroupID
+getSystemGroup :: Text -> TenM p 'Privileged GroupID
 getSystemGroup groupname = liftIO $ do
     groupEntry <- getGroupEntryForName (T.unpack groupname)
     return $ groupID groupEntry
@@ -768,3 +897,7 @@ derivationEquals d1 d2 = derivHash d1 == derivHash d2
 -- | Compare StorePaths for equality
 derivationPathsEqual :: StorePath -> StorePath -> Bool
 derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == storeName p2
+
+-- | Helper for privilege errors
+privilegeError :: Text -> BuildError
+privilegeError = PrivilegeError
