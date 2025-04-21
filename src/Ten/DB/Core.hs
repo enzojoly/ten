@@ -1,6 +1,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE DataKinds #-}
 
 module Ten.DB.Core (
     -- Database types
@@ -17,6 +19,7 @@ module Ten.DB.Core (
     -- Transaction management
     dbWithTransaction,
     withTransaction,
+    withTenTransaction,
 
     -- Low-level query functions
     dbExecute,
@@ -25,18 +28,29 @@ module Ten.DB.Core (
     dbQuery,
     dbQuery_,
 
+    -- TenM-integrated query functions
+    tenQuery,
+    tenQuery_,
+    tenExecute,
+    tenExecute_,
+    tenExecuteSimple_,
+
     -- Database metadata
     getSchemaVersion,
     updateSchemaVersion,
 
     -- Utility functions
     runDBAction,
-    retryOnBusy
+    retryOnBusy,
+    withDB
 ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket, catch, throwIO, Exception, SomeException)
-import Control.Monad (when, void)
+import Control.Exception (bracket, catch, throwIO, finally, Exception, SomeException)
+import Control.Monad (when, void, unless)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Reader (MonadReader, ask)
+import Control.Monad.Except (MonadError, throwError)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -46,7 +60,7 @@ import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import System.Posix.Files (setFileMode)
 
-import Ten.Core (defaultDBPath)
+import Ten.Core
 
 -- | Database error types
 data DBError
@@ -58,6 +72,8 @@ data DBError
     | DBResourceError Text
     | DBMigrationError Text
     | DBInvalidStateError Text
+    | DBPhaseError Text
+    | DBPermissionError Text
     deriving (Show, Eq)
 
 instance Exception DBError
@@ -135,6 +151,33 @@ withDatabase dbPath busyTimeout = bracket
     (initDatabase dbPath busyTimeout)
     closeDatabase
 
+-- | Run an action with a database in the TenM monad
+withDB :: (MonadIO m, MonadError BuildError m, MonadReader BuildEnv m) => (Database -> m a) -> m a
+withDB action = do
+    env <- ask
+    let dbPath = defaultDBPath (storeDir env)
+    let busyTimeout = 5000  -- 5 seconds
+
+    -- Create a bracket-like operation in the TenM monad
+    bracket
+        (liftIO $ initDatabase dbPath busyTimeout)
+        (liftIO . closeDatabase)
+        action
+  where
+    -- Implementation of bracket for the TenM monad
+    bracket :: MonadIO m => IO a -> (a -> IO b) -> (a -> m c) -> m c
+    bracket acquire release action' = do
+        resource <- liftIO acquire
+        result <- action' resource `onError` liftIO (release resource)
+        liftIO $ release resource
+        return result
+
+    -- Helper for error handling
+    onError :: MonadIO m => m a -> IO b -> m a
+    onError action' onErr = do
+        result <- action'
+        return result
+
 -- | Run a transaction with the specified mode
 dbWithTransaction :: Database -> TransactionMode -> (Database -> IO a) -> IO a
 dbWithTransaction db mode action = do
@@ -163,6 +206,45 @@ dbWithTransaction db mode action = do
 -- | Alias for dbWithTransaction for backward compatibility
 withTransaction :: Database -> TransactionMode -> (Database -> IO a) -> IO a
 withTransaction = dbWithTransaction
+
+-- | Run a transaction in the TenM monad
+withTenTransaction :: (MonadIO m, MonadError BuildError m) => Database -> TransactionMode -> (Database -> m a) -> m a
+withTenTransaction db mode action = do
+    -- Start transaction
+    let beginStmt = case mode of
+            ReadOnly -> "BEGIN TRANSACTION READONLY;"
+            ReadWrite -> "BEGIN TRANSACTION;"
+            Exclusive -> "BEGIN EXCLUSIVE TRANSACTION;"
+
+    -- Execute the transaction in a bracket-like pattern
+    bracketTen
+        (liftIO $ dbExecuteSimple_ db (Query beginStmt))
+        (\_ -> liftIO $ rollbackTx db)
+        (\_ -> do
+            result <- action db
+            liftIO $ dbExecuteSimple_ db "COMMIT;"
+            return result)
+  where
+    -- Implementation of bracket for TenM monad
+    bracketTen :: MonadIO m => IO a -> (a -> IO b) -> (a -> m c) -> m c
+    bracketTen acquire release action' = do
+        resource <- liftIO acquire
+        result <- action' resource `onError` liftIO (release resource)
+        liftIO $ release resource
+        return result
+
+    -- Helper for error handling
+    onError :: MonadIO m => m a -> IO b -> m a
+    onError action' onErr = do
+        result <- action'
+        return result
+
+    -- Roll back transaction
+    rollbackTx :: Database -> IO ()
+    rollbackTx db' = catch
+        (dbExecuteSimple_ db' "ROLLBACK;")
+        (\(e :: SomeException) ->
+            putStrLn $ "Warning: Error rolling back transaction: " ++ show e)
 
 -- | Roll back transaction on error
 rollbackOnError :: Database -> IO ()
@@ -197,6 +279,54 @@ dbQuery db q params = retryOnBusy db $
 dbQuery_ :: FromRow r => Database -> Query -> IO [r]
 dbQuery_ db q = retryOnBusy db $
     SQLite.query_ (dbConn db) q
+
+-- | TenM-integrated query with parameters
+tenQuery :: (MonadIO m, MonadError BuildError m, ToRow q, FromRow r) => Database -> Query -> q -> m [r]
+tenQuery db query params = do
+    result <- liftIO $ try $ dbQuery db query params
+    case result of
+        Left e -> throwError $ DBError $ T.pack $ "Database query error: " ++ show e
+        Right rows -> return rows
+  where
+    try :: IO a -> IO (Either SomeException a)
+    try action = catch (Right <$> action) (return . Left)
+
+-- | TenM-integrated query without parameters
+tenQuery_ :: (MonadIO m, MonadError BuildError m, FromRow r) => Database -> Query -> m [r]
+tenQuery_ db query = do
+    result <- liftIO $ try $ dbQuery_ db query
+    case result of
+        Left e -> throwError $ DBError $ T.pack $ "Database query error: " ++ show e
+        Right rows -> return rows
+  where
+    try :: IO a -> IO (Either SomeException a)
+    try action = catch (Right <$> action) (return . Left)
+
+-- | TenM-integrated execute with parameters
+tenExecute :: (MonadIO m, MonadError BuildError m, ToRow q) => Database -> Query -> q -> m Int64
+tenExecute db query params = do
+    result <- liftIO $ try $ dbExecute db query params
+    case result of
+        Left e -> throwError $ DBError $ T.pack $ "Database execute error: " ++ show e
+        Right count -> return count
+  where
+    try :: IO a -> IO (Either SomeException a)
+    try action = catch (Right <$> action) (return . Left)
+
+-- | TenM-integrated execute with parameters, discarding result
+tenExecute_ :: (MonadIO m, MonadError BuildError m, ToRow q) => Database -> Query -> q -> m ()
+tenExecute_ db query params = void $ tenExecute db query params
+
+-- | TenM-integrated simple execute
+tenExecuteSimple_ :: (MonadIO m, MonadError BuildError m) => Database -> Query -> m ()
+tenExecuteSimple_ db query = do
+    result <- liftIO $ try $ dbExecuteSimple_ db query
+    case result of
+        Left e -> throwError $ DBError $ T.pack $ "Database execute error: " ++ show e
+        Right () -> return ()
+  where
+    try :: IO a -> IO (Either SomeException a)
+    try action = catch (Right <$> action) (return . Left)
 
 -- | Execute a raw SQL statement (for pragmas)
 executeRaw :: Connection -> Text -> IO ()
@@ -301,12 +431,31 @@ initializeSchema db = dbWithTransaction db Exclusive $ \_ -> do
                 \deriver TEXT, \
                 \is_valid INTEGER NOT NULL DEFAULT 1);"
 
+    -- Create ActiveBuilds table
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS ActiveBuilds (\
+                \build_id TEXT PRIMARY KEY, \
+                \path TEXT NOT NULL, \
+                \status TEXT NOT NULL, \
+                \start_time INTEGER NOT NULL DEFAULT (strftime('%s','now')), \
+                \update_time INTEGER NOT NULL DEFAULT (strftime('%s','now')));"
+
+    -- Create GCRoots table
+    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS GCRoots (\
+                \path TEXT NOT NULL, \
+                \name TEXT NOT NULL, \
+                \type TEXT NOT NULL, \
+                \timestamp INTEGER NOT NULL DEFAULT (strftime('%s','now')), \
+                \active INTEGER NOT NULL DEFAULT 1, \
+                \PRIMARY KEY (path, name));"
+
     -- Create indices for performance
     dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
     dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
     dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
     dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
     dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_activebuilds_status ON ActiveBuilds(status);"
+    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_gcroots_active ON GCRoots(active);"
 
     -- Set schema version
     updateSchemaVersion db 1

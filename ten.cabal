@@ -52,6 +52,7 @@ library
                      , stm >=2.5.2
                      , network >=3.1
                      , unix >=2.7.2.2
+                     , unix-bytestring >= 0.3.8
                      , aeson >=2.1
                      , extra >= 1.7.10
                      , uuid >=1.3

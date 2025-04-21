@@ -44,6 +44,7 @@ import Control.Monad.State (get, modify)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Time
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Map.Strict (Map)
@@ -71,6 +72,7 @@ import qualified Data.ByteString.Char8 as BC
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Database.SQLite.Simple (Only(..))
+import Data.List (isPrefixOf, isInfixOf)
 
 import Ten.Core
 import Ten.Store
@@ -117,7 +119,7 @@ addRoot path name permanent = do
     let root = GCRoot path name rootType now
 
     -- Write the root to the roots directory
-    let rootsDir = storePath env </> "gc-roots"
+    let rootsDir = storeDir env </> "gc-roots"
     liftIO $ createDirectoryIfMissing True rootsDir
 
     -- Generate a unique filename for the root
@@ -128,7 +130,7 @@ addRoot path name permanent = do
     liftIO $ createSymbolicLink targetPath rootFile
 
     -- Also register the root in the database
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
     liftIO $ dbExecute db
         "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
         (storePathToText path, name, if permanent then "permanent" else "user")
@@ -144,7 +146,7 @@ removeRoot root = do
     env <- ask
 
     -- Generate the root file path
-    let rootsDir = storePath env </> "gc-roots"
+    let rootsDir = storeDir env </> "gc-roots"
     let rootFile = rootsDir </> (T.unpack $ storeHash (rootPath root) <> "-" <> rootName root)
 
     -- Check if it exists
@@ -158,7 +160,7 @@ removeRoot root = do
             liftIO $ removeFile rootFile
 
             -- Remove from database
-            db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+            db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
             liftIO $ dbExecute db
                 "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
                 (storePathToText (rootPath root), rootName root)
@@ -172,14 +174,14 @@ listRoots = do
     env <- ask
 
     -- Get the roots directory
-    let rootsDir = storePath env </> "gc-roots"
+    let rootsDir = storeDir env </> "gc-roots"
 
     -- Create it if it doesn't exist
     liftIO $ createDirectoryIfMissing True rootsDir
 
     -- Get roots both from filesystem and database
     fsRoots <- liftIO $ getFileSystemRoots rootsDir
-    dbRoots <- liftIO $ getDatabaseRoots (storePath env)
+    dbRoots <- liftIO $ getDatabaseRoots (storeDir env)
 
     -- Combine both sources, with filesystem taking precedence for duplicates
     let allRoots = Map.union (Map.fromList [(rootPath r, r) | r <- fsRoots])
@@ -209,7 +211,7 @@ getFileSystemRoots rootsDir = do
                 case target of
                     Left (_ :: SomeException) -> return Nothing
                     Right linkTarget -> do
-                        let path = case parseStorePathFromPath linkTarget of
+                        let path = case filePathToStorePath linkTarget of
                                 Just p -> p
                                 Nothing -> StorePath "unknown" "unknown"
 
@@ -271,12 +273,6 @@ getDatabaseRoots storeDir = do
     closeDatabase db
     return $ catMaybes roots
 
--- | Parse StorePath from filesystem path
-parseStorePathFromPath :: FilePath -> Maybe StorePath
-parseStorePathFromPath path =
-    -- Extract store path from a filesystem path like "/nix/store/hash-name"
-    parseStorePath $ T.pack $ takeFileName path
-
 -- | Run garbage collection
 collectGarbage :: TenM p GCStats
 collectGarbage = do
@@ -311,15 +307,15 @@ collectGarbageWithStats = do
     startTime <- liftIO getCurrentTime
 
     -- Open database connection
-    let dbPath = defaultDBPath (storePath env)
+    let dbPath = defaultDBPath (storeDir env)
     db <- liftIO $ initDatabase dbPath 5000
 
     -- Find all paths in the store
-    let storeDir = storePath env
-    allStorePaths <- liftIO $ findAllStorePaths storeDir
+    let storeDirPath = storeDir env
+    allStorePaths <- liftIO $ findAllStorePaths storeDirPath
 
     -- Find all root paths
-    rootPaths <- liftIO $ findAllRoots db storeDir
+    rootPaths <- liftIO $ findAllRoots db storeDirPath
 
     -- Log information about roots
     logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
@@ -342,8 +338,8 @@ collectGarbageWithStats = do
     let deletablePaths = Set.difference allStorePaths protectedPaths
 
     -- Get total size of deletable paths
-    totalSize <- liftIO $ sum <$> mapM (getFileSize . (storeDir </>))
-                                       (map (pathToFilePath . storePathToText) $ Set.toList deletablePaths)
+    totalSize <- liftIO $ sum <$> mapM (getPathSize storeDirPath)
+                                       (map storePathToText $ Set.toList deletablePaths)
 
     -- Delete unreachable paths
     deleted <- liftIO $ do
@@ -354,9 +350,10 @@ collectGarbageWithStats = do
         forM_ (Set.toList deletablePaths) $ \path -> do
             -- Skip paths in gc-roots directory
             let pathText = storePathToText path
+            let fsPath = storePathToFilePath path env
             unless ("gc-roots/" `T.isPrefixOf` pathText) $
                 -- Attempt to delete, ignoring errors
-                catch (removePathForcibly (storeDir </> pathToFilePath pathText)) $ \(_ :: IOError) -> return ()
+                catch (removePathForcibly fsPath) $ \(_ :: IOError) -> return ()
 
         return $ Set.size deletablePaths
 
@@ -376,9 +373,21 @@ collectGarbageWithStats = do
         , gcElapsedTime = elapsed
         }
 
--- | Convert StorePath to path relative to store (hash-name format)
-pathToFilePath :: Text -> FilePath
-pathToFilePath = T.unpack
+-- | Get file/path size in bytes
+getPathSize :: FilePath -> Text -> IO Integer
+getPathSize storeDir pathText = do
+    let fullPath = storeDir </> T.unpack pathText
+
+    -- Check if path exists
+    exists <- doesFileExist fullPath
+    if exists
+        then do
+            -- Get file size
+            fileStatus <- getFileStatus fullPath
+            return $ fromIntegral $ fileSize fileStatus
+        else
+            -- If it doesn't exist, return 0
+            return 0
 
 -- | Find all store paths
 findAllStorePaths :: FilePath -> IO (Set StorePath)
@@ -465,13 +474,17 @@ getFileSystemRootPaths rootsDir = do
                         case target of
                             Left (_ :: SomeException) -> return acc
                             Right targetPath ->
-                                case parseStorePathFromPath targetPath of
+                                case filePathToStorePath targetPath of
                                     Just sp -> return $ Set.insert sp acc
                                     Nothing -> return acc
                     else return acc
                 ) Set.empty files
 
             return paths
+
+-- | Helper function to check if a path is a symbolic link
+pathIsSymbolicLink :: FileStatus -> Bool
+pathIsSymbolicLink status = isSymbolicLink status
 
 -- | Get root paths from database
 getDatabaseRootPaths :: Database -> IO (Set StorePath)
@@ -512,23 +525,13 @@ getRuntimeRootPaths storeDir = do
 
                     return paths
   where
-    -- Simple function to extract store paths from text
+    -- Function to extract store paths from text
     extractStorePaths :: String -> Set StorePath
     extractStorePaths text =
         -- This is a simplified approach; in practice you'd use a proper parser
         let words = lines text
             paths = filter (\w -> length w > 10 && '-' `elem` w) words
         in Set.fromList $ catMaybes $ map (parseStorePath . T.pack) paths
-
--- | Get file size
-getFileSize :: FilePath -> IO Integer
-getFileSize path = do
-    exists <- doesFileExist path
-    if exists
-        then do
-            stat <- getFileStatus path
-            return $ fromIntegral $ fileSize stat
-        else return 0
 
 -- | Daemon-coordinated garbage collection
 daemonCollectGarbage :: TenM p GCStats
@@ -617,10 +620,10 @@ isReachable path = do
     env <- ask
 
     -- Initialize database
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
 
     -- Get all roots
-    roots <- liftIO $ findAllRoots db (storePath env)
+    roots <- liftIO $ findAllRoots db (storeDir env)
 
     -- Use database to check reachability
     result <- liftIO $ isPathReachable db roots path
@@ -636,10 +639,10 @@ findReachablePaths = do
     env <- ask
 
     -- Initialize database
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
 
     -- Find all roots
-    roots <- liftIO $ findAllRoots db (storePath env)
+    roots <- liftIO $ findAllRoots db (storeDir env)
 
     -- Compute all reachable paths
     reachable <- liftIO $ computeReachablePathsFromRoots db roots
@@ -648,6 +651,24 @@ findReachablePaths = do
     liftIO $ closeDatabase db
 
     return reachable
+
+-- | Break a stale lock
+breakStaleLock :: FilePath -> TenM p ()
+breakStaleLock lockPath = do
+    -- Check lock status
+    status <- liftIO $ checkLockFile lockPath
+
+    case status of
+        Left err ->
+            logMsg 1 $ "Cannot check lock status: " <> err
+        Right isValid ->
+            unless isValid $ liftIO $ do
+                -- Log that we're breaking a stale lock
+                hPutStrLn stderr $ "Breaking stale GC lock: " ++ lockPath
+
+                -- Remove the lock file
+                removeFile lockPath `catch` \(_ :: SomeException) ->
+                    hPutStrLn stderr $ "Warning: Failed to remove stale lock file: " ++ lockPath
 
 -- | Check if a lock file exists and is valid
 checkLockFile :: FilePath -> IO (Either Text Bool)
@@ -683,24 +704,6 @@ isProcessRunning pid = do
         Left (_ :: SomeException) -> return False  -- Process doesn't exist
         Right _ -> return True  -- Process exists
 
--- | Break a stale lock
-breakStaleLock :: FilePath -> IO ()
-breakStaleLock lockPath = do
-    -- Check if lock exists
-    exists <- doesFileExist lockPath
-
-    when exists $ do
-        -- Read the lock to log what we're breaking
-        content <- try $ readFile lockPath
-        case content of
-            Right pidStr ->
-                hPutStrLn stderr $ "Breaking stale GC lock held by process " ++ pidStr
-            _ ->
-                hPutStrLn stderr $ "Breaking stale GC lock (unreadable)"
-
-        -- Remove the lock file
-        removeFile lockPath
-
 -- | Create and acquire a lock file
 acquireFileLock :: FilePath -> IO (Either Text GCLock)
 acquireFileLock lockPath = do
@@ -721,7 +724,7 @@ acquireFileLock lockPath = do
             -- Create the lock file with our PID
             result <- try $ mask $ \unmask -> do
                 -- Use file creation with EXCL flag to ensure atomicity
-                fd <- createFile lockPath 0o644
+                fd <- openFd lockPath WriteOnly (Just 0o644) defaultFileFlags{exclusive=True}
 
                 unmask $ do
                     -- Write our PID to it
@@ -764,42 +767,42 @@ getActiveBuildPaths = do
     if isDaemon
         then getDaemonActivePaths
         else return Set.empty
-  where
-    getDaemonActivePaths :: TenM p (Set StorePath)
-    getDaemonActivePaths = do
-        env <- ask
 
-        -- In daemon mode, check for active build outputs in the runtime state
-        case runMode env of
-            DaemonMode -> do
-                -- Get runtime paths from database
-                db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+-- | Get active build paths from daemon mode
+getDaemonActivePaths :: TenM p (Set StorePath)
+getDaemonActivePaths = do
+    env <- ask
 
-                -- Query active build paths from database
-                results <- liftIO $ dbQuery_ db "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
+    -- In daemon mode, check for active build outputs in the runtime state
+    case runMode env of
+        DaemonMode -> do
+            -- Get runtime paths from database
+            db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
 
-                -- Close database
-                liftIO $ closeDatabase db
+            -- Query active build paths from database
+            results <- liftIO $ dbQuery_ db "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
 
-                -- Parse paths
-                return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
+            -- Close database
+            liftIO $ closeDatabase db
 
-            ClientMode conn -> do
-                -- Ask the daemon via protocol
-                result <- withDaemon $ \_ ->
-                    return $ Right Set.empty  -- This would make an RPC call in practice
-                return result
+            -- Parse paths
+            return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
 
-            _ -> return Set.empty
+        ClientMode conn -> do
+            -- Ask the daemon via protocol
+            result <- withDaemon $ \_ ->
+                return $ Right Set.empty  -- This would make an RPC call in practice
+            return result
+
+        _ -> return Set.empty
 
 -- | Verify the store integrity
 verifyStore :: TenM p Bool
 verifyStore = do
     env <- ask
-    let storeDir = storePath env
 
     -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath storeDir) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
 
     -- Get all valid paths from database
     paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
@@ -813,8 +816,8 @@ verifyStore = do
             Nothing -> return False
             Just storePath -> do
                 -- Verify that the store file exists and has the correct hash
-                result <- try $ do
-                    let fullPath = storeDir </> pathToFilePath pathText
+                result <- liftIO $ try $ do
+                    let fullPath = storePathToFilePath storePath env
                     fileExists <- doesFileExist fullPath
                     if fileExists
                         then do
@@ -836,7 +839,7 @@ repairStore = do
     startTime <- liftIO getCurrentTime
 
     -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
 
     -- Get all valid paths from database
     paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
@@ -848,7 +851,7 @@ repairStore = do
             Just storePath -> do
                 -- Check if file exists and has correct hash
                 result <- liftIO $ try $ do
-                    let fullPath = (storePath env) </> pathToFilePath pathText
+                    let fullPath = storePathToFilePath storePath env
                     fileExists <- doesFileExist fullPath
                     if fileExists
                         then do
@@ -866,7 +869,7 @@ repairStore = do
                                 -- Invalid path, mark as invalid and remove
                                 liftIO $ do
                                     -- Get size before deletion
-                                    pathSize <- getFileSize path
+                                    pathSize <- getFileSize' path
 
                                     -- Mark as invalid in database
                                     dbExecute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?" (Only pathText)
@@ -892,3 +895,13 @@ repairStore = do
         , gcBytes = totalSize
         , gcElapsedTime = elapsed
         }
+
+-- | Helper to get file size
+getFileSize' :: FilePath -> IO Integer
+getFileSize' path = do
+    exists <- doesFileExist path
+    if exists
+        then do
+            fileStatus <- getFileStatus path
+            return $ fromIntegral $ fileSize fileStatus
+        else return 0

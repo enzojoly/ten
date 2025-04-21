@@ -42,7 +42,7 @@ import Control.Concurrent.STM
 import Control.Exception (try, catch, finally, mask, bracket, throwIO, onException, evaluate, SomeException, ErrorCall(..))
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (get, modify)
+import Control.Monad.State (get, modify, gets)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Map.Strict (Map)
@@ -57,6 +57,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
 import Data.Time (getCurrentTime, diffUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.List (nub, isPrefixOf, isInfixOf)
 import System.Directory
 import System.FilePath
@@ -70,11 +71,9 @@ import System.Posix.Signals (signalProcess, sigKILL, sigTERM, installHandler, Ha
 import System.Posix.Types (ProcessID, FileMode, UserID, GroupID)
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
                        defaultFileFlags, OpenMode(..), OpenFileFlags(..),
-                       exclusive, fdToHandle)
--- Import dup2 from the proper module
+                       exclusive, fdToHandle, dup2)
 import Foreign.C.Error (Errno(..), getErrno)
 import Foreign.C (CInt(..))
-import System.Posix.IO.ByteString (dup2)   -- The correct import for dup2
 import GHC.IO.Handle.FD (handleToFd)
 import System.Timeout (timeout)
 import System.Random (randomRIO)
@@ -131,8 +130,8 @@ buildDerivation deriv = do
 
     -- Register the derivation in the database
     env <- ask
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
-    liftIO $ registerDerivationFile db deriv derivPath `finally` closeDatabase db
+    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+        liftIO $ registerDerivationFile db deriv derivPath
 
     -- First instantiate the derivation
     instantiateDerivation deriv
@@ -145,6 +144,19 @@ buildDerivation deriv = do
         MonadicStrategy -> do
             logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
             buildMonadicStrategy deriv
+
+-- | Instantiate the derivation (implement input handling and preparation)
+instantiateDerivation :: Derivation -> TenM 'Build ()
+instantiateDerivation deriv = do
+    -- Log instantiation start
+    logMsg 2 $ "Instantiating derivation: " <> derivName deriv
+
+    -- Add all inputs to the build inputs set
+    let inputs = Set.map inputPath (derivInputs deriv)
+    modify $ \s -> s { buildInputs = Set.union inputs (buildInputs s) }
+
+    -- Add proof for the build
+    addProof InputProof
 
 -- | Build a derivation using applicative strategy (parallel dependencies)
 buildApplicativeStrategy :: Derivation -> TenM 'Build BuildResult
@@ -208,19 +220,18 @@ findDependencyDerivations :: [StorePath] -> TenM 'Build (Map String Derivation)
 findDependencyDerivations paths = do
     env <- ask
 
-    -- Initialize the database connection
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
-
     -- Use the database to look up derivations for the provided output paths
-    result <- liftIO $ findDerivationsByOutputs db paths `finally` closeDatabase db
+    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+        -- Use the database to look up derivations for the provided output paths
+        result <- liftIO $ findDerivationsByOutputs db paths
 
-    -- If any lookup failed, throw an error
-    when (Map.size result /= length paths) $ do
-        let missingPaths = filter (\p -> not $ any (\(h, d) -> (storeHash p) `T.isInfixOf` (T.pack h)) (Map.toList result)) paths
-        throwError $ StoreError $ "Could not find derivations for outputs: " <>
-                    T.intercalate ", " (map storeName missingPaths)
+        -- If any lookup failed, throw an error
+        when (Map.size result /= length paths) $ do
+            let missingPaths = filter (\p -> not $ any (\(h, d) -> (storeHash p) `T.isInfixOf` (T.pack h)) (Map.toList result)) paths
+            throwError $ StoreError $ "Could not find derivations for outputs: " <>
+                        T.intercalate ", " (map storeName missingPaths)
 
-    return result
+        return result
 
 -- | Build a derivation using monadic strategy (sequential with return-continuation)
 buildMonadicStrategy :: Derivation -> TenM 'Build BuildResult
@@ -258,7 +269,7 @@ buildMonadicStrategy deriv = do
             -- Handle return-continuation case
             innerDrv <- handleReturnedDerivation result
             -- Track this in the derivation chain
-            addToDerivationChain' deriv
+            addToDerivationChain innerDrv
 
             -- Check for potential recursive build limits
             chain <- gets buildChain
@@ -272,10 +283,6 @@ buildMonadicStrategy deriv = do
         else
             -- Normal build result
             return result
-
--- | Add derivation to build chain
-addToDerivationChain' :: Derivation -> TenM 'Build ()
-addToDerivationChain' drv = modify $ \s -> s { buildChain = drv : buildChain s }
 
 -- | Build a derivation in a sandbox
 buildWithSandbox :: Derivation -> SandboxConfig -> TenM 'Build BuildResult
@@ -702,6 +709,8 @@ getBuildEnvironment env deriv buildDir =
             , ("TEN_UNPRIVILEGED", "1") -- Indicate unprivileged execution
             ]
         ]
+  where
+    buildState = get
 
 -- | Collect output files from a build and add them to the store
 -- This function now properly tracks references between outputs and inputs
@@ -722,44 +731,40 @@ collectBuildResult deriv buildDir = do
     -- Get environment information
     env <- ask
 
-    -- Open a database connection - we'll use this for multiple operations
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+    -- Process each expected output with database connection
+    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+        -- Process each expected output
+        outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
 
-    -- Process each expected output
-    outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
+        -- Register all input-output references
+        liftIO $ withTransaction db ReadWrite $ \txn -> do
+            -- Get derivation path in the store
+            let derivStorePath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
 
-    -- Register all input-output references
-    liftIO $ withTransaction db ReadWrite $ \txn -> do
-        -- Get derivation path in the store
-        derivPath <- storeDerivationFile deriv
+            -- Register each output in the database
+            derivInfo <- getDerivationPath txn (derivHash deriv)
+            case derivInfo of
+                Just storedDerivPath -> do
+                    -- Register each output for this derivation
+                    derivId <- storeDerivation txn deriv storedDerivPath
+                    forM_ (Set.toList outputPaths) $ \outputPath -> do
+                        -- 1. Register the derivation as a reference for this output
+                        registerReference txn outputPath storedDerivPath
 
-        -- Register each output in the database
-        derivInfo <- getDerivationPath txn (derivHash deriv)
-        case derivInfo of
-            Just storedDerivPath -> do
-                -- Register each output for this derivation
-                derivId <- storeDerivation txn deriv storedDerivPath
-                forM_ (Set.toList outputPaths) $ \outputPath -> do
-                    -- 1. Register the derivation as a reference for this output
-                    registerReference txn outputPath storedDerivPath
+                        -- 2. Register all input references for this output
+                        forM_ (Set.toList $ derivInputs deriv) $ \input -> do
+                            registerReference txn outputPath (inputPath input)
 
-                    -- 2. Register all input references for this output
-                    forM_ (Set.toList $ derivInputs deriv) $ \input -> do
-                        registerReference txn outputPath (inputPath input)
+                        -- 3. Scan the output file for additional references
+                        scanAndRegisterReferences txn (storePath env) outputPath
 
-                    -- 3. Scan the output file for additional references
-                    scanAndRegisterReferences txn (storePath env) outputPath
+                Nothing -> return () -- Should never happen if we stored the derivation first
 
-            Nothing -> return () -- Should never happen if we stored the derivation first
+        -- Add output proof
+        addProof OutputProof
 
-    -- Close the database connection
-    liftIO $ closeDatabase db
-
-    -- Add output proof
-    addProof OutputProof
-
-    -- Return the set of outputs
-    return outputPaths
+        -- Return the set of outputs
+        return outputPaths
   where
     -- Process a single output, adding it to the store
     processOutput :: Database -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build (Set StorePath)
@@ -821,7 +826,8 @@ collectBuildResult deriv buildDir = do
     scanAndRegisterReferences :: Database -> FilePath -> StorePath -> IO ()
     scanAndRegisterReferences db storeDir path = do
         -- Scan the file for references
-        foundRefs <- scanFileForReferences storeDir (storeDir </> T.unpack (storePathToText path))
+        outputFilePath <- storePathToFilePath path <$> initBuildEnv "" storeDir
+        foundRefs <- scanFileForReferences storeDir outputFilePath
 
         -- Register each found reference
         when (not $ Set.null foundRefs) $
@@ -934,8 +940,8 @@ handleReturnedDerivation result = do
 
             -- Register the inner derivation in the database
             env <- ask
-            db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
-            liftIO $ registerDerivationFile db innerDrv derivPath `finally` closeDatabase db
+            withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+                liftIO $ registerDerivationFile db innerDrv derivPath
 
             -- Check for cycles
             chain <- gets buildChain
@@ -965,7 +971,7 @@ buildDerivationGraph graph = do
         -- Build the derivation
         result <- buildDerivation drv
         -- Add to results
-        let drvId = derivNodeId drv
+        let drvId = derivHash drv
         return $ Map.insert drvId result results
 
 -- | Build derivations in dependency order
@@ -990,7 +996,7 @@ buildDependenciesConcurrently derivations = do
 
     -- Create a semaphore to limit concurrency
     maxConcurrent <- asks (\e -> fromMaybe 4 (maxConcurrentBuilds e))
-    sem <- liftIO $ Ten.Build.newQSem maxConcurrent
+    sem <- liftIO $ newQSem maxConcurrent
 
     -- Track all build threads
     threads <- liftIO $ newTVarIO []
@@ -1000,7 +1006,7 @@ buildDependenciesConcurrently derivations = do
         let hash = T.unpack $ derivHash drv
         thread <- mask $ \restore -> forkIO $ do
             -- Acquire semaphore
-            bracket (Ten.Build.waitQSem sem) (\_ -> Ten.Build.signalQSem sem) $ \_ -> restore $ do
+            bracket (waitQSem sem) (\_ -> signalQSem sem) $ \_ -> restore $ do
                 -- Run the build in a separate thread
                 result <- runTen (buildDerivation drv) env state
                 -- Store the result
@@ -1082,14 +1088,46 @@ updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build ()
 updateBuildStatus buildId status = do
     -- In a real daemon implementation, this would update a shared TVar
     -- and notify any clients waiting for status updates
-    return ()
+    env <- ask
+    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+        liftIO $ dbExecute db
+            "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
+            (T.pack (show buildId), T.pack (show status))
 
 -- | Get build status from daemon state
 getBuildStatus :: BuildId -> TenM 'Build BuildStatus
 getBuildStatus buildId = do
-    -- In a real daemon implementation, this would query shared state
-    -- For now, return a placeholder
-    throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
+    env <- ask
+    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+        results <- liftIO $ dbQuery db
+            "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
+            [T.pack (show buildId)] :: TenM 'Build [Only Text]
+
+        case results of
+            [Only statusText] -> case parseStatus statusText of
+                Just status -> return status
+                Nothing -> throwError $ BuildFailed $ "Invalid build status: " <> statusText
+            _ -> throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
+  where
+    parseStatus :: Text -> Maybe BuildStatus
+    parseStatus "BuildPending" = Just BuildPending
+    parseStatus t | "BuildRunning " `T.isPrefixOf` t =
+        case T.stripPrefix "BuildRunning " t of
+            Just progressText ->
+                case readMaybe (T.unpack progressText) of
+                    Just progress -> Just (BuildRunning progress)
+                    Nothing -> Nothing
+            Nothing -> Nothing
+    parseStatus t | "BuildRecursing " `T.isPrefixOf` t =
+        case T.stripPrefix "BuildRecursing " t of
+            Just bidText ->
+                case readMaybe (T.unpack bidText) of
+                    Just bid -> Just (BuildRecursing (BuildIdFromInt bid))
+                    Nothing -> Nothing
+            Nothing -> Nothing
+    parseStatus "BuildCompleted" = Just BuildCompleted
+    parseStatus "BuildFailed'" = Just BuildFailed'
+    parseStatus _ = Nothing
 
 -- | Semaphore implementation for controlling concurrency
 data QSem = QSem (MVar Int)
@@ -1128,10 +1166,6 @@ detectRecursionCycle derivations =
     let hashes = map derivHash derivations
         uniqueHashes = nub hashes
     in length uniqueHashes < length hashes
-
--- | Path to the returned derivation in a build directory
-returnDerivationPath :: FilePath -> FilePath
-returnDerivationPath buildDir = buildDir </> "return.drv"
 
 -- | Check if a derivation uses return-continuation
 isReturnContinuationDerivation :: Text -> [Text] -> Map Text Text -> Bool

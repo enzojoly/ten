@@ -85,17 +85,14 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
 import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr, BufferMode(..), hSetBuffering)
-import System.Process (createProcess, proc, waitForProcess, StdStream(..))
+import System.Process (createProcess, proc, waitForProcess, StdStream(..), CreateProcess(..))
 import System.Timeout (timeout)
 
-import Ten.Core hiding (UserCredentials) -- Import Core, but not UserCredentials
-import qualified Ten.Daemon.Protocol as Protocol -- Import Protocol qualified
-import Ten.Daemon.Auth (authenticateUser) -- Import Auth functions directly
+import Ten.Core
+import Ten.Daemon.Protocol
+import Ten.Daemon.Auth (authenticateUser)
 import Ten.Daemon.Config (getDefaultSocketPath)
 import Ten.Derivation (Derivation, serializeDerivation, deserializeDerivation)
-
--- | Re-export UserCredentials from Protocol
-type UserCredentials = Protocol.UserCredentials
 
 -- | Connection state for daemon communication
 data ConnectionState = ConnectionState {
@@ -103,7 +100,7 @@ data ConnectionState = ConnectionState {
     csHandle :: Handle,                     -- ^ Handle for socket I/O
     csUserId :: UserId,                     -- ^ Authenticated user ID
     csToken :: AuthToken,                   -- ^ Authentication token
-    csRequestMap :: IORef (Map Int (MVar Protocol.Response)), -- ^ Map of pending requests
+    csRequestMap :: IORef (Map Int (MVar Response)), -- ^ Map of pending requests
     csNextReqId :: IORef Int,               -- ^ Next request ID
     csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
     csShutdown :: IORef Bool                -- ^ Flag to indicate connection shutdown
@@ -118,7 +115,7 @@ data DaemonConnection = DaemonConnection {
 }
 
 -- | Connect to the Ten daemon
-connectToDaemon :: FilePath -> Protocol.UserCredentials -> IO DaemonConnection
+connectToDaemon :: FilePath -> UserCredentials -> IO DaemonConnection
 connectToDaemon socketPath credentials = do
     -- Check if daemon is running
     running <- isDaemonRunning socketPath
@@ -138,24 +135,25 @@ connectToDaemon socketPath credentials = do
     shutdownFlag <- newIORef False
 
     -- Authenticate with the daemon
-    let authReq = Protocol.AuthRequest {
-            Protocol.version = Protocol.currentProtocolVersion,
-            Protocol.credentials = credentials
+    let authReq = AuthRequest {
+            version = currentProtocolVersion,
+            authUser = username credentials,
+            authToken = token credentials
         }
 
     -- Send auth request
-    BS.hPut handle $ Protocol.serializeMessage $ Protocol.AuthRequestMsg authReq
+    BS.hPut handle $ serializeMessage $ AuthRequestMsg authReq
     hFlush handle
 
     -- Read auth response
     respBS <- readMessageWithTimeout handle 5000000 -- 5 seconds timeout
-    case Protocol.deserializeMessage respBS of
+    case deserializeMessage respBS of
         Left err -> do
             hClose handle
             close sock
             throwIO $ AuthError $ "Authentication failed: " <> err
 
-        Right (Protocol.AuthResponseMsg (Protocol.AuthAccepted userId authToken)) -> do
+        Right (AuthResponseMsg (AuthAccepted userId authToken)) -> do
             -- Set up handle buffering
             hSetBuffering handle NoBuffering
 
@@ -177,7 +175,7 @@ connectToDaemon socketPath credentials = do
             -- Return connection object
             return $ DaemonConnection sock userId authToken connState
 
-        Right (Protocol.AuthResponseMsg (Protocol.AuthRejected reason)) -> do
+        Right (AuthResponseMsg (AuthRejected reason)) -> do
             hClose handle
             close sock
             throwIO $ AuthError $ "Authentication failed: " <> reason
@@ -229,7 +227,7 @@ isDaemonRunning socketPath = do
                     return True
 
 -- | Execute an action with a daemon connection
-withDaemonConnection :: FilePath -> Protocol.UserCredentials -> (DaemonConnection -> IO a) -> IO a
+withDaemonConnection :: FilePath -> UserCredentials -> (DaemonConnection -> IO a) -> IO a
 withDaemonConnection socketPath credentials action =
     bracket
         (connectToDaemon socketPath credentials)
@@ -256,7 +254,7 @@ createSocketAndConnect socketPath = do
         )
 
 -- | Send a request to the daemon
-sendRequest :: DaemonConnection -> Protocol.Request -> IO Int
+sendRequest :: DaemonConnection -> Request -> IO Int
 sendRequest conn request = do
     -- Extract connection state
     let connState = connState conn
@@ -271,10 +269,10 @@ sendRequest conn request = do
     atomicModifyIORef' (csRequestMap connState) (\m -> (Map.insert reqId respVar m, ()))
 
     -- Create message with request ID
-    let msg = Protocol.RequestMsg reqId request
+    let msg = RequestMsg reqId request
 
     -- Send message
-    let serialized = Protocol.serializeMessage msg
+    let serialized = serializeMessage msg
     BS.hPut (csHandle connState) serialized
     hFlush (csHandle connState)
 
@@ -282,7 +280,7 @@ sendRequest conn request = do
     return reqId
 
 -- | Receive a response for a specific request
-receiveResponse :: DaemonConnection -> Int -> Int -> IO (Maybe Protocol.Response)
+receiveResponse :: DaemonConnection -> Int -> Int -> IO (Maybe Response)
 receiveResponse conn reqId timeoutMicros = do
     -- Extract connection state
     let connState = connState conn
@@ -305,7 +303,7 @@ receiveResponse conn reqId timeoutMicros = do
             return result
 
 -- | Send a request and wait for response (synchronous)
-sendRequestSync :: DaemonConnection -> Protocol.Request -> Int -> IO (Either BuildError Protocol.Response)
+sendRequestSync :: DaemonConnection -> Request -> Int -> IO (Either BuildError Response)
 sendRequestSync conn request timeoutMicros = do
     -- Send request
     reqId <- sendRequest conn request
@@ -316,14 +314,14 @@ sendRequestSync conn request timeoutMicros = do
         Nothing ->
             return $ Left $ DaemonError "Timeout waiting for daemon response"
 
-        Just (Protocol.ErrorResponse err) ->
+        Just (ErrorResponse err) ->
             return $ Left err
 
         Just response ->
             return $ Right response
 
 -- | Background thread to read and dispatch responses
-responseReaderThread :: Handle -> IORef (Map Int (MVar Protocol.Response)) -> IORef Bool -> IO ()
+responseReaderThread :: Handle -> IORef (Map Int (MVar Response)) -> IORef Bool -> IO ()
 responseReaderThread handle requestMap shutdownFlag = do
     let loop = do
             -- Check if we should shut down
@@ -338,12 +336,12 @@ responseReaderThread handle requestMap shutdownFlag = do
 
                     Right msgBS -> do
                         -- Process message if valid
-                        case Protocol.deserializeMessage msgBS of
+                        case deserializeMessage msgBS of
                             Left _ ->
                                 -- Parsing error, continue loop
                                 loop
 
-                            Right (Protocol.ResponseMsg reqId response) -> do
+                            Right (ResponseMsg reqId response) -> do
                                 -- Look up request
                                 reqMap <- readIORef requestMap
                                 case Map.lookup reqId reqMap of
@@ -397,15 +395,12 @@ readMessage handle = do
     return msgBytes
 
 -- | Encode a request for transmission
-encodeRequest :: Protocol.Request -> BS.ByteString
-encodeRequest req = Protocol.serializeRequest req
+encodeRequest :: Request -> BS.ByteString
+encodeRequest req = serializeRequest req
 
 -- | Decode a response from bytes
-decodeResponse :: BS.ByteString -> Either Text Protocol.Response
-decodeResponse bs =
-    case Protocol.deserializeResponse bs of
-        Left err -> Left err
-        Right resp -> Right resp
+decodeResponse :: BS.ByteString -> Either Text Response
+decodeResponse bs = deserializeResponse bs
 
 -- | Start the daemon if it's not running
 startDaemonIfNeeded :: FilePath -> IO ()
@@ -482,16 +477,16 @@ buildFile conn file = do
     content <- BS.readFile file
 
     -- Create build request
-    let request = Protocol.BuildFileRequest {
-            Protocol.filePath = T.pack file,
-            Protocol.fileContent = content,
-            Protocol.buildOptions = Protocol.defaultBuildOptions
+    let request = BuildFileRequest {
+            filePath = T.pack file,
+            fileContent = content,
+            buildOptions = defaultBuildRequestInfo
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
     case response of
-        Right (Protocol.BuildResponse result) ->
+        Right (BuildResponse result) ->
             return $ Right result
 
         Right _ ->
@@ -507,16 +502,16 @@ evalFile conn file = do
     content <- BS.readFile file
 
     -- Create eval request
-    let request = Protocol.EvalFileRequest {
-            Protocol.evalFilePath = T.pack file,
-            Protocol.evalContent = content,
-            Protocol.evalOptions = Protocol.defaultEvalOptions
+    let request = EvalFileRequest {
+            evalFilePath = T.pack file,
+            evalContent = content,
+            evalOptions = defaultBuildRequestInfo
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     case response of
-        Right (Protocol.EvalResponse derivation) ->
+        Right (EvalResponse derivation) ->
             return $ Right derivation
 
         Right _ ->
@@ -529,15 +524,15 @@ evalFile conn file = do
 buildDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError BuildResult)
 buildDerivation conn derivation = do
     -- Create build derivation request
-    let request = Protocol.BuildDerivationRequest {
-            Protocol.derivation = derivation,
-            Protocol.buildOptions = Protocol.defaultBuildOptions
+    let request = BuildDerivationRequest {
+            buildDerivation = derivation,
+            buildDerivOptions = defaultBuildRequestInfo
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
     case response of
-        Right (Protocol.BuildResponse result) ->
+        Right (BuildResponse result) ->
             return $ Right result
 
         Right _ ->
@@ -550,14 +545,14 @@ buildDerivation conn derivation = do
 cancelBuild :: DaemonConnection -> BuildId -> IO (Either BuildError ())
 cancelBuild conn buildId = do
     -- Create cancel build request
-    let request = Protocol.CancelBuildRequest {
-            Protocol.buildId = buildId
+    let request = CancelBuildRequest {
+            cancelBuildId = buildId
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (Protocol.CancelBuildResponse success) ->
+        Right (CancelBuildResponse success) ->
             if success
                 then return $ Right ()
                 else return $ Left $ BuildFailed "Failed to cancel build"
@@ -572,14 +567,14 @@ cancelBuild conn buildId = do
 getBuildStatus :: DaemonConnection -> BuildId -> IO (Either BuildError BuildStatus)
 getBuildStatus conn buildId = do
     -- Create build status request
-    let request = Protocol.BuildStatusRequest {
-            Protocol.statusBuildId = buildId
+    let request = BuildStatusRequest {
+            statusBuildId = buildId
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (Protocol.BuildStatusResponse status) ->
+        Right (BuildStatusResponse status) ->
             return $ Right status
 
         Right _ ->
@@ -595,15 +590,15 @@ addFileToStore conn file = do
     content <- BS.readFile file
 
     -- Create store add request
-    let request = Protocol.StoreAddRequest {
-            Protocol.name = T.pack (takeFileName file),
-            Protocol.content = content
+    let request = StoreAddRequest {
+            storeAddPath = T.pack file,
+            storeAddContent = content
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     case response of
-        Right (Protocol.StoreAddResponse path) ->
+        Right (StoreAddResponse path) ->
             return $ Right path
 
         Right _ ->
@@ -613,17 +608,17 @@ addFileToStore conn file = do
             return $ Left err
 
 -- | Verify a store path
-verifyStorePath :: DaemonConnection -> FilePath -> IO (Either BuildError Bool)
+verifyStorePath :: DaemonConnection -> StorePath -> IO (Either BuildError Bool)
 verifyStorePath conn path = do
     -- Create verify request
-    let request = Protocol.StoreVerifyRequest {
-            Protocol.storePath = T.pack path
+    let request = StoreVerifyRequest {
+            storeVerifyPath = storePathToText path
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (Protocol.StoreVerifyResponse isValid) ->
+        Right (StoreVerifyResponse isValid) ->
             return $ Right isValid
 
         Right _ ->
@@ -639,15 +634,15 @@ getStorePathForFile conn file = do
     content <- BS.readFile file
 
     -- Create path request
-    let request = Protocol.StorePathRequest {
-            Protocol.filePath = T.pack file,
-            Protocol.content = content
+    let request = StorePathRequest {
+            storePathForFile = T.pack file,
+            storePathContent = content
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (Protocol.StorePathResponse path) ->
+        Right (StorePathResponse path) ->
             return $ Right path
 
         Right _ ->
@@ -660,12 +655,12 @@ getStorePathForFile conn file = do
 listStore :: DaemonConnection -> IO (Either BuildError [StorePath])
 listStore conn = do
     -- Create list request
-    let request = Protocol.StoreListRequest
+    let request = StoreListRequest
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (Protocol.StoreListResponse paths) ->
+        Right (StoreListResponse paths) ->
             return $ Right paths
 
         Right _ ->
@@ -681,15 +676,15 @@ storeDerivation conn derivation = do
     let serialized = serializeDerivation derivation
 
     -- Create store derivation request
-    let request = Protocol.StoreDerivationRequest {
-            Protocol.derivationContent = serialized,
-            Protocol.registerOutputs = True
+    let request = StoreDerivationCmd StoreDerivationRequest {
+            derivationContent = serialized,
+            registerOutputs = True
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     case response of
-        Right (Protocol.StoreDerivationResponse path) ->
+        Right (DerivationStoredResponse path) ->
             return $ Right path
 
         Right _ ->
@@ -702,17 +697,18 @@ storeDerivation conn derivation = do
 retrieveDerivation :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
 retrieveDerivation conn path = do
     -- Create retrieve derivation request
-    let request = Protocol.RetrieveDerivationRequest {
-            Protocol.derivationPath = path
+    let request = RetrieveDerivationCmd RetrieveDerivationRequest {
+            derivationPath = path,
+            includeOutputs = True
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (Protocol.RetrieveDerivationResponse Nothing) ->
+        Right (DerivationRetrievedResponse Nothing) ->
             return $ Right Nothing
 
-        Right (Protocol.RetrieveDerivationResponse (Just derivation)) ->
+        Right (DerivationRetrievedResponse (Just derivation)) ->
             return $ Right $ Just derivation
 
         Right _ ->
@@ -725,19 +721,20 @@ retrieveDerivation conn path = do
 queryDerivationForOutput :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
 queryDerivationForOutput conn outputPath = do
     -- Create query derivation request
-    let request = Protocol.QueryDerivationRequest {
-            Protocol.queryType = Protocol.QueryByOutput,
-            Protocol.queryPath = outputPath
+    let request = QueryDerivationCmd QueryDerivationRequest {
+            queryType = "by-output",
+            queryValue = storePathToText outputPath,
+            queryLimit = Just 1
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (Protocol.QueryDerivationResponse Nothing) ->
+        Right (DerivationQueryResponse []) ->
             return $ Right Nothing
 
-        Right (Protocol.QueryDerivationResponse (Just derivation)) ->
-            return $ Right $ Just derivation
+        Right (DerivationQueryResponse (drv:_)) ->
+            return $ Right $ Just drv
 
         Right _ ->
             return $ Left $ DaemonError "Invalid response type for query derivation request"
@@ -749,14 +746,14 @@ queryDerivationForOutput conn outputPath = do
 queryOutputsForDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError (Set StorePath))
 queryOutputsForDerivation conn derivation = do
     -- Create query outputs request
-    let request = Protocol.QueryDerivationOutputsRequest {
-            Protocol.derivation = derivation
+    let request = GetDerivationForOutputRequest {
+            getDerivationForPath = derivHash derivation
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (Protocol.QueryDerivationOutputsResponse outputs) ->
+        Right (DerivationOutputResponse outputs) ->
             return $ Right outputs
 
         Right _ ->
@@ -769,12 +766,14 @@ queryOutputsForDerivation conn derivation = do
 listDerivations :: DaemonConnection -> IO (Either BuildError [StorePath])
 listDerivations conn = do
     -- Create list derivations request
-    let request = Protocol.ListDerivationsRequest
+    let request = ListDerivationsRequest {
+            listDerivLimit = Nothing
+        }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     case response of
-        Right (Protocol.ListDerivationsResponse paths) ->
+        Right (DerivationListResponse paths) ->
             return $ Right paths
 
         Right _ ->
@@ -784,17 +783,19 @@ listDerivations conn = do
             return $ Left err
 
 -- | Get detailed information about a derivation
-getDerivationInfo :: DaemonConnection -> StorePath -> IO (Either BuildError Protocol.DerivationInfo)
+getDerivationInfo :: DaemonConnection -> StorePath -> IO (Either BuildError DerivationInfoResponse)
 getDerivationInfo conn path = do
     -- Create get derivation info request
-    let request = Protocol.GetDerivationInfoRequest {
-            Protocol.infoPath = path
+    let request = QueryDerivationCmd QueryDerivationRequest {
+            queryType = "info",
+            queryValue = storePathToText path,
+            queryLimit = Just 1
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
     case response of
-        Right (Protocol.GetDerivationInfoResponse info) ->
+        Right (DerivationInfoResponse info) ->
             return $ Right info
 
         Right _ ->
@@ -807,14 +808,14 @@ getDerivationInfo conn path = do
 collectGarbage :: DaemonConnection -> Bool -> IO (Either BuildError GCStats)
 collectGarbage conn force = do
     -- Create GC request
-    let request = Protocol.GCRequest {
-            Protocol.force = force
+    let request = GCRequest {
+            gcForce = force
         }
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
     case response of
-        Right (Protocol.GCResponse stats) ->
+        Right (GCResponse stats) ->
             return $ Right stats
 
         Right _ ->
@@ -827,12 +828,12 @@ collectGarbage conn force = do
 shutdownDaemon :: DaemonConnection -> IO (Either BuildError ())
 shutdownDaemon conn = do
     -- Create shutdown request
-    let request = Protocol.ShutdownRequest
+    let request = ShutdownRequest
 
     -- Send request and expect connection to close
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right Protocol.ShutdownResponse ->
+        Right ShutdownResponse ->
             return $ Right ()
 
         Right _ ->
@@ -842,15 +843,15 @@ shutdownDaemon conn = do
             return $ Left err
 
 -- | Get daemon status
-getDaemonStatus :: DaemonConnection -> IO (Either BuildError Protocol.DaemonStatus)
+getDaemonStatus :: DaemonConnection -> IO (Either BuildError DaemonStatus)
 getDaemonStatus conn = do
     -- Create status request
-    let request = Protocol.StatusRequest
+    let request = StatusRequest
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (Protocol.StatusResponse status) ->
+        Right (StatusResponse status) ->
             return $ Right status
 
         Right _ ->
@@ -860,15 +861,15 @@ getDaemonStatus conn = do
             return $ Left err
 
 -- | Get daemon configuration
-getDaemonConfig :: DaemonConnection -> IO (Either BuildError Protocol.DaemonConfig)
+getDaemonConfig :: DaemonConnection -> IO (Either BuildError DaemonConfig)
 getDaemonConfig conn = do
     -- Create config request
-    let request = Protocol.ConfigRequest
+    let request = ConfigRequest
 
     -- Send request and wait for response
     response <- sendRequestSync conn request (5 * 1000000) -- 5 seconds timeout
     case response of
-        Right (Protocol.ConfigResponse config) ->
+        Right (ConfigResponse config) ->
             return $ Right config
 
         Right _ ->

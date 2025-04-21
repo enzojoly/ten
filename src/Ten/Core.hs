@@ -75,6 +75,8 @@ module Ten.Core (
     runTen,
     evalTen,
     buildTen,
+    runTenIO,
+    liftTenIO,
     logMsg,
     assertTen,
 
@@ -103,7 +105,11 @@ module Ten.Core (
 
     -- GC lock path helpers
     getGCLockPath,
-    ensureLockDirExists
+    ensureLockDirExists,
+
+    -- Path handling utilities
+    storePathToFilePath,
+    filePathToStorePath
 ) where
 
 import Control.Concurrent.STM
@@ -129,7 +135,8 @@ import System.Exit
 import Data.Unique (Unique, newUnique)
 import Network.Socket (Socket)
 import System.IO (Handle)
-import Data.Maybe (isJust, fromMaybe)
+import Data.Maybe (isJust, isNothing, fromMaybe, catMaybes)
+import Data.List (isPrefixOf, isInfixOf, nub)
 import System.Posix.User (getUserEntryForName, getGroupEntryForName,
                          setUserID, setGroupID, getEffectiveUserID,
                          userID, groupID)
@@ -143,7 +150,8 @@ import qualified Text.Read as Read
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Concurrent (ThreadId)
 import System.Posix.Files (setFileMode)
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Char (isHexDigit)
 
 -- | Build phases for type-level separation between evaluation and execution
@@ -198,6 +206,7 @@ data BuildError
     | ParseError Text                    -- Parsing errors
     | DBError Text                       -- Database-related errors
     | GCError Text                       -- Garbage collection errors
+    | PhaseError Text                    -- Error with phase transition/operation
     deriving (Show, Eq)
 
 instance Exception BuildError
@@ -235,6 +244,19 @@ parseStorePathText = parseStorePath
 validateStorePath :: StorePath -> Bool
 validateStorePath (StorePath hash name) =
     T.length hash >= 8 && T.all isHexDigit hash && not (T.null name)
+
+-- | Convert StorePath to a filesystem path (relative to store directory)
+storePathToFilePath :: StorePath -> BuildEnv -> FilePath
+storePathToFilePath storePath env =
+    storeDir env </> T.unpack (storeHash storePath) ++ "-" ++ T.unpack (storeName storePath)
+
+-- | Try to parse a StorePath from a filesystem path
+filePathToStorePath :: FilePath -> Maybe StorePath
+filePathToStorePath path =
+    case break (== '-') (takeFileName path) of
+        (hashPart, '-':namePart) ->
+            Just $ StorePath (T.pack hashPart) (T.pack namePart)
+        _ -> Nothing
 
 -- | Reference between store paths
 data StoreReference = StoreReference
@@ -454,7 +476,7 @@ data UserCredentials = UserCredentials
 -- | Environment for build operations
 data BuildEnv = BuildEnv
     { workDir :: FilePath                -- Temporary build directory
-    , storePath :: FilePath              -- Root of content-addressed store
+    , storeDir :: FilePath              -- Root of content-addressed store (renamed from storePath)
     , verbosity :: Int                   -- Logging verbosity level
     , allowedPaths :: Set FilePath       -- Paths accessible during build
     , runMode :: RunMode                 -- Current running mode
@@ -504,7 +526,7 @@ ensureDBDirectories storeDir = do
 initBuildEnv :: FilePath -> FilePath -> BuildEnv
 initBuildEnv wd sp = BuildEnv
     { workDir = wd
-    , storePath = sp
+    , storeDir = sp           -- Changed from storePath to storeDir
     , verbosity = 1
     , allowedPaths = Set.empty
     , runMode = StandaloneMode
@@ -555,6 +577,18 @@ buildTen :: TenM 'Build a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 buildTen m env = do
     bid <- BuildId <$> newUnique  -- Generate a new build ID
     runTen m env (initBuildState Build bid)
+
+-- | Run an IO operation within the TenM monad
+runTenIO :: IO a -> TenM p a
+runTenIO = liftIO
+
+-- | Lift an IO action that returns (Either BuildError a) into TenM
+liftTenIO :: IO (Either BuildError a) -> TenM p a
+liftTenIO action = do
+    result <- liftIO action
+    case result of
+        Left err -> throwError err
+        Right val -> return val
 
 -- | Safely transition between phases
 transitionPhase :: PhaseTransition p q -> TenM p a -> TenM q a

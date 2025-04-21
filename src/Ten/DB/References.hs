@@ -2,6 +2,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Ten.DB.References (
     -- Reference registration
@@ -25,7 +27,7 @@ module Ten.DB.References (
     markPathsAsValid,
     markPathsAsInvalid,
 
-    -- Path validity
+    -- Path reachability
     isPathReachable,
 
     -- Reference scanning (for initial import only)
@@ -41,28 +43,36 @@ module Ten.DB.References (
     ReferenceStats(..)
 ) where
 
-import Control.Exception (try, finally, catch, SomeException)
+import Control.Concurrent (forkIO, threadDelay, killThread)
+import Control.Exception (try, finally, catch, throwIO, SomeException, IOException)
 import Control.Monad (forM, forM_, when, unless, void, foldM)
+import Control.Monad.Reader (ask, asks)
+import Control.Monad.Except (throwError)
+import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.List (isInfixOf, isPrefixOf, nub)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.List (isInfixOf, isPrefixOf, nub, sort)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
+import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Database.SQLite.Simple (NamedParam(..), Query(..), ToRow(..), FromRow(..), Only(..))
 import qualified Database.SQLite.Simple as SQLite
 import qualified Database.SQLite.Simple.FromRow as SQLite (RowParser, field)
-import System.Directory (doesFileExist, doesDirectoryExist, listDirectory)
-import System.FilePath ((</>), takeFileName, takeExtension)
+import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
+import System.FilePath ((</>), takeFileName, takeExtension, takeDirectory)
 import System.Posix.Files (getFileStatus, isSymbolicLink, readSymbolicLink, isRegularFile, fileMode)
-import System.IO (IOMode(..), withFile, hFileSize)
+import System.IO (IOMode(..), withFile, hFileSize, stdout, stderr, hPutStrLn)
 import System.IO.MMap (mmapFileByteString)
+import Data.Char (isHexDigit)
 
-import Ten.Core (StorePath(..), storePathToText, parseStorePath, StorePathReference(..))
+import Ten.Core
 import Ten.DB.Core
 
 -- | A reference from one path to another
@@ -97,48 +107,38 @@ instance FromRow ReferenceEntry where
 instance ToRow ReferenceEntry where
     toRow (ReferenceEntry from to) = SQLite.toRow (storePathToText from, storePathToText to)
 
--- Make StorePathReference an instance of FromRow
-instance FromRow StorePathReference where
-    fromRow = do
-        fromText <- SQLite.field :: SQLite.RowParser Text
-        toText <- SQLite.field :: SQLite.RowParser Text
-
-        -- Parse store paths safely
-        let fromPath = fromMaybe (error $ "Invalid referrer path: " ++ T.unpack fromText)
-                                 (parseStorePath fromText)
-        let toPath = fromMaybe (error $ "Invalid reference path: " ++ T.unpack toText)
-                               (parseStorePath toText)
-
-        return $ StorePathReference fromPath toPath
-
 -- | Register a single reference between two store paths
-registerReference :: Database -> StorePath -> StorePath -> IO ()
-registerReference db from to = do
+registerReference :: Database -> StorePath -> StorePath -> TenM p ()
+registerReference db from to =
     -- Avoid self-references
-    when (from /= to) $ do
+    when (from /= to) $ liftIO $
         void $ dbExecute db
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText from, storePathToText to)
 
 -- | Register multiple references from one referrer
-registerReferences :: Database -> StorePath -> Set StorePath -> IO ()
-registerReferences db referrer references = do
+registerReferences :: Database -> StorePath -> Set StorePath -> TenM p ()
+registerReferences db referrer references = liftIO $
     -- Use a transaction for efficiency
     withTransaction db ReadWrite $ \db' -> do
         -- Insert each valid reference
         forM_ (Set.toList references) $ \ref ->
             -- Avoid self-references
             when (referrer /= ref) $
-                void $ registerReference db' referrer ref
+                void $ dbExecute db'
+                       "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
+                       (storePathToText referrer, storePathToText ref)
 
 -- | Register references for a path after scanning the file for references
-registerPathReferences :: Database -> FilePath -> StorePath -> IO Int
+registerPathReferences :: Database -> FilePath -> StorePath -> TenM p Int
 registerPathReferences db storeDir path = do
+    env <- ask
+
     -- Construct the full path
-    let fullPath = storeDir </> T.unpack (storePathToText path)
+    let fullPath = storePathToFilePath path env
 
     -- Verify the file exists
-    exists <- doesFileExist fullPath
+    exists <- liftIO $ doesFileExist fullPath
     if not exists
         then return 0
         else do
@@ -153,18 +153,18 @@ registerPathReferences db storeDir path = do
                     return $ Set.size references
 
 -- | Get direct references from a store path
-getDirectReferences :: Database -> StorePath -> IO (Set StorePath)
+getDirectReferences :: Database -> StorePath -> TenM p (Set StorePath)
 getDirectReferences db path = do
-    results <- dbQuery db
+    results <- liftIO $ dbQuery db
         "SELECT reference FROM References WHERE referrer = ?"
-        (Only (storePathToText path)) :: IO [Only Text]
+        (Only (storePathToText path))
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
         map (\(Only p) -> parseStorePath p) results
 
 -- | Get all references from a path (direct and indirect)
-getReferences :: Database -> StorePath -> IO (Set StorePath)
+getReferences :: Database -> StorePath -> TenM p (Set StorePath)
 getReferences db path = do
     -- Use recursive CTE to efficiently query the closure
     let query = "WITH RECURSIVE\n\
@@ -176,25 +176,25 @@ getReferences db path = do
                 \  )\n\
                 \SELECT path FROM closure WHERE path != ?"
 
-    results <- dbQuery db query (storePathToText path, storePathToText path) :: IO [Only Text]
+    results <- liftIO $ dbQuery db query (storePathToText path, storePathToText path)
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
         map (\(Only p) -> parseStorePath p) results
 
 -- | Get direct referrers to a store path
-getDirectReferrers :: Database -> StorePath -> IO (Set StorePath)
+getDirectReferrers :: Database -> StorePath -> TenM p (Set StorePath)
 getDirectReferrers db path = do
-    results <- dbQuery db
+    results <- liftIO $ dbQuery db
         "SELECT referrer FROM References WHERE reference = ?"
-        (Only (storePathToText path)) :: IO [Only Text]
+        (Only (storePathToText path))
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
         map (\(Only p) -> parseStorePath p) results
 
 -- | Get all referrers to a path (direct and indirect)
-getReferrers :: Database -> StorePath -> IO (Set StorePath)
+getReferrers :: Database -> StorePath -> TenM p (Set StorePath)
 getReferrers db path = do
     -- Use recursive CTE to efficiently query the closure
     let query = "WITH RECURSIVE\n\
@@ -206,18 +206,18 @@ getReferrers db path = do
                 \  )\n\
                 \SELECT path FROM closure WHERE path != ?"
 
-    results <- dbQuery db query (storePathToText path, storePathToText path) :: IO [Only Text]
+    results <- liftIO $ dbQuery db query (storePathToText path, storePathToText path)
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
         map (\(Only p) -> parseStorePath p) results
 
 -- | Find all GC roots
-findGCRoots :: Database -> FilePath -> IO (Set StorePath)
+findGCRoots :: Database -> FilePath -> TenM p (Set StorePath)
 findGCRoots db storeDir = do
     -- Get roots from the file system (symlinks in gc-roots directory)
     let rootsDir = storeDir </> "gc-roots"
-    fsRoots <- getGCRootsFromFS rootsDir
+    fsRoots <- liftIO $ getGCRootsFromFS rootsDir
 
     -- Get explicitly registered roots from the database
     dbRoots <- getRegisteredRoots db
@@ -257,115 +257,111 @@ getGCRootsFromFS rootsDir = do
             -- Return the set of valid roots
             return $ Set.fromList $ catMaybes roots
 
--- | Get roots registered in the database
-getRegisteredRoots :: Database -> IO (Set StorePath)
+-- | Get roots from database
+getRegisteredRoots :: Database -> TenM p (Set StorePath)
 getRegisteredRoots db = do
-    results <- dbQuery_ db
-        "SELECT path FROM GCRoots WHERE active = 1" :: IO [Only Text]
+    results <- liftIO $ dbQuery_ db
+        "SELECT path FROM GCRoots WHERE active = 1"
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
         map (\(Only p) -> parseStorePath p) results
 
 -- | Compute all paths reachable from a set of roots
-computeReachablePathsFromRoots :: Database -> Set StorePath -> IO (Set StorePath)
+computeReachablePathsFromRoots :: Database -> Set StorePath -> TenM p (Set StorePath)
 computeReachablePathsFromRoots db roots = do
     -- If no roots, return empty set
     if Set.null roots
         then return Set.empty
-        else do
-            -- Create temporary table for roots
-            withTransaction db ReadWrite $ \db' -> do
-                -- Create temp table
+        else liftIO $ withTransaction db ReadWrite $ \db' -> do
+            -- Create temp table
+            void $ dbExecute db'
+                "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
+                ()
+
+            -- Clear previous roots
+            void $ dbExecute db' "DELETE FROM temp_roots" ()
+
+            -- Insert all roots
+            forM_ (Set.toList roots) $ \root ->
                 void $ dbExecute db'
-                    "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
-                    ()
+                       "INSERT INTO temp_roots VALUES (?)"
+                       (Only (storePathToText root))
 
-                -- Clear previous roots
-                void $ dbExecute db' "DELETE FROM temp_roots" ()
+            -- Use recursive CTE to find all reachable paths
+            let query = "WITH RECURSIVE\n\
+                        \  reachable(path) AS (\n\
+                        \    SELECT path FROM temp_roots\n\
+                        \    UNION\n\
+                        \    SELECT reference FROM References, reachable \n\
+                        \    WHERE referrer = reachable.path\n\
+                        \  )\n\
+                        \SELECT path FROM reachable"
 
-                -- Insert all roots
-                forM_ (Set.toList roots) $ \root ->
-                    void $ dbExecute db'
-                           "INSERT INTO temp_roots VALUES (?)"
-                           (Only (storePathToText root))
+            results <- dbQuery_ db' query
 
-                -- Use recursive CTE to find all reachable paths
-                let query = "WITH RECURSIVE\n\
-                            \  reachable(path) AS (\n\
-                            \    SELECT path FROM temp_roots\n\
-                            \    UNION\n\
-                            \    SELECT reference FROM References, reachable \n\
-                            \    WHERE referrer = reachable.path\n\
-                            \  )\n\
-                            \SELECT path FROM reachable"
-
-                results <- dbQuery_ db' query :: IO [Only Text]
-
-                -- Parse each store path and return as a set
-                return $ Set.fromList $ catMaybes $
-                    map (\(Only p) -> parseStorePath p) results
+            -- Parse each store path and return as a set
+            return $ Set.fromList $ catMaybes $
+                map (\(Only p) -> parseStorePath p) results
 
 -- | Find the transitive closure of paths
-findPathsClosure :: Database -> Set StorePath -> IO (Set StorePath)
+findPathsClosure :: Database -> Set StorePath -> TenM p (Set StorePath)
 findPathsClosure db startingPaths =
     findPathsClosureWithLimit db startingPaths (-1)  -- No limit
 
 -- | Find the transitive closure of paths with depth limit
-findPathsClosureWithLimit :: Database -> Set StorePath -> Int -> IO (Set StorePath)
+findPathsClosureWithLimit :: Database -> Set StorePath -> Int -> TenM p (Set StorePath)
 findPathsClosureWithLimit db startingPaths depthLimit = do
     -- If no starting paths, return empty set
     if Set.null startingPaths
         then return Set.empty
-        else do
-            -- Create temporary table for the starting set
-            withTransaction db ReadWrite $ \db' -> do
-                -- Create temp table
+        else liftIO $ withTransaction db ReadWrite $ \db' -> do
+            -- Create temp table
+            void $ dbExecute db'
+                "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
+                ()
+
+            -- Clear previous data
+            void $ dbExecute db' "DELETE FROM temp_closure_start" ()
+
+            -- Insert all starting paths
+            forM_ (Set.toList startingPaths) $ \path ->
                 void $ dbExecute db'
-                    "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
-                    ()
+                          "INSERT INTO temp_closure_start VALUES (?)"
+                          (Only (storePathToText path))
 
-                -- Clear previous data
-                void $ dbExecute db' "DELETE FROM temp_closure_start" ()
+            -- Use recursive CTE to find the closure
+            let limitClause = if depthLimit > 0
+                             then T.pack $ ", " ++ show depthLimit
+                             else ""
 
-                -- Insert all starting paths
-                forM_ (Set.toList startingPaths) $ \path ->
-                    void $ dbExecute db'
-                              "INSERT INTO temp_closure_start VALUES (?)"
-                              (Only (storePathToText path))
+            let query = T.concat [
+                    "WITH RECURSIVE\n",
+                    "  closure(path, depth) AS (\n",
+                    "    SELECT path, 0 FROM temp_closure_start\n",
+                    "    UNION\n",
+                    "    SELECT reference, depth + 1 FROM References, closure \n",
+                    "    WHERE referrer = closure.path",
+                    if depthLimit > 0
+                        then T.concat [" AND depth < ", T.pack $ show depthLimit, "\n"]
+                        else "\n",
+                    "  )\n",
+                    "SELECT path FROM closure"
+                  ]
 
-                -- Use recursive CTE to find the closure
-                let limitClause = if depthLimit > 0
-                                 then T.pack $ ", " ++ show depthLimit
-                                 else ""
+            results <- dbQuery_ db' (Query query)
 
-                let query = T.concat [
-                        "WITH RECURSIVE\n",
-                        "  closure(path, depth) AS (\n",
-                        "    SELECT path, 0 FROM temp_closure_start\n",
-                        "    UNION\n",
-                        "    SELECT reference, depth + 1 FROM References, closure \n",
-                        "    WHERE referrer = closure.path",
-                        if depthLimit > 0
-                            then T.concat [" AND depth < ", T.pack $ show depthLimit, "\n"]
-                            else "\n",
-                        "  )\n",
-                        "SELECT path FROM closure"
-                      ]
-
-                results <- dbQuery_ db' (Query query) :: IO [Only Text]
-
-                -- Parse each store path and return as a set
-                return $ Set.fromList $ catMaybes $
-                    map (\(Only p) -> parseStorePath p) results
+            -- Parse each store path and return as a set
+            return $ Set.fromList $ catMaybes $
+                map (\(Only p) -> parseStorePath p) results
 
 -- | Check if a path is reachable from any of the GC roots
-isPathReachable :: Database -> Set StorePath -> StorePath -> IO Bool
+isPathReachable :: Database -> Set StorePath -> StorePath -> TenM p Bool
 isPathReachable db roots path = do
     -- First check if the path is itself a root
     if path `Set.member` roots
         then return True
-        else do
+        else liftIO $ do
             -- Use SQL to efficiently check reachability
             let rootValues = rootsToSqlValues (Set.toList roots)
             let query = "WITH RECURSIVE\n\
@@ -377,7 +373,7 @@ isPathReachable db roots path = do
                         \  )\n\
                         \SELECT COUNT(*) FROM reachable WHERE path = ?"
 
-            results <- dbQuery db (Query $ T.pack query) (Only (storePathToText path)) :: IO [Only Int]
+            results <- dbQuery db (Query $ T.pack query) (Only (storePathToText path))
 
             case results of
                 [Only count] -> return (count > 0)
@@ -389,8 +385,8 @@ isPathReachable db roots path = do
     rootsToSqlValues (r:rs) = "('" ++ T.unpack (storePathToText r) ++ "'), " ++ rootsToSqlValues rs
 
 -- | Mark a set of paths as valid in the ValidPaths table
-markPathsAsValid :: Database -> Set StorePath -> IO ()
-markPathsAsValid db paths =
+markPathsAsValid :: Database -> Set StorePath -> TenM p ()
+markPathsAsValid db paths = liftIO $
     withTransaction db ReadWrite $ \db' -> do
         forM_ (Set.toList paths) $ \path ->
             void $ dbExecute db'
@@ -398,8 +394,8 @@ markPathsAsValid db paths =
                 (Only (storePathToText path))
 
 -- | Mark a set of paths as invalid in the ValidPaths table
-markPathsAsInvalid :: Database -> Set StorePath -> IO ()
-markPathsAsInvalid db paths =
+markPathsAsInvalid :: Database -> Set StorePath -> TenM p ()
+markPathsAsInvalid db paths = liftIO $
     withTransaction db ReadWrite $ \db' -> do
         forM_ (Set.toList paths) $ \path ->
             void $ dbExecute db'
@@ -407,22 +403,22 @@ markPathsAsInvalid db paths =
                 (Only (storePathToText path))
 
 -- | Vacuum the reference database to optimize performance
-vacuumReferenceDb :: Database -> IO ()
+vacuumReferenceDb :: Database -> TenM p ()
 vacuumReferenceDb db = do
     -- Remove dangling references
     cleanupDanglingReferences db
 
     -- Analyze tables
-    void $ dbExecute db "ANALYZE References" ()
+    liftIO $ void $ dbExecute db "ANALYZE References" ()
 
     -- Vacuum database
-    void $ dbExecute db "VACUUM" ()
+    liftIO $ void $ dbExecute db "VACUUM" ()
 
 -- | Validate and repair the reference database
-validateReferenceDb :: Database -> FilePath -> IO (Int, Int)
+validateReferenceDb :: Database -> FilePath -> TenM p (Int, Int)
 validateReferenceDb db storeDir = do
     -- Count existing references
-    [Only totalRefs] <- dbQuery_ db "SELECT COUNT(*) FROM References" :: IO [Only Int]
+    [Only totalRefs] <- liftIO $ dbQuery_ db "SELECT COUNT(*) FROM References"
 
     -- Remove references to non-existent paths
     invalid <- cleanupDanglingReferences db
@@ -431,13 +427,12 @@ validateReferenceDb db storeDir = do
     return (totalRefs, invalid)
 
 -- | Cleanup dangling references
-cleanupDanglingReferences :: Database -> IO Int
-cleanupDanglingReferences db = withTransaction db ReadWrite $ \db' -> do
+cleanupDanglingReferences :: Database -> TenM p Int
+cleanupDanglingReferences db = liftIO $ withTransaction db ReadWrite $ \db' -> do
     -- Find references to paths that don't exist in ValidPaths
     dangling <- dbQuery_ db'
         "SELECT referrer, reference FROM References \
         \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)"
-        :: IO [(Text, Text)]
 
     -- Delete these references
     count <- foldM (\acc (from, to) -> do
@@ -449,21 +444,21 @@ cleanupDanglingReferences db = withTransaction db ReadWrite $ \db' -> do
     return count
 
 -- | Scan a file for references to store paths
-scanFileForReferences :: FilePath -> FilePath -> IO (Set StorePath)
+scanFileForReferences :: FilePath -> FilePath -> TenM p (Set StorePath)
 scanFileForReferences storeDir filePath = do
     -- Check if the file exists
-    exists <- doesFileExist filePath
+    exists <- liftIO $ doesFileExist filePath
     if not exists
         then return Set.empty
         else do
             -- Detect file type and use appropriate scanner
-            fileType <- detectFileType filePath
+            fileType <- liftIO $ detectFileType filePath
 
             case fileType of
-                ElfBinary -> scanElfBinary filePath storeDir
-                TextFile -> scanTextFile filePath storeDir
-                ScriptFile -> scanTextFile filePath storeDir
-                BinaryFile -> scanBinaryFile filePath storeDir
+                ElfBinary -> liftIO $ scanElfBinary filePath storeDir
+                TextFile -> liftIO $ scanTextFile filePath storeDir
+                ScriptFile -> liftIO $ scanTextFile filePath storeDir
+                BinaryFile -> liftIO $ scanBinaryFile filePath storeDir
 
 -- | File types for scanning
 data FileType = ElfBinary | TextFile | ScriptFile | BinaryFile
@@ -613,11 +608,6 @@ findStoreRefsInText storeRoot text =
                          T.all isValidNameChar (T.drop 1 name)
             _ -> False
 
-    isHexDigit :: Char -> Bool
-    isHexDigit c = (c >= '0' && c <= '9') ||
-                   (c >= 'a' && c <= 'f') ||
-                   (c >= 'A' && c <= 'F')
-
     isValidNameChar :: Char -> Bool
     isValidNameChar c = (c >= 'a' && c <= 'z') ||
                         (c >= 'A' && c <= 'Z') ||
@@ -651,13 +641,13 @@ findStoreReferences storeRoot s =
                    (c >= 'A' && c <= 'F')
 
 -- | Scan the entire store for references between paths
-scanStoreForReferences :: FilePath -> IO (Set StorePathReference)
+scanStoreForReferences :: FilePath -> TenM p (Set StorePathReference)
 scanStoreForReferences storeDir = do
     -- Get all store paths
-    paths <- listStoreContents storeDir
+    paths <- liftIO $ listStoreContents storeDir
 
     -- For each path, scan for references to other paths
-    references <- foldM (\acc path -> do
+    references <- liftIO $ foldM (\acc path -> do
         -- Get the full path in the filesystem
         let fullPath = storeDir </> T.unpack (storePathToText path)
 
@@ -667,7 +657,7 @@ scanStoreForReferences storeDir = do
             then return acc
             else do
                 -- Scan for references
-                refs <- scanFileForReferences storeDir fullPath
+                refs <- scanFileForReferences' storeDir fullPath
 
                 -- Add each reference to the accumulator
                 let newRefs = Set.map (StorePathReference path) refs
@@ -675,6 +665,23 @@ scanStoreForReferences storeDir = do
         ) Set.empty paths
 
     return references
+  where
+    -- Internal version without TenM context
+    scanFileForReferences' :: FilePath -> FilePath -> IO (Set StorePath)
+    scanFileForReferences' storeDir filePath = do
+        -- Check if the file exists
+        exists <- doesFileExist filePath
+        if not exists
+            then return Set.empty
+            else do
+                -- Detect file type and use appropriate scanner
+                fileType <- detectFileType filePath
+
+                case fileType of
+                    ElfBinary -> scanElfBinary filePath storeDir
+                    TextFile -> scanTextFile filePath storeDir
+                    ScriptFile -> scanTextFile filePath storeDir
+                    BinaryFile -> scanBinaryFile filePath storeDir
 
 -- | List all paths in the store
 listStoreContents :: FilePath -> IO (Set StorePath)
@@ -690,6 +697,10 @@ listStoreContents storeDir = do
             -- Filter for those that match the store path pattern
             let validPaths = catMaybes $ map (\entry -> parseStorePath $ T.pack entry) entries
             return $ Set.fromList validPaths
+
+-- Helper function to convert a StorePath to its filesystem path
+storePathToFilePath :: StorePath -> BuildEnv -> FilePath
+storePathToFilePath sp env = storePath env </> T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
 
 -- Helper function for Maybe mapping
 mapMaybe :: (a -> Maybe b) -> [a] -> [b]
