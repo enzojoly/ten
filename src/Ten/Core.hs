@@ -152,6 +152,7 @@ import System.FilePath
 import System.Process
 import System.Exit
 import Data.Unique (Unique, newUnique)
+import Data.Proxy (Proxy(..))
 import Network.Socket (Socket)
 import System.IO (Handle)
 import Data.Maybe (isJust, isNothing, fromMaybe, catMaybes)
