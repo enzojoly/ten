@@ -428,7 +428,7 @@ scanFilesystemForPaths storeDir = do
                         Just path -> return $ Set.insert path acc
                         Nothing -> return acc
                 return acc
-            ) Set.empty files
+                ) Set.empty files
 
             return paths
 

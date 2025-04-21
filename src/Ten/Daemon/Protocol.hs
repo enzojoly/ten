@@ -96,7 +96,7 @@ import Data.Word (Word32, Word64)
 import GHC.Generics (Generic)
 import Network.Socket (Socket, close)
 import qualified Network.Socket.ByteString as NByte
-import System.Exit (ExitCode(..), ExitSuccess, ExitFailure)
+import System.Exit (ExitCode(ExitSuccess, ExitFailure))
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush)
 import System.IO.Error (isEOFError)
 import Text.Read (readMaybe)

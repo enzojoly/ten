@@ -62,13 +62,16 @@ import System.Directory
 import System.FilePath
 import qualified System.Process as Process
 import System.Exit
-import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile, hDuplicateTo, hSetBuffering, BufferMode(..))
+import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile, hSetBuffering, BufferMode(..))
 import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup)
 import qualified System.Posix.User as User
 import System.Posix.Process (ProcessStatus(..), getProcessStatus, forkProcess, executeFile, getProcessID)
 import System.Posix.Signals (signalProcess, sigKILL, sigTERM, installHandler, Handler(..))
 import System.Posix.Types (ProcessID, FileMode, UserID, GroupID)
-import qualified System.Posix.IO as PosixIO
+import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
+                       defaultFileFlags, OpenMode(..), OpenFileFlags(..),
+                       exclusive, fdToHandle, dup2)
+import GHC.IO.Handle.FD (handleToFd)
 import System.Timeout (timeout)
 import System.Random (randomRIO)
 import Control.Concurrent.Async (async, Async, wait, cancel, waitCatch, race, withAsync)
@@ -485,8 +488,10 @@ runBuilder env = do
                     hClose stderrRead
 
                     -- Connect stdout and stderr
-                    hDuplicateTo stdoutWrite 1
-                    hDuplicateTo stderrWrite 2
+                    stdoutFd <- handleToFd stdoutWrite
+                    stderrFd <- handleToFd stderrWrite
+                    dup2 stdoutFd 1  -- 1 is stdout
+                    dup2 stderrFd 2  -- 2 is stderr
                     hClose stdoutWrite
                     hClose stderrWrite
 
@@ -578,9 +583,9 @@ runBuilder env = do
 -- | Create a pipe for process communication
 createPipe :: IO (Handle, Handle)
 createPipe = do
-    (readFd, writeFd) <- PosixIO.createPipe
-    readHandle <- PosixIO.fdToHandle readFd
-    writeHandle <- PosixIO.fdToHandle writeFd
+    (readFd, writeFd) <- System.Posix.IO.createPipe
+    readHandle <- fdToHandle readFd
+    writeHandle <- fdToHandle writeFd
     return (readHandle, writeHandle)
 
 -- | Set process group ID

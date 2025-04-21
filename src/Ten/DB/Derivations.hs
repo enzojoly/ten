@@ -61,6 +61,7 @@ import qualified Data.Map.Strict as Map
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
+import Data.Typeable (typeOf)
 import Database.SQLite.Simple (NamedParam(..), Query(..), ToRow(..), FromRow(..), Only(..))
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple.FromRow
@@ -145,13 +146,18 @@ instance FromRow PathInfo where
 
         return $ PathInfo path hash deriver regTime (isValid == 1)
 
--- Helper function to parse StorePath from a database field
+-- StorePath can be parsed directly from database fields
+instance FromField StorePath where
+    fromField f = do
+        text <- fromField f
+        case parseStorePath text of
+            Just sp -> pure sp
+            Nothing -> returnError ConversionFailed f
+                      ("Invalid store path format: " ++ T.unpack text)
+
+-- Helper function to parse StorePath from a database field - now simplified
 parseStorePathField :: RowParser StorePath
-parseStorePathField = do
-    path <- field
-    case parseStorePath path of
-        Just sp -> return sp
-        Nothing -> SQLite.conversionError $ "Invalid store path format: " ++ T.unpack path
+parseStorePathField = field
 
 -- | Store a derivation in the database
 storeDerivation :: Database -> Derivation -> StorePath -> IO Int64
