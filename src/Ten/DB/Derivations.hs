@@ -120,9 +120,9 @@ instance FromRow OutputInfo where
         <*> SQLite.field
         <*> parseStorePathField SQLite.field
 
--- Make DerivationReference an instance of FromRow
-instance FromRow DerivationReference where
-    fromRow = DerivationReference
+-- Make StorePathReference an instance of FromRow
+instance FromRow StorePathReference where
+    fromRow = StorePathReference
         <$> parseStorePathField SQLite.field
         <*> parseStorePathField SQLite.field
 

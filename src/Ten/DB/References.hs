@@ -61,7 +61,7 @@ import System.Posix.Files (getFileStatus, isSymbolicLink, readSymbolicLink, isRe
 import System.IO (IOMode(..), withFile, hFileSize)
 import System.IO.MMap (mmapFileByteString)
 
-import Ten.Core (StorePath(..), storePathToText, parseStorePath)
+import Ten.Core (StorePath(..), storePathToText, parseStorePath, StorePathReference(..))
 import Ten.DB.Core
 
 -- | A reference from one path to another
@@ -95,6 +95,20 @@ instance FromRow ReferenceEntry where
 -- Make ReferenceEntry an instance of ToRow
 instance ToRow ReferenceEntry where
     toRow (ReferenceEntry from to) = SQLite.toRow (storePathToText from, storePathToText to)
+
+-- Make StorePathReference an instance of FromRow
+instance FromRow StorePathReference where
+    fromRow = do
+        fromText <- SQLite.field :: SQLite.RowParser Text
+        toText <- SQLite.field :: SQLite.RowParser Text
+
+        -- Parse store paths safely
+        let fromPath = fromMaybe (error $ "Invalid referrer path: " ++ T.unpack fromText)
+                                 (parseStorePath fromText)
+        let toPath = fromMaybe (error $ "Invalid reference path: " ++ T.unpack toText)
+                               (parseStorePath toText)
+
+        return $ StorePathReference fromPath toPath
 
 -- | Register a single reference between two store paths
 registerReference :: Database -> StorePath -> StorePath -> IO ()
@@ -627,4 +641,43 @@ findStoreReferences storeRoot s =
                    (c >= 'a' && c <= 'f') ||
                    (c >= 'A' && c <= 'F')
 
--- |
+-- | Scan the entire store for references between paths
+scanStoreForReferences :: FilePath -> IO (Set StorePathReference)
+scanStoreForReferences storeDir = do
+    -- Get all store paths
+    paths <- listStoreContents storeDir
+
+    -- For each path, scan for references to other paths
+    references <- foldM (\acc path -> do
+        -- Get the full path in the filesystem
+        let fullPath = storeDir </> T.unpack (storePathToText path)
+
+        -- Skip if not a regular file (e.g., if it's a directory)
+        isFile <- doesFileExist fullPath
+        if not isFile
+            then return acc
+            else do
+                -- Scan for references
+                refs <- scanFileForReferences storeDir fullPath
+
+                -- Add each reference to the accumulator
+                let newRefs = Set.map (StorePathReference path) refs
+                return $ Set.union acc newRefs
+        ) Set.empty paths
+
+    return references
+
+-- | List all paths in the store
+listStoreContents :: FilePath -> IO (Set StorePath)
+listStoreContents storeDir = do
+    -- Check if directory exists
+    exists <- doesDirectoryExist storeDir
+    if not exists
+        then return Set.empty
+        else do
+            -- List all entries
+            entries <- listDirectory storeDir
+
+            -- Filter for those that match the store path pattern
+            let validPaths = catMaybes $ map (\entry -> parseStorePath $ T.pack entry) entries
+            return $ Set.fromList validPaths

@@ -40,7 +40,7 @@ module Ten.Core (
     -- Reference tracking types
     StoreReference(..),
     ReferenceType(..),
-    DerivationReference(..),  -- Properly defined here as the canonical source
+    StorePathReference(..),  -- Changed from DerivationReference
     GCRoot(..),
     RootType(..),
 
@@ -250,8 +250,8 @@ data ReferenceType
     | DerivationReference -- Reference from output to its derivation
     deriving (Show, Eq, Ord)
 
--- | Reference from derivation to its dependencies and outputs
-data DerivationReference = DerivationReference
+-- | Reference from one store path to another
+data StorePathReference = StorePathReference
     { refReferrer :: !StorePath  -- Path that refers to another
     , refReference :: !StorePath  -- Path being referred to
     } deriving (Show, Eq, Ord)
