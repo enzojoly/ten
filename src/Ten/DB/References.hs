@@ -53,8 +53,9 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Database.SQLite.Simple (NamedParam(..), Query(..), ToRow(..), FromRow(..))
+import Database.SQLite.Simple (NamedParam(..), Query(..), ToRow(..), FromRow(..), Only(..))
 import qualified Database.SQLite.Simple as SQLite
+import qualified Database.SQLite.Simple.FromRow as SQLite (RowParser, field)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory)
 import System.FilePath ((</>), takeFileName, takeExtension)
 import System.Posix.Files (getFileStatus, isSymbolicLink, readSymbolicLink, isRegularFile, fileMode)
@@ -681,3 +682,11 @@ listStoreContents storeDir = do
             -- Filter for those that match the store path pattern
             let validPaths = catMaybes $ map (\entry -> parseStorePath $ T.pack entry) entries
             return $ Set.fromList validPaths
+
+-- Helper function for Maybe mapping
+mapMaybe :: (a -> Maybe b) -> [a] -> [b]
+mapMaybe _ [] = []
+mapMaybe f (x:xs) =
+    case f x of
+        Nothing -> mapMaybe f xs
+        Just y -> y : mapMaybe f xs

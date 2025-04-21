@@ -619,7 +619,7 @@ data ResponseTag =
 -- | Daemon request types
 data DaemonRequest
     -- Authentication
-    = AuthRequest ProtocolVersion UserCredentials
+    = AuthCmd ProtocolVersion UserCredentials
 
     -- Build operations
     | BuildRequest {
@@ -698,7 +698,7 @@ data DaemonRequest
 
 instance Aeson.ToJSON DaemonRequest where
     toJSON req = case req of
-        AuthRequest ver creds -> Aeson.object [
+        AuthCmd ver creds -> Aeson.object [
                 "type" .= ("auth" :: Text),
                 "version" .= ver,
                 "credentials" .= creds
@@ -844,7 +844,7 @@ instance Aeson.FromJSON DaemonRequest where
             "auth" -> do
                 ver <- v .: "version"
                 creds <- v .: "credentials"
-                return $ AuthRequest ver creds
+                return $ AuthCmd ver creds
 
             "build" -> do
                 path <- v .: "path"
@@ -1787,7 +1787,7 @@ recvExactly sock n = go n []
 -- | Convert a request to human-readable text
 requestToText :: DaemonRequest -> Text
 requestToText req = case req of
-    AuthRequest ver _ ->
+    AuthCmd ver _ ->
         T.pack $ "Auth request (protocol version " ++ show ver ++ ")"
 
     BuildRequest{..} ->

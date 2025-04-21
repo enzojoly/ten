@@ -67,7 +67,6 @@ import Database.SQLite.Simple.FromRow
 import Database.SQLite.Simple.ToRow
 import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.FromField
-import Database.SQLite.Simple.Types (RowParser, FieldParser)
 import System.FilePath ((</>), takeFileName)
 import System.Directory (doesFileExist, createDirectoryIfMissing)
 import System.IO (withFile, IOMode(..))
