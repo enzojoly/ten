@@ -111,23 +111,21 @@ instance ToRow ReferenceEntry where
 registerReference :: Database -> StorePath -> StorePath -> TenM p ()
 registerReference db from to =
     -- Avoid self-references
-    when (from /= to) $ liftIO $
-        void $ dbExecute db
+    when (from /= to) $
+        tenExecute_ db
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText from, storePathToText to)
 
 -- | Register multiple references from one referrer
 registerReferences :: Database -> StorePath -> Set StorePath -> TenM p ()
-registerReferences db referrer references = liftIO $
-    -- Use a transaction for efficiency
-    withTransaction db ReadWrite $ \db' -> do
-        -- Insert each valid reference
-        forM_ (Set.toList references) $ \ref ->
-            -- Avoid self-references
-            when (referrer /= ref) $
-                void $ dbExecute db'
-                       "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
-                       (storePathToText referrer, storePathToText ref)
+registerReferences db referrer references = withTenTransaction db ReadWrite $ \_ -> do
+    -- Insert each valid reference
+    forM_ (Set.toList references) $ \ref ->
+        -- Avoid self-references
+        when (referrer /= ref) $
+            tenExecute_ db
+                   "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
+                   (storePathToText referrer, storePathToText ref)
 
 -- | Register references for a path after scanning the file for references
 registerPathReferences :: Database -> FilePath -> StorePath -> TenM p Int
@@ -155,7 +153,7 @@ registerPathReferences db storeDir path = do
 -- | Get direct references from a store path
 getDirectReferences :: Database -> StorePath -> TenM p (Set StorePath)
 getDirectReferences db path = do
-    results <- liftIO $ dbQuery db
+    results <- tenQuery db
         "SELECT reference FROM References WHERE referrer = ?"
         (Only (storePathToText path))
 
@@ -176,7 +174,7 @@ getReferences db path = do
                 \  )\n\
                 \SELECT path FROM closure WHERE path != ?"
 
-    results <- liftIO $ dbQuery db query (storePathToText path, storePathToText path)
+    results <- tenQuery db query (storePathToText path, storePathToText path)
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
@@ -185,7 +183,7 @@ getReferences db path = do
 -- | Get direct referrers to a store path
 getDirectReferrers :: Database -> StorePath -> TenM p (Set StorePath)
 getDirectReferrers db path = do
-    results <- liftIO $ dbQuery db
+    results <- tenQuery db
         "SELECT referrer FROM References WHERE reference = ?"
         (Only (storePathToText path))
 
@@ -206,7 +204,7 @@ getReferrers db path = do
                 \  )\n\
                 \SELECT path FROM closure WHERE path != ?"
 
-    results <- liftIO $ dbQuery db query (storePathToText path, storePathToText path)
+    results <- tenQuery db query (storePathToText path, storePathToText path)
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
@@ -260,7 +258,7 @@ getGCRootsFromFS rootsDir = do
 -- | Get roots from database
 getRegisteredRoots :: Database -> TenM p (Set StorePath)
 getRegisteredRoots db = do
-    results <- liftIO $ dbQuery_ db
+    results <- tenQuery_ db
         "SELECT path FROM GCRoots WHERE active = 1"
 
     -- Parse each store path and return as a set
@@ -273,18 +271,17 @@ computeReachablePathsFromRoots db roots = do
     -- If no roots, return empty set
     if Set.null roots
         then return Set.empty
-        else liftIO $ withTransaction db ReadWrite $ \db' -> do
+        else withTenTransaction db ReadWrite $ \_ -> do
             -- Create temp table
-            void $ dbExecute db'
+            tenExecuteSimple_ db
                 "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
-                ()
 
             -- Clear previous roots
-            void $ dbExecute db' "DELETE FROM temp_roots" ()
+            tenExecuteSimple_ db "DELETE FROM temp_roots"
 
             -- Insert all roots
             forM_ (Set.toList roots) $ \root ->
-                void $ dbExecute db'
+                tenExecute_ db
                        "INSERT INTO temp_roots VALUES (?)"
                        (Only (storePathToText root))
 
@@ -298,7 +295,7 @@ computeReachablePathsFromRoots db roots = do
                         \  )\n\
                         \SELECT path FROM reachable"
 
-            results <- dbQuery_ db' query
+            results <- tenQuery_ db query
 
             -- Parse each store path and return as a set
             return $ Set.fromList $ catMaybes $
@@ -315,18 +312,17 @@ findPathsClosureWithLimit db startingPaths depthLimit = do
     -- If no starting paths, return empty set
     if Set.null startingPaths
         then return Set.empty
-        else liftIO $ withTransaction db ReadWrite $ \db' -> do
+        else withTenTransaction db ReadWrite $ \_ -> do
             -- Create temp table
-            void $ dbExecute db'
+            tenExecuteSimple_ db
                 "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
-                ()
 
             -- Clear previous data
-            void $ dbExecute db' "DELETE FROM temp_closure_start" ()
+            tenExecuteSimple_ db "DELETE FROM temp_closure_start"
 
             -- Insert all starting paths
             forM_ (Set.toList startingPaths) $ \path ->
-                void $ dbExecute db'
+                tenExecute_ db
                           "INSERT INTO temp_closure_start VALUES (?)"
                           (Only (storePathToText path))
 
@@ -349,7 +345,7 @@ findPathsClosureWithLimit db startingPaths depthLimit = do
                     "SELECT path FROM closure"
                   ]
 
-            results <- dbQuery_ db' (Query query)
+            results <- tenQuery_ db (Query query)
 
             -- Parse each store path and return as a set
             return $ Set.fromList $ catMaybes $
@@ -361,7 +357,7 @@ isPathReachable db roots path = do
     -- First check if the path is itself a root
     if path `Set.member` roots
         then return True
-        else liftIO $ do
+        else do
             -- Use SQL to efficiently check reachability
             let rootValues = rootsToSqlValues (Set.toList roots)
             let query = "WITH RECURSIVE\n\
@@ -373,7 +369,7 @@ isPathReachable db roots path = do
                         \  )\n\
                         \SELECT COUNT(*) FROM reachable WHERE path = ?"
 
-            results <- dbQuery db (Query $ T.pack query) (Only (storePathToText path))
+            results <- tenQuery db (Query $ T.pack query) (Only (storePathToText path)) :: TenM p [Only Int]
 
             case results of
                 [Only count] -> return (count > 0)
@@ -386,21 +382,19 @@ isPathReachable db roots path = do
 
 -- | Mark a set of paths as valid in the ValidPaths table
 markPathsAsValid :: Database -> Set StorePath -> TenM p ()
-markPathsAsValid db paths = liftIO $
-    withTransaction db ReadWrite $ \db' -> do
-        forM_ (Set.toList paths) $ \path ->
-            void $ dbExecute db'
-                "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?"
-                (Only (storePathToText path))
+markPathsAsValid db paths = withTenTransaction db ReadWrite $ \_ -> do
+    forM_ (Set.toList paths) $ \path ->
+        tenExecute_ db
+            "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?"
+            (Only (storePathToText path))
 
 -- | Mark a set of paths as invalid in the ValidPaths table
 markPathsAsInvalid :: Database -> Set StorePath -> TenM p ()
-markPathsAsInvalid db paths = liftIO $
-    withTransaction db ReadWrite $ \db' -> do
-        forM_ (Set.toList paths) $ \path ->
-            void $ dbExecute db'
-                "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
-                (Only (storePathToText path))
+markPathsAsInvalid db paths = withTenTransaction db ReadWrite $ \_ -> do
+    forM_ (Set.toList paths) $ \path ->
+        tenExecute_ db
+            "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
+            (Only (storePathToText path))
 
 -- | Vacuum the reference database to optimize performance
 vacuumReferenceDb :: Database -> TenM p ()
@@ -409,16 +403,16 @@ vacuumReferenceDb db = do
     cleanupDanglingReferences db
 
     -- Analyze tables
-    liftIO $ void $ dbExecute db "ANALYZE References" ()
+    tenExecuteSimple_ db "ANALYZE References"
 
     -- Vacuum database
-    liftIO $ void $ dbExecute db "VACUUM" ()
+    tenExecuteSimple_ db "VACUUM"
 
 -- | Validate and repair the reference database
 validateReferenceDb :: Database -> FilePath -> TenM p (Int, Int)
 validateReferenceDb db storeDir = do
     -- Count existing references
-    [Only totalRefs] <- liftIO $ dbQuery_ db "SELECT COUNT(*) FROM References"
+    [Only totalRefs] <- tenQuery_ db "SELECT COUNT(*) FROM References" :: TenM p [Only Int]
 
     -- Remove references to non-existent paths
     invalid <- cleanupDanglingReferences db
@@ -428,15 +422,15 @@ validateReferenceDb db storeDir = do
 
 -- | Cleanup dangling references
 cleanupDanglingReferences :: Database -> TenM p Int
-cleanupDanglingReferences db = liftIO $ withTransaction db ReadWrite $ \db' -> do
+cleanupDanglingReferences db = withTenTransaction db ReadWrite $ \db' -> do
     -- Find references to paths that don't exist in ValidPaths
-    dangling <- dbQuery_ db'
+    dangling <- tenQuery_ db'
         "SELECT referrer, reference FROM References \
-        \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)"
+        \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)" :: TenM p [(Text, Text)]
 
     -- Delete these references
     count <- foldM (\acc (from, to) -> do
-        void $ dbExecute db'
+        tenExecute_ db'
             "DELETE FROM References WHERE referrer = ? AND reference = ?"
             (from, to)
         return $! acc + 1) 0 dangling

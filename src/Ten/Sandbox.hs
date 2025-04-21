@@ -71,7 +71,6 @@ import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
 import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
--- Foreign.Storable is a VERY broad import making most other Imports here redundant W.I.P.
 import Foreign.Storable
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
 import System.IO (hPutStrLn, stderr, hClose)
@@ -1032,7 +1031,7 @@ prepareSandboxEnvironment env buildState sandboxDir extraEnv =
   where
     -- Core environment variables that all sandboxes need
     baseEnv = Map.fromList
-        [ ("TEN_STORE", T.pack $ storePath env)
+        [ ("TEN_STORE", T.pack $ storeDir env)
         , ("TEN_BUILD_DIR", T.pack sandboxDir)
         , ("TEN_OUT", T.pack $ sandboxDir </> "out")
         , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath sandboxDir)
@@ -1042,6 +1041,9 @@ prepareSandboxEnvironment env buildState sandboxDir extraEnv =
         , ("TMPDIR", T.pack $ sandboxDir </> "tmp")    -- Set TMPDIR
         , ("TMP", T.pack $ sandboxDir </> "tmp")       -- Alternative tmp env var
         , ("TEMP", T.pack $ sandboxDir </> "tmp")      -- Another alternative
+        , ("TEN_BUILD_ID", T.pack $ showBuildId $ currentBuildId buildState) -- Current build ID
+        , ("TEN_DERIVATION_NAME", "unknown") -- Will be set by caller for actual builds
+        , ("TEN_SYSTEM", "unknown") -- Will be set by caller for actual builds
         ]
 
     -- Security-related variables

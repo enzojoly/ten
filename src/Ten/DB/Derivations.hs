@@ -155,28 +155,27 @@ parseStorePathField = field
 
 -- | Store a derivation in the database
 storeDerivation :: Database -> Derivation -> StorePath -> TenM p Int64
-storeDerivation db derivation storePath = liftIO $ dbWithTransaction db ReadWrite $ \txn -> do
+storeDerivation db derivation storePath = do
     -- Check if derivation already exists
-    existing <- isDerivationRegistered txn (derivHash derivation)
+    existing <- isDerivationRegistered db (derivHash derivation)
 
     if existing
         then do
             -- Get the ID
-            [Only derivId] <- dbQuery txn
+            rows <- tenQuery db
                 "SELECT id FROM Derivations WHERE hash = ?"
-                (Only (derivHash derivation)) :: IO [Only Int64]
-            return derivId
+                (Only (derivHash derivation))
+            case rows of
+                [Only derivId] -> return derivId
+                _ -> throwError $ DBError "Failed to retrieve derivation ID"
         else do
             -- Insert new derivation
-            dbExecute txn
+            derivId <- tenExecute db
                 "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
                 (derivHash derivation, storePathToText storePath)
 
-            -- Get the last inserted ID
-            [Only derivId] <- dbQuery_ txn "SELECT last_insert_rowid()" :: IO [Only Int64]
-
             -- Register the derivation path as valid
-            registerValidPath txn storePath (Just storePath)
+            registerValidPath db storePath (Just storePath)
 
             return derivId
 
@@ -197,61 +196,35 @@ storeDerivationInDB drv derivPath dbPath = do
 
 -- | Register a derivation file in the database with proper reference tracking
 registerDerivationFile :: Database -> Derivation -> StorePath -> TenM p Int64
-registerDerivationFile db derivation storePath = liftIO $ dbWithTransaction db ReadWrite $ \txn -> do
+registerDerivationFile db derivation storePath = withTenTransaction db ReadWrite $ \_ -> do
     -- Store in database
-    derivId <- storeDerivation' txn derivation storePath
+    derivId <- storeDerivation db derivation storePath
 
     -- Register outputs
     outputPaths <- forM (Set.toList $ derivOutputs derivation) $ \output -> do
         let outPath = outputPath output
-        registerDerivationOutput txn derivId (outputName output) outPath
+        registerDerivationOutput db derivId (outputName output) outPath
 
         -- Register this output path as valid
-        registerValidPath txn outPath (Just storePath)
+        registerValidPath db outPath (Just storePath)
 
         -- Return the output path for reference tracking
         return outPath
 
     -- Register references from derivation to inputs
     forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-        addDerivationReference txn storePath (inputPath input)
+        addDerivationReference db storePath (inputPath input)
 
     -- Register references from outputs to derivation (metadata)
     forM_ outputPaths $ \outPath -> do
-        addDerivationReference txn outPath storePath
+        addDerivationReference db outPath storePath
 
     -- Register references from outputs to inputs (direct dependencies)
     forM_ outputPaths $ \outPath -> do
         forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-            addDerivationReference txn outPath (inputPath input)
+            addDerivationReference db outPath (inputPath input)
 
     return derivId
-  where
-    -- Internal version without TenM context
-    storeDerivation' txn derivation storePath = do
-        -- Check if derivation already exists
-        existing <- isDerivationRegistered txn (derivHash derivation)
-
-        if existing
-            then do
-                -- Get the ID
-                [Only derivId] <- dbQuery txn
-                    "SELECT id FROM Derivations WHERE hash = ?"
-                    (Only (derivHash derivation)) :: IO [Only Int64]
-                return derivId
-            else do
-                -- Insert new derivation
-                dbExecute txn
-                    "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
-                    (derivHash derivation, storePathToText storePath)
-
-                -- Get the last inserted ID
-                [Only derivId] <- dbQuery_ txn "SELECT last_insert_rowid()" :: IO [Only Int64]
-
-                -- Register the derivation path as valid
-                registerValidPath txn storePath (Just storePath)
-
-                return derivId
 
 -- | Retrieve a derivation from the database
 retrieveDerivation :: Database -> Text -> TenM p (Maybe Derivation)
@@ -259,9 +232,9 @@ retrieveDerivation db hash = do
     env <- ask
 
     -- Query for derivation
-    derivRows <- liftIO $ dbQuery db
+    derivRows <- tenQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d WHERE d.hash = ?"
-        (Only hash) :: IO [DerivationInfo]
+        (Only hash)
 
     case derivRows of
         [] -> return Nothing
@@ -289,10 +262,10 @@ retrieveDerivationByHash dbPath hash = do
     db <- liftIO $ initDatabase dbPath 5000
 
     -- Query for store path
-    result <- liftIO $ try $ do
-        storePaths <- dbQuery db
+    result <- liftTenIO $ try $ do
+        storePaths <- tenQuery db
             "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-            (Only hash) :: IO [Only Text]
+            (Only hash) :: TenM p [Only Text]
 
         -- Get the derivation
         case storePaths of
@@ -309,23 +282,23 @@ retrieveDerivationByHash dbPath hash = do
 
     -- Handle any exceptions
     case result of
-        Left (e :: SomeException) -> do
-            logMsg 1 $ "Error retrieving derivation: " <> T.pack (show e)
+        Left err -> do
+            logMsg 1 $ "Error retrieving derivation: " <> T.pack (show err)
             return Nothing
         Right derivation -> return derivation
   where
-    readDerivationFromStore :: BuildEnv -> StorePath -> IO (Maybe Derivation)
+    readDerivationFromStore :: BuildEnv -> StorePath -> TenM p (Maybe Derivation)
     readDerivationFromStore env sp = do
         -- Construct the full path
         let fullPath = storePathToFilePath sp env
 
         -- Check if it exists
-        exists <- doesFileExist fullPath
+        exists <- liftIO $ doesFileExist fullPath
         if not exists
             then return Nothing
             else do
                 -- Read and deserialize
-                content <- BS.readFile fullPath
+                content <- liftIO $ BS.readFile fullPath
                 case deserializeDerivation content of
                     Left _ -> return Nothing
                     Right drv -> return $ Just drv
@@ -409,24 +382,24 @@ readDerivationFile env path = do
             return $ deserializeDerivation content
 
 -- | Register an output for a derivation
-registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> IO ()
+registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> TenM p ()
 registerDerivationOutput db derivId outputName outPath = do
     -- Insert output record
-    void $ dbExecute db
+    void $ tenExecute db
         "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
         (derivId, outputName, storePathToText outPath)
 
 -- | Get all outputs for a derivation
 getOutputsForDerivation :: Database -> Int64 -> TenM p [OutputInfo]
-getOutputsForDerivation db derivId = liftIO $
-    dbQuery db
+getOutputsForDerivation db derivId =
+    tenQuery db
         "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
         (Only derivId)
 
 -- | Find the derivation that produced a particular output
 getDerivationForOutput :: Database -> StorePath -> TenM p (Maybe DerivationInfo)
-getDerivationForOutput db outputPath = liftIO $ do
-    results <- dbQuery db
+getDerivationForOutput db outputPath = do
+    results <- tenQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
         \JOIN Outputs o ON d.id = o.derivation_id \
         \WHERE o.path = ?"
@@ -449,7 +422,7 @@ findDerivationsByOutputs db outputPaths = do
                   \JOIN Outputs o ON d.id = o.derivation_id \
                   \WHERE o.path IN " ++ placeholders
 
-    derivInfos <- liftIO $ dbQuery db (Query $ T.pack queryStr) pathTexts
+    derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts
 
     -- Now load each derivation
     derivations <- forM derivInfos $ \derivInfo -> do
@@ -462,24 +435,24 @@ findDerivationsByOutputs db outputPaths = do
     return $ Map.fromList $ catMaybes derivations
 
 -- | Add a reference between two paths
-addDerivationReference :: Database -> StorePath -> StorePath -> IO ()
-addDerivationReference db referrer reference = do
+addDerivationReference :: Database -> StorePath -> StorePath -> TenM p ()
+addDerivationReference db referrer reference =
     when (referrer /= reference) $ do
         -- Skip self-references
-        void $ dbExecute db
+        void $ tenExecute db
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText referrer, storePathToText reference)
 
 -- | Bulk register multiple references for efficiency
 bulkRegisterReferences :: Database -> [(StorePath, StorePath)] -> TenM p Int
 bulkRegisterReferences db [] = return 0
-bulkRegisterReferences db references = liftIO $ dbWithTransaction db ReadWrite $ \txn -> do
+bulkRegisterReferences db references = withTenTransaction db ReadWrite $ \_ -> do
     -- Filter out self-references
     let validRefs = filter (\(from, to) -> from /= to) references
 
     -- Insert each reference
     count <- foldM (\acc (from, to) -> do
-        void $ dbExecute txn
+        void $ tenExecute db
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText from, storePathToText to)
         return $! acc + 1) 0 validRefs
@@ -488,8 +461,8 @@ bulkRegisterReferences db references = liftIO $ dbWithTransaction db ReadWrite $
 
 -- | Get all direct references from a path
 getDerivationReferences :: Database -> StorePath -> TenM p [StorePath]
-getDerivationReferences db path = liftIO $ do
-    results <- dbQuery db
+getDerivationReferences db path = do
+    results <- tenQuery db
         "SELECT reference FROM References WHERE referrer = ?"
         (Only (storePathToText path))
 
@@ -498,8 +471,8 @@ getDerivationReferences db path = liftIO $ do
 
 -- | Get all direct referrers to a path
 getReferrers :: Database -> StorePath -> TenM p [StorePath]
-getReferrers db path = liftIO $ do
-    results <- dbQuery db
+getReferrers db path = do
+    results <- tenQuery db
         "SELECT referrer FROM References WHERE reference = ?"
         (Only (storePathToText path))
 
@@ -508,8 +481,8 @@ getReferrers db path = liftIO $ do
 
 -- | Get all transitive references (closure)
 getTransitiveReferences :: Database -> StorePath -> TenM p (Set StorePath)
-getTransitiveReferences db path = liftIO $ do
-    results <- dbQuery db
+getTransitiveReferences db path = do
+    results <- tenQuery db
         "WITH RECURSIVE\n\
         \  closure(p) AS (\n\
         \    VALUES(?)\n\
@@ -524,8 +497,8 @@ getTransitiveReferences db path = liftIO $ do
 
 -- | Get all transitive referrers (reverse closure)
 getTransitiveReferrers :: Database -> StorePath -> TenM p (Set StorePath)
-getTransitiveReferrers db path = liftIO $ do
-    results <- dbQuery db
+getTransitiveReferrers db path = do
+    results <- tenQuery db
         "WITH RECURSIVE\n\
         \  closure(p) AS (\n\
         \    VALUES(?)\n\
@@ -539,22 +512,22 @@ getTransitiveReferrers db path = liftIO $ do
     return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
 
 -- | Check if a derivation is already registered
-isDerivationRegistered :: Database -> Text -> IO Bool
+isDerivationRegistered :: Database -> Text -> TenM p Bool
 isDerivationRegistered db hash = do
-    results <- dbQuery db
+    results <- tenQuery db
         "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
         (Only hash)
     return $ not (null results)
 
 -- | List all registered derivations
 listRegisteredDerivations :: Database -> TenM p [DerivationInfo]
-listRegisteredDerivations db = liftIO $
-    dbQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+listRegisteredDerivations db =
+    tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
 
 -- | Get the store path for a derivation by hash
 getDerivationPath :: Database -> Text -> TenM p (Maybe StorePath)
-getDerivationPath db hash = liftIO $ do
-    results <- dbQuery db
+getDerivationPath db hash = do
+    results <- tenQuery db
         "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
         (Only hash)
 
@@ -563,28 +536,28 @@ getDerivationPath db hash = liftIO $ do
         _ -> return Nothing
 
 -- | Register a valid path in the store
-registerValidPath :: Database -> StorePath -> Maybe StorePath -> IO ()
+registerValidPath :: Database -> StorePath -> Maybe StorePath -> TenM p ()
 registerValidPath db path mDeriver = do
     let deriverText = case mDeriver of
             Just deriver -> Just (storePathToText deriver)
             Nothing -> Nothing
 
-    void $ dbExecute db
+    void $ tenExecute db
         "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
         \VALUES (?, ?, strftime('%s','now'), ?, 1)"
         (storePathToText path, storeHash path, deriverText)
 
 -- | Mark a path as invalid
 invalidatePath :: Database -> StorePath -> TenM p ()
-invalidatePath db path = liftIO $
-    void $ dbExecute db
+invalidatePath db path =
+    void $ tenExecute db
         "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
         (Only (storePathToText path))
 
 -- | Check if a path is valid
 isPathValid :: Database -> StorePath -> TenM p Bool
-isPathValid db path = liftIO $ do
-    results <- dbQuery db
+isPathValid db path = do
+    results <- tenQuery db
         "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
         (Only (storePathToText path))
 
@@ -594,8 +567,8 @@ isPathValid db path = liftIO $ do
 
 -- | Get detailed information about a path
 getPathInfo :: Database -> StorePath -> TenM p (Maybe PathInfo)
-getPathInfo db path = liftIO $ do
-    results <- dbQuery db
+getPathInfo db path = do
+    results <- tenQuery db
         "SELECT path, hash, deriver, registration_time, is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
         (Only (storePathToText path))
 
@@ -603,9 +576,9 @@ getPathInfo db path = liftIO $ do
 
 -- | Register a derivation with all its outputs in a single transaction
 registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> TenM p Int64
-registerDerivationWithOutputs db derivation storePath = liftIO $ dbWithTransaction db ReadWrite $ \txn -> do
+registerDerivationWithOutputs db derivation storePath = withTenTransaction db ReadWrite $ \_ -> do
     -- Register the derivation
-    derivId <- storeDerivation' txn derivation storePath
+    derivId <- storeDerivation db derivation storePath
 
     -- Get all outputs and inputs for reference tracking
     let outputs = Set.map outputPath $ derivOutputs derivation
@@ -614,48 +587,22 @@ registerDerivationWithOutputs db derivation storePath = liftIO $ dbWithTransacti
     -- Register all outputs
     forM_ (Set.toList $ derivOutputs derivation) $ \output -> do
         let outPath = outputPath output
-        registerDerivationOutput txn derivId (outputName output) outPath
+        registerDerivationOutput db derivId (outputName output) outPath
 
         -- Register this as a valid path
-        registerValidPath txn outPath (Just storePath)
+        registerValidPath db outPath (Just storePath)
 
     -- Register all input references
     forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-        addDerivationReference txn storePath (inputPath input)
+        addDerivationReference db storePath (inputPath input)
 
     -- Register references from outputs to inputs (direct dependencies)
     forM_ (Set.toList outputs) $ \outPath -> do
         -- Reference from output to derivation
-        addDerivationReference txn outPath storePath
+        addDerivationReference db outPath storePath
 
         -- References from output to each input
         forM_ (Set.toList inputs) $ \input -> do
-            addDerivationReference txn outPath input
+            addDerivationReference db outPath input
 
     return derivId
-  where
-    -- Internal version of storeDerivation
-    storeDerivation' txn derivation storePath = do
-        -- Check if derivation already exists
-        existing <- isDerivationRegistered txn (derivHash derivation)
-
-        if existing
-            then do
-                -- Get the ID
-                [Only derivId] <- dbQuery txn
-                    "SELECT id FROM Derivations WHERE hash = ?"
-                    (Only (derivHash derivation))
-                return derivId
-            else do
-                -- Insert new derivation
-                dbExecute txn
-                    "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
-                    (derivHash derivation, storePathToText storePath)
-
-                -- Get the last inserted ID
-                [Only derivId] <- dbQuery_ txn "SELECT last_insert_rowid()"
-
-                -- Register the derivation path as valid
-                registerValidPath txn storePath (Just storePath)
-
-                return derivId

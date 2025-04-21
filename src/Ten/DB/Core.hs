@@ -155,7 +155,7 @@ withDatabase dbPath busyTimeout = bracket
 withDB :: (MonadIO m, MonadError BuildError m, MonadReader BuildEnv m) => (Database -> m a) -> m a
 withDB action = do
     env <- ask
-    let dbPath = defaultDBPath (storeDir env)
+    let dbPath = defaultDBPath (storePath env)
     let busyTimeout = 5000  -- 5 seconds
 
     -- Create a bracket-like operation in the TenM monad
