@@ -473,7 +473,7 @@ getFileSystemRootPaths rootsDir = do
                                     Just sp -> return $ Set.insert sp acc
                                     Nothing -> return acc
                     else return acc
-            ) Set.empty files
+                ) Set.empty files
 
             return paths
 
@@ -512,7 +512,7 @@ getRuntimeRootPaths storeDir = do
                                 -- Extract store paths from lock file content
                                 let storePaths = extractStorePaths text
                                 return $ Set.union acc storePaths
-                    ) Set.empty locks
+                        ) Set.empty locks
 
                     return paths
   where
@@ -879,7 +879,7 @@ repairStore = do
                                     catchIOError (removeFile path) (\_ -> return ())
 
                                     return (v, i + 1, size + pathSize)
-    ) (0, 0, 0) paths
+        ) (0, 0, 0) paths
 
     -- Close database
     liftIO $ closeDatabase db
