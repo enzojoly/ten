@@ -130,7 +130,7 @@ buildDerivation deriv = do
 
     -- Register the derivation in the database
     env <- ask
-    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         liftIO $ registerDerivationFile db deriv derivPath
 
     -- First instantiate the derivation
@@ -221,7 +221,7 @@ findDependencyDerivations paths = do
     env <- ask
 
     -- Use the database to look up derivations for the provided output paths
-    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Use the database to look up derivations for the provided output paths
         result <- liftIO $ findDerivationsByOutputs db paths
 
@@ -301,7 +301,7 @@ buildWithSandbox deriv config = do
 
         -- Prepare environment variables
         env <- ask
-        let buildEnv = getBuildEnvironment env deriv buildDir
+        buildEnv <- getBuildEnvironment env deriv buildDir
 
         -- Create output directory
         liftIO $ createDirectoryIfMissing True (buildDir </> "out")
@@ -682,14 +682,18 @@ setupBuilder builderPath builderContent buildDir = do
     return execPath
 
 -- | Get environment variables for the build
-getBuildEnvironment :: BuildEnv -> Derivation -> FilePath -> Map Text Text
-getBuildEnvironment env deriv buildDir =
-    Map.unions
+getBuildEnvironment :: BuildEnv -> Derivation -> FilePath -> TenM 'Build (Map Text Text)
+getBuildEnvironment env deriv buildDir = do
+    -- Get current build state
+    state <- get
+
+    -- Construct environment variables map
+    return $ Map.unions
         [ -- Base environment from derivation
           derivEnv deriv
         , -- Ten-specific environment variables
           Map.fromList
-            [ ("TEN_STORE", T.pack $ storePath env)
+            [ ("TEN_STORE", T.pack $ storeLocation env)
             , ("TEN_BUILD_DIR", T.pack buildDir)
             , ("TEN_OUT", T.pack $ buildDir </> "out")
             , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath buildDir)
@@ -698,7 +702,7 @@ getBuildEnvironment env deriv buildDir =
             , ("TMPDIR", T.pack $ buildDir </> "tmp") -- Set TMPDIR to sandbox tmp
             , ("TMP", T.pack $ buildDir </> "tmp") -- Alternative tmp env var
             , ("TEMP", T.pack $ buildDir </> "tmp") -- Another alternative
-            , ("TEN_BUILD_ID", T.pack . show $ currentBuildId buildState) -- Current build ID
+            , ("TEN_BUILD_ID", T.pack . show $ currentBuildId state) -- Current build ID
             , ("TEN_DERIVATION_NAME", derivName deriv) -- Name of the derivation
             , ("TEN_SYSTEM", derivSystem deriv) -- Target system
             ]
@@ -709,8 +713,6 @@ getBuildEnvironment env deriv buildDir =
             , ("TEN_UNPRIVILEGED", "1") -- Indicate unprivileged execution
             ]
         ]
-  where
-    buildState = get
 
 -- | Collect output files from a build and add them to the store
 -- This function now properly tracks references between outputs and inputs
@@ -732,7 +734,7 @@ collectBuildResult deriv buildDir = do
     env <- ask
 
     -- Process each expected output with database connection
-    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Process each expected output
         outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
 
@@ -756,7 +758,7 @@ collectBuildResult deriv buildDir = do
                             registerReference txn outputPath (inputPath input)
 
                         -- 3. Scan the output file for additional references
-                        scanAndRegisterReferences txn (storePath env) outputPath
+                        scanAndRegisterReferences txn (storeLocation env) outputPath
 
                 Nothing -> return () -- Should never happen if we stored the derivation first
 
@@ -940,7 +942,7 @@ handleReturnedDerivation result = do
 
             -- Register the inner derivation in the database
             env <- ask
-            withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
                 liftIO $ registerDerivationFile db innerDrv derivPath
 
             -- Check for cycles
@@ -1089,7 +1091,7 @@ updateBuildStatus buildId status = do
     -- In a real daemon implementation, this would update a shared TVar
     -- and notify any clients waiting for status updates
     env <- ask
-    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         liftIO $ dbExecute db
             "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
             (T.pack (show buildId), T.pack (show status))
@@ -1098,7 +1100,7 @@ updateBuildStatus buildId status = do
 getBuildStatus :: BuildId -> TenM 'Build BuildStatus
 getBuildStatus buildId = do
     env <- ask
-    withDatabase (defaultDBPath (storePath env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         results <- liftIO $ dbQuery db
             "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
             [T.pack (show buildId)] :: TenM 'Build [Only Text]

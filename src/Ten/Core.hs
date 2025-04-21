@@ -250,8 +250,8 @@ validateStorePath (StorePath hash name) =
 
 -- | Convert StorePath to a filesystem path (relative to store root)
 storePathToFilePath :: StorePath -> BuildEnv -> FilePath
-storePathToFilePath storePath env =
-    storePath env </> T.unpack (storeHash storePath) ++ "-" ++ T.unpack (storeName storePath)
+storePathToFilePath path env =
+    storeLocation env </> T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
 
 -- | Try to parse a StorePath from a filesystem path
 filePathToStorePath :: FilePath -> Maybe StorePath
@@ -483,7 +483,7 @@ data UserCredentials = UserCredentials
 -- | Environment for build operations
 data BuildEnv = BuildEnv
     { workDir :: FilePath                -- Temporary build directory
-    , storePath :: FilePath              -- Root of content-addressed store (renamed from storeDir for consistency)
+    , storeLocation :: FilePath          -- Root of content-addressed store
     , verbosity :: Int                   -- Logging verbosity level
     , allowedPaths :: Set FilePath       -- Paths accessible during build
     , runMode :: RunMode                 -- Current running mode
@@ -524,12 +524,12 @@ instance MonadFail (TenM p) where
 
 -- | Get the default path for the Ten database
 defaultDBPath :: FilePath -> FilePath
-defaultDBPath storePath = storePath </> "var/ten/db/ten.db"
+defaultDBPath storeDir = storeDir </> "var/ten/db/ten.db"
 
 -- | Ensure database directories exist
 ensureDBDirectories :: FilePath -> IO ()
-ensureDBDirectories storePath = do
-    let dbDir = takeDirectory (defaultDBPath storePath)
+ensureDBDirectories storeDir = do
+    let dbDir = takeDirectory (defaultDBPath storeDir)
     createDirectoryIfMissing True dbDir
     return ()
 
@@ -537,7 +537,7 @@ ensureDBDirectories storePath = do
 initBuildEnv :: FilePath -> FilePath -> BuildEnv
 initBuildEnv wd sp = BuildEnv
     { workDir = wd
-    , storePath = sp
+    , storeLocation = sp
     , verbosity = 1
     , allowedPaths = Set.empty
     , runMode = StandaloneMode

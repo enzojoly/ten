@@ -1031,7 +1031,7 @@ prepareSandboxEnvironment env buildState sandboxDir extraEnv =
   where
     -- Core environment variables that all sandboxes need
     baseEnv = Map.fromList
-        [ ("TEN_STORE", T.pack $ storeDir env)
+        [ ("TEN_STORE", T.pack $ storeLocation env)
         , ("TEN_BUILD_DIR", T.pack sandboxDir)
         , ("TEN_OUT", T.pack $ sandboxDir </> "out")
         , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath sandboxDir)

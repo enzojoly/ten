@@ -1000,7 +1000,7 @@ handleDerivation env = \case
                 Nothing -> error "Invalid store path format"
 
         -- Query the database for the derivation that produced this output
-        db <- initDatabase (defaultDBPath (storePath env)) 5000
+        db <- initDatabase (defaultDBPath (storeLocation env)) 5000
 
         derivResult <- try $ getDerivationForOutput db storePath
         closeDatabase db
@@ -1080,7 +1080,7 @@ handleDerivation env = \case
 
     ListDerivations -> do
         -- Open database
-        db <- initDatabase (defaultDBPath (storePath env)) 5000
+        db <- initDatabase (defaultDBPath (storeLocation env)) 5000
 
         -- Query all registered derivations
         derivsResult <- try $ listRegisteredDerivations db
@@ -1397,7 +1397,7 @@ handleStore env = \case
 listStorePaths :: BuildEnv -> IO [FilePath]
 listStorePaths env = do
     -- Check if store directory exists
-    let storeDir = storePath env
+    let storeDir = storeLocation env
     exists <- doesDirectoryExist storeDir
     if not exists
         then return []
@@ -1478,7 +1478,7 @@ handleInfo env path = do
                                 return $ Right ()
                     else do
                         -- Check if this is an output of some derivation
-                        db <- initDatabase (defaultDBPath (storePath env)) 5000
+                        db <- initDatabase (defaultDBPath (storeLocation env)) 5000
                         derivResult <- try $ getDerivationForOutput db sp
                         closeDatabase db
 
@@ -1901,4 +1901,6 @@ fileExists = doesFileExist
 
 -- | Break a stale lock - imported from Ten.GC
 breakStaleLock :: FilePath -> IO ()
-breakStaleLock = error "Function imported from Ten.GC"
+breakStaleLock lockPath = do
+    exists <- doesFileExist lockPath
+    when exists $ removeFile lockPath

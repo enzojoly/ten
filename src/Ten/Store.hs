@@ -45,7 +45,7 @@ import Control.Monad
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask)
 import Control.Monad.Except (throwError)
-import Control.Monad.State (modify)
+import Control.Monad.State (modify, get)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.List (isPrefixOf)
@@ -91,11 +91,11 @@ addToStore name content = do
         logMsg 2 $ "Adding to store: " <> contentHash <> ":" <> name
 
         -- Create store directory if needed
-        liftIO $ createDirectoryIfMissing True (storeDir env)
+        liftIO $ createDirectoryIfMissing True (storeLocation env)
 
         -- Create temporary file
         tempPath <- liftIO $ do
-            let tempDir = storeDir env </> "tmp"
+            let tempDir = storeLocation env </> "tmp"
             createDirectoryIfMissing True tempDir
             let tempFile = tempDir </> (T.unpack contentHash ++ "-" ++ T.unpack name ++ ".tmp")
             BS.writeFile tempFile content
@@ -109,25 +109,13 @@ addToStore name content = do
         liftIO $ renameFile tempPath fullPath
 
     -- Build-specific operations
-    mState <- getBuildState
-    case mState of
-        Just state | currentPhase state == Build -> do
-            -- Record this as an output in build state
-            modify $ \s -> s { buildOutputs = Set.insert path (buildOutputs s) }
+    state <- get
+    when (currentPhase state == Build) $ do
+        -- Record this as an output in build state
+        modify $ \s -> s { buildOutputs = Set.insert path (buildOutputs s) }
 
-            -- We can't add BuildProof here because of type constraints
-            -- addProof BuildProof
-
-        _ -> return ()
-
-    -- Add to cache
-    atomicallyTen $ do
-        cache <- readTVar globalStoreCache
-        case Map.lookup (storeHash path) cache of
-            Nothing -> do
-                lock <- newTMVar ()
-                writeTVar globalStoreCache (Map.insert (storeHash path) lock cache)
-            Just _ -> return ()
+        -- We can't add BuildProof here because of type constraints
+        -- addProof BuildProof
 
     return path
 
@@ -357,13 +345,6 @@ invalidateCache path =
 clearStoreCache :: TenM p ()
 clearStoreCache =
     atomicallyTen $ writeTVar globalStoreCache Map.empty
-
--- | Internal helper to get the current build state (for context-aware operations)
-getBuildState :: TenM p (Maybe BuildState)
-getBuildState = do
-    -- This would be implemented to access the current state
-    -- in a real implementation, but we're just returning Nothing as a stub.
-    return Nothing
 
 -- | Combine POSIX permission bits
 (.|.) :: FileMode -> FileMode -> FileMode

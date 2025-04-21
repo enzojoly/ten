@@ -983,24 +983,24 @@ dropPrivileges context config = do
 -- | Ensure store directories have appropriate permissions for unprivileged user
 ensureStorePermissions :: DaemonContext -> DaemonConfig -> UserID -> GroupID -> IO ()
 ensureStorePermissions context config uid gid = do
-    let storePath = daemonStorePath config
+    let storeDir = daemonStorePath config
         tmpDir = daemonTmpDir config
         stateFile = daemonStateFile config
         socketPath = daemonSocketPath config
 
     -- Create necessary directories if they don't exist
-    createDirectoryIfMissing True storePath
+    createDirectoryIfMissing True storeDir
     createDirectoryIfMissing True tmpDir
     createDirectoryIfMissing True (takeDirectory stateFile)
     createDirectoryIfMissing True (takeDirectory socketPath)
 
     -- Set appropriate ownership and permissions
-    setOwnerAndGroup storePath uid gid
+    setOwnerAndGroup storeDir uid gid
     setOwnerAndGroup tmpDir uid gid
     setOwnerAndGroup (takeDirectory stateFile) uid gid
 
     -- Set permissions to ensure user can read/write
-    setFileMode storePath (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
+    setFileMode storeDir (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
                           groupReadMode .|. groupWriteMode .|. groupExecuteMode)
     setFileMode tmpDir (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
                        groupReadMode .|. groupWriteMode .|. groupExecuteMode)

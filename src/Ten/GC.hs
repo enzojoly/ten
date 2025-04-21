@@ -119,7 +119,7 @@ addRoot path name permanent = do
     let root = GCRoot path name rootType now
 
     -- Write the root to the roots directory
-    let rootsDir = storeDir env </> "gc-roots"
+    let rootsDir = storeLocation env </> "gc-roots"
     liftIO $ createDirectoryIfMissing True rootsDir
 
     -- Generate a unique filename for the root
@@ -130,7 +130,7 @@ addRoot path name permanent = do
     liftIO $ createSymbolicLink targetPath rootFile
 
     -- Also register the root in the database
-    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
     liftIO $ dbExecute db
         "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
         (storePathToText path, name, if permanent then "permanent" else "user")
@@ -146,7 +146,7 @@ removeRoot root = do
     env <- ask
 
     -- Generate the root file path
-    let rootsDir = storeDir env </> "gc-roots"
+    let rootsDir = storeLocation env </> "gc-roots"
     let rootFile = rootsDir </> (T.unpack $ storeHash (rootPath root) <> "-" <> rootName root)
 
     -- Check if it exists
@@ -160,7 +160,7 @@ removeRoot root = do
             liftIO $ removeFile rootFile
 
             -- Remove from database
-            db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+            db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
             liftIO $ dbExecute db
                 "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
                 (storePathToText (rootPath root), rootName root)
@@ -174,14 +174,14 @@ listRoots = do
     env <- ask
 
     -- Get the roots directory
-    let rootsDir = storeDir env </> "gc-roots"
+    let rootsDir = storeLocation env </> "gc-roots"
 
     -- Create it if it doesn't exist
     liftIO $ createDirectoryIfMissing True rootsDir
 
     -- Get roots both from filesystem and database
     fsRoots <- liftIO $ getFileSystemRoots rootsDir
-    dbRoots <- liftIO $ getDatabaseRoots (storeDir env)
+    dbRoots <- liftIO $ getDatabaseRoots (storeLocation env)
 
     -- Combine both sources, with filesystem taking precedence for duplicates
     let allRoots = Map.union (Map.fromList [(rootPath r, r) | r <- fsRoots])
@@ -238,9 +238,9 @@ getFileSystemRoots rootsDir = do
 
 -- | Get roots from database
 getDatabaseRoots :: FilePath -> IO [GCRoot]
-getDatabaseRoots storeDir = do
+getDatabaseRoots storeLocation = do
     -- Open database
-    db <- initDatabase (defaultDBPath storeDir) 5000
+    db <- initDatabase (defaultDBPath storeLocation) 5000
 
     -- Query active roots
     results <- dbQuery_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
@@ -307,15 +307,15 @@ collectGarbageWithStats = do
     startTime <- liftIO getCurrentTime
 
     -- Open database connection
-    let dbPath = defaultDBPath (storeDir env)
+    let dbPath = defaultDBPath (storeLocation env)
     db <- liftIO $ initDatabase dbPath 5000
 
     -- Find all paths in the store
-    let storeDirPath = storeDir env
-    allStorePaths <- liftIO $ findAllStorePaths storeDirPath
+    let storeLocationPath = storeLocation env
+    allStorePaths <- liftIO $ findAllStorePaths storeLocationPath
 
     -- Find all root paths
-    rootPaths <- liftIO $ findAllRoots db storeDirPath
+    rootPaths <- liftIO $ findAllRoots db storeLocationPath
 
     -- Log information about roots
     logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
@@ -338,7 +338,7 @@ collectGarbageWithStats = do
     let deletablePaths = Set.difference allStorePaths protectedPaths
 
     -- Get total size of deletable paths
-    totalSize <- liftIO $ sum <$> mapM (getPathSize storeDirPath)
+    totalSize <- liftIO $ sum <$> mapM (getPathSize storeLocationPath)
                                        (map storePathToText $ Set.toList deletablePaths)
 
     -- Delete unreachable paths
@@ -375,8 +375,8 @@ collectGarbageWithStats = do
 
 -- | Get file/path size in bytes
 getPathSize :: FilePath -> Text -> IO Integer
-getPathSize storeDir pathText = do
-    let fullPath = storeDir </> T.unpack pathText
+getPathSize storeLocation pathText = do
+    let fullPath = storeLocation </> T.unpack pathText
 
     -- Check if path exists
     exists <- doesFileExist fullPath
@@ -391,14 +391,14 @@ getPathSize storeDir pathText = do
 
 -- | Find all store paths
 findAllStorePaths :: FilePath -> IO (Set StorePath)
-findAllStorePaths storeDir = do
+findAllStorePaths storeLocation = do
     -- Check if store exists
-    exists <- doesDirectoryExist storeDir
+    exists <- doesDirectoryExist storeLocation
     if not exists
         then return Set.empty
         else do
             -- Get paths from database (preferred, more reliable)
-            db <- initDatabase (defaultDBPath storeDir) 5000
+            db <- initDatabase (defaultDBPath storeLocation) 5000
 
             -- Query paths from ValidPaths table
             results <- dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
@@ -411,14 +411,14 @@ findAllStorePaths storeDir = do
 
             -- Fallback: if database doesn't have all paths, scan filesystem as backup
             if Set.null dbPaths
-                then scanFilesystemForPaths storeDir
+                then scanFilesystemForPaths storeLocation
                 else return dbPaths
 
 -- | Scan filesystem for store paths as a fallback
 scanFilesystemForPaths :: FilePath -> IO (Set StorePath)
-scanFilesystemForPaths storeDir = do
+scanFilesystemForPaths storeLocation = do
     -- List all files in the store directory
-    entries <- try $ listDirectory storeDir
+    entries <- try $ listDirectory storeLocation
 
     case entries of
         Left (_ :: SomeException) -> return Set.empty
@@ -439,16 +439,16 @@ scanFilesystemForPaths storeDir = do
 
 -- | Find all roots for garbage collection
 findAllRoots :: Database -> FilePath -> IO (Set StorePath)
-findAllRoots db storeDir = do
+findAllRoots db storeLocation = do
     -- Get roots from filesystem (gc-roots directory)
-    let rootsDir = storeDir </> "gc-roots"
+    let rootsDir = storeLocation </> "gc-roots"
     fsRoots <- getFileSystemRootPaths rootsDir
 
     -- Get roots from database
     dbRoots <- getDatabaseRootPaths db
 
     -- Get runtime lock roots (for active builds)
-    runtimeRoots <- getRuntimeRootPaths storeDir
+    runtimeRoots <- getRuntimeRootPaths storeLocation
 
     -- Combine all root sources
     return $ Set.unions [fsRoots, dbRoots, runtimeRoots]
@@ -497,9 +497,9 @@ getDatabaseRootPaths db = do
 
 -- | Get runtime roots from active builds
 getRuntimeRootPaths :: FilePath -> IO (Set StorePath)
-getRuntimeRootPaths storeDir = do
+getRuntimeRootPaths storeLocation = do
     -- Check for runtime locks directory
-    let locksDir = storeDir </> "var/ten/locks"
+    let locksDir = storeLocation </> "var/ten/locks"
     exists <- doesDirectoryExist locksDir
 
     if not exists
@@ -620,10 +620,10 @@ isReachable path = do
     env <- ask
 
     -- Initialize database
-    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
 
     -- Get all roots
-    roots <- liftIO $ findAllRoots db (storeDir env)
+    roots <- liftIO $ findAllRoots db (storeLocation env)
 
     -- Use database to check reachability
     result <- liftIO $ isPathReachable db roots path
@@ -639,10 +639,10 @@ findReachablePaths = do
     env <- ask
 
     -- Initialize database
-    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
 
     -- Find all roots
-    roots <- liftIO $ findAllRoots db (storeDir env)
+    roots <- liftIO $ findAllRoots db (storeLocation env)
 
     -- Compute all reachable paths
     reachable <- liftIO $ computeReachablePathsFromRoots db roots
@@ -777,7 +777,7 @@ getDaemonActivePaths = do
     case runMode env of
         DaemonMode -> do
             -- Get runtime paths from database
-            db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+            db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
 
             -- Query active build paths from database
             results <- liftIO $ dbQuery_ db "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
@@ -802,7 +802,7 @@ verifyStore = do
     env <- ask
 
     -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
 
     -- Get all valid paths from database
     paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
@@ -839,7 +839,7 @@ repairStore = do
     startTime <- liftIO getCurrentTime
 
     -- Open database
-    db <- liftIO $ initDatabase (defaultDBPath (storeDir env)) 5000
+    db <- liftIO $ initDatabase (defaultDBPath (storeLocation env)) 5000
 
     -- Get all valid paths from database
     paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
@@ -905,3 +905,33 @@ getFileSize' path = do
             fileStatus <- getFileStatus path
             return $ fromIntegral $ fileSize fileStatus
         else return 0
+
+-- | Helper function to compute reachable paths from roots
+-- This would be implemented in Ten.DB.References
+computeReachablePathsFromRoots :: Database -> Set StorePath -> IO (Set StorePath)
+computeReachablePathsFromRoots db roots = do
+    -- This would perform a graph traversal starting from roots
+    -- and following references stored in the database
+    -- For this implementation, we just return the roots themselves as a stub
+    return roots
+
+-- | Helper function to check if a path is reachable from any root
+-- This would be implemented in Ten.DB.References
+isPathReachable :: Database -> Set StorePath -> StorePath -> IO Bool
+isPathReachable db roots path = do
+    -- Check if path is directly in roots
+    if path `Set.member` roots
+        then return True
+        else do
+            -- This would perform a reachability check in the reference graph
+            -- For this implementation, we just return false as a stub
+            return False
+
+-- | Helper function to mark paths as invalid in the database
+-- This would be implemented in Ten.DB.References
+markPathsAsInvalid :: Database -> Set StorePath -> IO ()
+markPathsAsInvalid db paths = do
+    -- Mark each path as invalid in the ValidPaths table
+    forM_ (Set.toList paths) $ \path ->
+        dbExecute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
+                  (Only (storePathToText path))

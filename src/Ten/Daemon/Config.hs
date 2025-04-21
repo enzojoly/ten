@@ -24,7 +24,7 @@ module Ten.Daemon.Config (
     getDefaultSocketPath,
     getDefaultStatePath,
     getDefaultConfig,
-    getDefaultStorePath,
+    getDefaultStoreLocation,
     getDefaultGcInterval,
 
     -- Command-line argument parsing
@@ -34,6 +34,7 @@ module Ten.Daemon.Config (
 
 import Control.Exception (try, SomeException)
 import Control.Monad (when, unless)
+import Control.Applicative ((<|>))
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
@@ -58,7 +59,7 @@ import Ten.Core (BuildError(..))
 -- | Log levels for daemon operations
 data LogLevel
     = LogQuiet     -- ^ Almost no logging (only critical errors)
-    | LogNormal    -- ^ Normal logging level (warnings and important events)
+    | LogNormal    -- ^ Normal logging (warnings and important events)
     | LogVerbose   -- ^ Verbose logging (detailed operation information)
     | LogDebug     -- ^ Debug logging (low-level details for troubleshooting)
     deriving (Show, Eq, Ord, Enum, Bounded)
@@ -71,7 +72,7 @@ data DaemonConfig = DaemonConfig {
     daemonBindAddress   :: Maybe String,  -- ^ Optional bind address for TCP connections
 
     -- Storage settings
-    daemonStorePath     :: FilePath,      -- ^ Path to the content-addressable store
+    daemonStoreLocation :: FilePath,      -- ^ Path to the content-addressable store directory
     daemonStateFile     :: FilePath,      -- ^ Path to the daemon state file
     daemonTmpDir        :: FilePath,      -- ^ Path for temporary files
 
@@ -113,7 +114,7 @@ defaultDaemonConfig = DaemonConfig {
     daemonBindAddress   = Nothing,
 
     -- Storage defaults - will be updated by getDefaultConfig
-    daemonStorePath     = "/var/lib/ten/store",
+    daemonStoreLocation = "/var/lib/ten/store",
     daemonStateFile     = "/var/lib/ten/daemon-state.json",
     daemonTmpDir        = "/var/lib/ten/tmp",
 
@@ -171,7 +172,7 @@ getDefaultConfig = do
             else defaultDaemonConfig {
                 -- Non-root appropriate paths
                 daemonSocketPath    = xdgStateDir </> "daemon.sock",
-                daemonStorePath     = xdgDataDir </> "store",
+                daemonStoreLocation = xdgDataDir </> "store",
                 daemonStateFile     = xdgStateDir </> "daemon-state.json",
                 daemonTmpDir        = xdgStateDir </> "tmp",
                 daemonLogFile       = Just (xdgStateDir </> "daemon.log"),
@@ -184,7 +185,7 @@ getDefaultConfig = do
     -- Create directories for the updated paths
     let dirsToCreate = [
             takeDirectory (daemonSocketPath config),
-            daemonStorePath config,
+            daemonStoreLocation config,
             daemonTmpDir config,
             takeDirectory (daemonStateFile config),
             maybe "" takeDirectory (daemonLogFile config)
@@ -206,17 +207,22 @@ getDefaultStatePath = do
     config <- getDefaultConfig
     return $ daemonStateFile config
 
--- | Get the default store path
-getDefaultStorePath :: IO FilePath
-getDefaultStorePath = do
+-- | Get the default store location
+getDefaultStoreLocation :: IO FilePath
+getDefaultStoreLocation = do
     -- Check environment variable first
-    envPath <- lookupEnv "TEN_STORE_PATH"
+    envPath <- lookupEnv "TEN_STORE_LOCATION"
     case envPath of
         Just path -> return path
         Nothing -> do
-            -- Use config default
-            config <- getDefaultConfig
-            return $ daemonStorePath config
+            -- Check legacy environment variable
+            legacyPath <- lookupEnv "TEN_STORE_PATH"
+            case legacyPath of
+                Just path -> return path
+                Nothing -> do
+                    -- Use config default
+                    config <- getDefaultConfig
+                    return $ daemonStoreLocation config
 
 -- | Get the default garbage collection interval
 getDefaultGcInterval :: IO (Maybe Int)
@@ -269,7 +275,11 @@ loadConfigFromEnv = do
     mSocketPath <- lookupEnv "TEN_DAEMON_SOCKET"
     mPort <- lookupEnvInt "TEN_DAEMON_PORT"
     mBindAddr <- lookupEnv "TEN_DAEMON_BIND_ADDRESS"
-    mStorePath <- lookupEnv "TEN_STORE_PATH"
+    mStoreLocation <- lookupEnv "TEN_STORE_LOCATION"
+    -- Check legacy environment variable if the new one is not set
+    mStoreLocation' <- if isJust mStoreLocation
+                       then return mStoreLocation
+                       else lookupEnv "TEN_STORE_PATH"
     mStateFile <- lookupEnv "TEN_DAEMON_STATE_FILE"
     mTmpDir <- lookupEnv "TEN_DAEMON_TMP_DIR"
     mMaxJobs <- lookupEnvInt "TEN_DAEMON_MAX_JOBS"
@@ -292,7 +302,7 @@ loadConfigFromEnv = do
             daemonSocketPath = fromMaybe (daemonSocketPath defaultConfig) mSocketPath,
             daemonPort = mPort <|> daemonPort defaultConfig,
             daemonBindAddress = mBindAddr <|> daemonBindAddress defaultConfig,
-            daemonStorePath = fromMaybe (daemonStorePath defaultConfig) mStorePath,
+            daemonStoreLocation = fromMaybe (daemonStoreLocation defaultConfig) mStoreLocation',
             daemonStateFile = fromMaybe (daemonStateFile defaultConfig) mStateFile,
             daemonTmpDir = fromMaybe (daemonTmpDir defaultConfig) mTmpDir,
             daemonMaxJobs = fromMaybe (daemonMaxJobs defaultConfig) mMaxJobs,
@@ -386,8 +396,8 @@ configOptionDescriptions = [
         "TCP port for remote connections",
     Option ['b'] ["bind"] (ReqArg (\b cfg -> cfg { daemonBindAddress = Just b }) "ADDRESS")
         "Bind address for TCP connections",
-    Option [] ["store"] (ReqArg (\s cfg -> cfg { daemonStorePath = s }) "PATH")
-        "Path to store",
+    Option [] ["store"] (ReqArg (\s cfg -> cfg { daemonStoreLocation = s }) "PATH")
+        "Path to store directory",
     Option [] ["state-file"] (ReqArg (\s cfg -> cfg { daemonStateFile = s }) "PATH")
         "Path to daemon state file",
     Option [] ["tmp-dir"] (ReqArg (\t cfg -> cfg { daemonTmpDir = t }) "PATH")
@@ -467,6 +477,9 @@ validateConfig config = do
     when (null $ daemonSocketPath config) $
         Left "Socket path cannot be empty"
 
+    when (null $ daemonStoreLocation config) $
+        Left "Store location cannot be empty"
+
     when (daemonMaxJobs config <= 0) $
         Left "Maximum jobs must be positive"
 
@@ -493,7 +506,7 @@ instance Aeson.ToJSON DaemonConfig where
             "socketPath" .= daemonSocketPath,
             "port" .= daemonPort,
             "bindAddress" .= daemonBindAddress,
-            "storePath" .= daemonStorePath,
+            "storeLocation" .= daemonStoreLocation,
             "stateFile" .= daemonStateFile,
             "tmpDir" .= daemonTmpDir,
             "maxJobs" .= daemonMaxJobs,
@@ -517,7 +530,8 @@ instance Aeson.FromJSON DaemonConfig where
         daemonSocketPath <- v .: "socketPath"
         daemonPort <- v .: "port"
         daemonBindAddress <- v .: "bindAddress"
-        daemonStorePath <- v .: "storePath"
+        -- Try new field name first, fall back to old field name for backward compatibility
+        daemonStoreLocation <- (v .: "storeLocation") <|> (v .: "storePath")
         daemonStateFile <- v .: "stateFile"
         daemonTmpDir <- v .: "tmpDir"
         daemonMaxJobs <- v .: "maxJobs"

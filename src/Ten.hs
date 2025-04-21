@@ -113,13 +113,16 @@ module Ten (
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask)
 import Control.Monad.Except (throwError)
+import Control.Monad (forM_, when)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import Data.Char (isSpace)
+import Data.List (isPrefixOf)
 import System.Directory
 import System.FilePath
 import System.Exit
-import System.Environment (getArgs)
+import System.Environment (getArgs, lookupEnv)
 
 -- Core imports
 import Ten.Core
@@ -145,13 +148,13 @@ import qualified Ten.Daemon.Core as DaemonCore
 build :: FilePath -> IO (Either BuildError BuildResult)
 build file = do
     -- Set up environment
-    storePath <- getDefaultStorePath
+    storeLocation <- getDefaultStoreLocation
     workDir <- getDefaultWorkDir
 
-    createDirectoryIfMissing True storePath
+    createDirectoryIfMissing True storeLocation
     createDirectoryIfMissing True workDir
 
-    let env = initBuildEnv workDir storePath
+    let env = initBuildEnv workDir storeLocation
 
     -- Check file existence
     exists <- doesFileExist file
@@ -211,10 +214,10 @@ buildDerivation' env derivation = do
 eval :: FilePath -> IO (Either BuildError Derivation)
 eval file = do
     -- Set up environment
-    storePath <- getDefaultStorePath
+    storeLocation <- getDefaultStoreLocation
     workDir <- getDefaultWorkDir
 
-    let env = initBuildEnv workDir storePath
+    let env = initBuildEnv workDir storeLocation
 
     -- Check file existence
     exists <- doesFileExist file
@@ -244,10 +247,10 @@ evalExpression expr = do
 clean :: IO (Either BuildError ())
 clean = do
     -- Set up environment
-    storePath <- getDefaultStorePath
+    storeLocation <- getDefaultStoreLocation
     workDir <- getDefaultWorkDir
 
-    let env = initBuildEnv workDir storePath
+    let env = initBuildEnv workDir storeLocation
 
     -- Run garbage collection
     gcResult <- runTen (withGCLock collectGarbage) env (initBuildState Build)
@@ -350,9 +353,9 @@ isDaemonRunning' = do
     -- Check if daemon is running at that path
     DaemonClient.isDaemonRunning socketPath
 
--- | Get default store path
-getDefaultStorePath :: IO FilePath
-getDefaultStorePath = do
+-- | Get default store location
+getDefaultStoreLocation :: IO FilePath
+getDefaultStoreLocation = do
     -- Check environment variable
     envPath <- lookupEnv "TEN_STORE_PATH"
     case envPath of
