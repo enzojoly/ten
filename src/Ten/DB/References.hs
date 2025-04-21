@@ -279,9 +279,10 @@ computeReachablePathsFromRoots db roots = do
                 -- Create temp table
                 void $ dbExecute db'
                     "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
+                    ()
 
                 -- Clear previous roots
-                void $ dbExecute db' "DELETE FROM temp_roots"
+                void $ dbExecute db' "DELETE FROM temp_roots" ()
 
                 -- Insert all roots
                 forM_ (Set.toList roots) $ \root ->
@@ -322,9 +323,10 @@ findPathsClosureWithLimit db startingPaths depthLimit = do
                 -- Create temp table
                 void $ dbExecute db'
                     "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
+                    ()
 
                 -- Clear previous data
-                void $ dbExecute db' "DELETE FROM temp_closure_start"
+                void $ dbExecute db' "DELETE FROM temp_closure_start" ()
 
                 -- Insert all starting paths
                 forM_ (Set.toList startingPaths) $ \path ->
@@ -411,10 +413,10 @@ vacuumReferenceDb db = do
     cleanupDanglingReferences db
 
     -- Analyze tables
-    void $ dbExecute db "ANALYZE References"
+    void $ dbExecute db "ANALYZE References" ()
 
     -- Vacuum database
-    void $ dbExecute db "VACUUM"
+    void $ dbExecute db "VACUUM" ()
 
 -- | Validate and repair the reference database
 validateReferenceDb :: Database -> FilePath -> IO (Int, Int)
@@ -438,12 +440,13 @@ cleanupDanglingReferences db = withTransaction db ReadWrite $ \db' -> do
         :: IO [(Text, Text)]
 
     -- Delete these references
-    forM_ dangling $ \(from, to) ->
+    count <- foldM (\acc (from, to) -> do
         void $ dbExecute db'
             "DELETE FROM References WHERE referrer = ? AND reference = ?"
             (from, to)
+        return $! acc + 1) 0 dangling
 
-    return $ length dangling
+    return count
 
 -- | Scan a file for references to store paths
 scanFileForReferences :: FilePath -> FilePath -> IO (Set StorePath)
