@@ -117,7 +117,7 @@ buildDerivation deriv = do
     logMsg 1 $ "Building derivation: " <> derivName deriv
 
     -- Serialize and store the derivation in the store
-    derivPath <- storeDerivationFile deriv
+    derivPath <- storeDerivation deriv
 
     -- No need to check for Maybe BuildId since it's now required
     -- Simply use the current build ID
@@ -685,6 +685,7 @@ getBuildEnvironment env deriv buildDir =
         ]
 
 -- | Collect output files from a build and add them to the store
+-- This function now properly tracks references between outputs and inputs
 collectBuildResult :: Derivation -> FilePath -> TenM 'Build (Set StorePath)
 collectBuildResult deriv buildDir = do
     -- Get the output directory
@@ -699,8 +700,52 @@ collectBuildResult deriv buildDir = do
     outFiles <- liftIO $ listDirectory outDir
     logMsg 2 $ "Output directory contents: " <> T.pack (show outFiles)
 
+    -- Get environment information
+    env <- ask
+
+    -- Open a database connection - we'll use this for multiple operations
+    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
+
     -- Process each expected output
-    outputPaths <- forM (Set.toList $ derivOutputs deriv) $ \output -> do
+    outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
+
+    -- Register all input-output references
+    liftIO $ withTransaction db ReadWrite $ \txn -> do
+        -- Get derivation path in the store
+        derivPath <- storeDerivationFile deriv
+
+        -- Register each output in the database
+        derivInfo <- getDerivationPath txn (derivHash deriv)
+        case derivInfo of
+            Just storedDerivPath -> do
+                -- Register each output for this derivation
+                derivId <- storeDerivation txn deriv storedDerivPath
+                forM_ (Set.toList outputPaths) $ \outputPath -> do
+                    -- 1. Register the derivation as a reference for this output
+                    registerReference txn outputPath storedDerivPath
+
+                    -- 2. Register all input references for this output
+                    forM_ (Set.toList $ derivInputs deriv) $ \input -> do
+                        registerReference txn outputPath (inputPath input)
+
+                    -- 3. Scan the output file for additional references
+                    scanAndRegisterReferences txn (storePath env) outputPath
+
+            Nothing -> return () -- Should never happen if we stored the derivation first
+
+    -- Close the database connection
+    liftIO $ closeDatabase db
+
+    -- Add output proof
+    addProof OutputProof
+
+    -- Return the set of outputs
+    return outputPaths
+  where
+    -- Process a single output, adding it to the store
+    processOutput :: Database -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build (Set StorePath)
+    processOutput db outDir accPaths output = do
+        env <- ask
         let outputFile = outDir </> T.unpack (outputName output)
 
         -- Normalize and validate path
@@ -721,7 +766,7 @@ collectBuildResult deriv buildDir = do
             then do
                 -- Check if it's a file or directory
                 isDir <- liftIO $ doesDirectoryExist outputFile'
-                if isDir
+                outputPath <- if isDir
                     then do
                         -- For directories, create a tarball
                         let tarballPath = outputFile' <> ".tar.gz"
@@ -734,46 +779,34 @@ collectBuildResult deriv buildDir = do
                         -- For regular files, read directly
                         content <- liftIO $ BS.readFile outputFile'
                         addToStore (outputName output) content
+
+                -- Register this as a valid path in the database
+                liftIO $ dbExecute db
+                    "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
+                    \VALUES (?, ?, strftime('%s','now'), ?, 1)"
+                    (storePathToText outputPath, storeHash outputPath, Just $ derivHash deriv)
+
+                -- Return updated set
+                return $ Set.insert outputPath accPaths
             else if isReturnContinuationDerivation (derivName deriv) (derivArgs deriv) (derivEnv deriv)
                 then do
                     -- For return-continuation builds, outputs might not be created
                     -- Return the predicted output path anyway
-                    return $ outputPath output
+                    let outputPath' = outputPath output
+                    return $ Set.insert outputPath' accPaths
                 else
                     throwError $ BuildFailed $
                         "Expected output not produced: " <> outputName output
 
-    -- Add output proof
-    addProof OutputProof
+    -- Scan an output file for references and register them
+    scanAndRegisterReferences :: Database -> FilePath -> StorePath -> IO ()
+    scanAndRegisterReferences db storeDir path = do
+        -- Scan the file for references
+        foundRefs <- scanFileForReferences storeDir (storeDir </> T.unpack (storePathToText path))
 
-    -- Register derivation-output mappings in the database
-    env <- ask
-    db <- liftIO $ initDatabase (defaultDBPath (storePath env)) 5000
-
-    -- Get derivation path in the store
-    derivPath <- storeDerivationFile deriv
-
-    -- Register each output in the database
-    liftIO $ withTransaction db ReadWrite $ \db' -> do
-        derivInfo <- getDerivationPath db' (derivHash deriv)
-        case derivInfo of
-            Just storedDerivPath -> do
-                -- Register each output for this derivation
-                derivId <- storeDerivation db' deriv storedDerivPath
-                forM_ (Set.toList $ derivOutputs deriv) $ \output -> do
-                    let outputPath' = outputPath output
-                    registerDerivationOutput db' derivId (outputName output) outputPath'
-
-                    -- Register reference from output to derivation
-                    addDerivationReference db' outputPath' storedDerivPath
-
-            Nothing -> return () -- Should never happen if we stored the derivation first
-
-    -- Close the database connection
-    liftIO $ closeDatabase db
-
-    -- Return the set of outputs
-    return $ Set.fromList outputPaths
+        -- Register each found reference
+        when (not $ Set.null foundRefs) $
+            registerReferences db path foundRefs
 
 -- | Create a tarball from a directory
 createTarball :: FilePath -> FilePath -> IO ()
@@ -878,7 +911,7 @@ handleReturnedDerivation result = do
             addProof RecursionProof
 
             -- Store the inner derivation in the content store
-            derivPath <- storeDerivationFile innerDrv
+            derivPath <- storeDerivation innerDrv
 
             -- Register the inner derivation in the database
             env <- ask

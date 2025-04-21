@@ -31,6 +31,16 @@ module Ten.Core (
 
     -- Store types
     StorePath(..),
+    storePathToText,
+    textToStorePath,
+    parseStorePath,
+    validateStorePath,
+
+    -- Reference tracking types
+    StoreReference(..),
+    ReferenceType(..),
+    GCRoot(..),
+    RootType(..),
 
     -- Database paths
     defaultDBPath,
@@ -117,7 +127,7 @@ import System.Exit
 import Data.Unique (Unique, newUnique)
 import Network.Socket (Socket)
 import System.IO (Handle)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, fromMaybe)
 import System.Posix.User (getUserEntryForName, getGroupEntryForName,
                          setUserID, setGroupID, getEffectiveUserID,
                          userID, groupID)
@@ -131,6 +141,8 @@ import qualified Text.Read as Read
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Concurrent (ThreadId)
 import System.Posix.Files (setFileMode)
+import Data.Time.Clock (UTCTime)
+import Data.Char (isHexDigit)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -183,40 +195,96 @@ data BuildError
     | NetworkError Text                  -- Network-related errors
     | ParseError Text                    -- Parsing errors
     | DBError Text                       -- Database-related errors
+    | GCError Text                       -- Garbage collection errors
     deriving (Show, Eq)
 
 instance Exception BuildError
 
 -- | Store path representing a content-addressed location
 data StorePath = StorePath
-    { storeHash :: Text                  -- Hash part of the path
-    , storeName :: Text                  -- Human-readable name component
+    { storeHash :: !Text             -- Hash part of the path
+    , storeName :: !Text             -- Human-readable name component
     } deriving (Show, Eq, Ord)
+
+-- | Convert StorePath to a standard text representation
+storePathToText :: StorePath -> Text
+storePathToText (StorePath hash name) = hash <> "-" <> name
+
+-- | Attempt to convert Text to StorePath
+textToStorePath :: Text -> Maybe StorePath
+textToStorePath = parseStorePath
+
+-- | Parse a StorePath from Text
+parseStorePath :: Text -> Maybe StorePath
+parseStorePath text =
+    case T.breakOn "-" text of
+        (hash, name) | not (T.null name) && validateHash hash ->
+            Just $ StorePath hash (T.drop 1 name)
+        _ -> Nothing
+  where
+    validateHash :: Text -> Bool
+    validateHash h = T.length h >= 8 && T.all isHexDigit h
+
+-- | Validate a StorePath's format
+validateStorePath :: StorePath -> Bool
+validateStorePath (StorePath hash name) =
+    T.length hash >= 8 && T.all isHexDigit hash && not (T.null name)
+
+-- | Reference between store paths
+data StoreReference = StoreReference
+    { refSource :: !StorePath     -- Source of the reference
+    , refTarget :: !StorePath     -- Target being referenced
+    , refType :: !ReferenceType   -- Type of reference
+    } deriving (Show, Eq, Ord)
+
+-- | Types of references between store objects
+data ReferenceType
+    = DirectReference     -- Direct reference (e.g., output → input)
+    | IndirectReference   -- Indirect reference (found during scanning)
+    | DerivationReference -- Reference from output to its derivation
+    deriving (Show, Eq, Ord)
+
+-- | A garbage collection root
+data GCRoot = GCRoot
+    { rootPath :: !StorePath        -- Path protected from garbage collection
+    , rootName :: !Text             -- Name/purpose of this root
+    , rootType :: !RootType         -- Type of root
+    , rootTime :: !UTCTime          -- When this root was created
+    } deriving (Show, Eq)
+
+-- | Types of GC roots
+data RootType
+    = SymlinkRoot      -- Symlink in gc-roots directory
+    | ProfileRoot      -- From a user profile
+    | RuntimeRoot      -- Temporary runtime root (active build)
+    | RegistryRoot     -- Explicitly registered in database
+    | PermanentRoot    -- Never to be collected (e.g., system components)
+    deriving (Show, Eq, Ord)
 
 -- | Input to a derivation
 data DerivationInput = DerivationInput
-    { inputPath :: StorePath             -- Path in the store
-    , inputName :: Text                  -- Name to expose this input as
+    { inputPath :: !StorePath        -- Path in the store
+    , inputName :: !Text             -- Name to expose this input as
     } deriving (Show, Eq, Ord)
 
 -- | Expected output from a derivation
 data DerivationOutput = DerivationOutput
-    { outputName :: Text                 -- Name of the output
-    , outputPath :: StorePath            -- Where it will be stored
+    { outputName :: !Text            -- Name of the output
+    , outputPath :: !StorePath       -- Where it will be stored
     } deriving (Show, Eq, Ord)
 
 -- | A derivation is a pure description of a build
 data Derivation = Derivation
-    { derivName :: Text                      -- Human-readable name
-    , derivHash :: Text                      -- Deterministic hash of derivation
-    , derivBuilder :: StorePath              -- Path to the builder executable
-    , derivArgs :: [Text]                    -- Arguments to the builder
-    , derivInputs :: Set DerivationInput     -- Input dependencies
-    , derivOutputs :: Set DerivationOutput   -- Expected outputs
-    , derivEnv :: Map Text Text              -- Environment variables
-    , derivSystem :: Text                    -- Target system (e.g., "x86_64-linux")
-    , derivStrategy :: BuildStrategy         -- How to build this derivation
-    , derivMeta :: Map Text Text             -- Metadata for derivation
+    { derivName :: !Text                    -- Human-readable name
+    , derivHash :: !Text                    -- Deterministic hash of derivation
+    , derivBuilder :: !StorePath            -- Path to the builder executable
+    , derivArgs :: ![Text]                  -- Arguments to the builder
+    , derivInputs :: !(Set DerivationInput) -- Input dependencies
+    , derivOutputs :: !(Set DerivationOutput) -- Expected outputs
+    , derivEnv :: !(Map Text Text)          -- Environment variables
+    , derivSystem :: !Text                  -- Target system (e.g., "x86_64-linux")
+    , derivStrategy :: !BuildStrategy       -- How to build this derivation
+    , derivMeta :: !(Map Text Text)         -- Metadata for derivation
     } deriving (Show, Eq)
 
 -- | Compare two derivations for equality
@@ -229,32 +297,32 @@ derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == sto
 
 -- | Node in a build graph
 data BuildNode
-    = InputNode StorePath                  -- An input that doesn't need to be built
-    | DerivationNode Derivation            -- A derivation that needs to be built
-    | OutputNode StorePath Derivation      -- An output produced by a derivation
+    = InputNode !StorePath              -- An input that doesn't need to be built
+    | DerivationNode !Derivation        -- A derivation that needs to be built
+    | OutputNode !StorePath !Derivation  -- An output produced by a derivation
     deriving (Show, Eq)
 
 -- | Graph errors
 data GraphError
-    = CycleError [Text]                    -- A cycle was detected (node IDs)
-    | MissingNodeError Text                -- A referenced node doesn't exist
-    | InconsistentGraphError Text          -- Graph is in an inconsistent state
-    | DeserializationError Text            -- Couldn't deserialize graph
+    = CycleError [Text]                 -- A cycle was detected (node IDs)
+    | MissingNodeError Text             -- A referenced node doesn't exist
+    | InconsistentGraphError Text       -- Graph is in an inconsistent state
+    | DeserializationError Text         -- Couldn't deserialize graph
     deriving (Show, Eq)
 
 -- | Proof about a build graph
 data GraphProof
-    = AcyclicGraphProof      -- Graph has no cycles
-    | CompleteProof     -- Graph contains all dependencies
-    | ValidProof        -- Graph is both acyclic and complete
+    = AcyclicGraphProof                 -- Graph has no cycles
+    | CompleteProof                     -- Graph contains all dependencies
+    | ValidProof                        -- Graph is both acyclic and complete
     deriving (Show, Eq)
 
 -- | A build graph representing the dependency relationships
 data BuildGraph = BuildGraph
-    { graphNodes :: Map Text BuildNode     -- Nodes indexed by ID
-    , graphEdges :: Map Text (Set Text)    -- Edges from node -> dependencies
-    , graphRoots :: Set Text               -- Root nodes (outputs requested)
-    , graphProof :: Maybe GraphProof       -- Proof about this graph
+    { graphNodes :: !(Map Text BuildNode)   -- Nodes indexed by ID
+    , graphEdges :: !(Map Text (Set Text))  -- Edges from node -> dependencies
+    , graphRoots :: !(Set Text)             -- Root nodes (outputs requested)
+    , graphProof :: !(Maybe GraphProof)     -- Proof about this graph
     } deriving (Show, Eq)
 
 -- | Proof of a property, parameterized by phase
@@ -272,6 +340,10 @@ data Proof (p :: Phase) where
     -- Proofs for Return-Continuation
     ReturnProof    :: Proof 'Build
     RecursionProof :: Proof 'Build
+
+    -- Proofs for garbage collection
+    GCRootProof    :: Proof 'Build  -- Proof that path is a GC root
+    ReachableProof :: Proof 'Build  -- Proof that path is reachable
 
     -- Composite proofs
     ComposeProof   :: Proof p -> Proof p -> Proof p
@@ -543,6 +615,8 @@ addProof proof = case proof of
     p@OutputProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
     p@ReturnProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
     p@RecursionProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
+    p@GCRootProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
+    p@ReachableProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
     p@(ComposeProof p1 p2) -> do
         addProof p1
         addProof p2
