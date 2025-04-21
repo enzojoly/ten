@@ -151,7 +151,7 @@ parseStorePathField = do
     path <- field
     case parseStorePath path of
         Just sp -> return sp
-        Nothing -> fail $ "Invalid store path format: " ++ T.unpack path
+        Nothing -> SQLite.conversionError $ "Invalid store path format: " ++ T.unpack path
 
 -- | Store a derivation in the database
 storeDerivation :: Database -> Derivation -> StorePath -> IO Int64
