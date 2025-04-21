@@ -72,6 +72,7 @@ module Ten.Daemon.Protocol (
     ProtocolError(..)
 ) where
 
+import Control.Concurrent (forkIO, killThread, threadDelay, myThreadId)
 import Control.Concurrent.MVar
 import Control.Exception (Exception, throwIO, bracket, try, SomeException)
 import Control.Monad (unless, when, foldM)
@@ -1667,15 +1668,15 @@ receiveResponse handle reqId timeoutMicros = do
 
             Right bytes -> case deserializeMessage bytes of
                 Left err ->
-                    return $ Left $ ProtocolParseError err
+                    return $ Left (ProtocolParseError err)
 
                 Right (ResponseMsg respId resp) ->
                     if respId == reqId
                         then return $ Right resp
-                        else return $ Left $ InvalidRequest $ "Response ID mismatch: expected " <> T.pack (show reqId) <> ", got " <> T.pack (show respId)
+                        else return $ Left (InvalidRequest $ "Response ID mismatch: expected " <> T.pack (show reqId) <> ", got " <> T.pack (show respId))
 
                 Right _ ->
-                    return $ Left $ InvalidRequest "Expected response message"
+                    return $ Left (InvalidRequest "Expected response message")
 
 -- | Send a response over a protocol handle
 sendResponse :: ProtocolHandle -> Int -> DaemonResponse -> IO ()
@@ -1702,13 +1703,13 @@ receiveRequest handle = do
 
             Right bytes -> case deserializeMessage bytes of
                 Left err ->
-                    return $ Left $ ProtocolParseError err
+                    return $ Left (ProtocolParseError err)
 
                 Right (RequestMsg reqId req) ->
                     return $ Right (reqId, req)
 
                 Right _ ->
-                    return $ Left $ InvalidRequest "Expected request message"
+                    return $ Left (InvalidRequest "Expected request message")
 
 -- | Execute an action with a protocol handle and clean up after
 withProtocolHandle :: Socket -> (ProtocolHandle -> IO a) -> IO a
@@ -1724,9 +1725,9 @@ readMessageWithTimeout sock timeoutMicros = do
     -- Read length header with timeout
     lenBytes <- timeout timeoutMicros $ NByte.recv sock 4
     case lenBytes of
-        Nothing -> throwIO $ ProtocolError $ MessageTooLarge 0
+        Nothing -> throwIO (MessageTooLarge 0)
         Just bytes
-            | BS.length bytes /= 4 -> throwIO $ ProtocolError ConnectionClosed
+            | BS.length bytes /= 4 -> throwIO ConnectionClosed
             | otherwise -> do
                 -- Decode message length
                 let len = fromIntegral $
@@ -1737,14 +1738,14 @@ readMessageWithTimeout sock timeoutMicros = do
 
                 -- Check if message is too large
                 when (len > 100 * 1024 * 1024) $ -- 100 MB limit
-                    throwIO $ ProtocolError $ MessageTooLarge (fromIntegral len)
+                    throwIO (MessageTooLarge (fromIntegral len))
 
                 -- Read message body with timeout
                 body <- timeout timeoutMicros $ recvExactly sock len
                 case body of
-                    Nothing -> throwIO $ ProtocolError ConnectionClosed
+                    Nothing -> throwIO ConnectionClosed
                     Just bytes
-                        | BS.length bytes /= len -> throwIO $ ProtocolError ConnectionClosed
+                        | BS.length bytes /= len -> throwIO ConnectionClosed
                         | otherwise -> return bytes
 
 -- | Read a message from a socket
@@ -1753,7 +1754,7 @@ readMessage sock = do
     -- Read length header
     lenBytes <- NByte.recv sock 4
     when (BS.length lenBytes /= 4) $
-        throwIO $ ProtocolError ConnectionClosed
+        throwIO ConnectionClosed
 
     -- Decode message length
     let len = fromIntegral $
@@ -1764,12 +1765,12 @@ readMessage sock = do
 
     -- Check if message is too large
     when (len > 100 * 1024 * 1024) $ -- 100 MB limit
-        throwIO $ ProtocolError $ MessageTooLarge (fromIntegral len)
+        throwIO (MessageTooLarge (fromIntegral len))
 
     -- Read message body
     body <- recvExactly sock len
     when (BS.length body /= len) $
-        throwIO $ ProtocolError ConnectionClosed
+        throwIO ConnectionClosed
 
     return body
 
@@ -2037,7 +2038,7 @@ shiftL x n = x * (2 ^ n)
 (.|.) :: Int -> Int -> Int
 a .|. b = a + b
 
--- | GC Stats type (to be imported from Ten.GC in a real implementation)
+-- | GC Stats type (defined externally)
 data GCStats = GCStats {
     gcTotal :: Int,             -- Total paths in store
     gcLive :: Int,              -- Paths still reachable

@@ -10,7 +10,6 @@ module Ten.GC (
     daemonCollectGarbage,
 
     -- GC roots management
-    GCRoot(..),
     addRoot,
     removeRoot,
     listRoots,
@@ -36,6 +35,7 @@ module Ten.GC (
     repairStore
 ) where
 
+import Control.Concurrent (forkIO, threadDelay, killThread)
 import Control.Concurrent.STM
 import Control.Exception (bracket, try, catch, throwIO, finally, mask, SomeException, IOException)
 import Control.Monad
@@ -70,6 +70,7 @@ import System.IO (SeekMode(AbsoluteSeek))
 import qualified Data.ByteString.Char8 as BC
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Database.SQLite.Simple (Only(..))
 
 import Ten.Core
 import Ten.Store
@@ -79,14 +80,6 @@ import Ten.Graph
 import Ten.DB.Core
 import Ten.DB.References
 import Ten.DB.Derivations
-
--- | A garbage collection root
-data GCRoot = GCRoot
-    { rootPath :: StorePath        -- Path protected from garbage collection
-    , rootName :: Text             -- Name/purpose of this root
-    , rootCreated :: UTCTime       -- When this root was created
-    , rootPermanent :: Bool        -- Whether this is a permanent root
-    } deriving (Show, Eq)
 
 -- | Statistics from a garbage collection run
 data GCStats = GCStats
@@ -120,12 +113,8 @@ addRoot path name permanent = do
 
     -- Create the root
     now <- liftIO getCurrentTime
-    let root = GCRoot
-            { rootPath = path
-            , rootName = name
-            , rootCreated = now
-            , rootPermanent = permanent
-            }
+    let rootType = if permanent then PermanentRoot else SymlinkRoot
+    let root = GCRoot path name rootType now
 
     -- Write the root to the roots directory
     let rootsDir = storePath env </> "gc-roots"
@@ -164,7 +153,7 @@ removeRoot root = do
     -- Remove from filesystem and database
     when exists $ do
         -- Don't remove permanent roots unless forced
-        unless (rootPermanent root) $ do
+        unless (rootType root == PermanentRoot) $ do
             -- Remove from filesystem
             liftIO $ removeFile rootFile
 
@@ -229,14 +218,16 @@ getFileSystemRoots rootsDir = do
                                 (_, '-':rest) -> T.pack rest
                                 _ -> T.pack file
 
-                        -- Check if it's permanent (in a real implementation, this would be stored in metadata)
-                        let isPermanent = "permanent-" `T.isPrefixOf` name
+                        -- Determine root type based on file name pattern
+                        let rootType = if "permanent-" `T.isPrefixOf` name
+                                      then PermanentRoot
+                                      else SymlinkRoot
 
                         return $ Just $ GCRoot
                             { rootPath = path
                             , rootName = name
-                            , rootCreated = now
-                            , rootPermanent = isPermanent
+                            , rootType = rootType
+                            , rootTime = now
                             }
             else return Nothing
 
@@ -260,14 +251,19 @@ getDatabaseRoots storeDir = do
             Just path -> do
                 -- Convert timestamp to UTCTime
                 let rootTime = posixSecondsToUTCTime (fromIntegral timestamp)
-                -- Determine if permanent
-                let isPermanent = typeStr == "permanent"
+                -- Determine root type
+                let rootType = case typeStr of
+                      "permanent" -> PermanentRoot
+                      "runtime" -> RuntimeRoot
+                      "profile" -> ProfileRoot
+                      "registry" -> RegistryRoot
+                      _ -> SymlinkRoot
 
                 return $ Just $ GCRoot
                     { rootPath = path
                     , rootName = name
-                    , rootCreated = rootTime
-                    , rootPermanent = isPermanent
+                    , rootType = rootType
+                    , rootTime = rootTime
                     }
             Nothing -> return Nothing
 

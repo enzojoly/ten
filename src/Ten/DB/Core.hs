@@ -7,6 +7,7 @@ module Ten.DB.Core (
     Database(..),
     DBError(..),
     TransactionMode(..),
+    Only(..),  -- Re-export the Only type needed by modules like Ten.GC
 
     -- Database initialization
     initDatabase,
