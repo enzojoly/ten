@@ -45,11 +45,7 @@ module Ten.Derivation (
     newDerivationChain,
     Ten.Core.addToDerivationChain,
     Ten.Core.isInDerivationChain,
-    derivationChainLength,
-
-    -- Utilities for external use
-    parseStorePathText,
-    storePathToText
+    derivationChainLength
 ) where
 
 import Control.Concurrent.STM
@@ -212,18 +208,6 @@ storeDerivation drv = do
 
     -- Add to store with .drv extension
     addToStore (derivName drv <> ".drv") serialized
-
--- | Convert a store path to text
-storePathToText :: StorePath -> Text
-storePathToText (StorePath hash name) = hash <> "-" <> name
-
--- | Parse a store path from text
-parseStorePathText :: Text -> Maybe StorePath
-parseStorePathText path =
-    case T.breakOn "-" path of
-        (hash, name) | not (T.null name) ->
-            Just $ StorePath hash (T.drop 1 name)
-        _ -> Nothing
 
 -- | Retrieve a derivation from the store
 retrieveDerivation :: StorePath -> TenM p (Maybe Derivation)

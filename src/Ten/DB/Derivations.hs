@@ -42,7 +42,6 @@ module Ten.DB.Derivations (
     -- Types
     DerivationInfo(..),
     OutputInfo(..),
-    DerivationReference(..),
     PathInfo(..)
 ) where
 
@@ -68,6 +67,7 @@ import Database.SQLite.Simple.FromRow
 import Database.SQLite.Simple.ToRow
 import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.FromField
+import Database.SQLite.Simple.Types (RowParser, FieldParser)
 import System.FilePath ((</>), takeFileName)
 import System.Directory (doesFileExist, createDirectoryIfMissing)
 import System.IO (withFile, IOMode(..))
@@ -75,6 +75,8 @@ import System.Posix.Files (getFileStatus, fileSize)
 import System.Time.Extra (offsetTime, showDuration)
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (getPOSIXTime, posixSecondsToUTCTime)
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as Aeson
 
 import Ten.DB.Core
 import Ten.Core
@@ -94,12 +96,6 @@ data OutputInfo = OutputInfo {
     outputInfoPath :: StorePath       -- ^ Path in the store
 } deriving (Show, Eq)
 
--- | Reference between store paths
-data DerivationReference = DerivationReference {
-    refReferrer :: StorePath,  -- ^ Path that refers to another
-    refReference :: StorePath  -- ^ Path being referred to
-} deriving (Show, Eq)
-
 -- | Information about a store path
 data PathInfo = PathInfo {
     pathInfoPath :: StorePath,          -- ^ The store path
@@ -114,7 +110,7 @@ instance FromRow DerivationInfo where
     fromRow = DerivationInfo
         <$> SQLite.field
         <*> SQLite.field
-        <*> parseStorePath SQLite.field
+        <*> parseStorePathField SQLite.field
         <*> SQLite.field
 
 -- Make OutputInfo an instance of FromRow
@@ -122,22 +118,22 @@ instance FromRow OutputInfo where
     fromRow = OutputInfo
         <$> SQLite.field
         <*> SQLite.field
-        <*> parseStorePath SQLite.field
+        <*> parseStorePathField SQLite.field
 
 -- Make DerivationReference an instance of FromRow
 instance FromRow DerivationReference where
     fromRow = DerivationReference
-        <$> parseStorePath SQLite.field
-        <*> parseStorePath SQLite.field
+        <$> parseStorePathField SQLite.field
+        <*> parseStorePathField SQLite.field
 
 -- Make PathInfo an instance of FromRow
 instance FromRow PathInfo where
     fromRow = do
-        path <- parseStorePath SQLite.field
-        hash <- SQLite.field
-        deriverText <- SQLite.field :: SQLite.RowParser (Maybe Text)
-        timestamp <- SQLite.field :: SQLite.RowParser Int64
-        isValid <- SQLite.field :: SQLite.RowParser Int
+        path <- parseStorePathField SQLite.field
+        hash <- SQLite.field :: RowParser Text
+        deriverText <- SQLite.field :: RowParser (Maybe Text)
+        timestamp <- SQLite.field :: RowParser Int64
+        isValid <- SQLite.field :: RowParser Int
 
         -- Parse deriver if present
         let deriver = deriverText >>= parseStorePath
@@ -148,8 +144,8 @@ instance FromRow PathInfo where
         return $ PathInfo path hash deriver regTime (isValid == 1)
 
 -- Helper function to parse StorePath from a database field
-parseStorePath :: SQLite.FieldParser Text -> SQLite.RowParser StorePath
-parseStorePath parser = do
+parseStorePathField :: FieldParser Text -> RowParser StorePath
+parseStorePathField parser = do
     path <- parser
     case parseStorePath path of
         Just sp -> return sp
@@ -311,7 +307,57 @@ deserializeDerivation bs =
 
 -- | Convert JSON to Derivation (placeholder - implement based on your JSON format)
 derivationFromJSON :: Aeson.Value -> Either Text Derivation
-derivationFromJSON _ = Left "Derivation deserialization not implemented in this file"
+derivationFromJSON value = case Aeson.parseEither parseDerivation value of
+    Left err -> Left $ T.pack err
+    Right drv -> Right drv
+  where
+    parseDerivation = Aeson.withObject "Derivation" $ \o -> do
+        name <- o Aeson..: "name"
+        hash <- o Aeson..: "hash"
+        builderObj <- o Aeson..: "builder"
+        builder <- parseStorePath' builderObj
+        args <- o Aeson..: "args"
+        inputsArray <- o Aeson..: "inputs"
+        inputs <- parseInputs inputsArray
+        outputsArray <- o Aeson..: "outputs"
+        outputs <- parseOutputs outputsArray
+        envObj <- o Aeson..: "env"
+        env <- parseEnv envObj
+        system <- o Aeson..: "system"
+        strategyText <- o Aeson..: "strategy"
+        let strategy = if strategyText == ("monadic" :: Text) then MonadicStrategy else ApplicativeStrategy
+        metaObj <- o Aeson..: "meta"
+        meta <- parseEnv metaObj
+
+        return $ Derivation name hash builder args
+                           (Set.fromList inputs) (Set.fromList outputs)
+                           env system strategy meta
+
+    parseStorePath' = Aeson.withObject "StorePath" $ \o -> do
+        hash <- o Aeson..: "hash"
+        name <- o Aeson..: "name"
+        return $ StorePath hash name
+
+    parseInputs = Aeson.withArray "Inputs" $ \arr ->
+        mapM parseInput (Aeson.toList arr)
+
+    parseInput = Aeson.withObject "DerivationInput" $ \o -> do
+        pathObj <- o Aeson..: "path"
+        path <- parseStorePath' pathObj
+        name <- o Aeson..: "name"
+        return $ DerivationInput path name
+
+    parseOutputs = Aeson.withArray "Outputs" $ \arr ->
+        mapM parseOutput (Aeson.toList arr)
+
+    parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
+        name <- o Aeson..: "name"
+        pathObj <- o Aeson..: "path"
+        path <- parseStorePath' pathObj
+        return $ DerivationOutput name path
+
+    parseEnv = Aeson.withObject "Environment" $ \o ->
+        return $ Map.fromList [(k, v) | (k, Aeson.String v) <- Aeson.toList o]
 
 -- | Read and deserialize a derivation file
 readDerivationFile :: StorePath -> IO (Either Text Derivation)

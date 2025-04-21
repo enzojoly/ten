@@ -61,7 +61,7 @@ import System.Posix.Files (getFileStatus, isSymbolicLink, readSymbolicLink, isRe
 import System.IO (IOMode(..), withFile, hFileSize)
 import System.IO.MMap (mmapFileByteString)
 
-import Ten.Core (StorePath(..), storePathToText, parseStorePathText)
+import Ten.Core (StorePath(..), storePathToText, parseStorePath)
 import Ten.DB.Core
 
 -- | A reference from one path to another
@@ -86,9 +86,9 @@ instance FromRow ReferenceEntry where
 
         -- Parse store paths safely
         let fromPath = fromMaybe (error $ "Invalid referrer path: " ++ T.unpack fromText)
-                                 (parseStorePathText fromText)
+                                 (parseStorePath fromText)
         let toPath = fromMaybe (error $ "Invalid reference path: " ++ T.unpack toText)
-                               (parseStorePathText toText)
+                               (parseStorePath toText)
 
         return $ ReferenceEntry fromPath toPath
 
@@ -146,7 +146,7 @@ getDirectReferences db path = do
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePathText p) results
+        map (\(Only p) -> parseStorePath p) results
 
 -- | Get all references from a path (direct and indirect)
 getReferences :: Database -> StorePath -> IO (Set StorePath)
@@ -165,7 +165,7 @@ getReferences db path = do
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePathText p) results
+        map (\(Only p) -> parseStorePath p) results
 
 -- | Get direct referrers to a store path
 getDirectReferrers :: Database -> StorePath -> IO (Set StorePath)
@@ -176,7 +176,7 @@ getDirectReferrers db path = do
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePathText p) results
+        map (\(Only p) -> parseStorePath p) results
 
 -- | Get all referrers to a path (direct and indirect)
 getReferrers :: Database -> StorePath -> IO (Set StorePath)
@@ -195,7 +195,7 @@ getReferrers db path = do
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePathText p) results
+        map (\(Only p) -> parseStorePath p) results
 
 -- | Find all GC roots
 findGCRoots :: Database -> FilePath -> IO (Set StorePath)
@@ -236,7 +236,7 @@ getGCRootsFromFS rootsDir = do
                             Left (_ :: SomeException) -> return Nothing
                             Right targetPath -> do
                                 -- Parse the store path from the target filename
-                                return $ parseStorePathText $ T.pack $ takeFileName targetPath
+                                return $ parseStorePath $ T.pack $ takeFileName targetPath
                     else return Nothing
 
             -- Return the set of valid roots
@@ -250,7 +250,7 @@ getRegisteredRoots db = do
 
     -- Parse each store path and return as a set
     return $ Set.fromList $ catMaybes $
-        map (\(Only p) -> parseStorePathText p) results
+        map (\(Only p) -> parseStorePath p) results
 
 -- | Compute all paths reachable from a set of roots
 computeReachablePathsFromRoots :: Database -> Set StorePath -> IO (Set StorePath)
@@ -286,7 +286,7 @@ computeReachablePathsFromRoots db roots = do
 
                 -- Parse each store path and return as a set
                 return $ Set.fromList $ catMaybes $
-                    map (\(Only p) -> parseStorePathText p) results
+                    map (\(Only p) -> parseStorePath p) results
 
 -- | Find the transitive closure of paths
 findPathsClosure :: Database -> Set StorePath -> IO (Set StorePath)
@@ -336,7 +336,7 @@ findPathsClosureWithLimit db startingPaths depthLimit = do
 
                 -- Parse each store path and return as a set
                 return $ Set.fromList $ catMaybes $
-                    map (\(Only p) -> parseStorePathText p) results
+                    map (\(Only p) -> parseStorePath p) results
 
 -- | Check if a path is reachable from any of the GC roots
 isPathReachable :: Database -> Set StorePath -> StorePath -> IO Bool
@@ -488,7 +488,7 @@ scanElfBinary filePath storeDir = do
 
     -- Return unique valid references
     return $ Set.fromList $ catMaybes $
-        map (\path -> parseStorePathText $ T.pack path) $
+        map (\path -> parseStorePath $ T.pack path) $
         nub references
 
 -- | Scan a text file for store path references
@@ -506,7 +506,7 @@ scanTextFile filePath storeDir = do
 
     -- Return unique valid references
     return $ Set.fromList $ catMaybes $
-        map parseStorePathText $ nub references
+        map parseStorePath $ nub references
 
 -- | Scan a binary file for possible store path references
 scanBinaryFile :: FilePath -> FilePath -> IO (Set StorePath)
@@ -523,7 +523,7 @@ scanBinaryFile filePath storeDir = do
 
     -- Return unique valid references
     return $ Set.fromList $ catMaybes $
-        map (\path -> parseStorePathText $ T.pack path) $
+        map (\path -> parseStorePath $ T.pack path) $
         nub references
 
 -- | Extract text fragments from binary data
@@ -627,19 +627,4 @@ findStoreReferences storeRoot s =
                    (c >= 'a' && c <= 'f') ||
                    (c >= 'A' && c <= 'F')
 
--- | Scan the entire store for references
-scanStoreForReferences :: Database -> FilePath -> IO Int
-scanStoreForReferences db storeDir = do
-    -- Get all paths from the ValidPaths table
-    paths <- dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
-
-    -- Parse each path
-    let storePaths = catMaybes $
-                    map (\(Only p) -> parseStorePathText p) paths
-
-    -- Count total references found
-    total <- foldM (\count path -> do
-        refs <- registerPathReferences db storeDir path
-        return $! count + refs) 0 storePaths
-
-    return total
+-- |

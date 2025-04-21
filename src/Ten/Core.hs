@@ -34,11 +34,13 @@ module Ten.Core (
     storePathToText,
     textToStorePath,
     parseStorePath,
+    parseStorePathText, -- Added alias for API consistency
     validateStorePath,
 
     -- Reference tracking types
     StoreReference(..),
     ReferenceType(..),
+    DerivationReference(..),  -- Properly defined here as the canonical source
     GCRoot(..),
     RootType(..),
 
@@ -225,6 +227,10 @@ parseStorePath text =
     validateHash :: Text -> Bool
     validateHash h = T.length h >= 8 && T.all isHexDigit h
 
+-- | Alias for parseStorePath to maintain API compatibility
+parseStorePathText :: Text -> Maybe StorePath
+parseStorePathText = parseStorePath
+
 -- | Validate a StorePath's format
 validateStorePath :: StorePath -> Bool
 validateStorePath (StorePath hash name) =
@@ -243,6 +249,12 @@ data ReferenceType
     | IndirectReference   -- Indirect reference (found during scanning)
     | DerivationReference -- Reference from output to its derivation
     deriving (Show, Eq, Ord)
+
+-- | Reference from derivation to its dependencies and outputs
+data DerivationReference = DerivationReference
+    { refReferrer :: !StorePath  -- Path that refers to another
+    , refReference :: !StorePath  -- Path being referred to
+    } deriving (Show, Eq, Ord)
 
 -- | A garbage collection root
 data GCRoot = GCRoot
@@ -286,14 +298,6 @@ data Derivation = Derivation
     , derivStrategy :: !BuildStrategy       -- How to build this derivation
     , derivMeta :: !(Map Text Text)         -- Metadata for derivation
     } deriving (Show, Eq)
-
--- | Compare two derivations for equality
-derivationEquals :: Derivation -> Derivation -> Bool
-derivationEquals d1 d2 = derivHash d1 == derivHash d2
-
--- | Compare StorePaths for equality
-derivationPathsEqual :: StorePath -> StorePath -> Bool
-derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == storeName p2
 
 -- | Node in a build graph
 data BuildNode
@@ -711,3 +715,11 @@ ensureLockDirExists lockPath = do
     createDirectoryIfMissing True dir
     -- Set appropriate permissions (0755 - rwxr-xr-x)
     setFileMode dir 0o755
+
+-- | Compare two derivations for equality
+derivationEquals :: Derivation -> Derivation -> Bool
+derivationEquals d1 d2 = derivHash d1 == derivHash d2
+
+-- | Compare StorePaths for equality
+derivationPathsEqual :: StorePath -> StorePath -> Bool
+derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == storeName p2
