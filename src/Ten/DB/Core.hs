@@ -47,10 +47,11 @@ import Control.Monad (when, void, unless)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (MonadReader, ask, local, ReaderT, runReaderT)
 import Control.Monad.Except (MonadError, throwError, ExceptT, runExceptT)
-import Control.Monad.State (StateT, runStateT, get, put)
+import Control.Monad.State (StateT, runStateT, get, put, gets)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Set as Set
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), Only(..))
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -383,10 +384,6 @@ withTransactionIO db mode action = do
             SQLite.execute_ (dbConn db) "COMMIT;"
             return result)
 
--- | Get the default path for the Ten database
-defaultDBPath :: FilePath -> FilePath
-defaultDBPath storeDir = storeDir </> "var/ten/db/ten.db"
-
 -- | Ensure database directories exist
 ensureDBDirectories :: FilePath -> IO ()
 ensureDBDirectories storeDir = do
@@ -413,14 +410,3 @@ retryOnBusy db action = retryWithCount 0
                     threadDelay delayMicros
                     retryWithCount (attempt + 1)
                 _ -> throwIO e)
-
--- | Initialize build state for the appropriate phase
-initBuildState_Build :: BuildId -> BuildState 'Build
-initBuildState_Build bid = BuildState
-    { buildProofs = []
-    , buildInputs = Set.empty
-    , buildOutputs = Set.empty
-    , currentBuildId = bid
-    , buildChain = []
-    , recursionDepth = 0
-    }

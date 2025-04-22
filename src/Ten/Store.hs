@@ -545,7 +545,7 @@ computeReachablePaths st roots = do
         if Set.size newReached > Set.size reached
             then computeReachablePaths st newReached  -- Continue if we found new paths
             else return newReached                    -- Stop if no new paths found
-    ) reachable (Set.toList roots)
+        ) reachable (Set.toList roots)
 
 -- | Find all references in a path
 -- This is a daemon-only operation

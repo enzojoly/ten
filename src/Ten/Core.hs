@@ -865,44 +865,58 @@ storeDerivation deriv = do
     hashByteString :: BS.ByteString -> Int
     hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
--- | Read a derivation from the store (any privilege tier through protocol)
+-- | Read a derivation from the store
+-- This is a daemon-only operation for direct store access
+readDerivation_Daemon :: StorePath -> TenM p 'Daemon (Either BuildError Derivation)
+readDerivation_Daemon path = do
+    env <- ask
+    let fullPath = storePathToFilePath path env
+
+    -- Check if file exists
+    exists <- liftIO $ doesFileExist fullPath
+    if not exists
+        then return $ Left $ StoreError $ "Derivation not found: " <> storePathToText path
+        else do
+            -- Read and deserialize
+            content <- liftIO $ BS.readFile fullPath
+            case deserializeDerivation content of
+                Left err -> return $ Left $ SerializationError $
+                                   "Failed to deserialize derivation: " <> err
+                Right deriv -> return $ Right deriv
+
+-- | Request a derivation via the daemon protocol (builder-only operation)
+requestDerivation_Builder :: StorePath -> DaemonConnection -> TenM p 'Builder (Either BuildError Derivation)
+requestDerivation_Builder path conn = do
+    -- Request derivation content from daemon
+    response <- requestFromDaemon conn (storeRequestForPath path)
+    case response of
+        Right content ->
+            case deserializeDerivation content of
+                Left err -> return $ Left $ SerializationError $
+                                 "Failed to deserialize derivation: " <> err
+                Right deriv -> return $ Right deriv
+        Left err ->
+            return $ Left $ StoreError $ "Failed to read derivation: " <> err
+
+-- | Read a derivation from the store using the appropriate privilege mechanism
 readDerivation :: StorePath -> TenM p t (Either BuildError Derivation)
 readDerivation path = do
     env <- ask
 
-    case currentPrivilegeTier env of
-        -- Direct store access in daemon context
-        Daemon -> do
-            let fullPath = storePathToFilePath path env
+    case (currentPrivilegeTier env, runMode env) of
+        -- Daemon with direct store access
+        (Daemon, _) -> TenM $ \sp _ ->
+            let (TenM m) = readDerivation_Daemon path
+            in m sp sDaemon
 
-            -- Check if file exists
-            exists <- liftIO $ doesFileExist fullPath
-            if not exists
-                then return $ Left $ StoreError $ "Derivation not found: " <> storePathToText path
-                else do
-                    -- Read and deserialize
-                    content <- liftIO $ BS.readFile fullPath
-                    case deserializeDerivation content of
-                        Left err -> return $ Left $ SerializationError $
-                                          "Failed to deserialize derivation: " <> err
-                        Right deriv -> return $ Right deriv
+        -- Builder using protocol
+        (Builder, ClientMode conn) -> TenM $ \sp _ ->
+            let (TenM m) = requestDerivation_Builder path conn
+            in m sp sBuilder
 
-        -- Must use protocol in builder context
-        Builder -> case runMode env of
-            ClientMode conn -> do
-                -- Use daemon protocol to read derivation
-                response <- requestFromDaemon conn (storeRequestForPath path)
-                case response of
-                    Right content ->
-                        case deserializeDerivation content of
-                            Left err -> return $ Left $ SerializationError $
-                                              "Failed to deserialize derivation: " <> err
-                            Right deriv -> return $ Right deriv
-                    Left err ->
-                        return $ Left $ StoreError $ "Failed to read derivation: " <> err
-
-            _ -> return $ Left $ PrivilegeError
-                             "Cannot read derivation in builder context without daemon connection"
+        -- Builder without daemon connection - error
+        (Builder, _) -> return $ Left $ PrivilegeError
+                          "Cannot read derivation in builder context without daemon connection"
 
 -- | Store a build result (Daemon privilege)
 storeBuildResult :: BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
@@ -941,44 +955,57 @@ storeBuildResult buildId result = do
     hashByteString :: BS.ByteString -> Int
     hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
--- | Read a build result from the store (any privilege tier through protocol)
+-- | Read a build result from the store (daemon-only operation)
+readBuildResult_Daemon :: StorePath -> TenM p 'Daemon (Either BuildError BuildResult)
+readBuildResult_Daemon path = do
+    env <- ask
+    let fullPath = storePathToFilePath path env
+
+    -- Check if file exists
+    exists <- liftIO $ doesFileExist fullPath
+    if not exists
+        then return $ Left $ StoreError $ "Build result not found: " <> storePathToText path
+        else do
+            -- Read and deserialize
+            content <- liftIO $ BS.readFile fullPath
+            case deserializeBuildResult content of
+                Left err -> return $ Left $ SerializationError $
+                                  "Failed to deserialize build result: " <> err
+                Right result -> return $ Right result
+
+-- | Request a build result via the daemon protocol (builder-only operation)
+requestBuildResult_Builder :: StorePath -> DaemonConnection -> TenM p 'Builder (Either BuildError BuildResult)
+requestBuildResult_Builder path conn = do
+    -- Request build result content from daemon
+    response <- requestFromDaemon conn (storeRequestForPath path)
+    case response of
+        Right content ->
+            case deserializeBuildResult content of
+                Left err -> return $ Left $ SerializationError $
+                                 "Failed to deserialize build result: " <> err
+                Right buildResult -> return $ Right buildResult
+        Left err ->
+            return $ Left $ StoreError $ "Failed to read build result: " <> err
+
+-- | Read a build result from the store using the appropriate privilege mechanism
 readBuildResult :: StorePath -> TenM p t (Either BuildError BuildResult)
 readBuildResult path = do
     env <- ask
 
-    case currentPrivilegeTier env of
-        -- Direct store access in daemon context
-        Daemon -> do
-            let fullPath = storePathToFilePath path env
+    case (currentPrivilegeTier env, runMode env) of
+        -- Daemon with direct store access
+        (Daemon, _) -> TenM $ \sp _ ->
+            let (TenM m) = readBuildResult_Daemon path
+            in m sp sDaemon
 
-            -- Check if file exists
-            exists <- liftIO $ doesFileExist fullPath
-            if not exists
-                then return $ Left $ StoreError $ "Build result not found: " <> storePathToText path
-                else do
-                    -- Read and deserialize
-                    content <- liftIO $ BS.readFile fullPath
-                    case deserializeBuildResult content of
-                        Left err -> return $ Left $ SerializationError $
-                                          "Failed to deserialize build result: " <> err
-                        Right result -> return $ Right result
+        -- Builder using protocol
+        (Builder, ClientMode conn) -> TenM $ \sp _ ->
+            let (TenM m) = requestBuildResult_Builder path conn
+            in m sp sBuilder
 
-        -- Must use protocol in builder context
-        Builder -> case runMode env of
-            ClientMode conn -> do
-                -- Use daemon protocol to read build result
-                response <- requestFromDaemon conn (storeRequestForPath path)
-                case response of
-                    Right content ->
-                        case deserializeBuildResult content of
-                            Left err -> return $ Left $ SerializationError $
-                                              "Failed to deserialize build result: " <> err
-                            Right buildResult -> return $ Right buildResult
-                    Left err ->
-                        return $ Left $ StoreError $ "Failed to read build result: " <> err
-
-            _ -> return $ Left $ PrivilegeError
-                             "Cannot read build result in builder context without daemon connection"
+        -- Builder without daemon connection - error
+        (Builder, _) -> return $ Left $ PrivilegeError
+                          "Cannot read build result in builder context without daemon connection"
 
 -- | Create a store request for reading a path
 storeRequestForPath :: StorePath -> Request
@@ -1048,37 +1075,52 @@ timeout micros action = do
 
 -- | Implementation to serialize a derivation to JSON
 serializeDerivation :: Derivation -> BS.ByteString
-serializeDerivation deriv =
-    LBS.toStrict $ Aeson.encode $ Aeson.object [
+serializeDerivation = LBS.toStrict . Aeson.encode
+
+-- | ToJSON instance for Derivation
+instance Aeson.ToJSON Derivation where
+    toJSON deriv = Aeson.object [
         "name" .= derivName deriv,
         "hash" .= derivHash deriv,
         "builder" .= storePathToText (derivBuilder deriv),
         "args" .= derivArgs deriv,
-        "inputs" .= map serializeInput (Set.toList $ derivInputs deriv),
-        "outputs" .= map serializeOutput (Set.toList $ derivOutputs deriv),
+        "inputs" .= derivInputs deriv,
+        "outputs" .= derivOutputs deriv,
         "env" .= derivEnv deriv,
         "system" .= derivSystem deriv,
         "strategy" .= (if derivStrategy deriv == ApplicativeStrategy then "applicative" else "monadic" :: Text),
         "meta" .= derivMeta deriv
-    ]
-  where
-    serializeInput (DerivationInput path name) = Aeson.object [
+        ]
+
+-- | ToJSON instance for DerivationInput
+instance Aeson.ToJSON DerivationInput where
+    toJSON (DerivationInput path name) = Aeson.object [
         "path" .= storePathToText path,
         "name" .= name
         ]
-    serializeOutput (DerivationOutput name path) = Aeson.object [
+
+-- | ToJSON instance for DerivationOutput
+instance Aeson.ToJSON DerivationOutput where
+    toJSON (DerivationOutput name path) = Aeson.object [
         "name" .= name,
         "path" .= storePathToText path
         ]
+
+-- | ToJSON instance for StorePath
+instance Aeson.ToJSON StorePath where
+    toJSON = Aeson.String . storePathToText
 
 -- | Implementation to deserialize a derivation from JSON
 deserializeDerivation :: BS.ByteString -> Either Text Derivation
 deserializeDerivation bs = case Aeson.eitherDecodeStrict bs of
     Left err -> Left $ "JSON parse error: " <> T.pack err
-    Right obj -> parseDerivation obj
-  where
-    parseDerivation :: Aeson.Value -> Either Text Derivation
-    parseDerivation = Aeson.parseEither $ \obj -> do
+    Right val -> case Aeson.fromJSON val of
+        Aeson.Error err -> Left $ T.pack err
+        Aeson.Success deriv -> Right deriv
+
+-- | FromJSON instance for Derivation
+instance Aeson.FromJSON Derivation where
+    parseJSON = Aeson.withObject "Derivation" $ \obj -> do
         name <- obj .: "name"
         hash <- obj .: "hash"
         builderText <- obj .: "builder"
@@ -1087,12 +1129,12 @@ deserializeDerivation bs = case Aeson.eitherDecodeStrict bs of
             Nothing -> fail "Invalid builder path"
         args <- obj .: "args"
         inputObjs <- obj .: "inputs"
-        inputs <- Set.fromList <$> mapM parseInput inputObjs
+        inputs <- Set.fromList <$> mapM Aeson.parseJSON inputObjs
         outputObjs <- obj .: "outputs"
-        outputs <- Set.fromList <$> mapM parseOutput outputObjs
+        outputs <- Set.fromList <$> mapM Aeson.parseJSON outputObjs
         env <- obj .: "env"
         system <- obj .: "system"
-        strategyText <- obj .: "strategy"
+        strategyText <- obj .: "strategy" :: Aeson.Parser Text
         let strategy = if strategyText == "applicative" then ApplicativeStrategy else MonadicStrategy
         meta <- obj .: "meta"
         return Derivation {
@@ -1108,7 +1150,9 @@ deserializeDerivation bs = case Aeson.eitherDecodeStrict bs of
             derivMeta = meta
         }
 
-    parseInput = Aeson.withObject "DerivationInput" $ \obj -> do
+-- | FromJSON instance for DerivationInput
+instance Aeson.FromJSON DerivationInput where
+    parseJSON = Aeson.withObject "DerivationInput" $ \obj -> do
         pathText <- obj .: "path"
         path <- case textToStorePath pathText of
             Just p -> return p
@@ -1116,7 +1160,9 @@ deserializeDerivation bs = case Aeson.eitherDecodeStrict bs of
         name <- obj .: "name"
         return $ DerivationInput path name
 
-    parseOutput = Aeson.withObject "DerivationOutput" $ \obj -> do
+-- | FromJSON instance for DerivationOutput
+instance Aeson.FromJSON DerivationOutput where
+    parseJSON = Aeson.withObject "DerivationOutput" $ \obj -> do
         name <- obj .: "name"
         pathText <- obj .: "path"
         path <- case textToStorePath pathText of
@@ -1132,11 +1178,65 @@ serializeBuildResult = LBS.toStrict . Aeson.encode
 deserializeBuildResult :: BS.ByteString -> Either Text BuildResult
 deserializeBuildResult bs = case Aeson.eitherDecodeStrict bs of
     Left err -> Left $ "JSON parse error: " <> T.pack err
-    Right result -> Right result
+    Right val -> case Aeson.fromJSON val of
+        Aeson.Error err -> Left $ T.pack err
+        Aeson.Success result -> Right result
+
+-- | FromJSON instance for BuildResult
+instance Aeson.FromJSON BuildResult where
+    parseJSON = Aeson.withObject "BuildResult" $ \obj -> do
+        outputPathsTexts <- obj .: "outputPaths"
+        outputPaths <- Set.fromList <$> mapM parseStorePath outputPathsTexts
+        exitCodeObj <- obj .: "exitCode"
+        exitCode <- parseExitCode exitCodeObj
+        buildLog <- obj .: "log"
+        referencesTexts <- obj .: "references"
+        references <- Set.fromList <$> mapM parseStorePath referencesTexts
+        return BuildResult {
+            brOutputPaths = outputPaths,
+            brExitCode = exitCode,
+            brLog = buildLog,
+            brReferences = references
+        }
+      where
+        parseStorePath :: Text -> Aeson.Parser StorePath
+        parseStorePath txt = case textToStorePath txt of
+            Just path -> return path
+            Nothing -> fail $ "Invalid store path: " <> T.unpack txt
+
+        parseExitCode :: Aeson.Value -> Aeson.Parser ExitCode
+        parseExitCode = Aeson.withObject "ExitCode" $ \obj -> do
+            success <- obj .: "success"
+            if success
+                then return ExitSuccess
+                else ExitFailure <$> obj .: "code"
 
 -- | Encode a request
 encodeRequest :: Request -> ByteString
 encodeRequest = LBS.toStrict . Aeson.encode
+
+-- | ToJSON instance for Request
+instance Aeson.ToJSON Request where
+    toJSON req = Aeson.object [
+        "id" .= reqId req,
+        "type" .= reqType req,
+        "params" .= reqParams req,
+        "payload" .= fmap (const Aeson.Null) (reqPayload req)  -- Binary data represented as null in JSON
+        ]
+
+-- | FromJSON instance for Request
+instance Aeson.FromJSON Request where
+    parseJSON = Aeson.withObject "Request" $ \obj -> do
+        id' <- obj .: "id"
+        type' <- obj .: "type"
+        params <- obj .: "params"
+        -- Payload is handled separately since binary data can't be in JSON directly
+        return Request {
+            reqId = id',
+            reqType = type',
+            reqParams = params,
+            reqPayload = Nothing  -- Payload needs to be handled separately
+        }
 
 -- | Spawn a builder process with proper process isolation
 spawnBuilderProcess :: FilePath -> [String] -> Map Text Text -> TenM 'Build 'Daemon ProcessID
@@ -1148,7 +1248,7 @@ spawnBuilderProcess programPath args env = do
     let envVars = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList env
 
     -- Get user/group to run as
-    targetUser <- liftIO $ getUserEntryForName "nobody" `catch`
+    targetUser <- liftIO $ User.getUserEntryForName "nobody" `catch`
                   \(_ :: SomeException) -> User.getUserEntryForID 65534 -- nobody's typical UID
 
     targetGroup <- liftIO $ User.getGroupEntryForName "nogroup" `catch`
