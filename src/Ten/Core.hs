@@ -90,7 +90,6 @@ module Ten.Core (
 
     -- Database paths
     defaultDBPath,
-    ensureDBDirectories,
 
     -- Core derivation types
     Derivation(..),
@@ -680,15 +679,9 @@ withSPrivilegeTier st f = TenM $ \sp _ -> do
     g sp st
 
 -- | Get the default path for the Ten database
+-- This function computes a path but doesn't interact with the filesystem
 defaultDBPath :: FilePath -> FilePath
 defaultDBPath storeDir = storeDir </> "var/ten/db/ten.db"
-
--- | Ensure database directories exist
-ensureDBDirectories :: FilePath -> IO ()
-ensureDBDirectories storeDir = do
-    let dbDir = takeDirectory (defaultDBPath storeDir)
-    createDirectoryIfMissing True dbDir
-    return ()
 
 -- | Initialize the build environment
 initBuildEnv :: FilePath -> FilePath -> BuildEnv

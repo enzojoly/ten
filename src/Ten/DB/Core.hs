@@ -59,7 +59,10 @@ import System.FilePath (takeDirectory, (</>))
 import System.Posix.Files (setFileMode)
 import System.IO (withFile, IOMode(..), hPutStrLn, stderr)
 
-import Ten.Core
+-- Import from Ten.Core, but NOT importing ensureDBDirectories
+import Ten.Core (
+    TenM, BuildEnv(..), BuildError(..), privilegeError, StorePath, Phase(..),
+    PrivilegeTier(..), SPrivilegeTier(..), sDaemon, defaultDBPath)
 
 -- | Database error types
 data DBError
@@ -386,12 +389,31 @@ withTransactionIO db mode action = do
             SQLite.execute_ (dbConn db) "COMMIT;"
             return result)
 
--- | Ensure database directories exist
-ensureDBDirectories :: FilePath -> IO ()
+-- | Ensure database directories exist (privileged daemon-only operation)
+-- This is now the ONLY implementation of this function in the codebase
+ensureDBDirectories :: FilePath -> TenM 'Build 'Daemon ()
 ensureDBDirectories storeDir = do
+    -- Verify daemon privileges
+    env <- ask
+    when (currentPrivilegeTier env /= Daemon) $
+        throwError $ privilegeError "Database directory creation requires daemon privileges"
+
+    -- Use defaultDBPath from Ten.Core to calculate the path
     let dbDir = takeDirectory (defaultDBPath storeDir)
-    createDirectoryIfMissing True dbDir
-    return ()
+
+    -- Create the directory with appropriate permissions
+    liftIO $ do
+        createDirectoryIfMissing True dbDir
+        -- Set appropriate permissions (0700 - rwx------ for owner only)
+        setFileMode dbDir 0o700
+
+    logMsg 2 $ "Created database directory: " <> T.pack dbDir
+
+-- | Log a message with a given level
+logMsg :: Int -> Text -> TenM p t ()
+logMsg level msg = do
+    v <- asks verbosity
+    when (v >= level) $ liftIO $ putStrLn $ T.unpack msg
 
 -- | Retry an operation if the database is busy
 retryOnBusy :: Database -> IO a -> IO a
