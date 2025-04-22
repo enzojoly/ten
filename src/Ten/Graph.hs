@@ -6,6 +6,9 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module Ten.Graph (
     -- Graph construction
@@ -72,6 +75,8 @@ import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString as BS
 import qualified Data.Text.Encoding as TE
 import System.IO (withFile, IOMode(..))
+import Data.Singletons
+import Data.Singletons.TH
 
 import Ten.Core
 
@@ -97,32 +102,34 @@ emptyGraph = BuildGraph
     }
 
 -- | Create a build graph from a set of derivations
--- Works in both privileged and unprivileged contexts
-createBuildGraph :: PrivCtxConstraint ctx => Set StorePath -> Set Derivation -> TenM 'Eval ctx BuildGraph
-createBuildGraph requestedOutputs derivations = do
+-- Works in both privilege tiers
+createBuildGraph :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> Set StorePath -> Set Derivation -> TenM 'Eval t BuildGraph
+createBuildGraph st requestedOutputs derivations = TenM $ \sp _ -> do
     -- Start with an empty graph
     let graph = emptyGraph
 
     -- Add all derivations to the graph
-    graph' <- foldM addDerivation graph (Set.toList derivations)
+    graph' <- foldM (\g d -> runTenM (addDerivation st g d) sp st) graph (Set.toList derivations)
 
     -- Add requested outputs as roots
     let graph'' = graph' { graphRoots = Set.map outputNodeId requestedOutputs }
 
     -- Validate the graph
-    proof <- validateGraph graph''
+    proof <- runTenM (validateGraph st graph'') sp st
 
     -- Return the validated graph
     return $ graph'' { graphProof = Just proof }
 
 -- | Add a node to the graph
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 addNode :: BuildGraph -> Text -> BuildNode -> BuildGraph
 addNode graph nodeId node =
     graph { graphNodes = Map.insert nodeId node (graphNodes graph) }
 
 -- | Add an edge to the graph (dependency relationship)
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 addEdge :: BuildGraph -> Text -> Text -> BuildGraph
 addEdge graph fromId toId =
     let
@@ -132,9 +139,11 @@ addEdge graph fromId toId =
         graph { graphEdges = Map.insert fromId newDeps (graphEdges graph) }
 
 -- | Add a derivation to the graph
--- Works in both privileged and unprivileged contexts
-addDerivation :: PrivCtxConstraint ctx => BuildGraph -> Derivation -> TenM 'Eval ctx BuildGraph
-addDerivation graph drv = do
+-- Works in both privilege tiers
+addDerivation :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Derivation -> TenM 'Eval t BuildGraph
+addDerivation st graph drv = TenM $ \sp _ -> do
     -- Add the derivation node
     let nodeId = derivNodeId drv
     let graph' = addNode graph nodeId (DerivationNode drv)
@@ -168,46 +177,52 @@ addDerivation graph drv = do
       ) graph'' (Set.toList $ derivOutputs drv)
 
 -- | Validate a build graph
--- Works in both privileged and unprivileged contexts
-validateGraph :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx GraphProof
-validateGraph graph = do
+-- Works in both privilege tiers
+validateGraph :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> TenM 'Eval t GraphProof
+validateGraph st graph = TenM $ \sp _ -> do
     -- Check for cycles
-    hasCycles <- detectCycles graph
+    (hasCycles, _, _) <- runTenM (detectCycles st graph) sp st
     when hasCycles $
         throwError $ GraphError "Dependency cycle detected in build graph"
 
     -- Check for completeness (all dependencies are present)
-    isComplete <- checkCompleteness graph
+    isComplete <- runTenM (checkCompleteness st graph) sp st
     unless isComplete $
         throwError $ GraphError "Build graph is missing some dependencies"
-
-    -- Add acyclic proof
-    addProof AcyclicProof
 
     -- Return the appropriate proof
     return ValidProof
 
 -- | Detect cycles in the graph using depth-first search
--- Works in both privileged and unprivileged contexts
-detectCycles :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx Bool
-detectCycles graph = do
+-- Works in both privilege tiers
+detectCycles :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> TenM 'Eval t (Bool, Set Text, Set Text)
+detectCycles st graph = TenM $ \sp _ -> do
     -- Check each node that hasn't been visited yet
-    result <- foldM checkNode (False, Set.empty, Set.empty) (Map.keys $ graphNodes graph)
-    return $ case result of
-        (True, _, _) -> True
-        _ -> False
+    foldM (\state@(found, visited, stack) nodeId ->
+            if found
+                then return state  -- Short-circuit if cycle already found
+                else runTenM (checkNode state nodeId) sp st
+          )
+          (False, Set.empty, Set.empty)
+          (Map.keys $ graphNodes graph)
   where
-    checkNode :: PrivCtxConstraint ctx => (Bool, Set Text, Set Text) -> Text -> TenM 'Eval ctx (Bool, Set Text, Set Text)
-    checkNode state@(True, _, _) _ = return state  -- Short-circuit if cycle already found
-    checkNode (False, visited, recStack) nodeId =
+    checkNode :: (Bool, Set Text, Set Text) -> Text -> TenM 'Eval t (Bool, Set Text, Set Text)
+    checkNode state@(True, _, _) _ = TenM $ \_ _ -> return state  -- Cycle already found
+    checkNode (False, visited, recStack) nodeId = TenM $ \sp' st' ->
         if nodeId `Set.member` visited
             then return (False, visited, recStack)
-            else detectCyclesFrom graph nodeId visited recStack
+            else runTenM (detectCyclesFrom st graph nodeId visited recStack) sp' st'
 
 -- | Detect cycles starting from a specific node
--- Works in both privileged and unprivileged contexts
-detectCyclesFrom :: PrivCtxConstraint ctx => BuildGraph -> Text -> Set Text -> Set Text -> TenM 'Eval ctx (Bool, Set Text, Set Text)
-detectCyclesFrom graph nodeId visited recStack = do
+-- Works in both privilege tiers
+detectCyclesFrom :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Text -> Set Text -> Set Text -> TenM 'Eval t (Bool, Set Text, Set Text)
+detectCyclesFrom st graph nodeId visited recStack = TenM $ \sp _ -> do
     -- Mark current node as visited and add to recursion stack
     let visited' = Set.insert nodeId visited
     let recStack' = Set.insert nodeId recStack
@@ -216,77 +231,85 @@ detectCyclesFrom graph nodeId visited recStack = do
     let deps = Map.findWithDefault Set.empty nodeId (graphEdges graph)
 
     -- Check each dependency
-    foldM checkDep (False, visited', recStack') (Set.toList deps)
-  where
-    checkDep :: PrivCtxConstraint ctx => (Bool, Set Text, Set Text) -> Text -> TenM 'Eval ctx (Bool, Set Text, Set Text)
-    checkDep state@(True, _, _) _ = return state  -- Short-circuit if cycle already found
-    checkDep (False, visited, recStack) depId =
-        if depId `Set.member` recStack
-            then return (True, visited, recStack)  -- Cycle detected
-            else if depId `Set.member` visited
-                then return (False, visited, recStack)  -- Already visited, no cycle
-                else detectCyclesFrom graph depId visited recStack
+    foldM (\state@(found, visited'', recStack'') depId ->
+            if found
+                then return state  -- Short-circuit if cycle already found
+                else if depId `Set.member` recStack''
+                    then return (True, visited'', recStack'')  -- Cycle detected
+                    else if depId `Set.member` visited''
+                        then return (False, visited'', recStack'')  -- Already visited, no cycle
+                        else runTenM (detectCyclesFrom st graph depId visited'' recStack'') sp st
+          )
+          (False, visited', recStack')
+          (Set.toList deps)
 
 -- | Check graph completeness (all dependencies exist as nodes)
--- Works in both privileged and unprivileged contexts
-checkCompleteness :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx Bool
-checkCompleteness graph = do
+-- Works in both privilege tiers
+checkCompleteness :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> TenM 'Eval t Bool
+checkCompleteness _ graph = TenM $ \_ _ -> do
     -- Check each edge to make sure its target exists
     let allNodes = Map.keysSet $ graphNodes graph
     let allDeps = Set.unions $ Map.elems $ graphEdges graph
     return $ allDeps `Set.isSubsetOf` allNodes
 
 -- | Topologically sort the graph (return build order)
--- Works in both privileged and unprivileged contexts
-topologicalSort :: PrivCtxConstraint ctx => BuildGraph -> TenM 'Eval ctx [BuildNode]
-topologicalSort graph = do
+-- Works in both privilege tiers
+topologicalSort :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> TenM 'Eval t [BuildNode]
+topologicalSort st graph = TenM $ \sp _ -> do
     -- Verify the graph is acyclic
     case graphProof graph of
-        Just AcyclicGraphProof -> pure ()
         Just ValidProof -> pure ()
         _ -> do
-            hasCycles <- detectCycles graph
+            (hasCycles, _, _) <- runTenM (detectCycles st graph) sp st
             when hasCycles $
                 throwError $ GraphError "Cannot sort graph with cycles"
 
     -- Run topological sort
     let nodeIds = Map.keys $ graphNodes graph
-    sorted <- topologicalSortInternal graph nodeIds Set.empty []
+    sorted <- runTenM (topologicalSortInternal st graph nodeIds Set.empty []) sp st
 
     -- Convert sorted IDs to nodes
     return $ catMaybes $ map (\nodeId -> Map.lookup nodeId (graphNodes graph)) sorted
 
 -- | Internal topological sort implementation
--- Works in both privileged and unprivileged contexts
-topologicalSortInternal :: PrivCtxConstraint ctx => BuildGraph -> [Text] -> Set Text -> [Text] -> TenM 'Eval ctx [Text]
-topologicalSortInternal _ [] _ result = return $ reverse result
-topologicalSortInternal graph (nodeId:rest) visited result =
+-- Works in both privilege tiers
+topologicalSortInternal :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> [Text] -> Set Text -> [Text] -> TenM 'Eval t [Text]
+topologicalSortInternal _ _ [] _ result = TenM $ \_ _ -> return $ reverse result
+topologicalSortInternal st graph (nodeId:rest) visited result = TenM $ \sp _ ->
     if nodeId `Set.member` visited
-        then topologicalSortInternal graph rest visited result
+        then runTenM (topologicalSortInternal st graph rest visited result) sp st
         else do
             -- Visit all dependencies first
             let deps = Map.findWithDefault Set.empty nodeId (graphEdges graph)
             let depsToVisit = filter (\dep -> not $ dep `Set.member` visited) $ Set.toList deps
-            result' <- topologicalSortInternal graph depsToVisit (Set.insert nodeId visited) result
+            result' <- runTenM (topologicalSortInternal st graph depsToVisit (Set.insert nodeId visited) result) sp st
             -- Then add this node
-            topologicalSortInternal graph rest (Set.insert nodeId visited) (nodeId:result')
+            runTenM (topologicalSortInternal st graph rest (Set.insert nodeId visited) (nodeId:result')) sp st
 
 -- | Get direct dependencies of a node
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 getDependencies :: BuildGraph -> Text -> Set Text
 getDependencies graph nodeId =
     Map.findWithDefault Set.empty nodeId (graphEdges graph)
 
 -- | Get all transitive dependencies of a node
--- Works in both privileged and unprivileged contexts
-getTransitiveDependencies :: PrivCtxConstraint ctx => BuildGraph -> Text -> TenM 'Eval ctx (Set Text)
-getTransitiveDependencies graph nodeId = do
+-- Works in both privilege tiers
+getTransitiveDependencies :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Text -> TenM 'Eval t (Set Text)
+getTransitiveDependencies st graph nodeId = TenM $ \sp _ -> do
     -- Start with direct dependencies
     let directDeps = getDependencies graph nodeId
 
     -- For each direct dependency, get its transitive dependencies
     transDeps <- foldM (\acc dep -> do
-        depDeps <- getTransitiveDependencies graph dep
+        depDeps <- runTenM (getTransitiveDependencies st graph dep) sp st
         return $ Set.union acc depDeps
       ) Set.empty (Set.toList directDeps)
 
@@ -294,61 +317,69 @@ getTransitiveDependencies graph nodeId = do
     return $ Set.union directDeps transDeps
 
 -- | Find nodes affected by a change
--- Works in both privileged and unprivileged contexts
-findAffected :: PrivCtxConstraint ctx => BuildGraph -> Set StorePath -> TenM 'Eval ctx (Set Text)
-findAffected graph changedPaths = do
+-- Works in both privilege tiers
+findAffected :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Set StorePath -> TenM 'Eval t (Set Text)
+findAffected st graph changedPaths = TenM $ \sp _ -> do
     -- Convert paths to node IDs
     let changedIds = Set.map pathNodeId changedPaths
 
     -- Find all nodes that depend on the changed nodes (reverse edges)
     foldM (\affected nodeId -> do
         -- Find all nodes that depend on this one
-        dependent <- findReverseDependent graph nodeId
+        dependent <- runTenM (findReverseDependent st graph nodeId) sp st
         return $ Set.union affected dependent
       ) changedIds (Set.toList changedIds)
 
 -- | Find all nodes that depend on a given node (reverse edges)
--- Works in both privileged and unprivileged contexts
-findReverseDependent :: PrivCtxConstraint ctx => BuildGraph -> Text -> TenM 'Eval ctx (Set Text)
-findReverseDependent graph nodeId = do
+-- Works in both privilege tiers
+findReverseDependent :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Text -> TenM 'Eval t (Set Text)
+findReverseDependent st graph nodeId = TenM $ \sp _ -> do
     -- Find all edges that point to this node
     let reverseEdges = Map.filter (Set.member nodeId) (graphEdges graph)
     let dependentNodes = Map.keysSet reverseEdges
 
     -- Find nodes that depend on the dependent nodes (recursive)
     foldM (\acc dep -> do
-        depDeps <- findReverseDependent graph dep
+        depDeps <- runTenM (findReverseDependent st graph dep) sp st
         return $ Set.union acc depDeps
       ) dependentNodes (Set.toList dependentNodes)
 
 -- | Compute the transitive closure of a set of nodes
--- Works in both privileged and unprivileged contexts
-transitiveClosure :: PrivCtxConstraint ctx => BuildGraph -> Set Text -> TenM 'Eval ctx (Set Text)
-transitiveClosure graph startNodes = do
+-- Works in both privilege tiers
+transitiveClosure :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Set Text -> TenM 'Eval t (Set Text)
+transitiveClosure st graph startNodes = TenM $ \sp _ -> do
     -- For each starting node, get all transitive dependencies
     foldM (\closure nodeId -> do
-        deps <- getTransitiveDependencies graph nodeId
+        deps <- runTenM (getTransitiveDependencies st graph nodeId) sp st
         return $ Set.union closure (Set.insert nodeId deps)
       ) Set.empty (Set.toList startNodes)
 
 -- | Generic fold over a graph
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 foldGraph :: (a -> BuildNode -> a) -> a -> BuildGraph -> a
 foldGraph f initial graph =
     Map.foldl' (\acc node -> f acc node) initial (graphNodes graph)
 
 -- | Map a function over all nodes in a graph
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 mapGraph :: (BuildNode -> BuildNode) -> BuildGraph -> BuildGraph
 mapGraph f graph =
     graph { graphNodes = Map.map f (graphNodes graph) }
 
 -- | Get a subgraph containing only specified nodes and their dependencies
--- Works in both privileged and unprivileged contexts
-getSubgraph :: PrivCtxConstraint ctx => BuildGraph -> Set Text -> TenM 'Eval ctx BuildGraph
-getSubgraph graph nodeIds = do
+-- Works in both privilege tiers
+getSubgraph :: forall (t :: PrivilegeTier).
+    (PrivTierConstraint t, SingI t) =>
+    SPrivilegeTier t -> BuildGraph -> Set Text -> TenM 'Eval t BuildGraph
+getSubgraph st graph nodeIds = TenM $ \sp _ -> do
     -- Get transitive closure of specified nodes
-    closure <- transitiveClosure graph nodeIds
+    closure <- runTenM (transitiveClosure st graph nodeIds) sp st
 
     -- Create a new graph with only these nodes and their edges
     let newNodes = Map.filterWithKey (\k _ -> k `Set.member` closure) (graphNodes graph)
@@ -363,13 +394,13 @@ getSubgraph graph nodeIds = do
         }
 
 -- | Find a path between two nodes (if exists)
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 findPath :: BuildGraph -> Text -> Text -> Maybe [Text]
 findPath graph start end =
     findPathDFS graph start end Set.empty []
 
 -- | Depth-first search to find a path
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 findPathDFS :: BuildGraph -> Text -> Text -> Set Text -> [Text] -> Maybe [Text]
 findPathDFS graph current target visited path
     | current == target = Just (reverse (current:path))
@@ -390,13 +421,13 @@ findPathDFS graph current target visited path
     findFirstPath (Nothing:rest) = findFirstPath rest
 
 -- | Find all paths between two nodes
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 findAllPaths :: BuildGraph -> Text -> Text -> [[Text]]
 findAllPaths graph start end =
     findAllPathsDFS graph start end Set.empty []
 
 -- | Depth-first search to find all paths
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 findAllPathsDFS :: BuildGraph -> Text -> Text -> Set Text -> [Text] -> [[Text]]
 findAllPathsDFS graph current target visited path
     | current == target = [reverse (current:path)]
@@ -413,9 +444,11 @@ findAllPathsDFS graph current target visited path
               ) (Set.toList validNeighbors)
 
 -- | Check for a recursion cycle in a derivation chain
--- Works in both privileged and unprivileged contexts
-detectRecursionCycle :: PrivCtxConstraint ctx => [Derivation] -> TenM p ctx Bool
-detectRecursionCycle derivations = do
+-- Works in any phase, any privilege tier
+detectRecursionCycle :: forall (p :: Phase) (t :: PrivilegeTier).
+    (SingI p, SingI t) =>
+    SPhase p -> SPrivilegeTier t -> [Derivation] -> TenM p t Bool
+detectRecursionCycle sp st derivations = TenM $ \_ _ -> do
     -- Use a more efficient algorithm that handles structural equality properly
     -- and is optimized for potentially long chains
     if null derivations || length derivations < 2
@@ -427,9 +460,11 @@ detectRecursionCycle derivations = do
             return $ length (List.nub hashes) < length hashes
 
 -- | Add a derivation to the chain for cycle detection
--- Pure operation, no context constraints
-addToDerivationChain :: Derivation -> TenM p ctx ()
-addToDerivationChain drv = do
+-- Works in any phase and privilege tier
+addToDerivationChain :: forall (p :: Phase) (t :: PrivilegeTier).
+    (SingI p, SingI t) =>
+    SPhase p -> SPrivilegeTier t -> Derivation -> TenM p t ()
+addToDerivationChain _ _ drv = TenM $ \_ _ -> do
     depth <- gets recursionDepth
     maxDepth <- asks maxRecursionDepth
     when (depth >= maxDepth) $
@@ -437,7 +472,7 @@ addToDerivationChain drv = do
     modify $ \s -> s { buildChain = drv : buildChain s, recursionDepth = depth + 1 }
 
 -- | Serialize a build graph to JSON
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 serializeGraph :: BuildGraph -> LBS.ByteString
 serializeGraph graph = Aeson.encode $ Aeson.object
     [ "nodes" .= serializeNodes (graphNodes graph)
@@ -477,7 +512,7 @@ serializeGraph graph = Aeson.encode $ Aeson.object
         Map.toList $ Map.map Set.toList edges
 
 -- | Deserialize a build graph from JSON
--- Pure operation, no context constraints
+-- Pure operation, no privilege constraints
 deserializeGraph :: LBS.ByteString -> Either Text BuildGraph
 deserializeGraph json =
     case Aeson.eitherDecode json of
@@ -594,11 +629,11 @@ deserializeGraph json =
     parseText (Aeson.String txt) = Right txt
     parseText _ = Left "Expected string value"
 
--- | Constraint for operations that can work in any privilege context
-class PrivCtxConstraint (ctx :: PrivCtx) where
+-- | Constraint for operations that can work in any privilege tier
+class PrivTierConstraint (t :: PrivilegeTier)
 
--- | Instance for Privileged context
-instance PrivCtxConstraint 'Privileged where
+-- | Instance for Daemon privilege tier
+instance PrivTierConstraint 'Daemon
 
--- | Instance for Unprivileged context
-instance PrivCtxConstraint 'Unprivileged where
+-- | Instance for Builder privilege tier
+instance PrivTierConstraint 'Builder

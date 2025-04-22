@@ -6,16 +6,24 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 
 module Ten.GC (
-    -- Core GC operations
+    -- Core GC operations (daemon privileges only)
     collectGarbage,
+
+    -- GC operations via protocol (builder context)
     requestGarbageCollection,
 
-    -- GC roots management
+    -- GC roots management (daemon privileges only)
     addRoot,
     removeRoot,
     listRoots,
+
+    -- GC roots management via protocol (builder context)
     requestAddRoot,
     requestRemoveRoot,
     requestListRoots,
@@ -23,21 +31,21 @@ module Ten.GC (
     -- GC statistics
     GCStats(..),
 
-    -- Path reachability
+    -- Path reachability (works in both contexts via different mechanisms)
     isReachable,
     findReachablePaths,
     requestPathReachability,
 
-    -- Concurrent GC
+    -- Concurrent GC (daemon privileges only)
     acquireGCLock,
     releaseGCLock,
     withGCLock,
     breakStaleLock,
 
-    -- Active build management
+    -- Active build management (daemon privileges only)
     getActiveBuildPaths,
 
-    -- Store verification
+    -- Store verification (works in both contexts)
     verifyStore,
     repairStore,
 
@@ -84,6 +92,8 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Database.SQLite.Simple (Only(..))
 import Data.List (isPrefixOf, isInfixOf)
+import Data.Singletons
+import Data.Singletons.TH
 
 import Ten.Core
 import Ten.Store
@@ -122,13 +132,18 @@ data GCLock = GCLock {
 globalGCLockFdRef :: IORef (Maybe (Fd, FilePath))
 globalGCLockFdRef = unsafePerformIO $ newIORef Nothing
 
--- | Add a root to protect a path from garbage collection (privileged context only)
-addRoot :: StorePath -> Text -> Bool -> TenM 'Daemon a GCRoot
-addRoot path name permanent = do
+-- | Add a root to protect a path from garbage collection (daemon privilege only)
+addRoot ::
+    SPrivilegeTier 'Daemon ->  -- ^ Daemon privilege evidence
+    StorePath ->
+    Text ->
+    Bool ->
+    TenM 'Build 'Daemon GCRoot
+addRoot st path name permanent = TenM $ \sp _ -> do
     env <- ask
 
     -- Verify the path exists in the store
-    exists <- storePathExists path
+    exists <- storePathExists st path
     unless exists $
         throwError $ StoreError $ "Cannot add root for non-existent path: " <> storeHash path
 
@@ -148,54 +163,48 @@ addRoot path name permanent = do
     let targetPath = storePathToFilePath path env
     liftIO $ createSymbolicLink targetPath rootFile
 
-    -- Also register the root in the database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    -- Also register the root in the database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         liftIO $ dbExecute db
             "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
             (storePathToText path, name, if permanent then "permanent" else "user")
 
-    logMsg 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
+    logMsg env 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
 
     return root
 
--- | Request to add a root from unprivileged context
-requestAddRoot :: StorePath -> Text -> Bool -> TenM ctx a GCRoot
-requestAddRoot path name permanent = do
+-- | Request to add a root from builder context via protocol
+requestAddRoot ::
+    SPrivilegeTier 'Builder ->  -- ^ Builder privilege evidence
+    StorePath ->
+    Text ->
+    Bool ->
+    TenM 'Build 'Builder GCRoot
+requestAddRoot st path name permanent = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In daemon mode, call directly if already privileged
-        DaemonMode ->
-            addRoot path name permanent
+    -- Send request to daemon using protocol
+    daemonConn <- getDaemonConnection env
+    result <- sendToDaemon st daemonConn $ AddGCRootRequest
+        { gcRootPath = path
+        , gcRootName = name
+        , gcRootPermanent = permanent
+        }
 
-        -- In client mode, send request to daemon
-        ClientMode conn -> do
-            -- Send request to daemon using protocol
-            result <- withDaemon $ \conn' -> do
-                -- Implementation would use proper protocol
-                let req = AddGCRootRequest path name permanent
-                -- Send request and receive response
-                return $ Right $ GCRoot path name (if permanent then PermanentRoot else SymlinkRoot)
-                                      (UTCTime (toEnum 0) 0) -- Would get actual time from daemon
+    case result of
+        Left err ->
+            throwError $ DaemonError $ "Failed to add GC root: " <> T.pack (show err)
+        Right (GCRootResponse root) ->
+            return root
+        Right resp ->
+            throwError $ DaemonError $ "Unexpected response for add GC root: " <> T.pack (show resp)
 
-            case result of
-                Left err -> throwError $ DaemonError $ "Failed to add GC root: " <> T.pack (show err)
-                Right root -> return root
-
-        -- In standalone mode, can only add roots if running as root
-        _ -> do
-            -- Check if running as root
-            isRoot <- liftIO $ do
-                uid <- System.Posix.Process.getRealUserID
-                return (uid == 0)
-
-            if isRoot
-                then addRoot path name permanent
-                else throwError $ PermissionError "Adding GC roots requires root privileges or daemon connection"
-
--- | Remove a root (privileged context only)
-removeRoot :: GCRoot -> TenM 'Daemon a ()
-removeRoot root = do
+-- | Remove a root (daemon privilege only)
+removeRoot ::
+    SPrivilegeTier 'Daemon ->  -- ^ Daemon privilege evidence
+    GCRoot ->
+    TenM 'Build 'Daemon ()
+removeRoot st root = TenM $ \sp _ -> do
     env <- ask
 
     -- Generate the root file path
@@ -212,69 +221,60 @@ removeRoot root = do
             -- Remove from filesystem
             liftIO $ removeFile rootFile
 
-            -- Remove from database
-            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+            -- Remove from database with proper privilege
+            withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
                 liftIO $ dbExecute db
                     "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
                     (storePathToText (rootPath root), rootName root)
 
-            logMsg 1 $ "Removed GC root: " <> rootName root <> " -> " <> storeHash (rootPath root)
+            logMsg env 1 $ "Removed GC root: " <> rootName root <> " -> " <> storeHash (rootPath root)
 
--- | Request to remove a root from unprivileged context
-requestRemoveRoot :: GCRoot -> TenM ctx a ()
-requestRemoveRoot root = do
+-- | Request to remove a root from builder context via protocol
+requestRemoveRoot ::
+    SPrivilegeTier 'Builder ->  -- ^ Builder privilege evidence
+    GCRoot ->
+    TenM 'Build 'Builder ()
+requestRemoveRoot st root = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In daemon mode, call directly if already privileged
-        DaemonMode ->
-            removeRoot root
+    -- Send request to daemon using protocol
+    daemonConn <- getDaemonConnection env
+    result <- sendToDaemon st daemonConn $ RemoveGCRootRequest
+        { gcRootToRemove = root
+        }
 
-        -- In client mode, send request to daemon
-        ClientMode conn -> do
-            -- Send request to daemon using protocol
-            result <- withDaemon $ \conn' -> do
-                -- Implementation would use proper protocol
-                let req = RemoveGCRootRequest (rootName root)
-                -- Send request and receive confirmation
-                return $ Right ()
+    case result of
+        Left err ->
+            throwError $ DaemonError $ "Failed to remove GC root: " <> T.pack (show err)
+        Right SuccessResponse ->
+            return ()
+        Right resp ->
+            throwError $ DaemonError $ "Unexpected response for remove GC root: " <> T.pack (show resp)
 
-            case result of
-                Left err -> throwError $ DaemonError $ "Failed to remove GC root: " <> T.pack (show err)
-                Right _ -> return ()
-
-        -- In standalone mode, can only remove roots if running as root
-        _ -> do
-            -- Check if running as root
-            isRoot <- liftIO $ do
-                uid <- System.Posix.Process.getRealUserID
-                return (uid == 0)
-
-            if isRoot
-                then removeRoot root
-                else throwError $ PermissionError "Removing GC roots requires root privileges or daemon connection"
-
--- | List all current GC roots (works in both contexts through different mechanisms)
-listRoots :: TenM ctx a [GCRoot]
-listRoots = do
+-- | List all current GC roots
+-- Works in both contexts through different mechanisms
+listRoots :: forall (t :: PrivilegeTier).
+    SingI t =>
+    SPrivilegeTier t ->
+    TenM 'Build t [GCRoot]
+listRoots st = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In daemon mode or standalone root mode, list roots directly
-        DaemonMode -> listRootsPrivileged
-        _ -> do
-            -- Check if running as root in standalone
-            isRoot <- liftIO $ do
-                uid <- System.Posix.Process.getRealUserID
-                return (uid == 0)
+    -- Dispatch based on privilege tier
+    case fromSing st of
+        -- In daemon context, list roots directly
+        Daemon ->
+            runTenM (listRootsPrivileged st) sp st
 
-            if isRoot
-                then listRootsPrivileged
-                else requestListRoots -- Use daemon protocol
+        -- In builder context, use protocol
+        Builder ->
+            runTenM (requestListRoots st) sp st
 
 -- | Private implementation for listing roots with filesystem access
-listRootsPrivileged :: TenM ctx a [GCRoot]
-listRootsPrivileged = do
+listRootsPrivileged ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon [GCRoot]
+listRootsPrivileged st = TenM $ \sp _ -> do
     env <- ask
 
     -- Get the roots directory
@@ -286,13 +286,12 @@ listRootsPrivileged = do
     -- Get roots both from filesystem and database
     fsRoots <- liftIO $ getFileSystemRoots rootsDir
 
-    -- Get database roots (only in daemon context)
-    dbRoots <- case runMode env of
-        DaemonMode -> liftIO $ withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                         results <- dbQuery_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
-                                   :: IO [(Text, Text, Text, Int)]
-                         buildDatabaseRoots results
-        _ -> return []
+    -- Get database roots with proper privilege
+    dbRoots <- withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        liftIO $ do
+            results <- dbQuery_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
+                      :: IO [(Text, Text, Text, Int)]
+            buildDatabaseRoots results
 
     -- Combine both sources, with filesystem taking precedence for duplicates
     let allRoots = Map.union (Map.fromList [(rootPath r, r) | r <- fsRoots])
@@ -300,29 +299,24 @@ listRootsPrivileged = do
 
     return $ Map.elems allRoots
 
--- | Request to list roots from unprivileged context
-requestListRoots :: TenM ctx a [GCRoot]
-requestListRoots = do
+-- | Request to list roots from builder context via protocol
+requestListRoots ::
+    SPrivilegeTier 'Builder ->
+    TenM 'Build 'Builder [GCRoot]
+requestListRoots st = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In client mode, send request to daemon
-        ClientMode conn -> do
-            -- Send request to daemon using protocol
-            result <- withDaemon $ \conn' -> do
-                -- Implementation would use proper protocol
-                let req = ListGCRootsRequest
-                -- Send request and receive roots list
-                -- This is a stub that would be replaced with actual protocol implementation
-                return $ Right []
+    -- Send request to daemon using protocol
+    daemonConn <- getDaemonConnection env
+    result <- sendToDaemon st daemonConn ListGCRootsRequest
 
-            case result of
-                Left err -> throwError $ DaemonError $ "Failed to list GC roots: " <> T.pack (show err)
-                Right roots -> return roots
-
-        -- If not in client mode and we got here, then we're unprivileged
-        -- Just return an empty list since we can't access the roots
-        _ -> return []
+    case result of
+        Left err ->
+            throwError $ DaemonError $ "Failed to list GC roots: " <> T.pack (show err)
+        Right (GCRootListResponse roots) ->
+            return roots
+        Right resp ->
+            throwError $ DaemonError $ "Unexpected response for list GC roots: " <> T.pack (show resp)
 
 -- | Build database roots from query results
 buildDatabaseRoots :: [(Text, Text, Text, Int)] -> IO [GCRoot]
@@ -392,9 +386,11 @@ getFileSystemRoots rootsDir = do
                         }
         else return Nothing)
 
--- | Run garbage collection (privileged context only)
-collectGarbage :: TenM 'Daemon a GCStats
-collectGarbage = do
+-- | Run garbage collection (daemon privilege only)
+collectGarbage ::
+    SPrivilegeTier 'Daemon ->  -- ^ Daemon privilege evidence
+    TenM 'Build 'Daemon GCStats
+collectGarbage st = TenM $ \sp _ -> do
     env <- ask
     startTime <- liftIO getCurrentTime
 
@@ -404,71 +400,52 @@ collectGarbage = do
     -- Ensure the lock directory exists
     liftIO $ ensureLockDirExists (takeDirectory lockPath)
 
-    -- Acquire the GC lock (this will throw an exception if it fails)
-    acquireGCLock
+    -- Acquire the GC lock with privilege evidence
+    acquireGCLock st
 
     -- Run GC with proper cleanup
-    result <- collectGarbageWithStats `catchError` \e -> do
+    result <- collectGarbageWithStats st `catchError` \e -> do
         -- Make sure to release the lock on error
-        releaseGCLock
+        releaseGCLock st
         throwError e
 
     -- Release the lock
-    releaseGCLock
+    releaseGCLock st
 
     -- Return result
     return result
 
--- | Request garbage collection from unprivileged context
-requestGarbageCollection :: TenM ctx a GCStats
-requestGarbageCollection = do
+-- | Request garbage collection from builder context via protocol
+requestGarbageCollection ::
+    SPrivilegeTier 'Builder ->  -- ^ Builder privilege evidence
+    TenM 'Build 'Builder GCStats
+requestGarbageCollection st = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In daemon mode, call directly if already privileged
-        DaemonMode -> collectGarbage
+    -- Send request to daemon using protocol
+    daemonConn <- getDaemonConnection env
+    result <- sendToDaemon st daemonConn $ GCRequest
+        { gcForce = False -- Not forcing GC
+        }
 
-        -- In client mode, send request to daemon
-        ClientMode conn -> do
-            -- Send request to daemon using protocol
-            result <- withDaemon $ \conn' -> do
-                -- Implementation would use proper protocol
-                let req = GCRequest False -- Not forcing GC
-                -- Send request and receive GC stats
-                -- This is a stub that would be replaced with actual protocol implementation
-                return $ Right $ GCStats 0 0 0 0 0
-
-            case result of
-                Left err -> throwError $ DaemonError $ "Failed to request garbage collection: " <> T.pack (show err)
-                Right stats -> return stats
-
-        -- In standalone mode, can only run GC if running as root
-        _ -> do
-            -- Check if running as root
-            isRoot <- liftIO $ do
-                uid <- System.Posix.Process.getRealUserID
-                return (uid == 0)
-
-            if isRoot
-                then do
-                    -- Create simulated daemon environment
-                    let daemonEnv = env { runMode = DaemonMode }
-                    -- Run with daemon privileges
-                    result <- liftIO $ runTen collectGarbage daemonEnv (BuildState Build [] Set.empty Set.empty (BuildIdFromInt 0) [] 0)
-                    case result of
-                        Left err -> throwError err
-                        Right (stats, _) -> return stats
-                else
-                    throwError $ PermissionError "Garbage collection requires root privileges or daemon connection"
+    case result of
+        Left err ->
+            throwError $ DaemonError $ "Failed to request garbage collection: " <> T.pack (show err)
+        Right (GCResultResponse stats) ->
+            return stats
+        Right resp ->
+            throwError $ DaemonError $ "Unexpected response for GC request: " <> T.pack (show resp)
 
 -- | Run garbage collection with stats (internal implementation)
-collectGarbageWithStats :: TenM 'Daemon a GCStats
-collectGarbageWithStats = do
+collectGarbageWithStats ::
+    SPrivilegeTier 'Daemon ->  -- ^ Daemon privilege evidence
+    TenM 'Build 'Daemon GCStats
+collectGarbageWithStats st = TenM $ \sp _ -> do
     env <- ask
     startTime <- liftIO getCurrentTime
 
-    -- Open database connection
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    -- Open database connection with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Find all paths in the store
         let storeLocationPath = storeLocation env
         allStorePaths <- liftIO $ findAllStorePaths db storeLocationPath
@@ -477,18 +454,18 @@ collectGarbageWithStats = do
         rootPaths <- liftIO $ findAllRoots db storeLocationPath
 
         -- Log information about roots
-        logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
+        logMsg env 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
 
         -- Find all paths reachable from roots (transitive closure)
         reachablePaths <- liftIO $ computeReachablePathsFromRoots db rootPaths
 
         -- Log information about reachable paths
-        logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
+        logMsg env 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
 
         -- Get active build paths (if in daemon mode)
-        activePaths <- getActiveBuildPaths
+        activePaths <- getActiveBuildPaths st
         when (not $ Set.null activePaths) $
-            logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
+            logMsg env 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
 
         -- Combine reachable and active paths
         let protectedPaths = Set.union reachablePaths activePaths
@@ -545,7 +522,7 @@ getPathSize storeLocation pathText = do
             -- If it doesn't exist, return 0
             return 0
 
--- | Find all store paths (privileged context)
+-- | Find all store paths (daemon privilege context)
 findAllStorePaths :: Database -> FilePath -> IO (Set StorePath)
 findAllStorePaths db storeLocation = do
     -- Get paths from database (preferred, more reliable)
@@ -585,7 +562,7 @@ scanFilesystemForPaths storeLocation = do
                         return acc
                         ) Set.empty files
 
--- | Find all roots for garbage collection (privileged context)
+-- | Find all roots for garbage collection (daemon privilege context)
 findAllRoots :: Database -> FilePath -> IO (Set StorePath)
 findAllRoots db storeLocation = do
     -- Get roots from filesystem (gc-roots directory)
@@ -677,83 +654,88 @@ getRuntimeRootPaths storeLocation = do
             paths = filter (\w -> length w > 10 && '-' `elem` w) words
         in Set.fromList $ catMaybes $ map (parseStorePath . T.pack) paths
 
--- | Check if a path is reachable from any root (works in both contexts)
-isReachable :: StorePath -> TenM ctx a Bool
-isReachable path = do
+-- | Check if a path is reachable from any root
+-- Works in both contexts through different mechanisms
+isReachable :: forall (t :: PrivilegeTier).
+    SingI t =>
+    SPrivilegeTier t ->
+    StorePath ->
+    TenM 'Build t Bool
+isReachable st path = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In daemon mode, check directly
-        DaemonMode -> isReachablePrivileged path
+    -- Dispatch based on privilege tier
+    case fromSing st of
+        -- In daemon context, check directly
+        Daemon ->
+            runTenM (isReachablePrivileged st path) sp st
 
-        -- In other modes, check if running as root
-        _ -> do
-            -- Check if running as root
-            isRoot <- liftIO $ do
-                uid <- System.Posix.Process.getRealUserID
-                return (uid == 0)
-
-            if isRoot
-                then isReachablePrivileged path
-                else requestPathReachability path
+        -- In builder context, use protocol
+        Builder ->
+            runTenM (requestPathReachability st path) sp st
 
 -- | Internal implementation for privileged reachability check
-isReachablePrivileged :: StorePath -> TenM ctx a Bool
-isReachablePrivileged path = do
+isReachablePrivileged ::
+    SPrivilegeTier 'Daemon ->
+    StorePath ->
+    TenM 'Build 'Daemon Bool
+isReachablePrivileged st path = TenM $ \sp _ -> do
     env <- ask
 
-    -- Initialize database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    -- Initialize database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Get all roots
         roots <- liftIO $ findAllRoots db (storeLocation env)
 
         -- Use database to check reachability
         liftIO $ isPathReachable db roots path
 
--- | Request path reachability check from unprivileged context
-requestPathReachability :: StorePath -> TenM ctx a Bool
-requestPathReachability path = do
+-- | Request path reachability check from builder context via protocol
+requestPathReachability ::
+    SPrivilegeTier 'Builder ->
+    StorePath ->
+    TenM 'Build 'Builder Bool
+requestPathReachability st path = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In client mode, send request to daemon
-        ClientMode conn -> do
-            -- Send request to daemon using protocol
-            result <- withDaemon $ \conn' -> do
-                -- This is a stub that would be replaced with actual protocol implementation
-                return $ Right False
+    -- Send request to daemon using protocol
+    daemonConn <- getDaemonConnection env
+    result <- sendToDaemon st daemonConn $ PathReachabilityRequest
+        { reachabilityPath = path
+        }
 
-            case result of
-                Left err -> throwError $ DaemonError $ "Failed to check path reachability: " <> T.pack (show err)
-                Right reachable -> return reachable
+    case result of
+        Left err ->
+            throwError $ DaemonError $ "Failed to check path reachability: " <> T.pack (show err)
+        Right (PathReachabilityResponse reachable) ->
+            return reachable
+        Right resp ->
+            throwError $ DaemonError $ "Unexpected response for reachability check: " <> T.pack (show resp)
 
-        -- If not in client mode and we got here, then fall back to heuristic
-        -- An unprivileged process can't reliably determine reachability
-        -- But we can check if the path is in the store at least
-        _ -> do
-            -- Check if path exists in store (doesn't guarantee reachability)
-            storePathExists path
-
--- | Find all paths reachable from roots (privileged context only)
-findReachablePaths :: TenM 'Daemon a (Set StorePath)
-findReachablePaths = do
+-- | Find all paths reachable from roots (daemon privilege only)
+findReachablePaths ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon (Set StorePath)
+findReachablePaths st = TenM $ \sp _ -> do
     env <- ask
 
-    -- Initialize database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    -- Initialize database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Find all roots
         roots <- liftIO $ findAllRoots db (storeLocation env)
 
         -- Compute all reachable paths
         liftIO $ computeReachablePathsFromRoots db roots
 
--- | Acquire the GC lock (privileged context only)
-acquireGCLock :: TenM 'Daemon a ()
-acquireGCLock = do
+-- | Acquire the GC lock (daemon privilege only)
+acquireGCLock ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon ()
+acquireGCLock st = TenM $ \sp _ -> do
     env <- ask
     let lockPath = getGCLockPath env
 
-    -- Try to acquire the lock
+    -- Try to acquire the lock with proper privilege verification
     result <- liftIO $ acquireFileLock lockPath
 
     case result of
@@ -762,9 +744,11 @@ acquireGCLock = do
             -- Keep the fd in a global reference to avoid GC
             liftIO $ writeIORef globalGCLockFdRef (Just (lockFd lock, lockPath))
 
--- | Release the GC lock (privileged context only)
-releaseGCLock :: TenM 'Daemon a ()
-releaseGCLock = do
+-- | Release the GC lock (daemon privilege only)
+releaseGCLock ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon ()
+releaseGCLock st = TenM $ \sp _ -> do
     env <- ask
     let lockPath = getGCLockPath env
 
@@ -793,36 +777,41 @@ releaseGCLock = do
                     _ -> return ()
             _ -> return ()
 
--- | Execute an action with the GC lock (privileged context only)
-withGCLock :: TenM 'Daemon a b -> TenM 'Daemon a b
-withGCLock action = do
-    -- First acquire the lock
-    acquireGCLock
+-- | Execute an action with the GC lock (daemon privilege only)
+withGCLock ::
+    SPrivilegeTier 'Daemon ->
+    (SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon a) ->
+    TenM 'Build 'Daemon a
+withGCLock st action = TenM $ \sp _ -> do
+    -- First acquire the lock with privilege evidence
+    runTenM (acquireGCLock st) sp st
 
     -- Run the action with proper error handling
-    result <- catchError
-        action
-        (\e -> do
+    result <- runTenM (action st) sp st `catchError`
+        \e -> do
             -- Always release the lock on error
-            releaseGCLock
+            runTenM (releaseGCLock st) sp st
             -- Re-throw the error
-            throwError e)
+            throwError e
 
     -- Release the lock
-    releaseGCLock
+    runTenM (releaseGCLock st) sp st
 
     -- Return the result
     return result
 
--- | Break a stale lock (privileged context only)
-breakStaleLock :: FilePath -> TenM 'Daemon a ()
-breakStaleLock lockPath = do
+-- | Break a stale lock (daemon privilege only)
+breakStaleLock ::
+    SPrivilegeTier 'Daemon ->
+    FilePath ->
+    TenM 'Build 'Daemon ()
+breakStaleLock st lockPath = TenM $ \sp _ -> do
     -- Check lock status
     status <- liftIO $ checkLockFile lockPath
 
     case status of
         Left err ->
-            logMsg 1 $ "Cannot check lock status: " <> err
+            logMsg env 1 $ "Cannot check lock status: " <> err
         Right isValid ->
             unless isValid $ liftIO $ do
                 -- Log that we're breaking a stale lock
@@ -831,6 +820,8 @@ breakStaleLock lockPath = do
                 -- Remove the lock file
                 removeFile lockPath `catch` \(_ :: SomeException) ->
                     hPutStrLn stderr $ "Warning: Failed to remove stale lock file: " ++ lockPath
+  where
+    env = BuildEnv { verbosity = 1, storeLocation = "", workDir = "", userName = Nothing, privilegeContext = Daemon }
 
 -- | Check if a lock file exists and is valid
 checkLockFile :: FilePath -> IO (Either Text Bool)
@@ -856,6 +847,28 @@ checkLockFile lockPath = do
                             return $ Right pidRunning
 
                         _ -> return $ Left "Invalid lock file format"
+
+-- | Helper function for breakStaleLock that can be used from non-TenM contexts
+breakStaleLock' :: FilePath -> IO ()
+breakStaleLock' lockPath = do
+    -- Check if lock file exists
+    exists <- doesFileExist lockPath
+    when exists $ do
+        -- Read the lock file
+        content <- try $ readFile lockPath
+        case content of
+            Right pidStr -> do
+                case reads pidStr of
+                    [(lockPid, "")] -> do
+                        -- Check if the process is still running
+                        pidRunning <- isProcessRunning lockPid
+                        unless pidRunning $ do
+                            -- Remove the stale lock
+                            hPutStrLn stderr $ "Breaking stale GC lock: " ++ lockPath
+                            removeFile lockPath `catch` \(_ :: SomeException) ->
+                                hPutStrLn stderr $ "Warning: Failed to remove stale lock file: " ++ lockPath
+                    _ -> return ()
+            _ -> return ()
 
 -- | Check if a process is still running
 isProcessRunning :: ProcessID -> IO Bool
@@ -922,114 +935,103 @@ releaseFileLock lock = do
     catchIOError (removeFile (lockPath lock)) (\_ -> return ())
 
 -- | Get active build paths (to prevent GC during builds)
-getActiveBuildPaths :: TenM ctx a (Set StorePath)
-getActiveBuildPaths = do
-    -- In daemon mode, query the daemon for active build outputs
-    isDaemon <- isDaemonMode
-    if isDaemon
-        then getDaemonActivePaths
-        else return Set.empty
-
--- | Get active build paths from daemon mode
-getDaemonActivePaths :: TenM ctx a (Set StorePath)
-getDaemonActivePaths = do
+getActiveBuildPaths ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon (Set StorePath)
+getActiveBuildPaths st = TenM $ \sp _ -> do
     env <- ask
 
-    -- In daemon mode, check for active build outputs in the runtime state
-    case runMode env of
-        DaemonMode -> do
-            -- Get runtime paths from database
-            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                -- Query active build paths from database
-                results <- liftIO $ dbQuery_ db
-                    "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
+    -- Get runtime paths from database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Query active build paths from database
+        results <- liftIO $ dbQuery_ db
+            "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
 
-                -- Parse paths
-                return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
+        -- Parse paths
+        return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
 
-        ClientMode conn -> do
-            -- Ask the daemon via protocol
-            result <- withDaemon $ \_ ->
-                return $ Right Set.empty  -- This would make an RPC call in practice
-            return result
-
-        _ -> return Set.empty
-
--- | Verify the store integrity (works in both contexts)
-verifyStore :: TenM ctx a Bool
-verifyStore = do
+-- | Verify the store integrity
+-- Works in both contexts through different mechanisms
+verifyStore :: forall (t :: PrivilegeTier).
+    SingI t =>
+    SPrivilegeTier t ->
+    TenM 'Build t Bool
+verifyStore st = TenM $ \sp _ -> do
     env <- ask
 
-    case runMode env of
-        -- In daemon mode, verify directly
-        DaemonMode -> do
-            -- Open database
-            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                -- Get all valid paths from database
-                paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
+    -- Dispatch based on privilege tier
+    case fromSing st of
+        -- In daemon context, verify directly
+        Daemon ->
+            runTenM (verifyStorePrivileged st) sp st
 
-                -- Verify each path
-                results <- forM paths $ \(Only pathText) -> do
-                    case parseStorePath pathText of
-                        Nothing -> return False
-                        Just storePath -> do
-                            -- Verify that the store file exists and has the correct hash
-                            result <- liftIO $ try $ do
-                                let fullPath = storePathToFilePath storePath env
-                                fileExists <- doesFileExist fullPath
-                                if fileExists
-                                    then do
-                                        content <- BS.readFile fullPath
-                                        let actualHash = showHash $ hashByteString content
-                                        return $ actualHash == storeHash storePath
-                                    else return False
-                            case result of
-                                Left (_ :: SomeException) -> return False
-                                Right valid -> return valid
+        -- In builder context, use protocol
+        Builder ->
+            runTenM (requestStoreVerification st) sp st
 
-                -- Return true if all paths verify
-                return $ all id results
+-- | Private implementation for store verification with full access
+verifyStorePrivileged ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon Bool
+verifyStorePrivileged st = TenM $ \sp _ -> do
+    env <- ask
 
-        -- In client mode, request verification from daemon
-        ClientMode conn -> do
-            -- Send request to daemon using protocol
-            result <- withDaemon $ \conn' -> do
-                -- This is a stub that would be replaced with actual protocol implementation
-                let req = StoreVerifyRequest "/"  -- Verify entire store
-                return $ Right True -- Assume valid for stub
+    -- Open database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Get all valid paths from database
+        paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
-            case result of
-                Left err -> throwError $ DaemonError $ "Failed to verify store: " <> T.pack (show err)
-                Right valid -> return valid
-
-        -- In standalone mode, verify if running as root
-        _ -> do
-            -- Check if running as root
-            isRoot <- liftIO $ do
-                uid <- System.Posix.Process.getRealUserID
-                return (uid == 0)
-
-            if isRoot
-                then do
-                    -- Create simulated daemon environment
-                    let daemonEnv = env { runMode = DaemonMode }
-                    -- Run with daemon privileges
-                    result <- liftIO $ runTen verifyStore daemonEnv (BuildState Build [] Set.empty Set.empty (BuildIdFromInt 0) [] 0)
+        -- Verify each path
+        results <- forM paths $ \(Only pathText) -> do
+            case parseStorePath pathText of
+                Nothing -> return False
+                Just storePath -> do
+                    -- Verify that the store file exists and has the correct hash
+                    result <- liftIO $ try $ do
+                        let fullPath = storePathToFilePath storePath env
+                        fileExists <- doesFileExist fullPath
+                        if fileExists
+                            then do
+                                content <- BS.readFile fullPath
+                                let actualHash = showHash $ hashByteString content
+                                return $ actualHash == storeHash storePath
+                            else return False
                     case result of
-                        Left err -> throwError err
-                        Right (valid, _) -> return valid
-                else
-                    -- Unprivileged standalone mode can only verify paths it can read
-                    return True -- Just assume valid since we can't really check
+                        Left (_ :: SomeException) -> return False
+                        Right valid -> return valid
 
--- | Repair the store (remove invalid paths) - privileged context only
-repairStore :: TenM 'Daemon a GCStats
-repairStore = do
+        -- Return true if all paths verify
+        return $ all id results
+
+-- | Request store verification from builder context via protocol
+requestStoreVerification ::
+    SPrivilegeTier 'Builder ->
+    TenM 'Build 'Builder Bool
+requestStoreVerification st = TenM $ \sp _ -> do
+    env <- ask
+
+    -- Send request to daemon using protocol
+    daemonConn <- getDaemonConnection env
+    result <- sendToDaemon st daemonConn StoreVerifyRequest
+
+    case result of
+        Left err ->
+            throwError $ DaemonError $ "Failed to verify store: " <> T.pack (show err)
+        Right (StoreVerifyResponse valid) ->
+            return valid
+        Right resp ->
+            throwError $ DaemonError $ "Unexpected response for store verification: " <> T.pack (show resp)
+
+-- | Repair the store (remove invalid paths) - daemon privilege only
+repairStore ::
+    SPrivilegeTier 'Daemon ->
+    TenM 'Build 'Daemon GCStats
+repairStore st = TenM $ \sp _ -> do
     env <- ask
     startTime <- liftIO getCurrentTime
 
-    -- Open database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    -- Open database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Get all valid paths from database
         paths <- liftIO $ dbQuery_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
@@ -1092,7 +1094,7 @@ getFileSize' path = do
             return $ fromIntegral $ fileSize fileStatus
         else return 0
 
--- Helper function for database interaction - Path reachability
+-- | Helper function for database interaction - Path reachability
 isPathReachable :: Database -> Set StorePath -> StorePath -> IO Bool
 isPathReachable db roots path = do
     -- Check if path is directly in roots
@@ -1145,3 +1147,34 @@ markPathsAsInvalid db paths = do
     forM_ (Set.toList paths) $ \path ->
         dbExecute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
                   (Only (storePathToText path))
+
+-- | Helper functions for directories
+ensureLockDirExists :: FilePath -> IO ()
+ensureLockDirExists dir = createDirectoryIfMissing True dir
+
+-- | Helper to get the GC lock path
+getGCLockPath :: BuildEnv -> FilePath
+getGCLockPath env = storeLocation env </> "var/ten/gc.lock"
+
+-- | Helper to get a daemon connection in builder context
+getDaemonConnection :: BuildEnv -> TenM 'Build 'Builder DaemonConnection
+getDaemonConnection env =
+    case runMode env of
+        ClientMode conn -> return conn
+        _ -> throwError $ ConfigError "Not in client mode, cannot access daemon"
+
+-- | Helper to send a request to the daemon with privilege check
+sendToDaemon :: SPrivilegeTier 'Builder -> DaemonConnection -> DaemonRequest -> TenM 'Build 'Builder DaemonResponse
+sendToDaemon st conn request = do
+    -- Create a privileged capable request with proper evidence
+    result <- liftIO $ sendRequestWithPrivilege st conn request
+
+    case result of
+        Left err -> throwError $ DaemonError $ "Failed to send request to daemon: " <> T.pack (show err)
+        Right response -> return response
+
+-- | Enhanced helper for logging
+logMsg :: BuildEnv -> Int -> Text -> TenM p ctx ()
+logMsg env level msg =
+    when (verbosity env >= level) $
+        liftIO $ hPutStrLn stderr $ T.unpack msg
