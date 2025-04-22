@@ -11,6 +11,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Ten.Core (
     -- Core types
@@ -28,6 +29,10 @@ module Ten.Core (
     UserCredentials(..),
     UserId(..),
     AuthToken(..),
+
+    -- Type classes for type-level context mapping
+    GetContextFromType(..),
+    GetPhaseFromType(..),
 
     -- Return-Continuation types
     PhaseTransition(..),
@@ -182,6 +187,26 @@ data Phase = Eval | Build
 data PrivilegeContext = Privileged | Unprivileged
     deriving (Show, Eq)
 
+-- | Type class for mapping context types to runtime values
+class GetContextFromType (ctx :: PrivilegeContext) where
+    getContextFromType :: Proxy ctx -> PrivilegeContext
+
+instance GetContextFromType 'Privileged where
+    getContextFromType _ = Privileged
+
+instance GetContextFromType 'Unprivileged where
+    getContextFromType _ = Unprivileged
+
+-- | Type class for mapping phase types to runtime values
+class GetPhaseFromType (p :: Phase) where
+    getPhaseFromType :: Proxy p -> Phase
+
+instance GetPhaseFromType 'Eval where
+    getPhaseFromType _ = Eval
+
+instance GetPhaseFromType 'Build where
+    getPhaseFromType _ = Build
+
 -- | Build identifier type
 data BuildId
     = BuildId Unique               -- Normal constructor
@@ -232,6 +257,7 @@ data BuildError
     | GCError Text                       -- Garbage collection errors
     | PhaseError Text                    -- Error with phase transition/operation
     | PrivilegeError Text                -- Error with privilege context violation
+    | ProtocolError Text                 -- Error in protocol communication
     deriving (Show, Eq)
 
 instance Exception BuildError
@@ -608,16 +634,13 @@ initBuildState phase bid = BuildState
     }
 
 -- | Execute a Ten monad in the given environment and state
-runTen :: TenM p ctx a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTen :: forall p ctx a. GetContextFromType ctx
+       => TenM p ctx a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
 runTen m env state = do
     -- Validate privilege context matches
     if privilegeContext env == getContextFromType (Proxy :: Proxy ctx)
         then runExceptT $ runStateT (runReaderT (runTenM m) env) state
         else return $ Left $ PrivilegeError "Privilege context mismatch"
-  where
-    getContextFromType :: Proxy (ctx :: PrivilegeContext) -> PrivilegeContext
-    getContextFromType (_ :: Proxy 'Privileged) = Privileged
-    getContextFromType (_ :: Proxy 'Unprivileged) = Unprivileged
 
 -- | Execute an evaluation-phase computation in privileged mode
 evalTen :: TenM 'Eval 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
@@ -636,7 +659,8 @@ buildTen m env = do
     runTen m env' (initBuildState Build bid)
 
 -- | Execute a daemon operation (privileged)
-runTenDaemon :: TenM p 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+runTenDaemon :: forall p a. GetPhaseFromType p
+             => TenM p 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 runTenDaemon m env = do
     -- Verify we're in daemon mode
     case runMode env of
@@ -646,22 +670,15 @@ runTenDaemon m env = do
             bid <- BuildId <$> newUnique
             runTen m env' (initBuildState (getPhaseFromType (Proxy :: Proxy p)) bid)
         _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
-  where
-    getPhaseFromType :: Proxy (p :: Phase) -> Phase
-    getPhaseFromType (_ :: Proxy 'Eval) = Eval
-    getPhaseFromType (_ :: Proxy 'Build) = Build
 
 -- | Execute a builder operation (unprivileged)
-runTenBuilder :: TenM p 'Unprivileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+runTenBuilder :: forall p a. GetPhaseFromType p
+              => TenM p 'Unprivileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 runTenBuilder m env = do
     -- Set unprivileged context
     let env' = env { privilegeContext = Unprivileged }
     bid <- BuildId <$> newUnique
     runTen m env' (initBuildState (getPhaseFromType (Proxy :: Proxy p)) bid)
-  where
-    getPhaseFromType :: Proxy (p :: Phase) -> Phase
-    getPhaseFromType (_ :: Proxy 'Eval) = Eval
-    getPhaseFromType (_ :: Proxy 'Build) = Build
 
 -- | Run an IO operation within the TenM monad
 runTenIO :: IO a -> TenM p ctx a
