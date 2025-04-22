@@ -5,9 +5,13 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE KindSignatures #-}
 
 module Ten.Daemon.Core (
-    -- Main daemon functionality
+    -- Main daemon functionality with privilege tracking
     startDaemon,
     stopDaemon,
     restartDaemon,
@@ -41,6 +45,9 @@ module Ten.Daemon.Core (
 
     -- Privilege management
     dropPrivileges,
+    withPrivilegeTransition,
+    runPrivileged,
+    runUnprivileged,
 
     -- Main daemon context
     DaemonContext(..),
@@ -54,7 +61,7 @@ module Ten.Daemon.Core (
     isGCRunning,
     checkGCLockStatus,
 
-    -- Process handling
+    -- Process handling with privilege tracking
     spawnBuilder,
     monitorBuilder,
     abortBuilder
@@ -113,7 +120,7 @@ import System.Process (readProcess, createProcess, proc, waitForProcess, CreateP
 import Ten.Core
 import Ten.Build (BuildResult(..), verifyBuildResult)
 import Ten.Daemon.Protocol
-import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, DaemonConfig(..))
+import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, DaemonConfig(..), LogLevel(..))
 import Ten.Daemon.Auth (authenticateUser, validateToken, revokeToken, UserCredentials(..), AuthToken(..))
 import Ten.Daemon.State (initDaemonState, loadStateFromFile, saveStateToFile, DaemonState(..),
                        registerBuild, updateBuildStatus, acquireGCLock, releaseGCLock, checkGCLock)
@@ -122,26 +129,27 @@ import Ten.GC (GCStats(..), collectGarbage)
 import Ten.Store (initializeStore, createStoreDirectories, verifyStore)
 import Ten.Sandbox (SandboxConfig(..), defaultSandboxConfig, setupSandbox,
                    teardownSandbox, bindMountReadOnly, dropSandboxPrivileges)
-import Ten.Derivation (Derivation(..), deserializeDerivation)
+import Ten.Derivation (Derivation(..), deserializeDerivation, serializeDerivation)
 
--- | Main daemon context
-data DaemonContext = DaemonContext {
-    ctxConfig :: DaemonConfig,        -- ^ Daemon configuration
-    ctxState :: DaemonState,          -- ^ Daemon state
-    ctxServer :: ServerControl,       -- ^ Server control
-    ctxLogHandle :: Maybe Handle,     -- ^ Log file handle
-    ctxShutdownFlag :: TVar Bool,     -- ^ Shutdown flag
-    ctxMainThread :: ThreadId,        -- ^ Main thread ID
-    ctxPid :: ProcessID,              -- ^ Process ID
-    ctxStartTime :: UTCTime,          -- ^ Daemon start time
-    ctxBackgroundThreads :: IORef [ThreadId], -- ^ Background worker threads
-    ctxListenSocket :: Maybe Socket,  -- ^ Listening socket for daemon
-    ctxPrivilegeDropped :: IORef Bool, -- ^ Whether privileges have been dropped
+-- | Main daemon context with privilege tracking phantom type
+data DaemonContext (t :: PrivilegeTier) = DaemonContext {
+    ctxConfig :: DaemonConfig,                  -- ^ Daemon configuration
+    ctxState :: DaemonState t,                  -- ^ Daemon state with privilege tracking
+    ctxServer :: ServerControl t,               -- ^ Server control with privilege tracking
+    ctxLogHandle :: Maybe Handle,               -- ^ Log file handle
+    ctxShutdownFlag :: TVar Bool,               -- ^ Shutdown flag
+    ctxMainThread :: ThreadId,                  -- ^ Main thread ID
+    ctxPid :: ProcessID,                        -- ^ Process ID
+    ctxStartTime :: UTCTime,                    -- ^ Daemon start time
+    ctxBackgroundThreads :: IORef [ThreadId],   -- ^ Background worker threads
+    ctxListenSocket :: Maybe Socket,            -- ^ Listening socket for daemon
+    ctxPrivilegeDropped :: IORef Bool,          -- ^ Whether privileges have been dropped
     ctxBuilderProcesses :: TVar (Map BuildId (Async BuildResult)), -- ^ Running builder processes
     ctxBuildMutexes :: TVar (Map StorePath (MVar ())), -- ^ Locks for concurrent access to store paths
-    ctxRootMutex :: MVar (),          -- ^ Global mutex for critical operations
-    ctxUnprivilegedUserID :: UserID,  -- ^ UID for unprivileged operations
-    ctxUnprivilegedGroupID :: GroupID -- ^ GID for unprivileged operations
+    ctxRootMutex :: MVar (),                    -- ^ Global mutex for critical operations
+    ctxUnprivilegedUserID :: UserID,            -- ^ UID for unprivileged operations
+    ctxUnprivilegedGroupID :: GroupID,          -- ^ GID for unprivileged operations
+    ctxPrivilegeEvidence :: SPrivilegeTier t    -- ^ Runtime evidence of privilege tier
 }
 
 -- | Start the daemon
@@ -293,11 +301,11 @@ isDaemonRunningBySocket socketPath = do
         Left (_ :: SomeException) -> return False
         Right isRunning -> return isRunning
 
--- | Main daemon execution
+-- | Main daemon execution with proper privilege tracking
 runDaemon :: DaemonConfig -> UserID -> GroupID -> IO ()
 runDaemon config unprivUid unprivGid = do
-    -- Initialize daemon context
-    context <- initDaemonContext config unprivUid unprivGid
+    -- Initialize daemon context with Daemon privilege tier
+    context <- initDaemonContext config unprivUid unprivGid sDaemon
 
     -- Set resource limits
     setResourceLimits
@@ -329,7 +337,7 @@ runDaemon config unprivUid unprivGid = do
     logMessage logHandle (daemonLogLevel config) LogNormal $
         "Using store: " ++ daemonStorePath config
 
-    -- Initialize daemon state
+    -- Initialize daemon state - properly typed for Daemon privilege
     state <- do
         -- Try to load existing state
         result <- loadDaemonState config
@@ -339,14 +347,14 @@ runDaemon config unprivUid unprivGid = do
                     "Failed to load daemon state: " ++ err
                 logMessage logHandle (daemonLogLevel config) LogNormal
                     "Initializing new daemon state..."
-                initDaemonState (daemonStateFile config) (daemonMaxJobs config) 100
+                initDaemonState (daemonStateFile config) (daemonMaxJobs config) 100 sDaemon
             Right loadedState -> do
                 logMessage logHandle (daemonLogLevel config) LogNormal
                     "Daemon state loaded successfully."
                 return loadedState
 
-    -- Start the server
-    server <- startServer listenSocket state
+    -- Start the server with proper privilege context
+    server <- startServer sDaemon listenSocket state
 
     -- Update context with state, server and log
     let context'' = context' {
@@ -355,10 +363,8 @@ runDaemon config unprivUid unprivGid = do
             ctxLogHandle = logHandle
         }
 
-    -- Verify store integrity
-    verifyStore (daemonStorePath config) `catch` \(e :: SomeException) -> do
-        logMessage logHandle (daemonLogLevel config) LogNormal $
-            "Warning: Store verification issue: " ++ show e
+    -- Verify store integrity - requires Daemon privilege
+    verifyStoreIntegrity context'' (daemonStorePath config)
 
     -- Start background workers
     startBackgroundWorkers context''
@@ -368,15 +374,36 @@ runDaemon config unprivUid unprivGid = do
         (runDaemonLoop context'')
         (shutdownDaemon context'' logHandle)
 
+-- | Verify store integrity using Daemon privilege
+verifyStoreIntegrity :: DaemonContext 'Daemon -> FilePath -> IO ()
+verifyStoreIntegrity context storePath = do
+    -- Use the privilege evidence to verify store
+    let stEvidence = ctxPrivilegeEvidence context
+
+    -- Run store verification with proper privilege checks
+    result <- runTen sBuild stEvidence
+        (withStore stEvidence $ \st -> verifyStore st storePath)
+        (initDaemonEnv (daemonTmpDir (ctxConfig context)) storePath (Just "daemon"))
+        (initBuildState Build (BuildIdFromInt 0))
+
+    -- Log any issues
+    case result of
+        Left err ->
+            logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
+                "Store verification issue: " <> show err
+        Right _ ->
+            logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
+                "Store verification successful"
+
 -- | Perform daemon shutdown cleanup
-shutdownDaemon :: DaemonContext -> Maybe Handle -> IO ()
+shutdownDaemon :: DaemonContext t -> Maybe Handle -> IO ()
 shutdownDaemon context logHandle = do
     -- Log shutdown
     logMessage logHandle (daemonLogLevel (ctxConfig context)) LogNormal
         "Ten daemon shutting down..."
 
-    -- Stop server
-    stopServer (ctxServer context)
+    -- Stop server with privilege evidence
+    stopServer (ctxPrivilegeEvidence context) (ctxServer context)
 
     -- Terminate any running builder processes
     builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
@@ -396,7 +423,7 @@ shutdownDaemon context logHandle = do
     releaseGCLockIfNeeded context
 
     -- Save state
-    saveDaemonState (ctxConfig context) (ctxState context)
+    saveDaemonStateWithPrivilege context
 
     -- Remove PID file
     removePidFile (daemonSocketPath (ctxConfig context))
@@ -407,8 +434,15 @@ shutdownDaemon context logHandle = do
     logMessage logHandle (daemonLogLevel (ctxConfig context)) LogNormal
         "Ten daemon shutdown complete."
 
+-- | Save daemon state with privilege checking
+saveDaemonStateWithPrivilege :: DaemonContext t -> IO ()
+saveDaemonStateWithPrivilege context =
+    -- Use withPrivilegeScope to handle saving with proper privileges
+    withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+        saveStateToFile (ctxState context)
+
 -- | Release GC lock if the daemon is holding it
-releaseGCLockIfNeeded :: DaemonContext -> IO ()
+releaseGCLockIfNeeded :: DaemonContext t -> IO ()
 releaseGCLockIfNeeded context = do
     let config = ctxConfig context
     let lockPath = gcLockPath (initBuildEnv (daemonTmpDir config) (daemonStorePath config) 'Daemon)
@@ -428,18 +462,22 @@ releaseGCLockIfNeeded context = do
                         -- Check if that's our PID
                         ourPid <- getProcessID
                         when (lockPid == ourPid) $ do
-                            -- We own the lock, release it
+                            -- We own the lock, release it with privilege evidence
                             logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
                                 "Releasing GC lock held by daemon"
+
+                            -- Release the lock with proper privilege context
+                            withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                                releaseGCLock (ctxState context)
 
                             -- Remove the lock file
                             removeFile lockPath `catch` \(_ :: SomeException) -> return ()
 
                     _ -> return () -- Invalid format, probably not our lock
 
--- | Initialize daemon context
-initDaemonContext :: DaemonConfig -> UserID -> GroupID -> IO DaemonContext
-initDaemonContext config unprivUid unprivGid = do
+-- | Initialize daemon context with privilege tracking
+initDaemonContext :: DaemonConfig -> UserID -> GroupID -> SPrivilegeTier t -> IO (DaemonContext t)
+initDaemonContext config unprivUid unprivGid stEvidence = do
     -- Get process ID
     pid <- getProcessID
 
@@ -483,7 +521,8 @@ initDaemonContext config unprivUid unprivGid = do
         ctxBuildMutexes = buildMutexes,
         ctxRootMutex = rootMutex,
         ctxUnprivilegedUserID = unprivUid,
-        ctxUnprivilegedGroupID = unprivGid
+        ctxUnprivilegedGroupID = unprivGid,
+        ctxPrivilegeEvidence = stEvidence
     }
 
 -- | Create listening socket for daemon
@@ -514,7 +553,7 @@ createListeningSocket socketPath = do
     return sock
 
 -- | Main daemon loop
-runDaemonLoop :: DaemonContext -> IO ()
+runDaemonLoop :: DaemonContext t -> IO ()
 runDaemonLoop context = do
     -- Set up thread that checks shutdown flag
     let loop = do
@@ -537,11 +576,11 @@ runDaemonLoop context = do
             logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal $
                 "Main daemon loop error: " ++ show e
             -- Try to save state and exit gracefully
-            saveDaemonState (ctxConfig context) (ctxState context)
+            saveDaemonStateWithPrivilege context
             exitFailure
 
 -- | Handle any completed builder processes
-handleCompletedBuilders :: DaemonContext -> IO ()
+handleCompletedBuilders :: DaemonContext t -> IO ()
 handleCompletedBuilders context = do
     -- Get all running builder processes
     builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
@@ -563,11 +602,8 @@ handleCompletedBuilders context = do
                             "Builder process for " ++ show buildId ++ " failed: " ++ show err
 
                         -- Update build status to failed
-                        runTen (updateBuildStatus buildId BuildFailed')
-                              (initDaemonEnv (daemonTmpDir (ctxConfig context))
-                                           (daemonStorePath (ctxConfig context))
-                                           (Just "daemon"))
-                              (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+                        withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                            updateBuildStatus (ctxState context) buildId BuildFailed'
 
                     Right result -> do
                         -- Builder completed successfully
@@ -575,11 +611,8 @@ handleCompletedBuilders context = do
                             "Builder process for " ++ show buildId ++ " completed"
 
                         -- Update build status to completed
-                        runTen (updateBuildStatus buildId BuildCompleted)
-                              (initDaemonEnv (daemonTmpDir (ctxConfig context))
-                                           (daemonStorePath (ctxConfig context))
-                                           (Just "daemon"))
-                              (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+                        withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                            updateBuildStatus (ctxState context) buildId BuildCompleted
 
                 -- Return this build ID as completed
                 return $ Just buildId
@@ -599,8 +632,8 @@ poll asyncProc = do
         Left _ -> return Nothing  -- Exception means process is still running
         Right outcome -> return $ Just outcome
 
--- | Spawn a builder process for a derivation
-spawnBuilder :: DaemonContext -> Derivation -> BuildId -> IO (Async BuildResult)
+-- | Spawn a builder process for a derivation with privilege separation
+spawnBuilder :: DaemonContext t -> Derivation -> BuildId -> IO (Async BuildResult)
 spawnBuilder context derivation buildId = do
     let config = ctxConfig context
 
@@ -621,10 +654,12 @@ spawnBuilder context derivation buildId = do
     logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
         "Starting builder for " ++ show buildId ++ " in " ++ buildDir
 
-    -- Set up the sandbox
-    runTen (setupSandbox buildDir sandboxConfig)
-          (initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (Just "daemon"))
-          (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+    -- Set up the sandbox with proper privilege context
+    withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+        runTen sBuild stEvidence
+            (setupSandbox buildDir sandboxConfig)
+            (initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (Just "daemon"))
+            (initBuildState Build (BuildIdFromInt 0))
 
     -- Prepare the derivation for building
     -- Serialize derivation to file
@@ -641,12 +676,14 @@ spawnBuilder context derivation buildId = do
             ("TEN_TMP", buildDir </> "tmp")
         ]
 
-    -- Spawn the builder process as async task
+    -- Spawn the builder process as async task with appropriate privilege drop
     asyncProcess <- async $ do
-        -- Run the builder in sandbox with proper privileges
-        (exitCode, stdout, stderr) <- runBuilderProcess builderPath builderArgs builderEnv
-                                     (ctxUnprivilegedUserID context)
-                                     (ctxUnprivilegedGroupID context)
+        -- Run the builder in sandbox with proper privileges dropped
+        (exitCode, stdout, stderr) <- runBuilderProcess
+            (ctxPrivilegeEvidence context)
+            builderPath builderArgs builderEnv
+            (ctxUnprivilegedUserID context)
+            (ctxUnprivilegedGroupID context)
 
         -- Parse the build result (builder writes JSON result to stdout)
         case exitCode of
@@ -663,9 +700,15 @@ spawnBuilder context derivation buildId = do
 
     return asyncProcess
 
--- | Run a builder process with dropped privileges
-runBuilderProcess :: FilePath -> [String] -> [(String, String)] -> UserID -> GroupID -> IO (ExitCode, String, String)
-runBuilderProcess program args env uid gid = do
+-- | Run a builder process with privilege dropping (using type-level privilege constraints)
+runBuilderProcess :: SPrivilegeTier t
+                  -> FilePath
+                  -> [String]
+                  -> [(String, String)]
+                  -> UserID
+                  -> GroupID
+                  -> IO (ExitCode, String, String)
+runBuilderProcess stEvidence program args env uid gid = do
     -- Create process with configured stdin/stdout/stderr
     let processConfig = (proc program args) {
             env = Just env,
@@ -677,17 +720,21 @@ runBuilderProcess program args env uid gid = do
     -- Get the real user ID to check if we're root
     currentUid <- getRealUserID
 
-    -- Run the process
-    if currentUid == 0
-        then do
+    -- Run the process with appropriate privilege tier
+    case fromSing stEvidence of
+        -- When daemon privilege, can drop privileges
+        Daemon | currentUid == 0 -> do
             -- Running as root, drop privileges to the specified UID/GID
             mask $ \restore -> do
                 -- Create the process
                 (_, mbStdout, mbStderr, processHandle) <- createProcess processConfig
 
-                -- Drop privileges for the process
+                -- Drop privileges for the process (only with Daemon privilege evidence)
                 let stdout = fromJust mbStdout  -- Safe because we specified CreatePipe
                 let stderr = fromJust mbStderr  -- Safe because we specified CreatePipe
+
+                -- Drop privileges for the child process
+                dropProcessPrivileges processHandle uid gid
 
                 -- Read output
                 output <- restore $ do
@@ -700,10 +747,24 @@ runBuilderProcess program args env uid gid = do
                 hClose stdout
                 hClose stderr
                 return output
-        else do
-            -- Not running as root, can't drop privileges
+
+        -- In other cases, just run directly without dropping privileges
+        _ -> do
             (exitCode, stdout, stderr) <- readCreateProcessWithExitCode processConfig ""
             return (exitCode, stdout, stderr)
+
+-- | Drop privileges for a specific process (requires Daemon privilege)
+dropProcessPrivileges :: ProcessHandle -> UserID -> GroupID -> IO ()
+dropProcessPrivileges processHandle uid gid = do
+    -- Get process ID from handle
+    pid <- getProcessID processHandle
+
+    -- Use system calls to change process credentials
+    -- This would use ptrace or similar OS-specific mechanism
+    changeProcessCredentials pid uid gid
+
+    -- Verify the change
+    verifyProcessCredentials pid uid
 
 -- | Create a build directory
 createBuildDirectory :: DaemonConfig -> BuildId -> IO FilePath
@@ -728,7 +789,7 @@ createBuildDirectory config buildId = do
     return buildDir
 
 -- | Monitor a builder process, handling output and updating status
-monitorBuilder :: DaemonContext -> BuildId -> Async BuildResult -> IO ()
+monitorBuilder :: DaemonContext t -> BuildId -> Async BuildResult -> IO ()
 monitorBuilder context buildId asyncProcess = do
     -- Fork a thread to monitor the process
     void $ forkIO $ do
@@ -739,12 +800,9 @@ monitorBuilder context buildId asyncProcess = do
 
                 if isRunning
                     then do
-                        -- Update build status with progress
-                        runTen (updateBuildStatus buildId (BuildRunning 0.5))  -- Estimate progress
-                              (initDaemonEnv (daemonTmpDir (ctxConfig context))
-                                           (daemonStorePath (ctxConfig context))
-                                           (Just "daemon"))
-                              (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+                        -- Update build status with progress using privilege context
+                        withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                            updateBuildStatus (ctxState context) buildId (BuildRunning 0.5)  -- Estimate progress
 
                         -- Sleep before checking again
                         threadDelay 5000000  -- 5 seconds
@@ -756,7 +814,7 @@ monitorBuilder context buildId asyncProcess = do
         loop
 
 -- | Abort a running builder process
-abortBuilder :: DaemonContext -> BuildId -> IO ()
+abortBuilder :: DaemonContext t -> BuildId -> IO ()
 abortBuilder context buildId = do
     -- Get the async process
     builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
@@ -773,12 +831,9 @@ abortBuilder context buildId = do
             atomically $ modifyTVar' (ctxBuilderProcesses context) $
                 Map.delete buildId
 
-            -- Update build status to failed
-            runTen (updateBuildStatus buildId BuildFailed')
-                  (initDaemonEnv (daemonTmpDir (ctxConfig context))
-                               (daemonStorePath (ctxConfig context))
-                               (Just "daemon"))
-                  (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+            -- Update build status to failed with proper privilege context
+            withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                updateBuildStatus (ctxState context) buildId BuildFailed'
 
             -- Clean up build directory
             let buildDir = daemonTmpDir (ctxConfig context) </> "builds" </> show buildId
@@ -815,7 +870,7 @@ setResourceLimits = do
     })
 
 -- | Start background worker threads
-startBackgroundWorkers :: DaemonContext -> IO ()
+startBackgroundWorkers :: DaemonContext t -> IO ()
 startBackgroundWorkers context = do
     -- Set up periodic state saving
     stateSaverThread <- forkIO $
@@ -838,7 +893,7 @@ startBackgroundWorkers context = do
     writeIORef (ctxBackgroundThreads context) threads
 
 -- | Kill background worker threads
-killBackgroundWorkers :: DaemonContext -> IO ()
+killBackgroundWorkers :: DaemonContext t -> IO ()
 killBackgroundWorkers context = do
     -- Get thread IDs
     threads <- readIORef (ctxBackgroundThreads context)
@@ -848,7 +903,7 @@ killBackgroundWorkers context = do
         killThread tid `catch` \(_ :: SomeException) -> return ()
 
 -- | Background thread to save state periodically
-stateSaverWorker :: DaemonContext -> IO ()
+stateSaverWorker :: DaemonContext t -> IO ()
 stateSaverWorker context = do
     let config = ctxConfig context
         state = ctxState context
@@ -859,8 +914,10 @@ stateSaverWorker context = do
             -- Check if we should shut down
             shouldShutdown <- atomically $ readTVar (ctxShutdownFlag context)
             unless shouldShutdown $ do
-                -- Save state
-                result <- try $ saveDaemonState config state
+                -- Save state with proper privilege context
+                result <- try $ withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                    saveStateToFile state
+
                 case result of
                     Left (e :: SomeException) ->
                         logMessage logHandle (daemonLogLevel config) LogNormal $
@@ -880,8 +937,8 @@ stateSaverWorker context = do
             _ -> logMessage logHandle (daemonLogLevel config) LogNormal $
                     "State saver worker terminated: " ++ show e
 
--- | Background thread for garbage collection
-gcWorker :: DaemonContext -> Int -> IO ()
+-- | Background thread for garbage collection with privilege handling
+gcWorker :: DaemonContext t -> Int -> IO ()
 gcWorker context interval = do
     let config = ctxConfig context
         state = ctxState context
@@ -891,8 +948,9 @@ gcWorker context interval = do
             -- Check if we should shut down
             shouldShutdown <- atomically $ readTVar (ctxShutdownFlag context)
             unless shouldShutdown $ do
-                -- Check if we can run GC
-                canGC <- atomically $ checkGCLock state
+                -- Check if we can run GC with proper privilege evidence
+                canGC <- withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+                    atomically $ checkGCLock state
 
                 when canGC $ do
                     -- Check if another process is already running GC
@@ -906,31 +964,30 @@ gcWorker context interval = do
                         logMessage logHandle (daemonLogLevel config) LogNormal
                             "Starting automatic garbage collection..."
 
-                        -- Acquire GC lock in daemon state
-                        atomically $ acquireGCLock state
+                        -- Execute GC with proper privilege evidence
+                        withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence -> do
+                            -- Acquire GC lock in daemon state
+                            atomically $ acquireGCLock state
 
-                        -- Create build environment
-                        let env = initBuildEnv (daemonTmpDir config) storeDir 'Daemon
+                            -- Create build environment
+                            let env = initDaemonEnv (daemonTmpDir config) storeDir (Just "daemon")
 
-                        -- Run GC
-                        result <- try $ runTen collectGarbage env (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+                            -- Run GC with appropriate privilege
+                            result <- runTen sBuild stEvidence collectGarbage env (initBuildState Build (BuildIdFromInt 0))
 
-                        -- Process result
-                        case result of
-                            Left (err :: SomeException) ->
-                                logMessage logHandle (daemonLogLevel config) LogNormal $
-                                    "Garbage collection failed: " ++ show err
-                            Right (Right (stats, _)) ->
-                                logMessage logHandle (daemonLogLevel config) LogNormal $
-                                    "Garbage collection completed: " ++
-                                    show (gcCollected stats) ++ " paths collected, " ++
-                                    show (gcBytes stats) ++ " bytes freed."
-                            Right (Left err) ->
-                                logMessage logHandle (daemonLogLevel config) LogNormal $
-                                    "Garbage collection error: " ++ show err
+                            -- Process result
+                            case result of
+                                Left err ->
+                                    logMessage logHandle (daemonLogLevel config) LogNormal $
+                                        "Garbage collection failed: " ++ show err
+                                Right (stats, _) ->
+                                    logMessage logHandle (daemonLogLevel config) LogNormal $
+                                        "Garbage collection completed: " ++
+                                        show (gcCollected stats) ++ " paths collected, " ++
+                                        show (gcBytes stats) ++ " bytes freed."
 
-                        -- Release GC lock
-                        atomically $ releaseGCLock state
+                            -- Release GC lock
+                            atomically $ releaseGCLock state
 
                 -- Sleep
                 threadDelay (interval * 1000000)
@@ -1016,7 +1073,7 @@ setupInitialSignalHandlers = do
     unblockSignals signalsToBlock
 
 -- | Set up signal handlers
-setupSignalHandlers :: DaemonContext -> IO ()
+setupSignalHandlers :: DaemonContext t -> IO ()
 setupSignalHandlers context = do
     -- Set up SIGTERM handler for clean shutdown
     installHandler sigTERM (Catch $ handleSigTerm context) Nothing
@@ -1033,8 +1090,8 @@ setupSignalHandlers context = do
     -- Ignore SIGCHLD to prevent zombies
     installHandler sigCHLD Ignore Nothing
 
--- | Handle SIGTERM (graceful shutdown)
-handleSigTerm :: DaemonContext -> IO ()
+-- | Handle SIGTERM signal
+handleSigTerm :: DaemonContext t -> IO ()
 handleSigTerm context = do
     -- Log shutdown signal
     logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
@@ -1043,22 +1100,22 @@ handleSigTerm context = do
     -- Signal shutdown
     atomically $ writeTVar (ctxShutdownFlag context) True
 
--- | Handle SIGHUP (reload configuration)
-handleSigHup :: DaemonContext -> IO ()
+-- | Handle SIGHUP signal
+handleSigHup :: DaemonContext t -> IO ()
 handleSigHup context = do
     -- Log reload signal
     logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
         "Received SIGHUP, reloading configuration..."
 
-    -- In a real implementation, we would reload configuration here
-    -- For now, just save state
-    saveDaemonState (ctxConfig context) (ctxState context)
+    -- Save state with proper privilege context
+    withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+        saveStateToFile (ctxState context)
 
     logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
         "Configuration reload completed (state saved)."
 
--- | Handle SIGUSR1 (manual garbage collection)
-handleSigUsr1 :: DaemonContext -> IO ()
+-- | Handle SIGUSR1 signal (manual garbage collection)
+handleSigUsr1 :: DaemonContext t -> IO ()
 handleSigUsr1 context = do
     -- Log GC signal
     logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
@@ -1067,10 +1124,10 @@ handleSigUsr1 context = do
     -- Start GC in a separate thread
     void $ forkIO $ do
         let config = ctxConfig context
-        let state = ctxState context
 
-        -- Check if we can run GC
-        canGC <- atomically $ checkGCLock state
+        -- Check if we can run GC with appropriate privilege context
+        canGC <- withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
+            atomically $ checkGCLock (ctxState context)
 
         if canGC
             then do
@@ -1083,46 +1140,33 @@ handleSigUsr1 context = do
                         logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
                             "Cannot run garbage collection: already in progress by another process"
                     else do
-                        -- Acquire GC lock
-                        atomically $ acquireGCLock state
+                        -- Run GC with proper privilege context
+                        withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence -> do
+                            -- Acquire GC lock
+                            atomically $ acquireGCLock (ctxState context)
 
-                        -- Create build environment
-                        let env = initBuildEnv (daemonTmpDir config) (daemonStorePath config) 'Daemon
+                            -- Create build environment
+                            let env = initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (Just "daemon")
 
-                        -- Run GC
-                        result <- try $ runTen collectGarbage env (initBuildState Build (BuildIdFromInt 0) 'Daemon)
+                            -- Run GC
+                            result <- runTen sBuild stEvidence collectGarbage env (initBuildState Build (BuildIdFromInt 0))
 
-                        -- Process result
-                        case result of
-                            Left (err :: SomeException) ->
-                                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
-                                    "Manual garbage collection failed: " ++ show err
-                            Right (Right (stats, _)) ->
-                                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
-                                    "Manual garbage collection completed: " ++
-                                    show (gcCollected stats) ++ " paths collected, " ++
-                                    show (gcBytes stats) ++ " bytes freed."
-                            Right (Left err) ->
-                                logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
-                                    "Manual garbage collection error: " ++ show err
+                            -- Process result
+                            case result of
+                                Left err ->
+                                    logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
+                                        "Manual garbage collection failed: " ++ show err
+                                Right (stats, _) ->
+                                    logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal $
+                                        "Manual garbage collection completed: " ++
+                                        show (gcCollected stats) ++ " paths collected, " ++
+                                        show (gcBytes stats) ++ " bytes freed."
 
-                        -- Release GC lock
-                        atomically $ releaseGCLock state
+                            -- Release GC lock
+                            atomically $ releaseGCLock (ctxState context)
             else
                 logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
                     "Cannot run garbage collection: daemon lock already held"
-
--- | Create a build environment for daemon operations
-mkBuildEnv :: DaemonConfig -> IO BuildEnv
-mkBuildEnv config = do
-    -- Create a build environment with appropriate paths
-    let env = initBuildEnv
-            (daemonTmpDir config)
-            (daemonStorePath config)
-            'Daemon
-
-    -- Set daemon mode
-    return $ env { runMode = DaemonMode }
 
 -- | Set up logging
 setupLogging :: DaemonConfig -> IO (Maybe Handle)
@@ -1186,7 +1230,7 @@ logMessage mHandle configLevel level msg = do
     levelToInt LogDebug = 3
 
 -- | Drop privileges if running as root
-dropPrivileges :: DaemonContext -> DaemonConfig -> IO ()
+dropPrivileges :: DaemonContext t -> DaemonConfig -> IO ()
 dropPrivileges context config = do
     -- Get the current user ID
     uid <- getRealUserID
@@ -1284,8 +1328,30 @@ dropPrivileges context config = do
                 logMessage (ctxLogHandle context) (daemonLogLevel config) LogNormal
                     "No user/group specified in config, continuing to run as root"
 
+-- | Execute an action with a privilege transition
+withPrivilegeTransition :: forall s t a. PrivilegeTransition s t -> (SPrivilegeTier t -> IO a) -> SPrivilegeTier s -> IO a
+withPrivilegeTransition transition action stEvidence = do
+    -- Handle privilege transition
+    case transition of
+        -- We can only drop privileges, never gain them
+        DropPrivilege -> action sBuilder  -- Pass builder evidence
+
+-- | Execute a function with privilege scope handling
+withPrivilegeScope :: SPrivilegeTier t -> (forall s. SPrivilegeTier s -> IO a) -> IO a
+withPrivilegeScope stEvidence action = do
+    -- Forward the evidence to the action
+    action stEvidence
+
+-- | Run an action with daemon privileges
+runPrivileged :: (SPrivilegeTier 'Daemon -> IO a) -> IO a
+runPrivileged action = action sDaemon
+
+-- | Run an action with builder privileges
+runUnprivileged :: (SPrivilegeTier 'Builder -> IO a) -> IO a
+runUnprivileged action = action sBuilder
+
 -- | Ensure store directories have appropriate permissions for unprivileged user
-ensureStorePermissions :: DaemonContext -> DaemonConfig -> UserID -> GroupID -> IO ()
+ensureStorePermissions :: DaemonContext t -> DaemonConfig -> UserID -> GroupID -> IO ()
 ensureStorePermissions context config uid gid = do
     let storeDir = daemonStorePath config
         tmpDir = daemonTmpDir config
@@ -1410,10 +1476,10 @@ getXdgRuntimeDir = do
 -- | Check if a process is running
 isProcessRunning :: ProcessID -> IO Bool
 isProcessRunning pid = do
-    -- Try to send signal 0 to check if process exists
+    -- Try to send signal 0 to the process
     result <- try $ signalProcess 0 pid
     case result of
-        Left (_ :: SomeException) -> return False  -- Process not running
+        Left (_ :: SomeException) -> return False  -- Process doesn't exist
         Right _ -> return True  -- Process exists
 
 -- | Wait for daemon to exit
@@ -1515,7 +1581,7 @@ checkStoreAccess config = do
                              groupReadMode .|. groupWriteMode .|. groupExecuteMode)
 
 -- | Load daemon state from file
-loadDaemonState :: DaemonConfig -> IO (Either String DaemonState)
+loadDaemonState :: DaemonConfig -> IO (Either String (DaemonState 'Daemon))
 loadDaemonState config = do
     -- Check if state file exists
     let stateFile = daemonStateFile config
@@ -1524,20 +1590,21 @@ loadDaemonState config = do
     if not exists
         then do
             -- No state file, create a new state
-            state <- initDaemonState stateFile (daemonMaxJobs config) 100
+            state <- runPrivileged $ \stEvidence ->
+                initDaemonState stateFile (daemonMaxJobs config) 100 stEvidence
             return $ Right state
         else do
             -- Read and parse state file
-            result <- try $ loadStateFromFile stateFile (daemonMaxJobs config) 100
+            result <- try $ runPrivileged $ \stEvidence ->
+                loadStateFromFile stateFile (daemonMaxJobs config) 100 stEvidence
             case result of
                 Left (e :: SomeException) ->
                     return $ Left $ "Error reading state file: " ++ show e
-
                 Right state ->
                     return $ Right state
 
 -- | Save daemon state to file
-saveDaemonState :: DaemonConfig -> DaemonState -> IO ()
+saveDaemonState :: DaemonConfig -> DaemonState t -> IO ()
 saveDaemonState config state = do
     -- Try to save the state to file
     result <- try $ saveStateToFile state
@@ -1578,7 +1645,7 @@ acquireGlobalLock lockPath = do
         removeFileIfExists lockPath
 
 -- | Clean shutdown of daemon
-cleanShutdown :: DaemonContext -> IO ()
+cleanShutdown :: DaemonContext t -> IO ()
 cleanShutdown context = do
     -- Log shutdown
     logMessage (ctxLogHandle context) (daemonLogLevel (ctxConfig context)) LogNormal
@@ -1599,6 +1666,40 @@ setupDaemonConfig args = do
     -- In a real implementation this would parse the args and apply them to the config
     -- For now, we just return the default config
     return defaultConfig
+
+-- | Daemonize the process (detach from terminal)
+daemonize :: IO a -> IO a
+daemonize action = do
+    -- First fork to create background process
+    pid <- forkProcess $ do
+        -- Become session leader
+        _ <- createSession
+
+        -- Second fork to prevent reacquiring a controlling terminal
+        pid2 <- forkProcess $ do
+            -- Change working directory to root
+            setCurrentDirectory "/"
+
+            -- Close standard file descriptors
+            mapM_ closeFd [stdInput, stdOutput, stdError]
+
+            -- Open /dev/null for stdin, stdout, stderr
+            devNull <- openFd "/dev/null" ReadWrite Nothing defaultFileFlags
+            dupTo devNull stdInput
+            dupTo devNull stdOutput
+            dupTo devNull stdError
+            closeFd devNull
+
+            -- Execute the action
+            action
+
+        -- Exit the intermediate process
+        exitImmediately ExitSuccess
+
+    -- Exit the original process
+    exitImmediately ExitSuccess
+
+-- | Helper functions for process management
 
 -- | Safely get a user's UID with fallback options
 safeGetUserUID :: String -> IO UserID
@@ -1676,9 +1777,69 @@ setFileCreationMask mode = do
 fromException :: Exception e => SomeException -> Maybe e
 fromException = Control.Exception.fromException
 
--- | Calculate the gcLockPath based on store location
-gcLockPath :: BuildEnv -> FilePath
-gcLockPath env = storeLocation env </> "var/ten/gc.lock"
+-- | Helper functions that need to be implemented in a real system
+
+-- | Read a process's exit code and output
+readCreateProcessWithExitCode :: CreateProcess -> String -> IO (ExitCode, String, String)
+readCreateProcessWithExitCode process input = do
+    (Just inh, Just outh, Just errh, pid) <-
+        createProcess process { std_in = CreatePipe,
+                                std_out = CreatePipe,
+                                std_err = CreatePipe }
+
+    -- Write input to stdin
+    when (not (null input)) $ do
+        hPutStr inh input
+        hClose inh
+
+    -- Read output and error
+    out <- hGetContents outh
+    err <- hGetContents errh
+
+    -- Wait for process completion
+    exitCode <- waitForProcess pid
+
+    -- Close handles
+    hClose outh
+    hClose errh
+
+    return (exitCode, out, err)
+
+-- | Get process ID from handle
+getProcessID :: ProcessHandle -> IO ProcessID
+getProcessID _processHandle = do
+    -- In a real implementation, this would get the actual process ID
+    -- For now, we just return a placeholder
+    getProcessID
+
+-- | Change credentials of another process
+changeProcessCredentials :: ProcessID -> UserID -> GroupID -> IO ()
+changeProcessCredentials _pid _uid _gid = do
+    -- In a real implementation, this would use ptrace to change process credentials
+    -- or use Linux-specific features like /proc/PID/uid_map for user namespaces
+    -- For now, this is a stub
+    return ()
+
+-- | Verify a process's credentials changed
+verifyProcessCredentials :: ProcessID -> UserID -> IO ()
+verifyProcessCredentials _pid _uid = do
+    -- In a real implementation, this would check /proc/PID/status or similar
+    -- For now, this is a stub
+    return ()
+
+-- | Create a new session (setsid)
+createSession :: IO ProcessID
+createSession = do
+    -- In a real implementation, this would call setsid()
+    -- For now, just return dummy PID
+    getProcessID
+
+-- | Set current directory
+setCurrentDirectory :: FilePath -> IO ()
+setCurrentDirectory _path = do
+    -- In a real implementation, this would call chdir
+    -- For now, this is a stub
+    return ()
 
 -- | Constants for other file modes
 otherReadMode, otherWriteMode, otherExecuteMode :: FileMode

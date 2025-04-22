@@ -3,15 +3,19 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Ten.Daemon.Client (
-    -- Socket management
+    -- Socket management with privilege awareness
     connectToDaemon,
     disconnectFromDaemon,
     getDefaultSocketPath,
     withDaemonConnection,
 
-    -- Basic client communication
+    -- Client communication with privilege checks
     sendRequest,
     receiveResponse,
     sendRequestSync,
@@ -29,7 +33,7 @@ module Ten.Daemon.Client (
     getBuildOutput,
     listBuilds,
 
-    -- Store operations
+    -- Store operations (with proper privilege handling)
     addFileToStore,
     verifyStorePath,
     getStorePathForFile,
@@ -43,7 +47,7 @@ module Ten.Daemon.Client (
     listDerivations,
     getDerivationInfo,
 
-    -- GC operations
+    -- GC operations (daemon-only, via protocol)
     collectGarbage,
     getGCStatus,
     addGCRoot,
@@ -58,7 +62,7 @@ module Ten.Daemon.Client (
     -- Authentication types re-exports
     UserCredentials(..),
 
-    -- Internal utilities exposed for testing
+    -- Internal utilities
     createSocketAndConnect,
     readResponseWithTimeout,
     encodeRequest,
@@ -67,6 +71,7 @@ module Ten.Daemon.Client (
 
 import Control.Concurrent (forkIO, ThreadId, threadDelay, myThreadId, killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, newMVar, readMVar)
+import Control.Concurrent.STM
 import Control.Exception (catch, finally, bracketOnError, bracket, throwIO, SomeException, try, IOException)
 import Control.Monad (void, when, forever, unless)
 import qualified Data.Aeson as Aeson
@@ -106,22 +111,26 @@ data ConnectionState = ConnectionState {
     csHandle :: Handle,                     -- ^ Handle for socket I/O
     csUserId :: UserId,                     -- ^ Authenticated user ID
     csToken :: AuthToken,                   -- ^ Authentication token
-    csRequestMap :: IORef (Map Int (MVar Response)), -- ^ Map of pending requests
-    csNextReqId :: IORef Int,               -- ^ Next request ID
+    csRequestMap :: TVar (Map Int (MVar Response)), -- ^ Map of pending requests
+    csNextReqId :: TVar Int,                -- ^ Next request ID
     csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
-    csShutdown :: IORef Bool,               -- ^ Flag to indicate connection shutdown
-    csLastError :: IORef (Maybe BuildError) -- ^ Last error encountered
+    csShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
+    csLastError :: TVar (Maybe BuildError), -- ^ Last error encountered
+    csCapabilities :: Set DaemonCapability, -- ^ Granted capabilities from auth
+    csPrivilegeTier :: PrivilegeTier        -- ^ Always 'Builder for client
 }
 
--- | Daemon connection type
+-- | Daemon connection type with privilege context
 data DaemonConnection = DaemonConnection {
     connSocket :: Socket,
     connUserId :: UserId,
     connAuthToken :: AuthToken,
-    connState :: ConnectionState
+    connState :: ConnectionState,
+    -- Builder privilege singleton for runtime evidence
+    connPrivEvidence :: SPrivilegeTier 'Builder
 }
 
--- | Connect to the Ten daemon
+-- | Connect to the Ten daemon - always in Builder context
 connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError DaemonConnection)
 connectToDaemon socketPath credentials = try $ do
     -- Check if daemon is running
@@ -140,20 +149,21 @@ connectToDaemon socketPath credentials = try $ do
     (sock, handle) <- createSocketAndConnect socketPath
 
     -- Initialize request tracking
-    requestMap <- newIORef Map.empty
-    nextReqId <- newIORef 1
-    shutdownFlag <- newIORef False
-    lastError <- newIORef Nothing
+    requestMap <- newTVarIO Map.empty
+    nextReqId <- newTVarIO 1
+    shutdownFlag <- newTVarIO False
+    lastError <- newTVarIO Nothing
 
     -- Authenticate with the daemon
     let authReq = AuthRequest {
             authVersion = currentProtocolVersion,
             authUser = username credentials,
-            authToken = token credentials
+            authToken = token credentials,
+            authRequestedTier = Builder -- Always request Builder tier
         }
 
     -- Encode auth request
-    let reqBS = serializeMessage (AuthRequestMsgWrapper (AuthRequestMsg authReq))
+    let reqBS = serializeMessage (AuthRequestMsg authReq)
 
     -- Send auth request
     BS.hPut handle reqBS
@@ -164,12 +174,10 @@ connectToDaemon socketPath credentials = try $ do
 
     -- Parse and handle the response
     case deserializeMessage respBS of
-        Left err -> do
-            hClose handle
-            close sock
+        Left err ->
             throwIO $ AuthError $ "Authentication failed: " <> err
 
-        Right (AuthResponseMsgWrapper (AuthResponseMsg (AuthAccepted userId authToken))) -> do
+        Right (AuthResponseMsg (AuthAccepted userId authToken capabilities)) -> do
             -- Set up proper handle buffering
             hSetBuffering handle (BlockBuffering Nothing)
 
@@ -186,41 +194,19 @@ connectToDaemon socketPath credentials = try $ do
                     csNextReqId = nextReqId,
                     csReaderThread = readerThread,
                     csShutdown = shutdownFlag,
-                    csLastError = lastError
+                    csLastError = lastError,
+                    csCapabilities = capabilities,
+                    csPrivilegeTier = Builder -- Always 'Builder for client
                 }
 
-            -- Return connection object
-            return $ DaemonConnection sock userId authToken connState
+            -- Get singleton evidence for Builder context
+            let privilegeEvidence = SBuilder
 
-        Right (AuthResponseMsgWrapper (AuthResponseMsg (AuthRejected reason))) -> do
-            hClose handle
-            close sock
+            -- Return connection object with privilege evidence
+            return $ DaemonConnection sock userId authToken connState privilegeEvidence
+
+        Right (AuthResponseMsg (AuthRejected reason)) ->
             throwIO $ AuthError $ "Authentication rejected: " <> reason
-
-        Right (AuthResponseMsgWrapper (AuthResponseMsg (AuthSuccess userId authToken))) -> do
-            -- For backward compatibility with older daemons
-            hSetBuffering handle (BlockBuffering Nothing)
-
-            readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag lastError
-
-            let connState = ConnectionState {
-                    csSocket = sock,
-                    csHandle = handle,
-                    csUserId = userId,
-                    csToken = authToken,
-                    csRequestMap = requestMap,
-                    csNextReqId = nextReqId,
-                    csReaderThread = readerThread,
-                    csShutdown = shutdownFlag,
-                    csLastError = lastError
-                }
-
-            return $ DaemonConnection sock userId authToken connState
-
-        Right _ -> do
-            hClose handle
-            close sock
-            throwIO $ DaemonError "Invalid authentication response from daemon"
 
 -- | Disconnect from the Ten daemon
 disconnectFromDaemon :: DaemonConnection -> IO ()
@@ -229,7 +215,7 @@ disconnectFromDaemon conn = do
     let state = connState conn
 
     -- Signal reader thread to shut down
-    writeIORef (csShutdown state) True
+    atomically $ writeTVar (csShutdown state) True
 
     -- Close socket handle and socket
     catch (hClose $ csHandle state) (\(_ :: IOException) -> return ())
@@ -294,36 +280,55 @@ createSocketAndConnect socketPath = do
             handle <- socketToHandle s ReadWriteMode
             return (s, handle))
 
--- | Send a request to the daemon
-sendRequest :: DaemonConnection -> DaemonRequest -> IO Int
-sendRequest conn request = do
-    -- Extract connection state
-    let state = connState conn
+-- | Send a request to the daemon with privilege checking
+sendRequest :: SPrivilegeTier 'Builder -> DaemonConnection -> DaemonRequest -> IO (Either PrivilegeError Int)
+sendRequest st conn request = do
+    -- Get request capabilities and privilege requirement
+    let capabilities = requestCapabilities request
+        privReq = requestPrivilegeRequirement request
 
-    -- Generate request ID
-    reqId <- atomicModifyIORef' (csNextReqId state) (\id -> (id + 1, id))
+    -- Verify capabilities against Builder tier
+    case verifyCapabilities st capabilities of
+        Left err -> return $ Left err
+        Right () ->
+            -- Check privilege requirement (Builder vs Daemon)
+            case checkPrivilegeRequirement st privReq of
+                Left err -> return $ Left err
+                Right () -> do
+                    -- Extract connection state
+                    let state = connState conn
 
-    -- Create response MVar
-    respVar <- newEmptyMVar
+                    -- Generate request ID
+                    reqId <- atomically $ do
+                        rid <- readTVar (csNextReqId state)
+                        writeTVar (csNextReqId state) (rid + 1)
+                        return rid
 
-    -- Register request
-    atomicModifyIORef' (csRequestMap state) (\m -> (Map.insert reqId respVar m, ()))
+                    -- Create response MVar
+                    respVar <- newEmptyMVar
 
-    -- Convert to Protocol.Request type
-    let req = Request (requestTypeToTag request) (Aeson.toJSON request)
+                    -- Register request
+                    atomically $ modifyTVar' (csRequestMap state) $ Map.insert reqId respVar
 
-    -- Create protocol message
-    let msg = RequestMsgWrapper (RequestMsg reqId req)
+                    -- Create protocol message with privilege evidence
+                    let reqMsg = RequestMessage {
+                            reqId = reqId,
+                            reqTag = requestTypeToTag request,
+                            reqPayload = Aeson.toJSON request,
+                            reqCapabilities = capabilities,
+                            reqPrivilege = privReq,
+                            reqAuth = Just (connAuthToken conn)
+                        }
 
-    -- Serialize message
-    let serialized = serializeMessage msg
+                    -- Serialize message
+                    let serialized = serializeMessage (RequestMsg reqMsg)
 
-    -- Send message
-    BS.hPut (csHandle state) serialized
-    hFlush (csHandle state)
+                    -- Send message
+                    BS.hPut (csHandle state) serialized
+                    hFlush (csHandle state)
 
-    -- Return request ID for tracking
-    return reqId
+                    -- Return request ID for tracking
+                    return $ Right reqId
 
 -- | Receive a response for a specific request
 receiveResponse :: DaemonConnection -> Int -> Int -> IO (Either BuildError Response)
@@ -332,8 +337,8 @@ receiveResponse conn reqId timeoutMicros = do
     let state = connState conn
 
     -- Get response MVar
-    respVarMap <- readIORef (csRequestMap state)
-    case Map.lookup reqId respVarMap of
+    reqMap <- atomically $ readTVar (csRequestMap state)
+    case Map.lookup reqId reqMap of
         Nothing ->
             -- No such request ID
             return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
@@ -343,10 +348,10 @@ receiveResponse conn reqId timeoutMicros = do
             result <- timeout timeoutMicros $ takeMVar respVar
 
             -- Clean up request map
-            atomicModifyIORef' (csRequestMap state) (\m -> (Map.delete reqId m, ()))
+            atomically $ modifyTVar' (csRequestMap state) $ Map.delete reqId
 
             -- Check for error
-            lastErr <- readIORef (csLastError state)
+            lastErr <- atomically $ readTVar (csLastError state)
 
             -- Return response or error
             case (result, lastErr) of
@@ -354,46 +359,53 @@ receiveResponse conn reqId timeoutMicros = do
                     return $ Left $ DaemonError "Timeout waiting for daemon response"
                 (_, Just err) -> do
                     -- Clear the error
-                    writeIORef (csLastError state) Nothing
+                    atomically $ writeTVar (csLastError state) Nothing
                     return $ Left err
                 (Just resp, _) ->
                     return $ Right resp
 
--- | Send a request and wait for response (synchronous)
+-- | Send a request and wait for response (synchronous) with privilege checking
 sendRequestSync :: DaemonConnection -> DaemonRequest -> Int -> IO (Either BuildError DaemonResponse)
 sendRequestSync conn request timeoutMicros = do
-    -- Send request and get ID
-    reqId <- sendRequest conn request
+    -- Send request with privilege evidence
+    reqIdResult <- sendRequest (connPrivEvidence conn) conn request
 
-    -- Wait for response
-    respResult <- receiveResponse conn reqId timeoutMicros
-
-    -- Process the response
-    case respResult of
+    -- Process result
+    case reqIdResult of
         Left err ->
-            return $ Left err
+            -- Return privilege error
+            return $ Left $ PrivilegeError $ T.pack $ show err
 
-        Right resp ->
-            -- Convert to Response type
-            case responseToResponseData resp of
+        Right reqId -> do
+            -- Wait for response
+            respResult <- receiveResponse conn reqId timeoutMicros
+
+            -- Process the response
+            case respResult of
                 Left err ->
-                    return $ Left $ DaemonError $ "Failed to decode response: " <> err
-                Right respData ->
-                    return $ Right respData
+                    return $ Left err
+
+                Right resp ->
+                    -- Convert to Response type
+                    case responseToResponseData resp of
+                        Left err ->
+                            return $ Left $ DaemonError $ "Failed to decode response: " <> err
+                        Right respData ->
+                            return $ Right respData
 
 -- | Background thread to read and dispatch responses
-responseReaderThread :: Handle -> IORef (Map Int (MVar Response)) -> IORef Bool -> IORef (Maybe BuildError) -> IO ()
+responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> TVar (Maybe BuildError) -> IO ()
 responseReaderThread handle requestMap shutdownFlag lastError = do
     let loop = do
             -- Check if we should shut down
-            shutdown <- readIORef shutdownFlag
+            shutdown <- atomically $ readTVar shutdownFlag
             unless shutdown $ do
                 -- Try to read a message with error handling
                 result <- try $ readMessage handle
                 case result of
                     Left (e :: SomeException) -> do
                         -- Socket error, write to lastError and exit thread
-                        writeIORef lastError $ Just $ DaemonError $ "Connection error: " <> T.pack (show e)
+                        atomically $ writeTVar lastError $ Just $ DaemonError $ "Connection error: " <> T.pack (show e)
                         return ()
 
                     Right msgBS -> do
@@ -401,21 +413,35 @@ responseReaderThread handle requestMap shutdownFlag lastError = do
                         case deserializeMessage msgBS of
                             Left err -> do
                                 -- Parsing error, write to lastError and continue
-                                writeIORef lastError $ Just $ DaemonError $ "Protocol error: " <> err
+                                atomically $ writeTVar lastError $ Just $ DaemonError $ "Protocol error: " <> err
                                 loop
 
-                            Right (ResponseMsgWrapper (ResponseMsg reqId resp)) -> do
+                            Right (ResponseMsg reqId resp) -> do
                                 -- Look up request
-                                reqMap <- readIORef requestMap
+                                reqMap <- atomically $ readTVar requestMap
                                 case Map.lookup reqId reqMap of
                                     Nothing ->
                                         -- Unknown request ID, ignore and continue
                                         loop
 
                                     Just respVar -> do
-                                        -- Deliver response
-                                        putMVar respVar resp
-                                        loop
+                                        -- Check privilege requirements for response
+                                        let privRequirement = responsePrivilegeRequirement resp
+
+                                        -- Builder context can only receive unprivileged responses
+                                        case privRequirement of
+                                            PrivilegedResponse -> do
+                                                -- Cannot receive privileged response in builder context
+                                                atomically $ writeTVar lastError $ Just $ PrivilegeError
+                                                    "Received privileged response in builder context"
+                                                -- Still deliver to unblock waiting thread
+                                                putMVar respVar resp
+                                                loop
+
+                                            UnprivilegedResponse -> do
+                                                -- Deliver response
+                                                putMVar respVar resp
+                                                loop
 
                             Right _ ->
                                 -- Other message type, ignore and continue
@@ -424,11 +450,11 @@ responseReaderThread handle requestMap shutdownFlag lastError = do
     -- Start the loop and handle exceptions
     loop `catch` (\(e :: SomeException) -> do
         -- Store the error
-        writeIORef lastError $ Just $ DaemonError $ "Connection error: " <> T.pack (show e)
+        atomically $ writeTVar lastError $ Just $ DaemonError $ "Connection error: " <> T.pack (show e)
         -- Continue loop if the socket is still open
-        unlessM (readIORef shutdownFlag) loop)
+        unlessM (atomically $ readTVar shutdownFlag) loop)
 
--- | Read a message from a handle with timeout
+-- | Read a message with timeout
 readMessageWithTimeout :: Handle -> Int -> IO BS.ByteString
 readMessageWithTimeout handle timeoutMicros = do
     result <- timeout timeoutMicros $ readMessage handle
@@ -659,8 +685,7 @@ cancelBuild conn buildId = do
         Left err ->
             return $ Left err
 
-        Right ShutdownResponse ->
-            -- For backward compatibility with older daemons
+        Right CancelBuildResponse ->
             return $ Right ()
 
         Right resp ->
@@ -736,7 +761,7 @@ listBuilds conn limit = do
             return $ Left $ DaemonError $
                 "Invalid response type for list builds request: " <> T.pack (show resp)
 
--- | Add a file to the store
+-- | Add a file to the store (requires daemon privileges via protocol)
 addFileToStore :: DaemonConnection -> FilePath -> IO (Either BuildError StorePath)
 addFileToStore conn filePath = do
     -- Check file existence
@@ -844,16 +869,15 @@ listStore conn = do
             return $ Left $ DaemonError $
                 "Invalid response type for store list request: " <> T.pack (show resp)
 
--- | Store a derivation in the daemon store
+-- | Store a derivation in the daemon store (requires daemon privileges via protocol)
 storeDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError StorePath)
 storeDerivation conn derivation = do
     -- Serialize the derivation
     let serialized = serializeDerivation derivation
 
     -- Create store derivation request
-    let request = StoreDerivationCmd StoreDerivationRequest
+    let request = StoreDerivationRequest
             { derivationContent = serialized
-            , registerOutputs = True
             }
 
     -- Send request and wait for response
@@ -875,9 +899,8 @@ storeDerivation conn derivation = do
 retrieveDerivation :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
 retrieveDerivation conn path = do
     -- Create retrieve derivation request
-    let request = RetrieveDerivationCmd RetrieveDerivationRequest
+    let request = RetrieveDerivationRequest
             { derivationPath = path
-            , includeOutputs = True
             }
 
     -- Send request and wait for response
@@ -925,7 +948,7 @@ queryDerivationForOutput conn outputPath = do
 queryOutputsForDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError (Set StorePath))
 queryOutputsForDerivation conn derivation = do
     -- Create query derivation outputs request
-    let request = QueryDerivationCmd QueryDerivationRequest
+    let request = QueryDerivationRequest
             { queryType = "outputs"
             , queryValue = derivHash derivation
             , queryLimit = Nothing
@@ -970,10 +993,10 @@ listDerivations conn = do
                 "Invalid response type for list derivations request: " <> T.pack (show resp)
 
 -- | Get detailed information about a derivation
-getDerivationInfo :: DaemonConnection -> StorePath -> IO (Either BuildError DerivationInfoResponse)
+getDerivationInfo :: DaemonConnection -> StorePath -> IO (Either BuildError DerivationInfo)
 getDerivationInfo conn path = do
     -- Create query derivation info request
-    let request = QueryDerivationCmd QueryDerivationRequest
+    let request = QueryDerivationRequest
             { queryType = "info"
             , queryValue = storePathToText path
             , queryLimit = Just 1
@@ -994,7 +1017,7 @@ getDerivationInfo conn path = do
             return $ Left $ DaemonError $
                 "Invalid response type for get derivation info request: " <> T.pack (show resp)
 
--- | Run garbage collection
+-- | Run garbage collection (requires daemon privileges via protocol)
 collectGarbage :: DaemonConnection -> Bool -> IO (Either BuildError GCStats)
 collectGarbage conn force = do
     -- Create GC request
@@ -1018,11 +1041,11 @@ collectGarbage conn force = do
                 "Invalid response type for GC request: " <> T.pack (show resp)
 
 -- | Get GC status
-getGCStatus :: DaemonConnection -> Bool -> IO (Either BuildError GCStatusResponseData)
+getGCStatus :: DaemonConnection -> Bool -> IO (Either BuildError GCStatusResponse)
 getGCStatus conn forceCheck = do
     -- Create GC status request
-    let request = GCStatusCmd GCStatusRequestData
-            { forceCheck = forceCheck
+    let request = GCStatusRequest
+            { gcForceCheck = forceCheck
             }
 
     -- Send request and wait for response
@@ -1040,7 +1063,7 @@ getGCStatus conn forceCheck = do
             return $ Left $ DaemonError $
                 "Invalid response type for GC status request: " <> T.pack (show resp)
 
--- | Add a GC root
+-- | Add a GC root (requires daemon privileges via protocol)
 addGCRoot :: DaemonConnection -> StorePath -> Text -> Bool -> IO (Either BuildError Text)
 addGCRoot conn path name permanent = do
     -- Create add GC root request
@@ -1065,7 +1088,7 @@ addGCRoot conn path name permanent = do
             return $ Left $ DaemonError $
                 "Invalid response type for add GC root request: " <> T.pack (show resp)
 
--- | Remove a GC root
+-- | Remove a GC root (requires daemon privileges via protocol)
 removeGCRoot :: DaemonConnection -> Text -> IO (Either BuildError Text)
 removeGCRoot conn name = do
     -- Create remove GC root request
@@ -1109,7 +1132,7 @@ listGCRoots conn = do
             return $ Left $ DaemonError $
                 "Invalid response type for list GC roots request: " <> T.pack (show resp)
 
--- | Shutdown the daemon
+-- | Shutdown the daemon (requires daemon privileges via protocol)
 shutdownDaemon :: DaemonConnection -> IO (Either BuildError ())
 shutdownDaemon conn = do
     -- Create shutdown request
@@ -1172,34 +1195,142 @@ getDaemonConfig conn = do
             return $ Left $ DaemonError $
                 "Invalid response type for config request: " <> T.pack (show resp)
 
+-- | Helper function for control flow - unlessM
+unlessM :: Monad m => m Bool -> m () -> m ()
+unlessM cond action = do
+    result <- cond
+    unless result action
+
 -- | Map protocol request type to tag
 requestTypeToTag :: DaemonRequest -> RequestTag
-requestTypeToTag (AuthCmd _ _) = TagAuth
-requestTypeToTag (BuildRequest _ _ _) = TagBuild
-requestTypeToTag (EvalRequest _ _ _) = TagEval
-requestTypeToTag (BuildDerivationRequest _ _) = TagBuildDerivation
-requestTypeToTag (BuildStatusRequest _) = TagBuildStatus
-requestTypeToTag (CancelBuildRequest _) = TagCancelBuild
-requestTypeToTag (QueryBuildOutputRequest _) = TagQueryBuildOutput
-requestTypeToTag (ListBuildsRequest _) = TagListBuilds
-requestTypeToTag (StoreAddRequest _ _) = TagStoreAdd
-requestTypeToTag (StoreVerifyRequest _) = TagStoreVerify
-requestTypeToTag (StorePathRequest _ _) = TagStorePath
-requestTypeToTag StoreListRequest = TagStoreList
-requestTypeToTag (StoreDerivationCmd _) = TagStoreDerivation
-requestTypeToTag (RetrieveDerivationCmd _) = TagRetrieveDerivation
-requestTypeToTag (QueryDerivationCmd _) = TagQueryDerivation
-requestTypeToTag (GetDerivationForOutputRequest _) = TagGetDerivationForOutput
-requestTypeToTag (ListDerivationsRequest _) = TagListDerivations
-requestTypeToTag (GCRequest _) = TagGC
-requestTypeToTag (GCStatusCmd _) = TagGCStatus
-requestTypeToTag (AddGCRootRequest _ _ _) = TagAddGCRoot
-requestTypeToTag (RemoveGCRootRequest _) = TagRemoveGCRoot
-requestTypeToTag ListGCRootsRequest = TagListGCRoots
-requestTypeToTag PingRequest = TagPing
-requestTypeToTag ShutdownRequest = TagShutdown
-requestTypeToTag StatusRequest = TagStatus
-requestTypeToTag ConfigRequest = TagConfig
+requestTypeToTag = \case
+    BuildRequest {} -> TagBuild
+    EvalRequest {} -> TagEval
+    BuildDerivationRequest {} -> TagBuildDerivation
+    BuildStatusRequest {} -> TagBuildStatus
+    CancelBuildRequest {} -> TagCancelBuild
+    QueryBuildOutputRequest {} -> TagQueryBuildOutput
+    ListBuildsRequest {} -> TagListBuilds
+    StoreAddRequest {} -> TagStoreAdd
+    StoreVerifyRequest {} -> TagStoreVerify
+    StorePathRequest {} -> TagStorePath
+    StoreListRequest -> TagStoreList
+    StoreDerivationRequest {} -> TagStoreDerivation
+    RetrieveDerivationRequest {} -> TagRetrieveDerivation
+    QueryDerivationRequest {} -> TagQueryDerivation
+    GetDerivationForOutputRequest {} -> TagGetDerivationForOutput
+    ListDerivationsRequest {} -> TagListDerivations
+    GCRequest {} -> TagGC
+    GCStatusRequest {} -> TagGCStatus
+    AddGCRootRequest {} -> TagAddGCRoot
+    RemoveGCRootRequest {} -> TagRemoveGCRoot
+    ListGCRootsRequest -> TagListGCRoots
+    PingRequest -> TagPing
+    ShutdownRequest -> TagShutdown
+    StatusRequest -> TagStatus
+    ConfigRequest -> TagConfig
+
+-- | Check if a response requires privileged context
+responsePrivilegeRequirement :: Response -> ResponsePrivilege
+responsePrivilegeRequirement = \case
+    -- Responses containing privileged information
+    StoreAddResponse {} -> PrivilegedResponse
+    GCResponse {} -> PrivilegedResponse
+    DerivationStoredResponse {} -> PrivilegedResponse
+    GCRootAddedResponse {} -> PrivilegedResponse
+    GCRootRemovedResponse {} -> PrivilegedResponse
+
+    -- Responses that can be received in any context
+    BuildResponse {} -> UnprivilegedResponse
+    BuildStatusResponse {} -> UnprivilegedResponse
+    StoreVerifyResponse {} -> UnprivilegedResponse
+    StoreListResponse {} -> UnprivilegedResponse
+    DerivationResponse {} -> UnprivilegedResponse
+    DerivationRetrievedResponse {} -> UnprivilegedResponse
+    BuildOutputResponse {} -> UnprivilegedResponse
+    BuildListResponse {} -> UnprivilegedResponse
+    DerivationOutputResponse {} -> UnprivilegedResponse
+    DerivationListResponse {} -> UnprivilegedResponse
+    GCStatusResponse {} -> UnprivilegedResponse
+    GCRootsListResponse {} -> UnprivilegedResponse
+    CancelBuildResponse {} -> UnprivilegedResponse
+    StatusResponse {} -> UnprivilegedResponse
+    ConfigResponse {} -> UnprivilegedResponse
+    ShutdownResponse -> UnprivilegedResponse
+    PongResponse -> UnprivilegedResponse
+
+    -- By default, treat as unprivileged
+    _ -> UnprivilegedResponse
+
+-- | Required capabilities for requests
+requestCapabilities :: DaemonRequest -> Set DaemonCapability
+requestCapabilities = \case
+    -- Store operations
+    StoreAddRequest {} -> Set.singleton StoreAccess
+    StoreVerifyRequest {} -> Set.singleton StoreQuery
+    StorePathRequest {} -> Set.singleton StoreQuery
+    StoreListRequest -> Set.singleton StoreQuery
+
+    -- Build operations
+    BuildRequest {} -> Set.singleton DerivationBuild
+    EvalRequest {} -> Set.singleton DerivationBuild
+    BuildDerivationRequest {} -> Set.singleton DerivationBuild
+    BuildStatusRequest {} -> Set.singleton BuildQuery
+    CancelBuildRequest {} -> Set.singleton BuildQuery
+    QueryBuildOutputRequest {} -> Set.singleton BuildQuery
+    ListBuildsRequest {} -> Set.singleton BuildQuery
+
+    -- GC operations
+    GCRequest {} -> Set.singleton GarbageCollection
+    GCStatusRequest {} -> Set.singleton BuildQuery
+    AddGCRootRequest {} -> Set.singleton GarbageCollection
+    RemoveGCRootRequest {} -> Set.singleton GarbageCollection
+    ListGCRootsRequest -> Set.singleton BuildQuery
+
+    -- Derivation operations
+    StoreDerivationRequest {} -> Set.fromList [DerivationRegistration, StoreAccess]
+    RetrieveDerivationRequest {} -> Set.singleton StoreQuery
+    QueryDerivationRequest {} -> Set.singleton StoreQuery
+    GetDerivationForOutputRequest {} -> Set.singleton StoreQuery
+    ListDerivationsRequest {} -> Set.singleton StoreQuery
+
+    -- Administrative operations
+    StatusRequest -> Set.singleton BuildQuery
+    ConfigRequest -> Set.singleton BuildQuery
+    ShutdownRequest -> Set.singleton GarbageCollection
+    PingRequest -> Set.singleton BuildQuery
+
+-- | Privilege requirement for requests
+requestPrivilegeRequirement :: DaemonRequest -> RequestPrivilege
+requestPrivilegeRequirement = \case
+    -- Operations requiring daemon privileges
+    StoreAddRequest {} -> PrivilegedRequest
+    StoreDerivationRequest {} -> PrivilegedRequest
+    GCRequest {} -> PrivilegedRequest
+    AddGCRootRequest {} -> PrivilegedRequest
+    RemoveGCRootRequest {} -> PrivilegedRequest
+    ShutdownRequest -> PrivilegedRequest
+
+    -- Operations that can be done from either context
+    BuildRequest {} -> UnprivilegedRequest
+    EvalRequest {} -> UnprivilegedRequest
+    BuildDerivationRequest {} -> UnprivilegedRequest
+    BuildStatusRequest {} -> UnprivilegedRequest
+    CancelBuildRequest {} -> UnprivilegedRequest
+    QueryBuildOutputRequest {} -> UnprivilegedRequest
+    ListBuildsRequest {} -> UnprivilegedRequest
+    StoreVerifyRequest {} -> UnprivilegedRequest
+    StorePathRequest {} -> UnprivilegedRequest
+    StoreListRequest -> UnprivilegedRequest
+    RetrieveDerivationRequest {} -> UnprivilegedRequest
+    QueryDerivationRequest {} -> UnprivilegedRequest
+    GetDerivationForOutputRequest {} -> UnprivilegedRequest
+    ListDerivationsRequest {} -> UnprivilegedRequest
+    GCStatusRequest {} -> UnprivilegedRequest
+    ListGCRootsRequest -> UnprivilegedRequest
+    StatusRequest -> UnprivilegedRequest
+    ConfigRequest -> UnprivilegedRequest
+    PingRequest -> UnprivilegedRequest
 
 -- | Bitwise operations for message length encoding/decoding
 shiftL :: Int -> Int -> Int
@@ -1207,9 +1338,3 @@ shiftL x n = x * (2 ^ n)
 
 (.|.) :: Int -> Int -> Int
 a .|. b = a + b
-
--- | Helper function for control flow - unlessM
-unlessM :: Monad m => m Bool -> m () -> m ()
-unlessM cond action = do
-    result <- cond
-    unless result action

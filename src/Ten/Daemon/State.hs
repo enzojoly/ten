@@ -4,6 +4,16 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module Ten.Daemon.State (
     -- Core state types
@@ -14,6 +24,13 @@ module Ten.Daemon.State (
     initDaemonState,
     loadStateFromFile,
     saveStateToFile,
+    populateState,
+
+    -- Privilege-aware state transitions
+    withDaemonState,
+    asDaemonState,
+    asBuilderState,
+    transitionStatePrivilege,
 
     -- Active build tracking
     ActiveBuild(..),
@@ -52,6 +69,7 @@ module Ten.Daemon.State (
     releaseGCLock,
     withGCLock,
     checkGCLock,
+    tryAcquireGCLock,
 
     -- System statistics
     DaemonStats(..),
@@ -62,6 +80,7 @@ module Ten.Daemon.State (
     hasPendingBuilds,
     hasActiveBuild,
     getNextBuildToSchedule,
+    hasBuildCapacity,
 
     -- Background maintenance
     pruneCompletedBuilds,
@@ -120,11 +139,16 @@ import Data.Ord (comparing)
 import System.Posix.Signals (Signal)
 import System.Posix.Files.ByteString (createLink, removeLink)
 import qualified Data.ByteString.Char8 as BC
+import Data.Singletons
+import Data.Singletons.TH
+import Data.Kind (Type)
 
 -- Import Ten modules
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), UserId(..),
-                 AuthToken(..), BuildState(..), BuildStrategy(..),
-                 BuildEnv(..), runTen, Phase(..), getGCLockPath, ensureLockDirExists)
+                 AuthToken(..), BuildState(..), BuildStrategy(..), Phase(..), PrivilegeTier(..),
+                 SPrivilegeTier(..), BuildEnv(..), runTen, Phase(..), getGCLockPath, ensureLockDirExists,
+                 CanAccessStore, CanCreateSandbox, CanModifyStore, CanDropPrivileges, CanAccessDatabase,
+                 storePathToText, storePathToFilePath)
 import Ten.Derivation (Derivation, DerivationInput, DerivationOutput,
                       derivationEquals, derivHash, hashDerivation)
 import Ten.Build (BuildResult(..))
@@ -140,6 +164,7 @@ data StateError
     | StateFormatError Text
     | StateVersionError Text
     | StateResourceError Text
+    | StatePrivilegeError Text  -- New: error when privilege constraints violated
     deriving (Show, Eq)
 
 instance Exception StateError
@@ -158,13 +183,14 @@ data ActiveBuild = ActiveBuild {
     abDerivationChain :: TVar [Derivation],  -- Chain for return-continuation
     abProcessId :: TVar (Maybe ProcessID),
     abTimeout :: Maybe Int,  -- Timeout in seconds
-    abThread :: TVar (Maybe (Async ()))  -- Reference to build thread
+    abThread :: TVar (Maybe (Async ())),  -- Reference to build thread
+    abPrivilegeTier :: PrivilegeTier  -- Which tier initiated this build
 } deriving (Eq)
 
 instance Show ActiveBuild where
     show ActiveBuild{..} = "ActiveBuild { id = " ++ show abBuildId ++
                           ", derivation = " ++ show (derivHash abDerivation) ++
-                          ", owner = " ++ show abOwner ++ " }"
+                          ", owner = " ++ show abOwner ++ ", tier = " ++ show abPrivilegeTier ++ " }"
 
 -- | Build queue entry
 data BuildQueueEntry = BuildQueueEntry {
@@ -173,7 +199,8 @@ data BuildQueueEntry = BuildQueueEntry {
     bqOwner :: UserId,
     bqPriority :: Int,
     bqEnqueueTime :: UTCTime,
-    bqDependencies :: Set BuildId  -- Dependencies that must complete first
+    bqDependencies :: Set BuildId,  -- Dependencies that must complete first
+    bqPrivilegeTier :: PrivilegeTier -- Which tier queued this build
 } deriving (Show, Eq)
 
 -- | Build queue
@@ -185,8 +212,20 @@ data BuildQueue = BuildQueue {
 instance Show BuildQueue where
     show BuildQueue{..} = "BuildQueue { maxPending = " ++ show bqMaxPending ++ " }"
 
--- | Comprehensive daemon state
-data DaemonState = DaemonState {
+-- | System statistics
+data DaemonStats = DaemonStats {
+    statsBuildsTotalCompleted :: Int,
+    statsBuildsTotalFailed :: Int,
+    statsCPUUsage :: Double,  -- CPU usage (0-100%)
+    statsMemoryUsage :: Integer,  -- Memory usage in bytes
+    statsStoreSize :: Integer,  -- Store size in bytes
+    statsStoreEntries :: Int,  -- Number of store entries
+    statsSystemLoad :: [Double],  -- Load averages (1, 5, 15 min)
+    statsLastUpdated :: UTCTime
+} deriving (Show, Eq)
+
+-- | Comprehensive daemon state with privilege phantom type parameter
+data DaemonState (t :: PrivilegeTier) = DaemonState {
     -- Build tracking
     dsActiveBuilds :: TVar (Map BuildId ActiveBuild),
     dsBuildQueue :: BuildQueue,
@@ -219,24 +258,22 @@ data DaemonState = DaemonState {
     dsStateFilePath :: FilePath,
     dsMaxCompletedBuilds :: Int,
     dsMaxFailedBuilds :: Int,
-    dsMaxConcurrentBuilds :: Int
-} deriving (Eq)
+    dsMaxConcurrentBuilds :: Int,
 
--- | System statistics
-data DaemonStats = DaemonStats {
-    statsBuildsTotalCompleted :: Int,
-    statsBuildsTotalFailed :: Int,
-    statsCPUUsage :: Double,  -- CPU usage (0-100%)
-    statsMemoryUsage :: Integer,  -- Memory usage in bytes
-    statsStoreSize :: Integer,  -- Store size in bytes
-    statsStoreEntries :: Int,  -- Number of store entries
-    statsSystemLoad :: [Double],  -- Load averages (1, 5, 15 min)
-    statsLastUpdated :: UTCTime
-} deriving (Show, Eq)
+    -- Runtime privilege evidence
+    dsPrivilegeEvidence :: SPrivilegeTier t  -- Singleton evidence of privilege tier
+}
 
--- | Initialize a new daemon state
-initDaemonState :: FilePath -> Int -> Int -> IO DaemonState
-initDaemonState stateFile maxJobs maxHistory = do
+-- Custom equality instance that ignores the privilege evidence
+instance Eq (DaemonState t) where
+    a == b = (dsStateFilePath a == dsStateFilePath b) &&
+             (dsMaxCompletedBuilds a == dsMaxCompletedBuilds b) &&
+             (dsMaxFailedBuilds a == dsMaxFailedBuilds b) &&
+             (dsMaxConcurrentBuilds a == dsMaxConcurrentBuilds b)
+
+-- | Initialize a new daemon state with explicit privilege tier
+initDaemonState :: SPrivilegeTier t -> FilePath -> Int -> Int -> IO (DaemonState t)
+initDaemonState st stateFile maxJobs maxHistory = do
     now <- getCurrentTime
 
     activeBuildsVar <- newTVarIO Map.empty
@@ -294,29 +331,76 @@ initDaemonState stateFile maxJobs maxHistory = do
             dsStateFilePath = stateFile,
             dsMaxCompletedBuilds = maxHistory,
             dsMaxFailedBuilds = maxHistory,
-            dsMaxConcurrentBuilds = maxJobs
+            dsMaxConcurrentBuilds = maxJobs,
+            dsPrivilegeEvidence = st
         }
 
     -- Ensure the lock directory exists
     ensureLockDirExists gcLockPath
 
-    -- Set up maintenance thread
-    setupMaintenanceThread state
+    -- Set up maintenance thread (only for Daemon privilege)
+    case fromSing st of
+        Daemon -> setupMaintenanceThread state
+        Builder -> return () -- Builder can't set up maintenance
 
-    -- Set up signal handlers
-    setupSignalHandlers state
+    -- Set up signal handlers (only for Daemon privilege)
+    case fromSing st of
+        Daemon -> setupSignalHandlers state
+        Builder -> return () -- Builder can't set up signal handlers
 
     return state
 
--- | Load daemon state from a file
-loadStateFromFile :: FilePath -> Int -> Int -> IO DaemonState
-loadStateFromFile stateFile maxJobs maxHistory = do
+-- | Helper function to work with daemon state with a specific privilege tier
+withDaemonState ::
+    SPrivilegeTier t -> (forall s. SPrivilegeTier s -> DaemonState s -> IO a) -> DaemonState t -> IO a
+withDaemonState st f state = f st state
+
+-- | Convert state to daemon privilege tier if possible (errors if not possible)
+asDaemonState :: DaemonState t -> IO (DaemonState 'Daemon)
+asDaemonState state = case dsPrivilegeEvidence state of
+    SDaemon -> return state
+    SBuilder -> throwIO $ StateError $ StatePrivilegeError "Cannot treat Builder state as Daemon state"
+
+-- | Convert state to builder privilege tier (always safe since we can drop privileges)
+asBuilderState :: DaemonState t -> DaemonState 'Builder
+asBuilderState state = DaemonState {
+    dsActiveBuilds = dsActiveBuilds state,
+    dsBuildQueue = dsBuildQueue state,
+    dsCompletedBuilds = dsCompletedBuilds state,
+    dsFailedBuilds = dsFailedBuilds state,
+    dsPathLocks = dsPathLocks state,
+    dsReachablePaths = dsReachablePaths state,
+    dsKnownDerivations = dsKnownDerivations state,
+    dsDerivationGraphs = dsDerivationGraphs state,
+    dsGCLock = dsGCLock state,
+    dsGCLockOwner = dsGCLockOwner state,
+    dsGCLockPath = dsGCLockPath state,
+    dsLastGC = dsLastGC state,
+    dsGCStats = dsGCStats state,
+    dsDaemonStats = dsDaemonStats state,
+    dsStartTime = dsStartTime state,
+    dsMaintenanceThread = dsMaintenanceThread state,
+    dsStateFilePath = dsStateFilePath state,
+    dsMaxCompletedBuilds = dsMaxCompletedBuilds state,
+    dsMaxFailedBuilds = dsMaxFailedBuilds state,
+    dsMaxConcurrentBuilds = dsMaxConcurrentBuilds state,
+    dsPrivilegeEvidence = SBuilder
+}
+
+-- | Transition state from one privilege tier to another (can only drop privileges)
+transitionStatePrivilege :: DaemonState 'Daemon -> DaemonState 'Builder
+transitionStatePrivilege = asBuilderState
+
+-- | Load daemon state from a file with proper privilege tier
+loadStateFromFile ::
+    SPrivilegeTier t -> FilePath -> Int -> Int -> IO (DaemonState t)
+loadStateFromFile st stateFile maxJobs maxHistory = do
     -- Check if the file exists
     exists <- doesFileExist stateFile
     if not exists
         then do
             -- Create a new state if the file doesn't exist
-            initDaemonState stateFile maxJobs maxHistory
+            initDaemonState st stateFile maxJobs maxHistory
         else do
             -- Try to load the state from the file
             result <- try $ do
@@ -325,9 +409,9 @@ loadStateFromFile stateFile maxJobs maxHistory = do
                     Left err -> throwIO $ StateError $ StateFormatError $ T.pack err
                     Right stateData -> do
                         -- Initialize a new state
-                        state <- initDaemonState stateFile maxJobs maxHistory
+                        state <- initDaemonState st stateFile maxJobs maxHistory
 
-                        -- Populate it with the loaded data
+                        -- Populate it with the loaded data (respecting privilege tier)
                         populateState state stateData
 
                         return state
@@ -336,11 +420,11 @@ loadStateFromFile stateFile maxJobs maxHistory = do
                 Left (err :: SomeException) -> do
                     -- If anything goes wrong, create a fresh state
                     putStrLn $ "Error loading state: " ++ show err
-                    initDaemonState stateFile maxJobs maxHistory
+                    initDaemonState st stateFile maxJobs maxHistory
                 Right state -> return state
 
--- | Populate state from loaded data
-populateState :: DaemonState -> Aeson.Value -> IO ()
+-- | Populate state from loaded data (same implementation, but now takes a state with phantom type)
+populateState :: DaemonState t -> Aeson.Value -> IO ()
 populateState state jsonData = do
     -- Parse completed builds
     case Aeson.parseEither extractCompletedBuilds jsonData of
@@ -406,8 +490,8 @@ populateState state jsonData = do
         gcStats <- v .: "gcStats"
         return gcStats
 
--- | Save daemon state to a file
-saveStateToFile :: DaemonState -> IO ()
+-- | Save daemon state to a file - requires daemon privilege for file operations
+saveStateToFile :: (CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 saveStateToFile state = do
     -- Create the directory if it doesn't exist
     createDirectoryIfMissing True (takeDirectory (dsStateFilePath state))
@@ -423,7 +507,7 @@ saveStateToFile state = do
     renameFile tempFile (dsStateFilePath state)
 
 -- | Capture the current state as JSON-serializable data
-captureStateData :: DaemonState -> IO Aeson.Value
+captureStateData :: DaemonState t -> IO Aeson.Value
 captureStateData state = do
     -- Read all relevant state data atomically
     (completedBuilds, failedBuilds, reachablePaths, knownDerivations, lastGC, gcStats) <-
@@ -448,13 +532,16 @@ captureStateData state = do
             "gcStats" .= gcStats
         ]
 
--- | Register a new build
-registerBuild :: DaemonState -> Derivation -> UserId -> Int -> Maybe Int -> IO BuildId
+-- | Register a new build - available for both privilege tiers
+registerBuild :: DaemonState t -> Derivation -> UserId -> Int -> Maybe Int -> IO BuildId
 registerBuild state derivation owner priority timeout = do
     -- Generate a new build ID
     buildId <- BuildId <$> newUnique
 
     now <- getCurrentTime
+
+    -- Record the privilege tier that initiated this build
+    let tier = fromSing $ dsPrivilegeEvidence state
 
     -- Check if we're at capacity for concurrent builds
     activeBuildCount <- atomically $ Map.size <$> readTVar (dsActiveBuilds state)
@@ -462,7 +549,7 @@ registerBuild state derivation owner priority timeout = do
     if activeBuildCount >= dsMaxConcurrentBuilds state
         then do
             -- Queue the build
-            queueBuild state buildId derivation owner priority now Set.empty
+            queueBuild state buildId derivation owner priority now Set.empty tier
             return buildId
         else do
             -- Create a new active build
@@ -488,7 +575,8 @@ registerBuild state derivation owner priority timeout = do
                     abDerivationChain = derivationChainVar,
                     abProcessId = processIdVar,
                     abTimeout = timeout,
-                    abThread = threadVar
+                    abThread = threadVar,
+                    abPrivilegeTier = tier
                 }
 
             -- Register the build
@@ -501,22 +589,23 @@ registerBuild state derivation owner priority timeout = do
             return buildId
 
 -- | Queue a build for later execution
-queueBuild :: DaemonState -> BuildId -> Derivation -> UserId -> Int -> UTCTime -> Set BuildId -> IO ()
-queueBuild state buildId derivation owner priority timestamp dependencies = do
+queueBuild :: DaemonState t -> BuildId -> Derivation -> UserId -> Int -> UTCTime -> Set BuildId -> PrivilegeTier -> IO ()
+queueBuild state buildId derivation owner priority timestamp dependencies tier = do
     -- Check if we're at queue capacity
     queueSize <- atomically $ length <$> readTVar (bqEntries $ dsBuildQueue state)
 
     if queueSize >= bqMaxPending (dsBuildQueue state)
         then throwIO $ StateError $ StateResourceError "Build queue is full"
         else do
-            -- Create a queue entry
+            -- Create a queue entry with privilege tier information
             let entry = BuildQueueEntry {
                     bqBuildId = buildId,
                     bqDerivation = derivation,
                     bqOwner = owner,
                     bqPriority = priority,
                     bqEnqueueTime = timestamp,
-                    bqDependencies = dependencies
+                    bqDependencies = dependencies,
+                    bqPrivilegeTier = tier
                 }
 
             -- Add to the queue
@@ -528,7 +617,7 @@ sortQueueEntries :: [BuildQueueEntry] -> [BuildQueueEntry]
 sortQueueEntries = sortBy (comparing (\e -> (-bqPriority e, bqEnqueueTime e)))
 
 -- | Unregister a build
-unregisterBuild :: DaemonState -> BuildId -> IO ()
+unregisterBuild :: DaemonState t -> BuildId -> IO ()
 unregisterBuild state buildId = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -547,6 +636,15 @@ unregisterBuild state buildId = do
                         filter (\e -> bqBuildId e /= buildId)
 
         Just build -> do
+            -- Verify privilege tier - we can only cancel builds initiated at our tier or lower
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can't cancel Daemon-initiated builds
+            when (stateTier == Builder && buildTier == Daemon) $
+                throwIO $ StateError $ StatePrivilegeError
+                    "Builder privilege tier cannot cancel Daemon-initiated builds"
+
             -- Cancel the build thread if it's running
             threadRef <- atomically $ readTVar (abThread build)
             case threadRef of
@@ -590,7 +688,7 @@ unregisterBuild state buildId = do
             tryScheduleNextBuild state
 
 -- | Update a build's status
-updateBuildStatus :: DaemonState -> BuildId -> BuildStatus -> IO ()
+updateBuildStatus :: DaemonState t -> BuildId -> BuildStatus -> IO ()
 updateBuildStatus state buildId status = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -598,6 +696,15 @@ updateBuildStatus state buildId status = do
     case mBuild of
         Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
         Just build -> do
+            -- Verify privilege tier - we can only update builds initiated at our tier or lower
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can't update Daemon-initiated builds
+            when (stateTier == Builder && buildTier == Daemon) $
+                throwIO $ StateError $ StatePrivilegeError
+                    "Builder privilege tier cannot update Daemon-initiated builds"
+
             -- Update the status and timestamp
             now <- getCurrentTime
             atomically $ do
@@ -605,7 +712,7 @@ updateBuildStatus state buildId status = do
                 writeTVar (abUpdateTime build) now
 
 -- | Append to a build's log
-appendBuildLog :: DaemonState -> BuildId -> Text -> IO ()
+appendBuildLog :: DaemonState t -> BuildId -> Text -> IO ()
 appendBuildLog state buildId logText = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -613,11 +720,20 @@ appendBuildLog state buildId logText = do
     case mBuild of
         Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
         Just build -> do
+            -- Verify privilege tier - we can only append to builds initiated at our tier or lower
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can't append to Daemon-initiated builds
+            when (stateTier == Builder && buildTier == Daemon) $
+                throwIO $ StateError $ StatePrivilegeError
+                    "Builder privilege tier cannot append to logs of Daemon-initiated builds"
+
             -- Append to the log
             atomically $ modifyTVar' (abLogBuffer build) $ \log -> log <> logText
 
 -- | Get a build's status
-getBuildStatus :: DaemonState -> BuildId -> IO BuildStatus
+getBuildStatus :: DaemonState t -> BuildId -> IO BuildStatus
 getBuildStatus state buildId = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -638,7 +754,7 @@ getBuildStatus state buildId = do
         Just build -> atomically $ readTVar (abStatus build)
 
 -- | Get a build's log
-getBuildLog :: DaemonState -> BuildId -> IO Text
+getBuildLog :: DaemonState t -> BuildId -> IO Text
 getBuildLog state buildId = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -660,13 +776,21 @@ getBuildLog state buildId = do
         Just build -> atomically $ readTVar (abLogBuffer build)
 
 -- | List active builds
-listActiveBuilds :: DaemonState -> IO [(BuildId, Derivation, BuildStatus, UTCTime, Double)]
+listActiveBuilds :: DaemonState t -> IO [(BuildId, Derivation, BuildStatus, UTCTime, Double)]
 listActiveBuilds state = do
     -- Get all active builds
     activeBuilds <- atomically $ readTVar (dsActiveBuilds state)
 
+    -- Get the privilege tier of the state
+    let stateTier = fromSing $ dsPrivilegeEvidence state
+
+    -- Filter builds based on privilege tier (Builder can only see Builder builds)
+    let filteredBuilds = case stateTier of
+            Daemon -> activeBuilds -- Daemon can see all builds
+            Builder -> Map.filter (\build -> abPrivilegeTier build == Builder) activeBuilds
+
     -- Collect build information
-    mapM collectBuildInfo (Map.toList activeBuilds)
+    mapM collectBuildInfo (Map.toList filteredBuilds)
   where
     collectBuildInfo (buildId, build) = do
         status <- atomically $ readTVar (abStatus build)
@@ -678,16 +802,25 @@ listActiveBuilds state = do
         return (buildId, abDerivation build, status, updateTime, progress)
 
 -- | List queued builds
-listQueuedBuilds :: DaemonState -> IO [(BuildId, Derivation, Int, UTCTime)]
+listQueuedBuilds :: DaemonState t -> IO [(BuildId, Derivation, Int, UTCTime)]
 listQueuedBuilds state = do
     -- Get all queued builds
     queueEntries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
 
+    -- Get the privilege tier of the state
+    let stateTier = fromSing $ dsPrivilegeEvidence state
+
+    -- Filter queue entries based on privilege tier (Builder can only see Builder entries)
+    let filteredEntries = case stateTier of
+            Daemon -> queueEntries -- Daemon can see all entries
+            Builder -> filter (\entry -> bqPrivilegeTier entry == Builder) queueEntries
+
     -- Return information
-    return $ map (\entry -> (bqBuildId entry, bqDerivation entry, bqPriority entry, bqEnqueueTime entry)) queueEntries
+    return $ map (\entry -> (bqBuildId entry, bqDerivation entry, bqPriority entry, bqEnqueueTime entry))
+             filteredEntries
 
 -- | Register a returned derivation for a build
-registerReturnedDerivation :: DaemonState -> BuildId -> Derivation -> IO Bool
+registerReturnedDerivation :: DaemonState t -> BuildId -> Derivation -> IO Bool
 registerReturnedDerivation state buildId innerDerivation = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -695,6 +828,15 @@ registerReturnedDerivation state buildId innerDerivation = do
     case mBuild of
         Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
         Just build -> do
+            -- Verify privilege tier - we can only register for builds initiated at our tier or lower
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can't register for Daemon-initiated builds
+            when (stateTier == Builder && buildTier == Daemon) $
+                throwIO $ StateError $ StatePrivilegeError
+                    "Builder privilege tier cannot register derivations for Daemon-initiated builds"
+
             -- Check for cycle
             inChain <- isDerivationInChain state buildId innerDerivation
 
@@ -715,17 +857,27 @@ registerReturnedDerivation state buildId innerDerivation = do
                     return True
 
 -- | Get the derivation chain for a build
-getDerivationChain :: DaemonState -> BuildId -> IO [Derivation]
+getDerivationChain :: DaemonState t -> BuildId -> IO [Derivation]
 getDerivationChain state buildId = do
     -- Check if the build exists
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
 
     case mBuild of
         Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
-        Just build -> atomically $ readTVar (abDerivationChain build)
+        Just build -> do
+            -- Verify privilege tier - we can only get chains for builds initiated at our tier or lower
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can't get chains for Daemon-initiated builds
+            when (stateTier == Builder && buildTier == Daemon) $
+                throwIO $ StateError $ StatePrivilegeError
+                    "Builder privilege tier cannot access derivation chains for Daemon-initiated builds"
+
+            atomically $ readTVar (abDerivationChain build)
 
 -- | Check if a derivation is in a build's chain
-isDerivationInChain :: DaemonState -> BuildId -> Derivation -> IO Bool
+isDerivationInChain :: DaemonState t -> BuildId -> Derivation -> IO Bool
 isDerivationInChain state buildId derivation = do
     -- Get the chain
     chain <- getDerivationChain state buildId
@@ -734,7 +886,7 @@ isDerivationInChain state buildId derivation = do
     return $ any (derivationEquals derivation) chain
 
 -- | Acquire a lock for a store path
-acquirePathLock :: DaemonState -> StorePath -> IO ()
+acquirePathLock :: DaemonState t -> StorePath -> IO ()
 acquirePathLock state path = do
     -- Get or create a lock for this path
     lock <- atomically $ do
@@ -752,7 +904,7 @@ acquirePathLock state path = do
         atomically $ takeTMVar lock
 
 -- | Release a lock for a store path
-releasePathLock :: DaemonState -> StorePath -> IO ()
+releasePathLock :: DaemonState t -> StorePath -> IO ()
 releasePathLock state path = do
     -- Get the lock
     mLock <- atomically $ Map.lookup path <$> readTVar (dsPathLocks state)
@@ -768,41 +920,41 @@ releasePathLock state path = do
                 atomically $ putTMVar lock ()
 
 -- | Execute an action with a locked store path
-withPathLock :: DaemonState -> StorePath -> IO a -> IO a
+withPathLock :: DaemonState t -> StorePath -> IO a -> IO a
 withPathLock state path action = do
     bracket
         (acquirePathLock state path)
         (\_ -> releasePathLock state path)
         (\_ -> action)
 
--- | Mark a path as reachable
-markPathAsReachable :: DaemonState -> StorePath -> IO ()
+-- | Mark a path as reachable - requires CanModifyStore privilege
+markPathAsReachable :: (CanModifyStore t ~ 'True) => DaemonState t -> StorePath -> IO ()
 markPathAsReachable state path = do
     atomically $ modifyTVar' (dsReachablePaths state) $ Set.insert path
 
 -- | Check if a path is reachable
-isPathReachable :: DaemonState -> StorePath -> IO Bool
+isPathReachable :: DaemonState t -> StorePath -> IO Bool
 isPathReachable state path = do
     atomically $ Set.member path <$> readTVar (dsReachablePaths state)
 
 -- | Get all reachable paths
-getReachablePaths :: DaemonState -> IO (Set StorePath)
+getReachablePaths :: DaemonState t -> IO (Set StorePath)
 getReachablePaths state = do
     atomically $ readTVar (dsReachablePaths state)
 
 -- | Register a derivation's build graph
-registerDerivationGraph :: DaemonState -> Derivation -> Graph.BuildGraph -> IO ()
+registerDerivationGraph :: DaemonState t -> Derivation -> Graph.BuildGraph -> IO ()
 registerDerivationGraph state derivation graph = do
     atomically $ modifyTVar' (dsDerivationGraphs state) $
         Map.insert (derivHash derivation) graph
 
 -- | Get a derivation's build graph
-getDerivationGraph :: DaemonState -> Derivation -> IO (Maybe Graph.BuildGraph)
+getDerivationGraph :: DaemonState t -> Derivation -> IO (Maybe Graph.BuildGraph)
 getDerivationGraph state derivation = do
     atomically $ Map.lookup (derivHash derivation) <$> readTVar (dsDerivationGraphs state)
 
 -- | Get transitive dependencies of a derivation
-getTransitiveDependencies :: DaemonState -> Derivation -> IO (Set Text)
+getTransitiveDependencies :: DaemonState t -> Derivation -> IO (Set Text)
 getTransitiveDependencies state derivation = do
     -- Get the build graph
     mGraph <- getDerivationGraph state derivation
@@ -900,7 +1052,7 @@ releaseGCLockFile lockPath fd = do
     catchIOError (removeFile lockPath) (\_ -> return ())
 
 -- | Check if GC lock is available (can be acquired)
-checkGCLock :: DaemonState -> STM Bool
+checkGCLock :: DaemonState t -> STM Bool
 checkGCLock state = do
     -- Check if we have a recorded owner
     mOwner <- readTVar (dsGCLockOwner state)
@@ -908,8 +1060,33 @@ checkGCLock state = do
         Nothing -> return True  -- No owner, lock is available
         Just _ -> return False  -- Owned by some process
 
--- | Acquire the GC lock
-acquireGCLock :: DaemonState -> IO ()
+-- | Try to acquire the GC lock without throwing
+tryAcquireGCLock :: (CanModifyStore t ~ 'True) => DaemonState t -> IO Bool
+tryAcquireGCLock state = do
+    -- Try to get the file-based lock
+    result <- acquireGCLockFile (dsGCLockPath state)
+
+    case result of
+        Left _ -> return False
+        Right (fd, pid) -> do
+            -- Record the lock state in memory too
+            atomically $ do
+                -- Update the lock owner
+                writeTVar (dsGCLockOwner state) (Just pid)
+
+                -- For backwards compatibility, try to take the TMVar lock too
+                empty <- isEmptyTMVar (dsGCLock state)
+                unless empty $ do
+                    void $ takeTMVar (dsGCLock state)
+
+            -- Keep the fd in a global reference to avoid GC
+            -- (This is a bit of a hack, but we don't have a place to store it in the state)
+            -- In a real implementation you'd want to track this properly
+            writeIORef globalGCLockFdRef (Just (fd, dsGCLockPath state))
+            return True
+
+-- | Acquire the GC lock - requires CanModifyStore privilege
+acquireGCLock :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 acquireGCLock state = do
     -- Try to get the file-based lock
     result <- acquireGCLockFile (dsGCLockPath state)
@@ -933,8 +1110,8 @@ acquireGCLock state = do
             -- In a real implementation you'd want to track this properly
             writeIORef globalGCLockFdRef (Just (fd, dsGCLockPath state))
 
--- | Release the GC lock
-releaseGCLock :: DaemonState -> IO ()
+-- | Release the GC lock - requires CanModifyStore privilege
+releaseGCLock :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 releaseGCLock state = do
     -- Get the file descriptor from the global reference
     mFdInfo <- readIORef globalGCLockFdRef
@@ -966,8 +1143,8 @@ releaseGCLock state = do
 globalGCLockFdRef :: IORef (Maybe (Fd, FilePath))
 globalGCLockFdRef = unsafePerformIO $ newIORef Nothing
 
--- | Execute an action with the GC lock
-withGCLock :: DaemonState -> IO a -> IO a
+-- | Execute an action with the GC lock - requires CanModifyStore privilege
+withGCLock :: (CanModifyStore t ~ 'True) => DaemonState t -> IO a -> IO a
 withGCLock state action = do
     bracket
         (acquireGCLock state)
@@ -975,13 +1152,13 @@ withGCLock state action = do
         (\_ -> action)
 
 -- | Update system statistics
-updateSystemStats :: DaemonState -> IO ()
+updateSystemStats :: DaemonState t -> IO ()
 updateSystemStats state = do
     stats <- captureSystemStats
     atomically $ writeTVar (dsDaemonStats state) stats
 
 -- | Get daemon statistics
-getDaemonStats :: DaemonState -> IO DaemonStats
+getDaemonStats :: DaemonState t -> IO DaemonStats
 getDaemonStats state = do
     atomically $ readTVar (dsDaemonStats state)
 
@@ -1038,19 +1215,46 @@ getLoadAverages = do
     return [0.0, 0.0, 0.0]
 
 -- | Check if there are pending builds
-hasPendingBuilds :: DaemonState -> IO Bool
+hasPendingBuilds :: DaemonState t -> IO Bool
 hasPendingBuilds state = do
     queueEntries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
-    return $ not $ null queueEntries
+
+    -- Get the privilege tier of the state
+    let stateTier = fromSing $ dsPrivilegeEvidence state
+
+    -- Filter entries by privilege (Builder can only see Builder entries)
+    let relevantEntries = case stateTier of
+            Daemon -> queueEntries
+            Builder -> filter (\e -> bqPrivilegeTier e == Builder) queueEntries
+
+    return $ not $ null relevantEntries
 
 -- | Check if a specific build is active
-hasActiveBuild :: DaemonState -> BuildId -> IO Bool
+hasActiveBuild :: DaemonState t -> BuildId -> IO Bool
 hasActiveBuild state buildId = do
     activeBuilds <- atomically $ readTVar (dsActiveBuilds state)
-    return $ Map.member buildId activeBuilds
+
+    -- Check if the build exists
+    case Map.lookup buildId activeBuilds of
+        Nothing -> return False
+        Just build -> do
+            -- Verify privilege tier
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can only see Builder builds
+            case stateTier of
+                Daemon -> return True
+                Builder -> return (buildTier == Builder)
+
+-- | Check if there is capacity for more builds
+hasBuildCapacity :: DaemonState t -> IO Bool
+hasBuildCapacity state = do
+    activeBuildCount <- atomically $ Map.size <$> readTVar (dsActiveBuilds state)
+    return $ activeBuildCount < dsMaxConcurrentBuilds state
 
 -- | Get the next build to schedule
-getNextBuildToSchedule :: DaemonState -> IO (Maybe BuildQueueEntry)
+getNextBuildToSchedule :: DaemonState t -> IO (Maybe BuildQueueEntry)
 getNextBuildToSchedule state = do
     -- Check if we're at capacity
     activeBuildCount <- atomically $ Map.size <$> readTVar (dsActiveBuilds state)
@@ -1061,11 +1265,19 @@ getNextBuildToSchedule state = do
             -- Get queue entries
             queueEntries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
 
-            if null queueEntries
+            -- Get the privilege tier of the state
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+
+            -- Filter entries by privilege (Builder can only see Builder entries)
+            let relevantEntries = case stateTier of
+                    Daemon -> queueEntries
+                    Builder -> filter (\e -> bqPrivilegeTier e == Builder) queueEntries
+
+            if null relevantEntries
                 then return Nothing
                 else do
                     -- Find the first entry with all dependencies satisfied
-                    findReadyEntry queueEntries
+                    findReadyEntry relevantEntries
   where
     findReadyEntry [] = return Nothing
     findReadyEntry (entry:rest) = do
@@ -1082,7 +1294,7 @@ getNextBuildToSchedule state = do
             else findReadyEntry rest
 
 -- | Try to schedule the next build from the queue
-tryScheduleNextBuild :: DaemonState -> IO ()
+tryScheduleNextBuild :: DaemonState t -> IO ()
 tryScheduleNextBuild state = do
     -- Get the next build to schedule
     mEntry <- getNextBuildToSchedule state
@@ -1093,6 +1305,9 @@ tryScheduleNextBuild state = do
             -- Remove from queue
             atomically $ modifyTVar' (bqEntries $ dsBuildQueue state) $
                 filter (\e -> bqBuildId e /= bqBuildId entry)
+
+            -- Get the privilege tier that queued this build
+            let tier = bqPrivilegeTier entry
 
             -- Register as active build
             now <- getCurrentTime
@@ -1118,7 +1333,8 @@ tryScheduleNextBuild state = do
                     abDerivationChain = derivationChainVar,
                     abProcessId = processIdVar,
                     abTimeout = Nothing,
-                    abThread = threadVar
+                    abThread = threadVar,
+                    abPrivilegeTier = tier
                 }
 
             -- Register the build
@@ -1126,7 +1342,7 @@ tryScheduleNextBuild state = do
                 Map.insert (bqBuildId entry) activeBuild
 
 -- | Prune old completed builds to stay within limits
-pruneCompletedBuilds :: DaemonState -> IO ()
+pruneCompletedBuilds :: DaemonState t -> IO ()
 pruneCompletedBuilds state = do
     -- Get current completed and failed builds
     completedBuilds <- atomically $ readTVar (dsCompletedBuilds state)
@@ -1157,7 +1373,7 @@ pruneCompletedBuilds state = do
         atomically $ writeTVar (dsFailedBuilds state) kept
 
 -- | Clean up stale builds (e.g., timed out or crashed)
-cleanupStaleBuilds :: DaemonState -> IO ()
+cleanupStaleBuilds :: DaemonState t -> IO ()
 cleanupStaleBuilds state = do
     now <- getCurrentTime
 
@@ -1166,30 +1382,36 @@ cleanupStaleBuilds state = do
 
     -- Check each build for staleness
     forM_ (Map.toList activeBuilds) $ \(buildId, build) -> do
-        -- Check if the build has timed out
-        case abTimeout build of
-            Just timeout -> do
-                let timeoutTime = addUTCTime (fromIntegral timeout) (abStartTime build)
-                when (now > timeoutTime) $ do
-                    -- Mark as failed and remove
-                    let err = BuildError $ BuildFailed "Build timed out"
-                    atomically $ putTMVar (abResult build) (Left err)
-                    unregisterBuild state buildId
+        -- Check if we have the privilege to clean up this build
+        let stateTier = fromSing $ dsPrivilegeEvidence state
+        let buildTier = abPrivilegeTier build
 
-            Nothing -> do
-                -- Check for last update time
-                lastUpdate <- atomically $ readTVar (abUpdateTime build)
-                let idleTime = diffUTCTime now lastUpdate
+        -- Only clean up builds we have the privilege to clean
+        when (stateTier == Daemon || buildTier == Builder) $ do
+            -- Check if the build has timed out
+            case abTimeout build of
+                Just timeout -> do
+                    let timeoutTime = addUTCTime (fromIntegral timeout) (abStartTime build)
+                    when (now > timeoutTime) $ do
+                        -- Mark as failed and remove
+                        let err = BuildError $ BuildFailed "Build timed out"
+                        atomically $ putTMVar (abResult build) (Left err)
+                        unregisterBuild state buildId
 
-                -- If idle for more than 1 hour, consider it stale
-                when (idleTime > 3600) $ do
-                    -- Mark as failed and remove
-                    let err = BuildError $ BuildFailed "Build stalled or crashed"
-                    atomically $ putTMVar (abResult build) (Left err)
-                    unregisterBuild state buildId
+                Nothing -> do
+                    -- Check for last update time
+                    lastUpdate <- atomically $ readTVar (abUpdateTime build)
+                    let idleTime = diffUTCTime now lastUpdate
 
--- | Setup periodic maintenance
-setupMaintenanceThread :: DaemonState -> IO ()
+                    -- If idle for more than 1 hour, consider it stale
+                    when (idleTime > 3600) $ do
+                        -- Mark as failed and remove
+                        let err = BuildError $ BuildFailed "Build stalled or crashed"
+                        atomically $ putTMVar (abResult build) (Left err)
+                        unregisterBuild state buildId
+
+-- | Setup periodic maintenance - requires CanModifyStore privilege
+setupMaintenanceThread :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 setupMaintenanceThread state = do
     -- Create a thread that runs maintenance tasks periodically
     thread <- async $ maintenanceLoop state
@@ -1197,8 +1419,8 @@ setupMaintenanceThread state = do
     -- Store the thread
     atomically $ writeTVar (dsMaintenanceThread state) (Just thread)
 
--- | Maintenance loop
-maintenanceLoop :: DaemonState -> IO ()
+-- | Maintenance loop - requires CanModifyStore privilege
+maintenanceLoop :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 maintenanceLoop state = do
     -- Run forever
     forever $ do
@@ -1208,8 +1430,8 @@ maintenanceLoop state = do
         -- Sleep for a while
         threadDelay (60 * 1000 * 1000)  -- 60 seconds
 
--- | Run scheduled maintenance tasks
-scheduledMaintenance :: DaemonState -> IO ()
+-- | Run scheduled maintenance tasks - requires CanModifyStore privilege
+scheduledMaintenance :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 scheduledMaintenance state = do
     -- Update system stats
     updateSystemStats state
@@ -1223,8 +1445,8 @@ scheduledMaintenance state = do
     -- Save state to file
     saveStateToFile state
 
--- | Set up signal handlers
-setupSignalHandlers :: DaemonState -> IO ()
+-- | Set up signal handlers - requires Daemon privileges
+setupSignalHandlers :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 setupSignalHandlers state = do
     -- Handle SIGTERM to gracefully shut down
     void $ installHandler Signals.sigTERM (Catch $ handleTermSignal state) Nothing
@@ -1235,8 +1457,8 @@ setupSignalHandlers state = do
     -- Handle SIGHUP for config reload
     void $ installHandler Signals.sigHUP (Catch $ handleHupSignal state) Nothing
 
--- | Handle SIGTERM signal
-handleTermSignal :: DaemonState -> IO ()
+-- | Handle SIGTERM signal - requires CanModifyStore privilege
+handleTermSignal :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 handleTermSignal state = do
     -- Save state
     putStrLn "Received termination signal, shutting down..."
@@ -1258,8 +1480,8 @@ handleTermSignal state = do
     putStrLn "Shutdown complete."
     exitSuccess
 
--- | Handle SIGHUP signal
-handleHupSignal :: DaemonState -> IO ()
+-- | Handle SIGHUP signal - requires CanModifyStore privilege
+handleHupSignal :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 handleHupSignal state = do
     -- Save and reload state
     putStrLn "Received HUP signal, reloading..."
@@ -1275,21 +1497,21 @@ atomicallyState :: STM a -> IO a
 atomicallyState = atomically
 
 -- | Execute an action with daemon state
-withState :: DaemonState -> (DaemonState -> IO a) -> IO a
+withState :: DaemonState t -> (DaemonState t -> IO a) -> IO a
 withState state action = action state
 
 -- | Modify daemon state
-modifyState :: DaemonState -> (DaemonState -> IO (DaemonState, a)) -> IO a
+modifyState :: DaemonState t -> (DaemonState t -> IO (DaemonState t, a)) -> IO a
 modifyState state f = do
     (newState, result) <- f state
     return result
 
 -- | Read daemon state
-readState :: DaemonState -> (DaemonState -> IO a) -> IO a
+readState :: DaemonState t -> (DaemonState t -> IO a) -> IO a
 readState state f = f state
 
 -- | Capture build status information
-captureStatus :: DaemonState -> BuildId -> IO (BuildStatus, Double, UTCTime, UTCTime)
+captureStatus :: DaemonState t -> BuildId -> IO (BuildStatus, Double, UTCTime, UTCTime)
 captureStatus state buildId = do
     -- Get the build
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
@@ -1297,6 +1519,15 @@ captureStatus state buildId = do
     case mBuild of
         Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
         Just build -> do
+            -- Verify privilege tier - we can only capture status for builds initiated at our tier or lower
+            let stateTier = fromSing $ dsPrivilegeEvidence state
+            let buildTier = abPrivilegeTier build
+
+            -- Builder can't capture status for Daemon-initiated builds
+            when (stateTier == Builder && buildTier == Daemon) $
+                throwIO $ StateError $ StatePrivilegeError
+                    "Builder privilege tier cannot capture status of Daemon-initiated builds"
+
             -- Get status
             status <- atomically $ readTVar (abStatus build)
 
@@ -1336,11 +1567,7 @@ newUnique = do
     -- Combine time and random number
     return $ micros * 1000 + fromIntegral (r `mod` 1000)
 
--- | Microsecond delay
-threadDelay :: Int -> IO ()
-threadDelay = Control.Concurrent.threadDelay
-
--- | Random number generation (to replace missing randomIO)
+-- | Random number generation
 randomIO :: IO Int
 randomIO = do
     now <- getCurrentTime

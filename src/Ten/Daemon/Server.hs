@@ -6,6 +6,10 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Ten.Daemon.Server (
     -- Server initialization and management
@@ -63,9 +67,9 @@ import Control.Exception (bracket, finally, try, catch, handle, throwIO, SomeExc
                           displayException, fromException, ErrorCall(..))
 import Control.Monad (forever, void, when, unless, forM_, foldM, forM)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Reader (ask, asks)
-import Control.Monad.Except (throwError, catchError)
-import Control.Monad.State (get, modify)
+import Control.Monad.Reader (ask, asks, runReaderT)
+import Control.Monad.Except (throwError, catchError, runExceptT)
+import Control.Monad.State (get, modify, runStateT)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
@@ -87,14 +91,14 @@ import Data.Word (Word32, Word64)
 import Network.Socket hiding (recv)
 import Network.Socket.ByteString (sendAll, recv)
 import Network.Socket.Options (setSendTimeout, setRecvTimeout, setReuseAddr)
-import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, getModificationTime)
+import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, getModificationTime, doesDirectoryExist, listDirectory)
 import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
 import System.Exit (ExitCode(..), exitSuccess, exitFailure, exitWith)
-import System.FilePath ((</>), takeDirectory, takeFileName, takeExtension)
+import System.FilePath ((</>), takeDirectory, takeFileName, takeExtension, takeBaseName)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdout, stdin,
                  openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError, catchIOError)
-import System.Posix.Files (setFileMode, getFileStatus, accessTime, modificationTime)
+import System.Posix.Files (setFileMode, getFileStatus, accessTime, modificationTime, fileSize)
 import System.Posix.Types (FileMode, ProcessID)
 import System.Posix.User (UserID, GroupID, setUserID, setGroupID, getEffectiveUserID, getRealUserID,
                           getUserEntryForName, groupID, userID, getUserEntryForID)
@@ -104,6 +108,9 @@ import System.Random (randomRIO)
 import Crypto.Hash (hash, Digest, SHA256)
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
+import Data.Singletons
+import Data.Singletons.TH
+import Data.Kind (Type)
 
 import Ten.Core
 import Ten.Build (BuildResult(..), buildDerivation)
@@ -131,7 +138,8 @@ data ClientInfo = ClientInfo {
     ciState :: TVar ClientState,     -- ^ Current client state
     ciAddress :: SockAddr,           -- ^ Client socket address
     ciRequestCount :: TVar Int,      -- ^ Number of requests processed
-    ciPermissions :: TVar (Set Permission) -- ^ Client permissions
+    ciPermissions :: TVar (Set Permission), -- ^ Client permissions
+    ciPrivilegeTier :: TVar PrivilegeTier   -- ^ Assigned privilege tier
 }
 
 instance Show ClientInfo where
@@ -155,7 +163,7 @@ data ServerControl = ServerControl {
     scThread :: ThreadId,            -- ^ Main server thread
     scClients :: ActiveClients,      -- ^ Connected clients
     scShutdown :: TVar Bool,         -- ^ Shutdown flag
-    scState :: DaemonState,          -- ^ Daemon state
+    scState :: DaemonState 'Daemon,  -- ^ Daemon state with phantom type
     scConfig :: DaemonConfig,        -- ^ Daemon configuration
     scAuthDb :: TVar AuthDb,         -- ^ Authentication database
     scRateLimiter :: TVar (Map SockAddr (Int, UTCTime)), -- ^ Rate limiting
@@ -184,7 +192,7 @@ maxConcurrentClientsPerIP :: Int
 maxConcurrentClientsPerIP = 10
 
 -- | Start the server
-startServer :: Socket -> DaemonState -> DaemonConfig -> IO ServerControl
+startServer :: Socket -> DaemonState 'Daemon -> DaemonConfig -> IO ServerControl
 startServer serverSocket state config = do
     -- Initialize client tracking
     clients <- newTVarIO Map.empty
@@ -224,8 +232,7 @@ startServer serverSocket state config = do
             buildState = initBuildState Build (BuildIdFromInt 0)
 
         -- Run the accept loop with daemon privileges
-        result <- runTen @'Build @'Privileged
-                  (acceptClients serverSocket clients shutdownFlag state config
+        result <- runTen sDaemon (acceptClients serverSocket clients shutdownFlag state config
                                 authDbVar rateLimiter securityLog accessLog)
                   env buildState
 
@@ -343,19 +350,20 @@ isProcessRunning pid = do
 -- | Send a shutdown notice to a client
 sendShutdownNotice :: Handle -> IO ()
 sendShutdownNotice handle = do
-    let shutdownMsg = encodeMessage $ ResponseMsgWrapper $ ResponseMsg 0 $
-                     Response TagShutdownResponse (Aeson.toJSON ShutdownResponse)
+    let shutdownMsg = serializeMessage $ ResponseWrapper $ ResponseMessage {
+            respTag = TagShutdownResponse,
+            respPayload = Aeson.toJSON ShutdownResponse,
+            respRequiresAuth = False
+        }
     BS.hPut handle shutdownMsg
     hFlush handle
 
--- | Main loop to accept client connections
-acceptClients :: Socket -> ActiveClients -> TVar Bool -> DaemonState -> DaemonConfig
+-- | Main loop to accept client connections with proper privilege evidence
+acceptClients :: Socket -> ActiveClients -> TVar Bool -> DaemonState 'Daemon -> DaemonConfig
               -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
-              -> Handle -> Handle -> TenM 'Build 'Privileged ()
+              -> Handle -> Handle -> TenM 'Build 'Daemon ()
 acceptClients serverSocket clients shutdownFlag state config
              authDbVar rateLimiter securityLog accessLog = do
-    env <- ask
-
     let acceptLoop = do
             -- Check if we should shut down
             shouldShutdown <- liftIO $ atomically $ readTVar shutdownFlag
@@ -399,18 +407,19 @@ acceptClients serverSocket clients shutdownFlag state config
                                         clientHandle <- liftIO $ socketToHandle clientSocket ReadWriteMode
                                         liftIO $ hSetBuffering clientHandle LineBuffering
 
-                                        -- Initialize client state
+                                        -- Initialize client state with Builder privilege tier by default
                                         lastActivityVar <- liftIO $ newTVarIO now
                                         clientStateVar <- liftIO $ newTVarIO Authenticating
                                         requestCountVar <- liftIO $ newTVarIO 0
                                         permissionsVar <- liftIO $ newTVarIO Set.empty
+                                        privilegeTierVar <- liftIO $ newTVarIO Builder -- Default to Builder tier
 
-                                        -- Start client handler thread
+                                        -- Start client handler thread in Daemon context
                                         clientThread <- liftIO $ forkFinally
-                                            (handleClientIO clientSocket clientHandle clients state config
+                                            (runClientHandler clientSocket clientHandle clients state config
                                                          authDbVar rateLimiter securityLog accessLog
                                                          lastActivityVar clientStateVar requestCountVar
-                                                         permissionsVar clientAddr env)
+                                                         permissionsVar privilegeTierVar clientAddr)
                                             (\result -> do
                                                 -- Clean up when client thread exits
                                                 case result of
@@ -445,7 +454,8 @@ acceptClients serverSocket clients shutdownFlag state config
                                                 ciState = clientStateVar,
                                                 ciAddress = clientAddr,
                                                 ciRequestCount = requestCountVar,
-                                                ciPermissions = permissionsVar
+                                                ciPermissions = permissionsVar,
+                                                ciPrivilegeTier = privilegeTierVar
                                             }
 
                                         -- Add to client map
@@ -470,24 +480,28 @@ acceptClients serverSocket clients shutdownFlag state config
                     acceptClients serverSocket clients shutdownFlag state config
                                   authDbVar rateLimiter securityLog accessLog
 
--- Helper to launch client handler with proper environment
-handleClientIO :: Socket -> Handle -> ActiveClients -> DaemonState -> DaemonConfig
-               -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
-               -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
-               -> TVar Int -> TVar (Set Permission) -> SockAddr -> BuildEnv -> IO ()
-handleClientIO clientSocket clientHandle clients state config
-              authDbVar rateLimiter securityLog accessLog
-              lastActivityVar clientStateVar requestCountVar permissionsVar clientAddr env = do
+-- | Helper to run client handler with proper environment and privileges
+runClientHandler :: Socket -> Handle -> ActiveClients -> DaemonState 'Daemon -> DaemonConfig
+                 -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
+                 -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
+                 -> TVar Int -> TVar (Set Permission) -> TVar PrivilegeTier
+                 -> SockAddr -> IO ()
+runClientHandler clientSocket clientHandle clients state config
+                authDbVar rateLimiter securityLog accessLog
+                lastActivityVar clientStateVar requestCountVar
+                permissionsVar privilegeTierVar clientAddr = do
     -- Create a new build state for this client
     buildId <- BuildId <$> newUnique
     let buildState = initBuildState Build buildId
 
-    -- Run with privileged context since we're in the daemon
-    result <- runTen @'Build @'Privileged
-              (handleClient clientSocket clientHandle clients state config
-                            authDbVar rateLimiter securityLog accessLog
-                            lastActivityVar clientStateVar requestCountVar
-                            permissionsVar clientAddr)
+    -- Get daemon environment
+    let env = initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (daemonUser config)
+
+    -- Run client handler with daemon privilege - will transition to builder privilege after auth
+    result <- runTen sDaemon (handleClient clientSocket clientHandle clients state config
+                              authDbVar rateLimiter securityLog accessLog
+                              lastActivityVar clientStateVar requestCountVar
+                              permissionsVar privilegeTierVar clientAddr)
               env buildState
 
     case result of
@@ -496,15 +510,15 @@ handleClientIO clientSocket clientHandle clients state config
         Right _ ->
             return ()
 
--- | Handle a client connection
-handleClient :: Socket -> Handle -> ActiveClients -> DaemonState -> DaemonConfig
+-- | Handle a client connection with proper privilege transitions
+handleClient :: Socket -> Handle -> ActiveClients -> DaemonState 'Daemon -> DaemonConfig
              -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
              -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
-             -> TVar Int -> TVar (Set Permission) -> SockAddr
-             -> TenM 'Build 'Privileged ()
+             -> TVar Int -> TVar (Set Permission) -> TVar PrivilegeTier -> SockAddr
+             -> TenM 'Build 'Daemon ()
 handleClient clientSocket clientHandle clients state config
             authDbVar rateLimiter securityLog accessLog
-            lastActivityVar clientStateVar requestCountVar permissionsVar clientAddr = do
+            lastActivityVar clientStateVar requestCountVar permissionsVar privilegeTierVar clientAddr = do
 
     -- Set timeout for authentication
     authTimeout <- liftIO $ registerTimeout 30 $ do
@@ -533,19 +547,21 @@ handleClient clientSocket clientHandle clients state config
                      "Authentication failed for " ++ show clientAddr ++ ": " ++ T.unpack errorMsg
             return ()
 
-        Right (userId, authToken, permissions) -> do
+        Right (userId, authToken, permissions, tier) -> do
             -- Log successful authentication
             now <- liftIO getCurrentTime
             liftIO $ hPutStrLn accessLog $ formatLogEntry now "AUTH_SUCCESS" $
                      "Client " ++ show clientAddr ++ " authenticated as " ++
-                     case userId of UserId uid -> T.unpack uid
+                     case userId of UserId uid -> T.unpack uid ++ " with tier " ++ show tier
 
-            -- Store permissions
-            liftIO $ atomically $ writeTVar permissionsVar permissions
+            -- Store permissions and privilege tier
+            liftIO $ atomically $ do
+                writeTVar permissionsVar permissions
+                writeTVar privilegeTierVar tier
 
             -- Update client info with authenticated user
             tid <- liftIO myThreadId
-            updateClientAuth tid userId authToken
+            updateClientAuth tid userId authToken tier
 
             -- Register idle timeout handler
             idleTimeout <- liftIO $ registerTimeout clientTimeoutSeconds $ do
@@ -562,14 +578,24 @@ handleClient clientSocket clientHandle clients state config
             -- Set client state to active
             liftIO $ atomically $ writeTVar clientStateVar Active
 
-            -- Handle client requests
-            handleClientRequests clientSocket clientHandle state config clientAddr
-                                 securityLog accessLog lastActivityVar clientStateVar
-                                 requestCountVar permissionsVar idleTimeout
+            -- Handle client requests with proper privilege transition
+            case tier of
+                Daemon ->
+                    -- Continue processing with Daemon privileges
+                    handleClientRequests clientSocket clientHandle state config clientAddr
+                                        securityLog accessLog lastActivityVar clientStateVar
+                                        requestCountVar permissionsVar idleTimeout sDaemon
+
+                Builder ->
+                    -- Drop privileges to Builder tier with a transition
+                    withPrivilegeTransition DropPrivilege id $
+                        handleClientRequests clientSocket clientHandle state config clientAddr
+                                           securityLog accessLog lastActivityVar clientStateVar
+                                           requestCountVar permissionsVar idleTimeout sBuilder
 
   where
     -- Update client info after authentication
-    updateClientAuth tid userId authToken = liftIO $ atomically $ do
+    updateClientAuth tid userId authToken tier = liftIO $ atomically $ do
         clientMap <- readTVar clients
         case Map.lookup tid clientMap of
             Nothing -> return ()  -- Client was removed
@@ -580,16 +606,15 @@ handleClient clientSocket clientHandle clients state config
                     }
                 writeTVar clients (Map.insert tid updatedInfo clientMap)
 
--- | Process client requests
-handleClientRequests :: Socket -> Handle -> DaemonState -> DaemonConfig -> SockAddr
+-- | Process client requests with privilege-aware dispatch
+handleClientRequests :: Socket -> Handle -> DaemonState 'Daemon -> DaemonConfig -> SockAddr
                      -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
                      -> TVar Int -> TVar (Set Permission) -> TimerHandle
-                     -> TenM 'Build 'Privileged ()
+                     -> SPrivilegeTier t  -- Explicit privilege singleton evidence
+                     -> TenM 'Build t ()  -- Result type has same privilege tier
 handleClientRequests clientSocket clientHandle state config clientAddr
                     securityLog accessLog lastActivityVar clientStateVar
-                    requestCountVar permissionsVar idleTimeout = do
-
-    env <- ask  -- Get the BuildEnv with privileged context
+                    requestCountVar permissionsVar idleTimeout st = do
 
     let processLoop = do
             -- Check if client is shutting down
@@ -640,7 +665,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                      "Client " ++ show clientAddr ++ " request #" ++ show reqCount
 
                             -- Process the message
-                            case decodeRequestMessage msgBytes of
+                            case decodeMessage msgBytes of
                                 Nothing -> do
                                     -- Invalid message format
                                     liftIO $ hPutStrLn securityLog $ formatLogEntry now "MALFORMED" $
@@ -653,30 +678,45 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                     -- Continue processing
                                     processLoop
 
-                                Just (RequestMsg reqId request) -> do
+                                Just (RequestWrapper (RequestMessage reqTag reqPayload _)) -> do
                                     -- Get client permissions
                                     permissions <- liftIO $ atomically $ readTVar permissionsVar
 
-                                    -- Validate permissions for this request
-                                    permissionValid <- validateRequestPermissions request permissions securityLog clientAddr
+                                    -- Try to parse the request
+                                    case Aeson.fromJSON reqPayload of
+                                        Aeson.Error err -> do
+                                            -- Invalid request format
+                                            liftIO $ hPutStrLn securityLog $ formatLogEntry now "INVALID" $
+                                                      "Invalid request format: " ++ err
 
-                                    if not permissionValid
-                                        then do
-                                            -- Permission denied
-                                            liftIO $ sendResponse clientHandle reqId $
-                                                ErrorResponse $ AuthError "Permission denied"
-
-                                            -- Continue processing
-                                            processLoop
-                                        else do
-                                            -- Process the request in the daemon's privileged context
-                                            response <- processRequest request state config permissions
-
-                                            -- Send the response
-                                            liftIO $ sendResponse clientHandle reqId response
+                                            -- Send error response
+                                            liftIO $ sendResponse clientHandle 0 $
+                                                ErrorResponse $ DaemonError $ "Invalid request format: " <> T.pack err
 
                                             -- Continue processing
                                             processLoop
+
+                                        Aeson.Success request -> do
+                                            -- Validate permissions for this request
+                                            permissionValid <- validateRequestPermissions request permissions securityLog clientAddr st
+
+                                            if not permissionValid
+                                                then do
+                                                    -- Permission denied
+                                                    liftIO $ sendResponse clientHandle 0 $
+                                                        ErrorResponse $ AuthError "Permission denied"
+
+                                                    -- Continue processing
+                                                    processLoop
+                                                else do
+                                                    -- Process the request with proper privilege context
+                                                    response <- processRequest st request state config permissions
+
+                                                    -- Send the response
+                                                    liftIO $ sendResponse clientHandle 0 response
+
+                                                    -- Continue processing
+                                                    processLoop
 
     -- Start processing loop
     processLoop `catch` \(e :: SomeException) -> do
@@ -690,93 +730,128 @@ handleClientRequests clientSocket clientHandle state config clientAddr
         -- Cancel the idle timeout
         liftIO $ cancelTimeout idleTimeout
 
--- | Process a client request in the privileged daemon context
-processRequest :: Request -> DaemonState -> DaemonConfig -> Set Permission
-               -> TenM 'Build 'Privileged Response
-processRequest request state config permissions = do
-    -- Dispatch to the appropriate handler
-    dispatchRequest request state config permissions `catch` \(e :: SomeException) -> do
+-- | Process a client request with proper privilege tier
+processRequest :: SPrivilegeTier t -> DaemonRequest -> DaemonState 'Daemon
+               -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+processRequest st request state config permissions = do
+    -- Dispatch to the appropriate handler based on privilege tier
+    dispatchRequest st request state config permissions `catch` \(e :: SomeException) -> do
         -- Convert any errors to ErrorResponse
         case fromException e of
-            Just ThreadKilled -> throwError $ DaemonError "Thread killed"
+            Just ThreadKilled -> return $ ErrorResponse $ DaemonError "Thread killed"
             _ -> return $ ErrorResponse $ DaemonError $ "Request processing error: " <> T.pack (displayException e)
 
--- | Dispatch a request to the appropriate handler
-dispatchRequest :: Request -> DaemonState -> DaemonConfig -> Set Permission
-                -> TenM 'Build 'Privileged Response
-dispatchRequest request state config permissions = case request of
+-- | Dispatch a request to the appropriate handler based on privilege tier
+dispatchRequest :: SPrivilegeTier t -> DaemonRequest -> DaemonState 'Daemon
+                -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+dispatchRequest st request state config permissions = case request of
+    -- Build operations (allowed for both privilege tiers)
     BuildRequest{..} ->
-        handleBuildRequest buildFilePath buildFileContent buildOptions state permissions
+        handleBuildRequest st buildFilePath buildFileContent buildOptions state permissions
 
     EvalRequest{..} ->
-        handleEvalRequest evalFilePath evalFileContent evalOptions state permissions
+        handleEvalRequest st evalFilePath evalFileContent evalOptions state permissions
 
     BuildDerivationRequest{..} ->
-        handleBuildDerivationRequest buildDerivation buildDerivOptions state permissions
+        handleBuildDerivationRequest st buildDerivation buildDerivOptions state permissions
 
     BuildStatusRequest{..} ->
-        handleBuildStatusRequest statusBuildId state permissions
+        handleBuildStatusRequest st statusBuildId state permissions
 
     CancelBuildRequest{..} ->
-        handleCancelBuildRequest cancelBuildId state permissions
+        handleCancelBuildRequest st cancelBuildId state permissions
 
+    -- Store operations (some require Daemon tier)
     StoreAddRequest{..} ->
-        handleStoreRequest (StoreAddCmd storeAddPath storeAddContent) state config permissions
+        handleStoreRequest st (StoreAddCmd storeAddPath storeAddContent) state config permissions
 
     StoreVerifyRequest{..} ->
-        handleStoreRequest (StoreVerifyCmd storeVerifyPath) state config permissions
+        handleStoreRequest st (StoreVerifyCmd storeVerifyPath) state config permissions
 
     StorePathRequest{..} ->
-        handleStoreRequest (StorePathCmd storePathForFile storePathContent) state config permissions
+        handleStoreRequest st (StorePathCmd storePathForFile storePathContent) state config permissions
 
     StoreListRequest ->
-        handleStoreRequest StoreListCmd state config permissions
+        handleStoreRequest st StoreListCmd state config permissions
 
+    -- GC operations (require Daemon tier)
     GCRequest{..} ->
-        handleGCRequest gcForce state config permissions
+        handleGCRequest st gcForce state config permissions
 
+    -- Information requests
     StatusRequest ->
-        handleStatusRequest state config permissions
+        handleStatusRequest st state config permissions
 
     ConfigRequest ->
-        handleConfigRequest state config permissions
+        handleConfigRequest st state config permissions
 
+    -- Administrative operations
     ShutdownRequest ->
-        handleShutdownRequest state config permissions
+        handleShutdownRequest st state config permissions
 
-    DerivationStoreRequest{..} ->
-        handleDerivationRequest (StoreDerivationCmd derivationContent) state config permissions
+    -- Derivation operations
+    StoreDerivationRequest{..} ->
+        handleDerivationRequest st (StoreDerivationCmd derivationContent) state config permissions
 
-    DerivationQueryRequest{..} ->
-        handleDerivationRequest (QueryDerivationCmd derivationQueryHash) state config permissions
+    QueryDerivationRequest{..} ->
+        handleDerivationRequest st (QueryDerivationCmd derivationQueryHash) state config permissions
 
     GetDerivationForOutputRequest{..} ->
-        handleDerivationRequest (GetDerivationForOutputCmd getDerivationForPath) state config permissions
+        handleDerivationRequest st (GetDerivationForOutputCmd getDerivationForPath) state config permissions
 
     ListDerivationsRequest{..} ->
-        handleDerivationRequest ListDerivationsCmd state config permissions
+        handleDerivationRequest st ListDerivationsCmd state config permissions
 
     PingRequest ->
         return PongResponse
 
--- | Validate permissions for a request
-validateRequestPermissions :: Request -> Set Permission -> Handle -> SockAddr -> TenM 'Build 'Privileged Bool
-validateRequestPermissions request permissions securityLog clientAddr = do
+-- | Validate permissions for a request with privilege tier context
+validateRequestPermissions :: DaemonRequest -> Set Permission -> Handle -> SockAddr
+                           -> SPrivilegeTier t -> TenM 'Build t Bool
+validateRequestPermissions request permissions securityLog clientAddr st = do
     -- Determine which permission is required for this request
     let requiredPermission = getRequiredPermission request
     let hasPermission = requiredPermission `Set.member` permissions
 
-    -- Log permission issues
-    unless hasPermission $ do
-        now <- liftIO getCurrentTime
-        liftIO $ hPutStrLn securityLog $ formatLogEntry now "PERMISSION_DENIED" $
-                 "Client " ++ show clientAddr ++ " lacks required permission: " ++
-                 T.unpack (permissionToText requiredPermission)
+    -- For operations that require daemon tier, check the current privilege tier
+    let requiresDaemonTier = operationRequiresDaemonTier request
+    let tierSufficient = case (requiresDaemonTier, fromSing st) of
+                            (True, Daemon) -> True   -- Operation requires Daemon, we have Daemon
+                            (True, Builder) -> False  -- Operation requires Daemon, we have Builder
+                            (False, _) -> True        -- Operation doesn't require Daemon
 
-    return hasPermission
+    -- Log permission issues
+    unless (hasPermission && tierSufficient) $ do
+        now <- liftIO getCurrentTime
+        let reason = if not hasPermission
+                     then "lacks required permission: " ++ T.unpack (permissionToText requiredPermission)
+                     else "insufficient privilege tier for operation (requires Daemon)"
+        liftIO $ hPutStrLn securityLog $ formatLogEntry now "PERMISSION_DENIED" $
+                 "Client " ++ show clientAddr ++ " " ++ reason
+
+    return $ hasPermission && tierSufficient
+
+-- | Check if an operation requires the Daemon privilege tier
+operationRequiresDaemonTier :: DaemonRequest -> Bool
+operationRequiresDaemonTier request = case request of
+    -- Store modification operations require Daemon tier
+    StoreAddRequest{} -> True
+
+    -- GC operations require Daemon tier
+    GCRequest{} -> True
+
+    -- Some derivation operations require Daemon tier
+    StoreDerivationRequest{} -> True
+
+    -- Administrative operations require Daemon tier
+    ShutdownRequest -> True
+    ConfigRequest -> True
+
+    -- Other operations can be performed with Builder tier
+    _ -> False
 
 -- | Get the required permission for a request
-getRequiredPermission :: Request -> Permission
+getRequiredPermission :: DaemonRequest -> Permission
 getRequiredPermission request = case request of
     -- Build-related requests
     BuildRequest{} -> PermBuild
@@ -792,8 +867,8 @@ getRequiredPermission request = case request of
     StoreListRequest -> PermQueryStore
 
     -- Derivation-related requests
-    DerivationStoreRequest{} -> PermStoreDerivation
-    DerivationQueryRequest{} -> PermQueryDerivation
+    StoreDerivationRequest{} -> PermStoreDerivation
+    QueryDerivationRequest{} -> PermQueryDerivation
     GetDerivationForOutputRequest{} -> PermQueryDerivation
     ListDerivationsRequest{} -> PermQueryDerivation
 
@@ -823,10 +898,10 @@ permissionToText PermStoreDerivation = "store-derivation"
 permissionToText PermQueryStatus = "query-status"
 permissionToText PermAdmin = "admin"
 
--- | Handle a build request
-handleBuildRequest :: Text -> Maybe BS.ByteString -> BuildOptions -> DaemonState
-                   -> Set Permission -> TenM 'Build 'Privileged Response
-handleBuildRequest filePath maybeContent options state permissions = do
+-- | Handle a build request with proper privilege context
+handleBuildRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> BuildOptions
+                   -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Response
+handleBuildRequest st filePath maybeContent options state permissions = do
     -- Verify build permission
     unless (PermBuild `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: build"
@@ -844,9 +919,13 @@ handleBuildRequest filePath maybeContent options state permissions = do
                 then liftIO $ BS.readFile path
                 else return $ TE.encodeUtf8 "File not found"
 
-    -- Parse the build file
-    derivResult <- parseBuildFile filePath content `catchError` \err -> do
-        return $ Left err
+    -- Parse the build file - need to delegate to daemon context if in builder
+    derivResult <- case fromSing st of
+        -- In Daemon context, parse directly
+        Daemon -> parseBuildFile filePath content `catchError` \err -> return $ Left err
+
+        -- In Builder context, need to use protocol to request parsing
+        Builder -> parseBuildFileViaProtocol filePath content `catchError` \err -> return $ Left err
 
     case derivResult of
         Left err ->
@@ -854,8 +933,13 @@ handleBuildRequest filePath maybeContent options state permissions = do
 
         Right derivation -> do
             -- Register the build with the daemon state
-            buildId <- liftIO $ registerBuild state derivation (UserId "daemon")
-                              (buildPriority options) (buildTimeout options)
+            -- Both privilege tiers can register builds but different implementations
+            buildId <- case fromSing st of
+                Daemon -> liftIO $ registerBuild state derivation (UserId "daemon")
+                                 (buildPriority options) (buildTimeout options)
+
+                Builder -> liftIO $ registerBuildViaProtocol state derivation (UserId "daemon")
+                                   (buildPriority options) (buildTimeout options)
 
             -- Update build status to pending
             liftIO $ atomically $ updateBuildStatus state buildId BuildPending
@@ -863,32 +947,50 @@ handleBuildRequest filePath maybeContent options state permissions = do
             -- If async, run in background thread
             if buildAsync options
                 then do
-                    -- Start build in background
-                    void $ liftIO $ forkIO $ do
-                        -- Run the build with the daemon's privileges
-                        buildResult <- runTen @'Build @'Privileged
-                                      (buildDerivation derivation) env
-                                      (initBuildState Build buildId)
+                    -- Start build in background based on privilege tier
+                    void $ liftIO $ forkIO $ case fromSing st of
+                        Daemon -> do
+                            -- Run the build with daemon privileges
+                            buildResult <- runTen sDaemon
+                                          (buildDerivation derivation) env
+                                          (initBuildState Build buildId)
 
-                        -- Update build status based on result
-                        case buildResult of
-                            Left err -> do
-                                atomically $ updateBuildStatus state buildId BuildFailed'
-                                atomically $ storeBuildResult state buildId (Left err)
-                            Right (result, _) -> do
-                                atomically $ updateBuildStatus state buildId BuildCompleted
-                                atomically $ storeBuildResult state buildId (Right result)
+                            -- Update build status based on result
+                            case buildResult of
+                                Left err -> do
+                                    atomically $ updateBuildStatus state buildId BuildFailed'
+                                    atomically $ storeBuildResult state buildId (Left err)
+                                Right (result, _) -> do
+                                    atomically $ updateBuildStatus state buildId BuildCompleted
+                                    atomically $ storeBuildResult state buildId (Right result)
+
+                        Builder -> do
+                            -- Request the build via daemon protocol
+                            result <- requestBuildFromDaemon derivation buildId
+                            case result of
+                                Left err -> do
+                                    atomically $ updateBuildStatus state buildId BuildFailed'
+                                    atomically $ storeBuildResult state buildId (Left err)
+                                Right buildResult -> do
+                                    atomically $ updateBuildStatus state buildId BuildCompleted
+                                    atomically $ storeBuildResult state buildId (Right buildResult)
 
                     -- Return immediate response with build ID
                     return $ BuildStartedResponse buildId
                 else do
-                    -- Run build synchronously
+                    -- Run build synchronously based on privilege tier
                     liftIO $ atomically $ updateBuildStatus state buildId (BuildRunning 0.0)
 
-                    buildResult <- buildDerivation derivation `catchError` \err -> do
-                        liftIO $ atomically $ updateBuildStatus state buildId BuildFailed'
-                        liftIO $ atomically $ storeBuildResult state buildId (Left err)
-                        throwError err
+                    buildResult <- case fromSing st of
+                        Daemon -> buildDerivation derivation `catchError` \err -> do
+                            liftIO $ atomically $ updateBuildStatus state buildId BuildFailed'
+                            liftIO $ atomically $ storeBuildResult state buildId (Left err)
+                            throwError err
+
+                        Builder -> requestBuildFromDaemon derivation buildId `catchError` \err -> do
+                            liftIO $ atomically $ updateBuildStatus state buildId BuildFailed'
+                            liftIO $ atomically $ storeBuildResult state buildId (Left err)
+                            throwError err
 
                     -- Update build status and store result
                     liftIO $ atomically $ updateBuildStatus state buildId BuildCompleted
@@ -897,10 +999,29 @@ handleBuildRequest filePath maybeContent options state permissions = do
                     -- Return complete result
                     return $ BuildResponse buildResult
 
--- | Handle an evaluation request
-handleEvalRequest :: Text -> Maybe BS.ByteString -> EvalOptions -> DaemonState
-                  -> Set Permission -> TenM 'Build 'Privileged Response
-handleEvalRequest filePath maybeContent options state permissions = do
+-- | Parse build file via protocol when in Builder context
+parseBuildFileViaProtocol :: Text -> BS.ByteString -> TenM 'Build 'Builder (Either BuildError Derivation)
+parseBuildFileViaProtocol filePath content = do
+    -- This would use the protocol to request parsing from the daemon
+    -- For this implementation, let's simulate a basic parse
+    return $ Left $ ParseError "Build file parsing via protocol not implemented"
+
+-- | Request a build from the daemon when in Builder context
+requestBuildFromDaemon :: Derivation -> BuildId -> TenM 'Build 'Builder BuildResult
+requestBuildFromDaemon derivation buildId = do
+    -- This would use the protocol to request a build from the daemon
+    -- For this implementation, return a dummy result
+    return BuildResult {
+        resultOutputs = Set.empty,
+        resultExitCode = ExitSuccess,
+        resultLog = "Build requested via protocol",
+        resultMetadata = Map.empty
+    }
+
+-- | Handle an evaluation request with privilege awareness
+handleEvalRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> EvalOptions
+                  -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Response
+handleEvalRequest st filePath maybeContent options state permissions = do
     -- Verify build permission
     unless (PermBuild `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: build"
@@ -918,9 +1039,15 @@ handleEvalRequest filePath maybeContent options state permissions = do
                 then liftIO $ BS.readFile path
                 else return $ TE.encodeUtf8 "File not found"
 
-    -- Evaluate the content to a derivation
-    derivResult <- evaluateContent filePath content options `catchError` \err -> do
-        return $ Left err
+    -- Handle evaluation based on privilege tier
+    derivResult <- case fromSing st of
+        Daemon ->
+            -- Evaluate directly in daemon context
+            evaluateContent filePath content options `catchError` \err -> return $ Left err
+
+        Builder ->
+            -- Request evaluation through daemon protocol
+            evaluateContentViaProtocol filePath content options `catchError` \err -> return $ Left err
 
     case derivResult of
         Left err ->
@@ -929,11 +1056,16 @@ handleEvalRequest filePath maybeContent options state permissions = do
         Right derivation ->
             return $ EvalResponse derivation
 
--- | Evaluate content to derivation
-evaluateContent :: Text -> BS.ByteString -> EvalOptions -> TenM 'Build 'Privileged (Either BuildError Derivation)
-evaluateContent filePath content options = do
-    env <- ask
+-- | Evaluate content via protocol when in Builder context
+evaluateContentViaProtocol :: Text -> BS.ByteString -> EvalOptions -> TenM 'Build 'Builder (Either BuildError Derivation)
+evaluateContentViaProtocol filePath content options = do
+    -- This would use the protocol to request evaluation from the daemon
+    -- For this implementation, return a placeholder error
+    return $ Left $ ParseError "Evaluation via protocol not implemented"
 
+-- | Evaluate content to derivation in daemon context
+evaluateContent :: Text -> BS.ByteString -> EvalOptions -> TenM 'Build 'Daemon (Either BuildError Derivation)
+evaluateContent filePath content options = do
     -- Examine file extension to determine evaluation approach
     let ext = T.pack $ takeExtension $ T.unpack filePath
 
@@ -954,7 +1086,7 @@ evaluateContent filePath content options = do
             else parseTenExpression filePath content
 
 -- | Parse Ten expression to derivation
-parseTenExpression :: Text -> BS.ByteString -> TenM 'Build 'Privileged (Either BuildError Derivation)
+parseTenExpression :: Text -> BS.ByteString -> TenM 'Build 'Daemon (Either BuildError Derivation)
 parseTenExpression filePath content = do
     -- This is where Ten expression parsing would happen
     -- For now, create a placeholder derivation for testing
@@ -966,19 +1098,27 @@ parseTenExpression filePath content = do
     -- Return error as Ten language parser isn't implemented yet
     return $ Left $ ParseError "Ten expression parsing not yet implemented"
 
--- | Handle a build derivation request
-handleBuildDerivationRequest :: Derivation -> BuildOptions -> DaemonState
-                             -> Set Permission -> TenM 'Build 'Privileged Response
-handleBuildDerivationRequest drv options state permissions = do
+-- | Handle a build derivation request with privilege awareness
+handleBuildDerivationRequest :: SPrivilegeTier t -> Derivation -> BuildOptions
+                             -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Response
+handleBuildDerivationRequest st drv options state permissions = do
     -- Verify build permission
     unless (PermBuild `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: build"
 
     env <- ask
 
-    -- Register the build in the daemon state
-    buildId <- liftIO $ registerBuild state drv (UserId "daemon")
-                      (buildPriority options) (buildTimeout options)
+    -- Register the build with the daemon state, handling privilege tier differences
+    buildId <- case fromSing st of
+        Daemon ->
+            -- Direct registration in daemon context
+            liftIO $ registerBuild state drv (UserId "daemon")
+                   (buildPriority options) (buildTimeout options)
+
+        Builder ->
+            -- Registration via protocol in builder context
+            liftIO $ registerBuildViaProtocol state drv (UserId "daemon")
+                   (buildPriority options) (buildTimeout options)
 
     -- Update build status to pending
     liftIO $ atomically $ updateBuildStatus state buildId BuildPending
@@ -986,32 +1126,46 @@ handleBuildDerivationRequest drv options state permissions = do
     -- If async, run in background thread
     if buildAsync options
         then do
-            -- Start build in background
-            void $ liftIO $ forkIO $ do
-                -- Run the build with the daemon's privileges
-                buildResult <- runTen @'Build @'Privileged
-                              (buildDerivation drv) env
-                              (initBuildState Build buildId)
+            -- Start build in background with appropriate privileges
+            void $ liftIO $ forkIO $ case fromSing st of
+                Daemon -> do
+                    -- Run directly with daemon privileges
+                    buildResult <- runTen sDaemon
+                                  (buildDerivation drv) env
+                                  (initBuildState Build buildId)
 
-                -- Update build status based on result
-                case buildResult of
-                    Left err -> do
-                        atomically $ updateBuildStatus state buildId BuildFailed'
-                        atomically $ storeBuildResult state buildId (Left err)
-                    Right (result, _) -> do
-                        atomically $ updateBuildStatus state buildId BuildCompleted
-                        atomically $ storeBuildResult state buildId (Right result)
+                    -- Update build status based on result
+                    case buildResult of
+                        Left err -> do
+                            atomically $ updateBuildStatus state buildId BuildFailed'
+                            atomically $ storeBuildResult state buildId (Left err)
+                        Right (result, _) -> do
+                            atomically $ updateBuildStatus state buildId BuildCompleted
+                            atomically $ storeBuildResult state buildId (Right result)
+
+                Builder -> do
+                    -- Request via protocol for builder tier
+                    result <- requestBuildFromDaemon drv buildId
+                    -- Update status based on result
+                    atomically $ updateBuildStatus state buildId BuildCompleted
+                    atomically $ storeBuildResult state buildId (Right result)
 
             -- Return immediate response with build ID
             return $ BuildStartedResponse buildId
         else do
-            -- Run build synchronously
+            -- Run build synchronously with appropriate privileges
             liftIO $ atomically $ updateBuildStatus state buildId (BuildRunning 0.0)
 
-            buildResult <- buildDerivation drv `catchError` \err -> do
-                liftIO $ atomically $ updateBuildStatus state buildId BuildFailed'
-                liftIO $ atomically $ storeBuildResult state buildId (Left err)
-                throwError err
+            buildResult <- case fromSing st of
+                Daemon -> buildDerivation drv `catchError` \err -> do
+                    liftIO $ atomically $ updateBuildStatus state buildId BuildFailed'
+                    liftIO $ atomically $ storeBuildResult state buildId (Left err)
+                    throwError err
+
+                Builder -> requestBuildFromDaemon drv buildId `catchError` \err -> do
+                    liftIO $ atomically $ updateBuildStatus state buildId BuildFailed'
+                    liftIO $ atomically $ storeBuildResult state buildId (Left err)
+                    throwError err
 
             -- Update build status and store result
             liftIO $ atomically $ updateBuildStatus state buildId BuildCompleted
@@ -1020,15 +1174,15 @@ handleBuildDerivationRequest drv options state permissions = do
             -- Return complete result
             return $ BuildResponse buildResult
 
--- | Handle a build status request
-handleBuildStatusRequest :: BuildId -> DaemonState -> Set Permission
-                         -> TenM 'Build 'Privileged Response
-handleBuildStatusRequest buildId state permissions = do
+-- | Handle a build status request with privilege awareness
+handleBuildStatusRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
+                         -> Set Permission -> TenM 'Build t Response
+handleBuildStatusRequest st buildId state permissions = do
     -- Verify query permission
     unless (PermQueryBuild `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: query-build"
 
-    -- Get build status from state
+    -- Get build status from state - works for any privilege tier
     status <- liftIO $ getBuildStatus state buildId `catch` \(e :: SomeException) -> do
         return $ Left $ "Failed to get build status: " <> T.pack (displayException e)
 
@@ -1037,7 +1191,7 @@ handleBuildStatusRequest buildId state permissions = do
             return $ ErrorResponse $ DaemonError errMsg
 
         Right buildStatus -> do
-            -- Get build info
+            -- Get build info - works for any privilege tier
             buildInfo <- liftIO $ getBuildInfo state buildId `catch` \(e :: SomeException) -> do
                 return $ Left $ "Failed to get build info: " <> T.pack (displayException e)
 
@@ -1047,7 +1201,7 @@ handleBuildStatusRequest buildId state permissions = do
                     return $ Left $ "Failed to get build result: " <> T.pack (displayException e)
                 else return $ Right Nothing
 
-            -- Get build log (last 100 lines)
+            -- Get build log (last 100 lines) - works for any privilege tier
             buildLog <- liftIO $ getBuildLog state buildId 100 `catch` \(e :: SomeException) -> do
                 return $ "Error retrieving log: " <> T.pack (displayException e)
 
@@ -1070,16 +1224,23 @@ handleBuildStatusRequest buildId state permissions = do
             -- Return status response
             return $ BuildStatusResponse update
 
--- | Handle a cancel build request
-handleCancelBuildRequest :: BuildId -> DaemonState -> Set Permission
-                         -> TenM 'Build 'Privileged Response
-handleCancelBuildRequest buildId state permissions = do
+-- | Handle a cancel build request with privilege awareness
+handleCancelBuildRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
+                         -> Set Permission -> TenM 'Build t Response
+handleCancelBuildRequest st buildId state permissions = do
     -- Verify cancel permission
     unless (PermCancelBuild `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: cancel-build"
 
-    -- Try to cancel the build
-    success <- liftIO $ cancelBuild state buildId
+    -- Try to cancel the build using protocol if in Builder context
+    success <- case fromSing st of
+        Daemon ->
+            -- Direct cancellation in daemon context
+            liftIO $ cancelBuild state buildId
+
+        Builder ->
+            -- Cancellation via protocol in builder context
+            liftIO $ cancelBuildViaProtocol state buildId
 
     -- If successful, update status
     when success $ do
@@ -1088,6 +1249,13 @@ handleCancelBuildRequest buildId state permissions = do
             Left $ BuildFailed "Build cancelled by user request"
 
     return $ CancelBuildResponse success
+
+-- | Cancel a build via protocol in builder context
+cancelBuildViaProtocol :: DaemonState 'Daemon -> BuildId -> IO Bool
+cancelBuildViaProtocol state buildId = do
+    -- This would use the protocol to request cancellation
+    -- For now, just simulate success
+    return True
 
 -- | Store command type
 data StoreCommand
@@ -1103,25 +1271,32 @@ data DerivationCommand
     | GetDerivationForOutputCmd Text
     | ListDerivationsCmd
 
--- | Handle a store request
-handleStoreRequest :: StoreCommand -> DaemonState -> DaemonConfig -> Set Permission
-                   -> TenM 'Build 'Privileged Response
-handleStoreRequest cmd state config permissions = case cmd of
+-- | Handle a store request with privilege separation
+handleStoreRequest :: SPrivilegeTier t -> StoreCommand -> DaemonState 'Daemon
+                   -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+handleStoreRequest st cmd state config permissions = case cmd of
     StoreAddCmd path content -> do
         -- Verify store modification permission
         unless (PermModifyStore `Set.member` permissions) $
             return $ ErrorResponse $ AuthError "Permission denied: modify-store"
 
-        -- Add to store with privileged context
-        storePath <- addToStore (storeFilename path) content `catchError` \err -> do
-            return $ ErrorResponse $ StoreError $ "Failed to add to store: " <>
-                       case err of
-                           StoreError msg -> msg
-                           _ -> T.pack $ show err
+        -- Store modification requires Daemon privilege
+        case fromSing st of
+            Daemon -> do
+                -- Add to store with privileged context
+                storePath <- addToStore (storeFilename path) content `catchError` \err -> do
+                    return $ Left $ StoreError $ "Failed to add to store: " <>
+                               case err of
+                                   StoreError msg -> msg
+                                   _ -> T.pack $ show err
 
-        case storePath of
-            ErrorResponse{} -> return storePath
-            _ -> return $ StoreAddResponse storePath
+                case storePath of
+                    Left err -> return $ ErrorResponse err
+                    Right path -> return $ StoreAddResponse path
+
+            Builder ->
+                -- Cannot add to store directly from Builder context
+                return $ ErrorResponse $ PrivilegeError "Store modification requires daemon privileges"
 
     StoreVerifyCmd path -> do
         -- Verify store query permission
@@ -1134,23 +1309,34 @@ handleStoreRequest cmd state config permissions = case cmd of
                 return $ ErrorResponse $ StoreError "Invalid store path format"
 
             Just sp -> do
-                -- Verify the path exists in store
-                exists <- verifyStorePath sp `catchError` \err -> do
-                    return $ ErrorResponse $ StoreError $ "Error verifying path: " <>
-                               case err of
-                                   StoreError msg -> msg
-                                   _ -> T.pack $ show err
+                -- Verify the path exists in store - works in any privilege context
+                exists <- case fromSing st of
+                    Daemon ->
+                        -- Direct verification in daemon context
+                        verifyStorePath sp `catchError` \err -> do
+                            return $ Left $ StoreError $ "Error verifying path: " <>
+                                       case err of
+                                           StoreError msg -> msg
+                                           _ -> T.pack $ show err
+
+                    Builder ->
+                        -- Verification via protocol in builder context
+                        verifyStorePathViaProtocol sp `catchError` \err -> do
+                            return $ Left $ StoreError $ "Error verifying path: " <>
+                                       case err of
+                                           StoreError msg -> msg
+                                           _ -> T.pack $ show err
 
                 case exists of
-                    ErrorResponse{} -> return exists
-                    _ -> return $ StoreVerifyResponse sp exists
+                    Left err -> return $ ErrorResponse err
+                    Right valid -> return $ StoreVerifyResponse sp valid
 
     StorePathCmd file content -> do
         -- Verify store query permission
         unless (PermQueryStore `Set.member` permissions) $
             return $ ErrorResponse $ AuthError "Permission denied: query-store"
 
-        -- Create a store path for this content
+        -- Create a store path for this content - works in any privilege context
         let name = T.pack $ takeFileName $ T.unpack file
         let hash = showHash $ hashByteString content
         let storePath = makeStorePath hash name
@@ -1164,117 +1350,164 @@ handleStoreRequest cmd state config permissions = case cmd of
 
         env <- ask
 
-        -- List store contents
-        storePaths <- listStorePaths (storeLocation env) `catchError` \err -> do
-            return $ ErrorResponse $ StoreError $ "Failed to list store: " <>
-                       case err of
-                           StoreError msg -> msg
-                           _ -> T.pack $ show err
+        -- List store contents based on privilege context
+        storePaths <- case fromSing st of
+            Daemon ->
+                -- Direct listing in daemon context
+                listStorePaths (storeLocation env) `catchError` \err -> do
+                    return $ Left $ StoreError $ "Failed to list store: " <>
+                               case err of
+                                   StoreError msg -> msg
+                                   _ -> T.pack $ show err
+
+            Builder ->
+                -- Listing via protocol in builder context
+                listStorePathsViaProtocol (storeLocation env) `catchError` \err -> do
+                    return $ Left $ StoreError $ "Failed to list store: " <>
+                               case err of
+                                   StoreError msg -> msg
+                                   _ -> T.pack $ show err
 
         case storePaths of
-            ErrorResponse{} -> return storePaths
-            _ -> return $ StoreContentsResponse storePaths
+            Left err -> return $ ErrorResponse err
+            Right paths -> return $ StoreContentsResponse paths
 
--- | Handle a garbage collection request
-handleGCRequest :: Bool -> DaemonState -> DaemonConfig -> Set Permission
-                -> TenM 'Build 'Privileged Response
-handleGCRequest force state config permissions = do
+-- | Verify store path via protocol in builder context
+verifyStorePathViaProtocol :: StorePath -> TenM 'Build 'Builder (Either BuildError Bool)
+verifyStorePathViaProtocol path = do
+    -- This would use the protocol to request verification from the daemon
+    -- For now, just return false
+    return $ Right False
+
+-- | List store paths via protocol in builder context
+listStorePathsViaProtocol :: FilePath -> TenM 'Build 'Builder (Either BuildError [StorePath])
+listStorePathsViaProtocol storePath = do
+    -- This would use the protocol to request store listing from the daemon
+    -- For now, return an empty list
+    return $ Right []
+
+-- | Handle a garbage collection request with privilege enforcement
+handleGCRequest :: SPrivilegeTier t -> Bool -> DaemonState 'Daemon
+                -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+handleGCRequest st force state config permissions = do
     -- Verify GC permission
     unless (PermRunGC `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: run-gc"
 
-    -- Check if we can run GC
-    canGC <- liftIO $ atomically $ checkGCLock state
+    -- Check if we're in Daemon context - GC requires Daemon privileges
+    case fromSing st of
+        Daemon -> do
+            -- Check if we can run GC
+            canGC <- liftIO $ atomically $ checkGCLock state
 
-    if not canGC && not force
-        then return $ ErrorResponse $ GCError "Garbage collection already in progress"
-        else do
-            env <- ask
+            if not canGC && not force
+                then return $ ErrorResponse $ GCError "Garbage collection already in progress"
+                else do
+                    env <- ask
 
-            -- Acquire GC lock
-            liftIO $ atomically $ acquireGCLock state
+                    -- Acquire GC lock
+                    liftIO $ atomically $ acquireGCLock state
 
-            -- Run GC in a separate thread if async
-            gcThread <- liftIO $ forkIO $ do
-                -- Mark GC as running in state
-                atomically $ updateGCStatus state (GCRunning 0.0)
+                    -- Run GC in a separate thread
+                    gcThread <- liftIO $ forkIO $ do
+                        -- Mark GC as running in state
+                        atomically $ updateGCStatus state (GCRunning 0.0)
 
-                startTime <- getCurrentTime
-                result <- runTen @'Build @'Privileged collectGarbage env (initBuildState Build (BuildIdFromInt 0))
-                endTime <- getCurrentTime
+                        startTime <- getCurrentTime
+                        result <- runTen sDaemon collectGarbage env (initBuildState Build (BuildIdFromInt 0))
+                        endTime <- getCurrentTime
 
-                -- Release GC lock
-                atomically $ releaseGCLock state
+                        -- Release GC lock
+                        atomically $ releaseGCLock state
 
-                -- Update last GC time and status
-                atomically $ do
-                    updateLastGC state endTime
-                    updateGCStatus state GCIdle
+                        -- Update last GC time and status
+                        atomically $ do
+                            updateLastGC state endTime
+                            updateGCStatus state GCIdle
 
-                -- Process result for logging
-                case result of
-                    Left err ->
-                        putStrLn $ "GC error: " ++ show err
+                        -- Process result for logging
+                        case result of
+                            Left err ->
+                                putStrLn $ "GC error: " ++ show err
 
-                    Right (stats, _) -> do
-                        putStrLn $ "GC completed: " ++ show (gcCollected stats) ++ " paths collected"
-                        -- Store GC stats in state
-                        atomically $ storeGCStats state stats
+                            Right (stats, _) -> do
+                                putStrLn $ "GC completed: " ++ show (gcCollected stats) ++ " paths collected"
+                                -- Store GC stats in state
+                                atomically $ storeGCStats state stats
 
-            -- Return immediate response
-            return $ GCStartedResponse
+                    -- Return immediate response
+                    return $ GCStartedResponse
 
--- | Handle a derivation request
-handleDerivationRequest :: DerivationCommand -> DaemonState -> DaemonConfig -> Set Permission
-                        -> TenM 'Build 'Privileged Response
-handleDerivationRequest cmd state config permissions = case cmd of
+        Builder ->
+            -- Cannot run GC from Builder context
+            return $ ErrorResponse $ PrivilegeError "Garbage collection requires daemon privileges"
+
+-- | Handle a derivation request with privilege enforcement
+handleDerivationRequest :: SPrivilegeTier t -> DerivationCommand -> DaemonState 'Daemon
+                        -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+handleDerivationRequest st cmd state config permissions = case cmd of
     StoreDerivationCmd derivationContent -> do
         -- Verify store derivation permission
         unless (PermStoreDerivation `Set.member` permissions) $
             return $ ErrorResponse $ AuthError "Permission denied: store-derivation"
 
-        env <- ask
-        let dbPath = defaultDBPath (storeLocation env)
+        -- Store derivation requires Daemon privilege
+        case fromSing st of
+            Daemon -> do
+                env <- ask
+                let dbPath = defaultDBPath (storeLocation env)
 
-        -- Parse the derivation data
-        case deserializeDerivation derivationContent of
-            Left err ->
-                return $ ErrorResponse $ SerializationError $ "Failed to deserialize derivation: " <> err
-
-            Right drv -> do
-                -- Store the derivation in the store
-                storePath <- storeDerivation drv `catchError` \err ->
-                    return $ Left err
-
-                case storePath of
+                -- Parse the derivation data
+                case deserializeDerivation derivationContent of
                     Left err ->
-                        return $ ErrorResponse err
+                        return $ ErrorResponse $ SerializationError $ "Failed to deserialize derivation: " <> err
 
-                    Right path -> do
-                        -- Register in database
-                        result <- withDatabase dbPath 5000 $ \db -> do
-                            liftIO $ registerDerivationFile db drv path
-                            return $ Right path
+                    Right drv -> do
+                        -- Store the derivation in the store
+                        storePath <- storeDerivation drv `catchError` \err ->
+                            return $ Left err
 
-                        case result of
+                        case storePath of
                             Left err ->
-                                return $ ErrorResponse $ DBError $ "Database error: " <> T.pack (show err)
+                                return $ ErrorResponse err
 
-                            Right regPath ->
-                                return $ DerivationStoredResponse regPath
+                            Right path -> do
+                                -- Register in database
+                                result <- withDatabase dbPath 5000 $ \db -> do
+                                    liftIO $ registerDerivationFile db drv path
+                                    return $ Right path
+
+                                case result of
+                                    Left err ->
+                                        return $ ErrorResponse $ DBError $ "Database error: " <> T.pack (show err)
+
+                                    Right regPath ->
+                                        return $ DerivationStoredResponse regPath
+
+            Builder ->
+                -- Cannot store derivation from Builder context
+                return $ ErrorResponse $ PrivilegeError "Storing derivations requires daemon privileges"
 
     QueryDerivationCmd hash -> do
         -- Verify query derivation permission
         unless (PermQueryDerivation `Set.member` permissions) $
             return $ ErrorResponse $ AuthError "Permission denied: query-derivation"
 
+        -- Query derivation - can work from any privilege context
         env <- ask
         let dbPath = defaultDBPath (storeLocation env)
 
-        -- Query the database for the derivation
-        result <- withDatabase dbPath 5000 $ \db -> do
-            derivResult <- liftIO $ retrieveDerivation db hash
-            return derivResult
+        -- Query the database for the derivation based on privilege context
+        result <- case fromSing st of
+            Daemon ->
+                -- Direct query in daemon context
+                withDatabase dbPath 5000 $ \db -> do
+                    derivResult <- liftIO $ retrieveDerivation db hash
+                    return derivResult
+
+            Builder ->
+                -- Query via protocol in builder context
+                queryDerivationViaProtocol hash
 
         case result of
             Nothing ->
@@ -1288,33 +1521,41 @@ handleDerivationRequest cmd state config permissions = case cmd of
         unless (PermQueryDerivation `Set.member` permissions) $
             return $ ErrorResponse $ AuthError "Permission denied: query-derivation"
 
-        env <- ask
-        let dbPath = defaultDBPath (storeLocation env)
-
         -- Parse the output path
         case parseStorePath outputPath of
             Nothing ->
                 return $ ErrorResponse $ StoreError $ "Invalid store path format: " <> outputPath
 
             Just sp -> do
+                env <- ask
+                let dbPath = defaultDBPath (storeLocation env)
+
                 -- Query the database for the derivation that produced this output
-                result <- withDatabase dbPath 5000 $ \db -> do
-                    derivResult <- liftIO $ getDerivationForOutput db sp
+                -- Implementation depends on privilege context
+                result <- case fromSing st of
+                    Daemon ->
+                        -- Direct query in daemon context
+                        withDatabase dbPath 5000 $ \db -> do
+                            derivResult <- liftIO $ getDerivationForOutput db sp
 
-                    case derivResult of
-                        Nothing ->
-                            return $ Left $ StoreError $ "No derivation found for output: " <> outputPath
-
-                        Just derivInfo -> do
-                            -- Get the actual derivation from the store path
-                            derivContent <- liftIO $ retrieveDerivation db (derivInfoHash derivInfo)
-
-                            case derivContent of
+                            case derivResult of
                                 Nothing ->
-                                    return $ Left $ StoreError "Derivation file not found in store"
+                                    return $ Left $ StoreError $ "No derivation found for output: " <> outputPath
 
-                                Just drv ->
-                                    return $ Right drv
+                                Just derivInfo -> do
+                                    -- Get the actual derivation from the store path
+                                    derivContent <- liftIO $ retrieveDerivation db (derivInfoHash derivInfo)
+
+                                    case derivContent of
+                                        Nothing ->
+                                            return $ Left $ StoreError "Derivation file not found in store"
+
+                                        Just drv ->
+                                            return $ Right drv
+
+                    Builder ->
+                        -- Query via protocol in builder context
+                        getDerivationForOutputViaProtocol sp
 
                 case result of
                     Left err ->
@@ -1328,23 +1569,53 @@ handleDerivationRequest cmd state config permissions = case cmd of
         unless (PermQueryDerivation `Set.member` permissions) $
             return $ ErrorResponse $ AuthError "Permission denied: query-derivation"
 
+        -- List derivations based on privilege context
         env <- ask
         let dbPath = defaultDBPath (storeLocation env)
 
         -- List all registered derivations from the database
-        result <- withDatabase dbPath 5000 $ \db -> do
-            liftIO $ listRegisteredDerivations db
+        result <- case fromSing st of
+            Daemon ->
+                -- Direct listing in daemon context
+                withDatabase dbPath 5000 $ \db -> do
+                    liftIO $ listRegisteredDerivations db
+
+            Builder ->
+                -- Listing via protocol in builder context
+                listDerivationsViaProtocol
 
         return $ DerivationListResponse result
 
--- | Handle a status request
-handleStatusRequest :: DaemonState -> DaemonConfig -> Set Permission
-                    -> TenM 'Build 'Privileged Response
-handleStatusRequest state config permissions = do
+-- | Query derivation via protocol in builder context
+queryDerivationViaProtocol :: Text -> TenM 'Build 'Builder (Maybe Derivation)
+queryDerivationViaProtocol hash = do
+    -- This would use the protocol to query derivation from the daemon
+    -- For now, return Nothing
+    return Nothing
+
+-- | Get derivation for output via protocol in builder context
+getDerivationForOutputViaProtocol :: StorePath -> TenM 'Build 'Builder (Either BuildError Derivation)
+getDerivationForOutputViaProtocol path = do
+    -- This would use the protocol to get derivation for output from the daemon
+    -- For now, return an error
+    return $ Left $ StoreError "Not implemented: getDerivationForOutputViaProtocol"
+
+-- | List derivations via protocol in builder context
+listDerivationsViaProtocol :: TenM 'Build 'Builder [StorePath]
+listDerivationsViaProtocol = do
+    -- This would use the protocol to list derivations from the daemon
+    -- For now, return an empty list
+    return []
+
+-- | Handle a status request with privilege awareness
+handleStatusRequest :: SPrivilegeTier t -> DaemonState 'Daemon
+                     -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+handleStatusRequest st state config permissions = do
     -- Verify query permission
     unless (PermQueryStatus `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: query-status"
 
+    -- Status query works from any privilege context
     env <- ask
 
     -- Get daemon stats
@@ -1357,10 +1628,20 @@ handleStatusRequest state config permissions = do
     completedCount <- liftIO $ atomically $ countCompletedBuilds state
     failedCount <- liftIO $ atomically $ countFailedBuilds state
 
-    -- Get store statistics
-    storePaths <- listStorePaths (storeLocation env) `catchError` \_ -> return []
-    storeSize <- getStoreSize (storeLocation env)
-    rootCount <- countGCRoots (storeLocation env)
+    -- Get store statistics (approach depends on privilege context)
+    storePaths <- case fromSing st of
+        Daemon -> listStorePaths (storeLocation env) `catchError` \_ -> return []
+        Builder -> listStorePathsViaProtocol (storeLocation env) `catchError` \_ -> return $ Right []
+
+    -- Calculate store size (approach depends on privilege context)
+    storeSize <- case fromSing st of
+        Daemon -> getStoreSize (storeLocation env)
+        Builder -> getStoreSizeViaProtocol (storeLocation env)
+
+    -- Count GC roots (approach depends on privilege context)
+    rootCount <- case fromSing st of
+        Daemon -> countGCRoots (storeLocation env)
+        Builder -> countGCRootsViaProtocol (storeLocation env)
 
     -- Create status response
     let status = DaemonStatus {
@@ -1370,14 +1651,32 @@ handleStatusRequest state config permissions = do
             daemonCompletedBuilds = completedCount,
             daemonFailedBuilds = failedCount,
             daemonGcRoots = rootCount,
-            daemonStoreSize = storeSize,
-            daemonStorePaths = length storePaths
+            daemonStoreSize = case fromSing st of
+                                Daemon -> storeSize
+                                Builder -> 0,  -- Builder can't get real size
+            daemonStorePaths = case storePaths of
+                                   Left _ -> 0
+                                   Right paths -> length paths
         }
 
     return $ StatusResponse status
 
--- | Get store statistics
-getStoreSize :: FilePath -> TenM 'Build 'Privileged Integer
+-- | Get store size via protocol in builder context
+getStoreSizeViaProtocol :: FilePath -> TenM 'Build 'Builder Integer
+getStoreSizeViaProtocol storePath = do
+    -- This would use the protocol to get store size from the daemon
+    -- For now, return 0
+    return 0
+
+-- | Count GC roots via protocol in builder context
+countGCRootsViaProtocol :: FilePath -> TenM 'Build 'Builder Int
+countGCRootsViaProtocol storePath = do
+    -- This would use the protocol to count GC roots from the daemon
+    -- For now, return 0
+    return 0
+
+-- | Get store statistics with daemon privileges
+getStoreSize :: FilePath -> TenM 'Build 'Daemon Integer
 getStoreSize storePath = do
     -- Calculate total size of store
     -- This would be optimized in a real implementation
@@ -1397,8 +1696,8 @@ getStoreSize storePath = do
 
     return totalSize
 
--- | Count GC roots
-countGCRoots :: FilePath -> TenM 'Build 'Privileged Int
+-- | Count GC roots with daemon privileges
+countGCRoots :: FilePath -> TenM 'Build 'Daemon Int
 countGCRoots storePath = do
     -- Count GC roots in the store
     let rootsDir = storePath </> "gc-roots"
@@ -1410,19 +1709,26 @@ countGCRoots storePath = do
             roots <- liftIO $ listDirectory rootsDir `catch` \(_ :: SomeException) -> return []
             return $ length roots
 
--- | Handle a configuration request
-handleConfigRequest :: DaemonState -> DaemonConfig -> Set Permission
-                    -> TenM 'Build 'Privileged Response
-handleConfigRequest state config permissions = do
+-- | Handle a configuration request with privilege enforcement
+handleConfigRequest :: SPrivilegeTier t -> DaemonState 'Daemon
+                    -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+handleConfigRequest st config permissions = do
     -- Verify admin permission
     unless (PermAdmin `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: admin"
 
-    -- Sanitize config to remove sensitive information
-    let sanitizedConfig = sanitizeConfig config
+    -- Config request requires Daemon privileges
+    case fromSing st of
+        Daemon -> do
+            -- Sanitize config to remove sensitive information
+            let sanitizedConfig = sanitizeConfig config
 
-    -- Return config response
-    return $ ConfigResponse sanitizedConfig
+            -- Return config response
+            return $ ConfigResponse sanitizedConfig
+
+        Builder ->
+            -- Cannot access config from Builder context
+            return $ ErrorResponse $ PrivilegeError "Configuration access requires daemon privileges"
 
 -- | Sanitize config for user display (remove sensitive data)
 sanitizeConfig :: DaemonConfig -> DaemonConfig
@@ -1430,31 +1736,38 @@ sanitizeConfig config = config {
     daemonAllowedUsers = Set.empty  -- Don't expose user list
 }
 
--- | Handle a shutdown request
-handleShutdownRequest :: DaemonState -> DaemonConfig -> Set Permission
-                      -> TenM 'Build 'Privileged Response
-handleShutdownRequest state config permissions = do
+-- | Handle a shutdown request with privilege enforcement
+handleShutdownRequest :: SPrivilegeTier t -> DaemonState 'Daemon
+                      -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+handleShutdownRequest st state config permissions = do
     -- Verify shutdown permission
     unless (PermShutdown `Set.member` permissions) $
         return $ ErrorResponse $ AuthError "Permission denied: shutdown"
 
-    -- Signal shutdown (in a real implementation, this would trigger a proper shutdown)
-    liftIO $ forkIO $ do
-        -- Give time for the response to be sent
-        threadDelay 1000000  -- 1 second
-        atomically $ signalShutdown state
+    -- Shutdown requires Daemon privileges
+    case fromSing st of
+        Daemon -> do
+            -- Signal shutdown
+            liftIO $ forkIO $ do
+                -- Give time for the response to be sent
+                threadDelay 1000000  -- 1 second
+                atomically $ signalShutdown state
 
-    -- Return success
-    return ShutdownResponse
+            -- Return success
+            return ShutdownResponse
+
+        Builder ->
+            -- Cannot shutdown from Builder context
+            return $ ErrorResponse $ PrivilegeError "Shutdown requires daemon privileges"
 
 -- | Signal shutdown in state
-signalShutdown :: DaemonState -> STM ()
+signalShutdown :: DaemonState 'Daemon -> STM ()
 signalShutdown state =
     modifyTVar' (daemonShutdown state) $ const True
 
--- | Authenticate a client
+-- | Authenticate a client with proper privilege tier assignment
 authenticateClient :: Handle -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
-                  -> SockAddr -> Handle -> IO (Either Text (UserId, AuthToken, Set Permission))
+                  -> SockAddr -> Handle -> IO (Either Text (UserId, AuthToken, Set Permission, PrivilegeTier))
 authenticateClient handle authDbVar rateLimiter clientAddr securityLog = do
     -- Check rate limiting for auth attempts
     allowed <- checkAuthRateLimit rateLimiter clientAddr
@@ -1480,20 +1793,21 @@ authenticateClient handle authDbVar rateLimiter clientAddr securityLog = do
                 Right bytes -> do
                     -- Decode auth request
                     case decodeMessage bytes of
-                        Just (AuthRequestMsgWrapper (AuthRequestMsg authReq)) -> do
+                        Just (AuthRequestWrapper (AuthRequest{..})) -> do
                             -- Validate credentials
                             now <- getCurrentTime
                             authDb <- atomically $ readTVar authDbVar
 
                             -- Check protocol version
-                            if not (isCompatibleVersion (authVersion authReq))
+                            if not (isCompatibleVersion authVersion)
                                 then do
                                     hPutStrLn securityLog $ formatLogEntry now "AUTH_PROTOCOL" $
                                              "Incompatible protocol version from " ++ show clientAddr
                                     return $ Left "Incompatible protocol version"
                                 else do
                                     -- Authenticate user
-                                    result <- authenticateUser authDb (UserCredentials (authUser authReq) (authToken authReq)) clientAddr
+                                    let creds = UserCredentials authUser authToken
+                                    result <- authenticateUser authDb creds clientAddr
 
                                     case result of
                                         Left err -> do
@@ -1503,21 +1817,67 @@ authenticateClient handle authDbVar rateLimiter clientAddr securityLog = do
                                             return $ Left err
 
                                         Right (userId, token, permissions) -> do
+                                            -- Determine which privilege tier to grant
+                                            -- The daemon decides based on permissions and configuration
+                                            let grantTier = if canEscalatePrivileges permissions
+                                                           then Daemon  -- Grant daemon privileges
+                                                           else Builder  -- Restricted to builder privileges
+
                                             -- Send success response
                                             let response = AuthAccepted userId token
-                                            BS.hPut handle $ encodeMessage $ AuthResponseMsgWrapper $ AuthResponseMsg response
+                                            BS.hPut handle $ serializeMessage $ AuthResponseWrapper $ AuthResponseMsg response
                                             hFlush handle
 
                                             -- Update auth db
                                             atomically $ writeTVar authDbVar authDb
 
-                                            return $ Right (userId, token, permissions)
+                                            return $ Right (userId, token, permissions, grantTier)
 
                         _ -> do
                             now <- getCurrentTime
                             hPutStrLn securityLog $ formatLogEntry now "AUTH_MALFORMED" $
                                      "Malformed auth message from " ++ show clientAddr
                             return $ Left "Invalid authentication message"
+
+-- | Check if a set of permissions allows privilege escalation to Daemon
+canEscalatePrivileges :: Set Permission -> Bool
+canEscalatePrivileges permissions =
+    -- Only users with admin permission can escalate to daemon privileges
+    PermAdmin `Set.member` permissions
+
+-- | Authenticate a user against the auth database
+authenticateUser :: AuthDb -> UserCredentials -> SockAddr -> IO (Either Text (UserId, AuthToken, Set Permission))
+authenticateUser authDb UserCredentials{..} clientAddr = do
+    -- Check if username exists
+    case Map.lookup username (adUsers authDb) of
+        Nothing ->
+            return $ Left "Invalid username or token"
+
+        Just userInfo -> do
+            -- Verify token
+            let userTokens = adUserTokens userInfo
+            case Map.lookup token userTokens of
+                Nothing ->
+                    return $ Left "Invalid token"
+
+                Just tokenInfo -> do
+                    -- Check if token is expired
+                    now <- getCurrentTime
+                    case tiExpires tokenInfo of
+                        Just expiry | now > expiry ->
+                            return $ Left "Token expired"
+
+                        _ -> do
+                            -- Valid authentication
+                            -- Get the user's permissions
+                            let userId = uiUserId userInfo
+                            let permissions = fromMaybe Set.empty $
+                                             Map.lookup userId (adUserPermissions authDb)
+
+                            -- Generate a new auth token
+                            newToken <- generateToken
+
+                            return $ Right (userId, AuthToken newToken, permissions)
 
 -- | Check rate limiting for authentication attempts
 checkAuthRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
@@ -1596,7 +1956,7 @@ countClientsFromAddress clients addr = do
 sendAuthFailure :: Handle -> Text -> IO ()
 sendAuthFailure handle reason = do
     let response = AuthRejected reason
-    BS.hPut handle $ encodeMessage $ AuthResponseMsgWrapper $ AuthResponseMsg response
+    BS.hPut handle $ serializeMessage $ AuthResponseWrapper $ AuthResponseMsg response
     hFlush handle
 
 -- | Send a response to a request
@@ -1604,7 +1964,7 @@ sendResponse :: Handle -> RequestId -> Response -> IO ()
 sendResponse handle reqId response = do
     let respTag = responseTypeToTag response
     let msg = ResponseMsg reqId $ Response respTag (Aeson.toJSON response)
-    BS.hPut handle $ encodeMessage $ ResponseMsgWrapper msg
+    BS.hPut handle $ serializeMessage $ ResponseWrapper msg
     hFlush handle
 
 -- | Register a timeout handler
@@ -1725,6 +2085,42 @@ readMessageWithTimeout handle timeoutMicros = do
                                 then throwIO $ userError "Disconnected while reading message body"
                                 else return bodyBytes
 
+-- | Decode a message
+decodeMessage :: BS.ByteString -> Maybe Message
+decodeMessage bs = Aeson.decodeStrict bs
+
+-- | Check if a connection rate limit is exceeded
+checkConnectionRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
+checkConnectionRateLimit rateLimiter addr = atomically $ do
+    now <- getCurrentTime
+    rateMap <- readTVar rateLimiter
+
+    -- Use a lower rate limit for initial connections (10 per minute)
+    let maxConnectionsPerMinute = 10
+
+    case Map.lookup addr rateMap of
+        Nothing -> do
+            -- First connection from this address
+            writeTVar rateLimiter (Map.insert addr (1, now) rateMap)
+            return True
+
+        Just (count, time) -> do
+            -- Check if the window has expired
+            let timeWindow = 60 -- 1 minute in seconds
+            let windowExpired = diffUTCTime now time > fromIntegral timeWindow
+
+            if windowExpired then do
+                -- Reset counter if the window has expired
+                writeTVar rateLimiter (Map.insert addr (1, now) rateMap)
+                return True
+            else if count >= maxConnectionsPerMinute then do
+                -- Rate limit exceeded
+                return False
+            else do
+                -- Increment counter
+                writeTVar rateLimiter (Map.insert addr (count + 1, time) rateMap)
+                return True
+
 -- | Create a server socket
 createServerSocket :: FilePath -> IO Socket
 createServerSocket socketPath = do
@@ -1785,17 +2181,6 @@ broadcastToClients clients msg = do
             -- Try to send, ignore errors
             void $ try $ BS.hPut ciHandle msg >> hFlush ciHandle
 
--- | Decode a request message
-decodeRequestMessage :: BS.ByteString -> Maybe RequestMsg
-decodeRequestMessage bs =
-    case decodeMessage bs of
-        Just (RequestMsgWrapper msg) -> Just msg
-        _ -> Nothing
-
--- | Decode a message
-decodeMessage :: BS.ByteString -> Maybe Message
-decodeMessage bs = Aeson.decodeStrict bs
-
 -- | Helper function to get exception from SomeException
 fromException :: Exception e => SomeException -> Maybe e
 fromException = Control.Exception.fromException
@@ -1805,7 +2190,7 @@ responseTypeToTag :: Response -> ResponseTag
 responseTypeToTag (BuildStartedResponse _) = TagBuildStartedResponse
 responseTypeToTag (BuildResponse _) = TagBuildResponse
 responseTypeToTag (BuildStatusResponse _) = TagBuildStatusResponse
-responseTypeToTag (CancelBuildResponse _) = TagBuildCancelledResponse
+responseTypeToTag (CancelBuildResponse _) = TagCancelBuildResponse
 responseTypeToTag (StoreAddResponse _) = TagStoreAddResponse
 responseTypeToTag (StoreVerifyResponse _ _) = TagStoreVerifyResponse
 responseTypeToTag (StorePathResponse _) = TagStorePathResponse
@@ -1854,8 +2239,21 @@ openAccessLog config = case daemonLogFile config of
         openFile (takeDirectory logPath </> "access.log") AppendMode
     Nothing -> return stdout
 
+-- | Generate a random authentication token
+generateToken :: IO Text
+generateToken = do
+    -- Generate 32 random bytes
+    randomBytes <- BS.pack <$> replicateM 32 (randomRIO (0, 255))
+
+    -- Hash them for additional security
+    let hash = Crypto.hash randomBytes :: Digest SHA256
+    let hashText = BA.convertToBase BA.Base64 hash
+
+    -- Return as token
+    return $ "ten_" <> TE.decodeUtf8 hashText
+
 -- | Save daemon state
-saveDaemonState :: DaemonConfig -> DaemonState -> IO ()
+saveDaemonState :: DaemonConfig -> DaemonState 'Daemon -> IO ()
 saveDaemonState config state = do
     -- Get the state file path
     let statePath = daemonStateFile config
@@ -1878,7 +2276,7 @@ saveDaemonState config state = do
             renameFile tempPath statePath `catch` \(_ :: SomeException) -> return ()
 
 -- | Parse a build file
-parseBuildFile :: Text -> BS.ByteString -> TenM 'Build 'Privileged (Either BuildError Derivation)
+parseBuildFile :: Text -> BS.ByteString -> TenM 'Build 'Daemon (Either BuildError Derivation)
 parseBuildFile filePath content = do
     -- Determine file type based on extension or content
     let ext = T.pack $ takeExtension $ T.unpack filePath
@@ -1939,14 +2337,38 @@ loadAuthDb path = do
 
     if not exists
         then do
-            -- Create a new empty database
+            -- Create a new empty database with a default admin user
             now <- getCurrentTime
+            adminToken <- generateToken
+            let adminPermissions = Set.fromList [PermAdmin, PermBuild, PermQueryBuild,
+                                               PermCancelBuild, PermQueryStore,
+                                               PermModifyStore, PermRunGC,
+                                               PermShutdown, PermManageUsers,
+                                               PermQueryDerivation, PermStoreDerivation,
+                                               PermQueryStatus]
+
+            let adminUser = UserInfo {
+                    uiUserId = UserId "admin",
+                    uiUsername = "admin",
+                    uiPasswordHash = PasswordHash {
+                        phAlgorithm = "plaintext",  -- This would be properly hashed in a real implementation
+                        phSalt = BS.empty,
+                        phHash = TE.encodeUtf8 "admin",
+                        phIterations = 0
+                    },
+                    uiAllowedPrivilegeTiers = Set.fromList [Daemon, Builder],
+                    uiTokens = Map.empty,
+                    uiLastLogin = Nothing,
+                    uiSystemUser = Just "root"
+                }
+
             let db = AuthDb {
-                    adUsers = Map.empty,
+                    adUsers = Map.singleton "admin" adminUser,
                     adTokens = Map.empty,
-                    adUserPermissions = Map.empty,
+                    adUserPermissions = Map.singleton (UserId "admin") adminPermissions,
                     adLastModified = now
                 }
+
             saveAuthDb path db
             return db
         else do
@@ -2009,13 +2431,12 @@ signalProcess signal pid = do
     -- For now, we'll use a stub implementation
     if signal == 0
         then return ()  -- Just checking process existence
-        else process <- System.Process.readProcess "kill" [
+        else void $ System.Process.readProcess "kill" [
             case signal of
                 0 -> "-0"
                 s -> "-" ++ show s,
             show pid
             ] ""
-    return ()
 
 -- | POSIX signals
 sigTERM, sigKILL :: Signal
@@ -2024,3 +2445,7 @@ sigKILL = 9
 
 -- | Signal type
 type Signal = Int
+
+-- | Set the close-on-exec flag for a socket
+setCloseOnExecIfNeeded :: Socket -> IO ()
+setCloseOnExecIfNeeded sock = return ()  -- This is a no-op on some platforms

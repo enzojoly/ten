@@ -1,11 +1,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Ten.Daemon.Config (
     -- Core configuration types
     DaemonConfig(..),
     LogLevel(..),
+    PrivilegeModel(..),
 
     -- Configuration management
     defaultDaemonConfig,
@@ -29,7 +34,12 @@ module Ten.Daemon.Config (
 
     -- Command-line argument parsing
     configOptionDescriptions,
-    parseConfigFromArgs
+    parseConfigFromArgs,
+
+    -- Privilege-aware configuration operations
+    withConfigPrivilege,
+    validatePrivilegeConfig,
+    requiresPrivilegeFor
 ) where
 
 import Control.Exception (try, SomeException)
@@ -54,7 +64,17 @@ import System.FilePath ((</>), takeDirectory)
 import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName)
 import qualified System.IO.Error as IOE
 
-import Ten.Core (BuildError(..))
+import Ten.Core (BuildError(..), Phase(..), PrivilegeTier(..), SPrivilegeTier(..),
+                 CanAccessStore, CanModifyStore, CanDropPrivileges, CanCreateSandbox,
+                 TenM(..), withSPrivilegeTier, sDaemon, sBuilder, privilegeError,
+                 SingI)
+
+-- | Privilege model for daemon operations
+data PrivilegeModel
+    = PrivilegeAlwaysDrop     -- ^ Always drop privileges (safest)
+    | PrivilegeDropSelective  -- ^ Drop privileges selectively based on operation
+    | PrivilegeNoDrop         -- ^ Never drop privileges (dangerous, only for special cases)
+    deriving (Show, Eq, Ord, Enum, Bounded)
 
 -- | Log levels for daemon operations
 data LogLevel
@@ -90,6 +110,11 @@ data DaemonConfig = DaemonConfig {
     daemonGroup         :: Maybe Text,    -- ^ Group to run daemon as (if running as root)
     daemonAllowedUsers  :: Set Text,      -- ^ Users allowed to connect to daemon
     daemonRequireAuth   :: Bool,          -- ^ Whether authentication is required
+
+    -- Privilege model settings
+    daemonAllowPrivilegeEscalation :: Bool,          -- ^ Allow users to escalate privileges (dangerous)
+    daemonPrivilegeModel :: PrivilegeModel,          -- ^ How to handle privileges
+    daemonDefaultPrivilegeTier :: PrivilegeTier,     -- ^ Default privilege tier for connections
 
     -- Logging settings
     daemonLogFile       :: Maybe FilePath, -- ^ Path to log file (Nothing = stdout)
@@ -133,6 +158,11 @@ defaultDaemonConfig = DaemonConfig {
     daemonAllowedUsers  = Set.empty,  -- Empty means all users are allowed
     daemonRequireAuth   = True,
 
+    -- Privilege model defaults
+    daemonAllowPrivilegeEscalation = False,  -- Default to disallowing privilege escalation
+    daemonPrivilegeModel = PrivilegeAlwaysDrop,  -- Default to safest model
+    daemonDefaultPrivilegeTier = Builder,  -- Default to unprivileged
+
     -- Logging defaults
     daemonLogFile       = Just "/var/log/ten/daemon.log",
     daemonLogLevel      = LogNormal,
@@ -168,7 +198,11 @@ getDefaultConfig = do
 
     -- Modify default config based on whether we're root or not
     let config = if isRoot
-            then defaultDaemonConfig
+            then defaultDaemonConfig {
+                -- When running as root, allow privilege escalation but default to Builder
+                daemonAllowPrivilegeEscalation = False,  -- Still default to False for safety
+                daemonDefaultPrivilegeTier = Builder  -- Default to unprivileged
+            }
             else defaultDaemonConfig {
                 -- Non-root appropriate paths
                 daemonSocketPath    = xdgStateDir </> "daemon.sock",
@@ -179,7 +213,10 @@ getDefaultConfig = do
                 -- Always run in foreground when not root
                 daemonForeground    = True,
                 -- Set current user as default allowed user
-                daemonAllowedUsers  = Set.singleton currentUser
+                daemonAllowedUsers  = Set.singleton currentUser,
+                -- Non-root users can't escalate privileges
+                daemonAllowPrivilegeEscalation = False,
+                daemonDefaultPrivilegeTier = Builder
             }
 
     -- Create directories for the updated paths
@@ -251,8 +288,9 @@ loadConfigFromFile path = do
                                 Right validConfig -> return $ Right validConfig
 
 -- | Save daemon configuration to a file
-saveConfigToFile :: FilePath -> DaemonConfig -> IO (Either String ())
-saveConfigToFile path config = do
+-- This operation requires Daemon privileges
+saveConfigToFile :: FilePath -> DaemonConfig -> TenM 'Build 'Daemon (Either String ())
+saveConfigToFile path config = TenM $ \sp st -> do
     let dir = takeDirectory path
     result <- try $ createDirectoryIfMissing True dir
     case result of
@@ -291,6 +329,9 @@ loadConfigFromEnv = do
     mGroup <- lookupEnvText "TEN_DAEMON_GROUP"
     mAllowedUsers <- lookupEnvTextList "TEN_DAEMON_ALLOWED_USERS"
     mRequireAuth <- lookupEnvBool "TEN_DAEMON_REQUIRE_AUTH"
+    mAllowPrivEsc <- lookupEnvBool "TEN_DAEMON_ALLOW_PRIVILEGE_ESCALATION"
+    mPrivModel <- lookupEnvPrivModel "TEN_DAEMON_PRIVILEGE_MODEL"
+    mDefaultTier <- lookupEnvPrivilegeTier "TEN_DAEMON_DEFAULT_PRIVILEGE_TIER"
     mLogFile <- lookupEnv "TEN_DAEMON_LOG_FILE"
     mLogLevel <- lookupEnvLogLevel "TEN_DAEMON_LOG_LEVEL"
     mForeground <- lookupEnvBool "TEN_DAEMON_FOREGROUND"
@@ -314,6 +355,9 @@ loadConfigFromEnv = do
             daemonGroup = mGroup <|> daemonGroup defaultConfig,
             daemonAllowedUsers = maybe (daemonAllowedUsers defaultConfig) Set.fromList mAllowedUsers,
             daemonRequireAuth = fromMaybe (daemonRequireAuth defaultConfig) mRequireAuth,
+            daemonAllowPrivilegeEscalation = fromMaybe (daemonAllowPrivilegeEscalation defaultConfig) mAllowPrivEsc,
+            daemonPrivilegeModel = fromMaybe (daemonPrivilegeModel defaultConfig) mPrivModel,
+            daemonDefaultPrivilegeTier = fromMaybe (daemonDefaultPrivilegeTier defaultConfig) mDefaultTier,
             daemonLogFile = (if mLogFile == Just "stdout" then Nothing else mLogFile) <|> daemonLogFile defaultConfig,
             daemonLogLevel = fromMaybe (daemonLogLevel defaultConfig) mLogLevel,
             daemonForeground = fromMaybe (daemonForeground defaultConfig) mForeground,
@@ -376,6 +420,27 @@ loadConfigFromEnv = do
                         return $ Just $ toEnum num
                     _ -> return Nothing
 
+    lookupEnvPrivModel :: String -> IO (Maybe PrivilegeModel)
+    lookupEnvPrivModel name = do
+        mValue <- lookupEnv name
+        case mValue of
+            Nothing -> return Nothing
+            Just value -> case toLower value of
+                "always-drop" -> return $ Just PrivilegeAlwaysDrop
+                "selective" -> return $ Just PrivilegeDropSelective
+                "no-drop" -> return $ Just PrivilegeNoDrop
+                _ -> return Nothing
+
+    lookupEnvPrivilegeTier :: String -> IO (Maybe PrivilegeTier)
+    lookupEnvPrivilegeTier name = do
+        mValue <- lookupEnv name
+        case mValue of
+            Nothing -> return Nothing
+            Just value -> case toLower value of
+                "daemon" -> return $ Just Daemon
+                "builder" -> return $ Just Builder
+                _ -> return Nothing
+
     toLower = map (\c -> if c >= 'A' && c <= 'Z' then toEnum (fromEnum c + 32) else c)
 
     splitOn :: Char -> String -> [String]
@@ -424,6 +489,16 @@ configOptionDescriptions = [
         "Users allowed to connect to daemon",
     Option [] ["no-auth"] (NoArg (\cfg -> cfg { daemonRequireAuth = False }))
         "Disable authentication requirement",
+    Option [] ["allow-privilege-escalation"] (NoArg (\cfg -> cfg { daemonAllowPrivilegeEscalation = True }))
+        "Allow users to escalate privileges (dangerous)",
+    Option [] ["privilege-model"] (ReqArg (\m cfg -> cfg {
+            daemonPrivilegeModel = parsePrivilegeModel m
+        }) "always-drop|selective|no-drop")
+        "Privilege model (how to handle privilege dropping)",
+    Option [] ["default-tier"] (ReqArg (\t cfg -> cfg {
+            daemonDefaultPrivilegeTier = parsePrivilegeTier t
+        }) "daemon|builder")
+        "Default privilege tier for connections",
     Option [] ["log-file"] (ReqArg (\f cfg -> cfg {
             daemonLogFile = if f == "stdout" then Nothing else Just f
         }) "PATH")
@@ -446,6 +521,21 @@ configOptionDescriptions = [
     splitOn c s = case break (== c) s of
         (chunk, []) -> [chunk]
         (chunk, _:rest) -> chunk : splitOn c rest
+
+    parsePrivilegeModel :: String -> PrivilegeModel
+    parsePrivilegeModel s = case toLower s of
+        "always-drop" -> PrivilegeAlwaysDrop
+        "selective" -> PrivilegeDropSelective
+        "no-drop" -> PrivilegeNoDrop
+        _ -> PrivilegeAlwaysDrop  -- Default to safest option
+
+    parsePrivilegeTier :: String -> PrivilegeTier
+    parsePrivilegeTier s = case toLower s of
+        "daemon" -> Daemon
+        "builder" -> Builder
+        _ -> Builder  -- Default to safer option
+
+    toLower = map (\c -> if c >= 'A' && c <= 'Z' then toEnum (fromEnum c + 32) else c)
 
 -- | Parse daemon configuration from command-line arguments
 parseConfigFromArgs :: [String] -> IO (Either String DaemonConfig)
@@ -489,16 +579,74 @@ validateConfig config = do
     when (daemonGcKeepLast config < 0) $
         Left "GC keep-last value cannot be negative"
 
-    -- Check for valid port number if specified
+    -- Check port range if specified
     case daemonPort config of
         Just port | port <= 0 || port > 65535 ->
             Left "Port number must be between 1 and 65535"
         _ -> Right ()
 
-    -- More validations could be added here
+    -- Check privilege-related settings
+    when (daemonAllowPrivilegeEscalation config && not (daemonRequireAuth config)) $
+        Left "Cannot allow privilege escalation without authentication"
+
+    -- No-drop privilege model is dangerous
+    when (daemonPrivilegeModel config == PrivilegeNoDrop) $
+        Left "PrivilegeNoDrop model is dangerous and not recommended"
 
     -- Return the validated config
     return config
+
+-- | Execute a configuration operation with the required privilege level
+withConfigPrivilege ::
+    forall p a. (SingI p) =>
+    SPrivilegeTier 'Daemon ->
+    DaemonConfig ->
+    (DaemonConfig -> TenM p 'Daemon a) ->
+    TenM p 'Daemon a
+withConfigPrivilege st config operation = TenM $ \sp _ -> do
+    -- Run the operation with daemon privileges
+    let (TenM m) = operation config
+    m sp st
+
+-- | Validate whether an operation is allowed with the current privilege model
+validatePrivilegeConfig ::
+    SPrivilegeTier t ->
+    DaemonConfig ->
+    PrivilegeTier ->
+    TenM p t Bool
+validatePrivilegeConfig st config requiredTier = TenM $ \sp _ -> do
+    -- Check if the current privilege tier is sufficient
+    case (fromSing st, requiredTier) of
+        (Daemon, _) ->
+            -- Daemon tier can do anything
+            return True
+        (Builder, Daemon) ->
+            -- Builder tier can only escalate if allowed
+            return $ daemonAllowPrivilegeEscalation config
+        (Builder, Builder) ->
+            -- Builder tier can perform Builder operations
+            return True
+
+-- | Check if an operation requires a specific privilege tier
+requiresPrivilegeFor ::
+    SPrivilegeTier t ->
+    DaemonConfig ->
+    Text ->
+    PrivilegeTier ->
+    TenM p t ()
+requiresPrivilegeFor st config operation requiredTier = TenM $ \sp _ -> do
+    -- Check if we have sufficient privileges
+    allowed <- case (fromSing st, requiredTier) of
+        (Daemon, _) -> return True  -- Daemon can do anything
+        (Builder, Builder) -> return True  -- Builder can do Builder operations
+        (Builder, Daemon) ->
+            -- Check if privilege escalation is allowed
+            return $ daemonAllowPrivilegeEscalation config
+
+    -- Throw an error if not allowed
+    unless allowed $
+        throwError $ PrivilegeError $ "Operation '" <> operation <> "' requires " <>
+                                     T.pack (show requiredTier) <> " privileges"
 
 -- | Make the DaemonConfig type an instance of ToJSON and FromJSON
 instance Aeson.ToJSON DaemonConfig where
@@ -518,12 +666,24 @@ instance Aeson.ToJSON DaemonConfig where
             "group" .= daemonGroup,
             "allowedUsers" .= Set.toList daemonAllowedUsers,
             "requireAuth" .= daemonRequireAuth,
+            "allowPrivilegeEscalation" .= daemonAllowPrivilegeEscalation,
+            "privilegeModel" .= privilegeModelToText daemonPrivilegeModel,
+            "defaultPrivilegeTier" .= privilegeTierToText daemonDefaultPrivilegeTier,
             "logFile" .= daemonLogFile,
             "logLevel" .= fromEnum daemonLogLevel,
             "foreground" .= daemonForeground,
             "autoStart" .= daemonAutoStart,
             "restrictive" .= daemonRestrictive
         ]
+      where
+        privilegeModelToText :: PrivilegeModel -> Text
+        privilegeModelToText PrivilegeAlwaysDrop = "always-drop"
+        privilegeModelToText PrivilegeDropSelective = "selective"
+        privilegeModelToText PrivilegeNoDrop = "no-drop"
+
+        privilegeTierToText :: PrivilegeTier -> Text
+        privilegeTierToText Daemon = "daemon"
+        privilegeTierToText Builder = "builder"
 
 instance Aeson.FromJSON DaemonConfig where
     parseJSON = Aeson.withObject "DaemonConfig" $ \v -> do
@@ -543,6 +703,12 @@ instance Aeson.FromJSON DaemonConfig where
         daemonGroup <- v .: "group"
         allowedUsersList <- v .: "allowedUsers"
         daemonRequireAuth <- v .: "requireAuth"
+
+        -- New privilege model fields, with fallbacks for older config files
+        daemonAllowPrivilegeEscalation <- v .: "allowPrivilegeEscalation" <|> pure False
+        privilegeModelText <- v .: "privilegeModel" <|> pure "always-drop"
+        defaultTierText <- v .: "defaultPrivilegeTier" <|> pure "builder"
+
         daemonLogFile <- v .: "logFile"
         logLevelInt <- v .: "logLevel"
         daemonForeground <- v .: "foreground"
@@ -551,5 +717,18 @@ instance Aeson.FromJSON DaemonConfig where
 
         let daemonAllowedUsers = Set.fromList allowedUsersList
         let daemonLogLevel = toEnum $ min 3 $ max 0 logLevelInt
+
+        -- Parse privilege model
+        let daemonPrivilegeModel = case privilegeModelText of
+                "always-drop" -> PrivilegeAlwaysDrop
+                "selective" -> PrivilegeDropSelective
+                "no-drop" -> PrivilegeNoDrop
+                _ -> PrivilegeAlwaysDrop  -- Default to safest
+
+        -- Parse default privilege tier
+        let daemonDefaultPrivilegeTier = case defaultTierText of
+                "daemon" -> Daemon
+                "builder" -> Builder
+                _ -> Builder  -- Default to safer
 
         return DaemonConfig{..}

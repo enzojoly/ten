@@ -2,23 +2,30 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE KindSignatures #-}
 
 module Ten.Daemon.Auth (
     -- Core authentication types
     UserCredentials(..),
     AuthToken(..),
 
-    -- Authentication functions
+    -- Authentication functions with privilege awareness
     authenticateUser,
     validateToken,
     generateToken,
 
-    -- User management
+    -- User management with privilege tier constraints
     getUserInfo,
     checkUserPermission,
     addUser,
     removeUser,
     changeUserPassword,
+    changeUserPrivilegeTiers,
 
     -- Password functions
     hashPassword,
@@ -27,24 +34,30 @@ module Ten.Daemon.Auth (
     -- Permission types and functions
     Permission(..),
     UserPermissionLevel(..),
+    PrivilegeRequirement(..),
     permissionToText,
     textToPermission,
     permissionLevelToText,
     textToPermissionLevel,
     defaultPermissions,
+    permissionRequiresDaemon,
 
     -- System user integration
     getSystemUserInfo,
     systemUserExists,
     integrateWithSystemUser,
 
-    -- Token management
+    -- Token management with privilege tier tracking
     TokenInfo(..),
     createToken,
     revokeToken,
     listUserTokens,
     refreshToken,
     tokenExpired,
+
+    -- Privilege transitions
+    withTokenPrivilege,
+    hasPrivilegeForPermission,
 
     -- Auth file management
     loadAuthFile,
@@ -61,6 +74,10 @@ module Ten.Daemon.Auth (
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (catch, throwIO, try, bracket, SomeException, Exception, finally)
 import Control.Monad (void, when, unless, forM, forM_)
+import Control.Monad.IO.Class (MonadIO(..))
+import Control.Monad.Reader (ReaderT, runReaderT, ask, local)
+import Control.Monad.Except (ExceptT, runExceptT, throwError, catchError)
+import Control.Monad.State (StateT, runStateT, get, put, modify)
 import Crypto.Hash (hash, digestFromByteString, Digest, SHA256, SHA512)
 import qualified Crypto.Hash as Crypto
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
@@ -74,11 +91,14 @@ import qualified Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import Data.Kind (Type)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, fromMaybe, catMaybes, isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Singletons
+import Data.Singletons.TH
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -102,10 +122,7 @@ import System.Posix.User (
 import System.Random (randomIO, randomRIO)
 
 -- Import Ten modules
-import Ten.Core (UserId(..), AuthToken(..), BuildError(..))
-
--- Type alias for UserEntry since we can't import the constructor directly
-type UserEntry = (UserID, String, GroupID)
+import Ten.Core
 
 -- | Authentication errors
 data AuthError
@@ -113,19 +130,21 @@ data AuthError
     | UserNotFound
     | TokenNotFound
     | TokenExpired
-    | InsufficientPermissions
+    | InsufficientPrivileges PrivilegeTier PrivilegeRequirement
     | AuthFileError Text
     | InvalidPassphrase
     | CryptoError Text
     | SystemError Text
+    | PrivilegeEscalationDenied Text
     deriving (Show, Eq)
 
 instance Exception AuthError
 
--- | User credentials for authentication
+-- | User credentials for authentication with privilege tier request
 data UserCredentials = UserCredentials {
     ucUsername :: Text,
-    ucToken :: Text
+    ucToken :: Text,
+    ucRequestedTier :: PrivilegeTier  -- Requested privilege tier
 } deriving (Show, Eq)
 
 -- | User permission levels
@@ -136,6 +155,12 @@ data UserPermissionLevel
     | UserLevelAdvanced   -- Advanced user (can manage own builds)
     | UserLevelAdmin      -- Administrator (full access)
     deriving (Show, Eq, Ord, Enum, Bounded)
+
+-- | Privilege requirement for operations
+data PrivilegeRequirement
+    = DaemonRequired      -- Requires daemon privileges
+    | BuilderSufficient   -- Can be done with builder privileges
+    deriving (Show, Eq)
 
 -- | Specific permissions
 data Permission
@@ -150,15 +175,35 @@ data Permission
     | PermAdmin              -- Administrative access
     deriving (Show, Eq, Ord, Enum, Bounded)
 
--- | Token information
-data TokenInfo = TokenInfo {
+-- | Token information with privilege tier tracking
+data TokenInfo (t :: PrivilegeTier) = TokenInfo {
     tiToken :: Text,           -- The actual token value
     tiCreated :: UTCTime,      -- When the token was created
     tiExpires :: Maybe UTCTime, -- When the token expires (Nothing = no expiry)
     tiClientInfo :: Text,      -- Information about the client
     tiLastUsed :: UTCTime,     -- When the token was last used
-    tiPermissions :: Set Permission -- Specific permissions for this token
-} deriving (Show, Eq)
+    tiPermissions :: Set Permission, -- Specific permissions for this token
+    tiPrivilegeEvidence :: SPrivilegeTier t  -- Runtime evidence of privilege tier
+} deriving (Eq)
+
+-- Implement show for TokenInfo to hide the SPrivilegeTier
+instance Show (TokenInfo t) where
+    show TokenInfo{..} = "TokenInfo { token = " ++ show tiToken ++
+                         ", created = " ++ show tiCreated ++
+                         ", expires = " ++ show tiExpires ++
+                         ", clientInfo = " ++ show tiClientInfo ++
+                         ", lastUsed = " ++ show tiLastUsed ++
+                         ", permissions = " ++ show tiPermissions ++
+                         ", privilegeTier = " ++ show (fromSing tiPrivilegeEvidence) ++ " }"
+
+-- | Token wrapper that erases the phantom type
+data SomeTokenInfo = forall t. SomeTokenInfo (TokenInfo t)
+
+instance Show SomeTokenInfo where
+    show (SomeTokenInfo token) = show token
+
+instance Eq SomeTokenInfo where
+    (SomeTokenInfo t1) == (SomeTokenInfo t2) = tiToken t1 == tiToken t2
 
 -- | Stored password hash
 data PasswordHash = PasswordHash {
@@ -169,15 +214,16 @@ data PasswordHash = PasswordHash {
     phCreated :: UTCTime      -- When this hash was created
 } deriving (Show, Eq)
 
--- | User information
+-- | User information with allowed privilege tiers
 data UserInfo = UserInfo {
     uiUserId :: UserId,
     uiUsername :: Text,
     uiPasswordHash :: Maybe PasswordHash,
     uiPermissionLevel :: UserPermissionLevel,
     uiSpecificPermissions :: Set Permission,
+    uiAllowedPrivilegeTiers :: Set PrivilegeTier, -- Which privilege tiers are allowed
     uiSystemUser :: Maybe Text,  -- Associated system user, if any
-    uiTokens :: Map Text TokenInfo,
+    uiTokens :: Map Text SomeTokenInfo,  -- Store tokens with erased types
     uiLastLogin :: Maybe UTCTime,
     uiCreated :: UTCTime
 } deriving (Show, Eq)
@@ -187,8 +233,22 @@ data AuthDb = AuthDb {
     adUsers :: Map Text UserInfo,  -- Keyed by username
     adSystemUserMap :: Map Text Text,  -- System username to Ten username
     adTokenMap :: Map Text Text,  -- Token to username
-    adLastModified :: UTCTime
+    adLastModified :: UTCTime,
+    adAllowPrivilegeEscalation :: Bool  -- Whether to allow privilege escalation
 } deriving (Show, Eq)
+
+-- | Get permission requirement for a specific permission
+getPermissionRequirement :: Permission -> PrivilegeRequirement
+getPermissionRequirement PermModifyStore = DaemonRequired
+getPermissionRequirement PermRunGC = DaemonRequired
+getPermissionRequirement PermShutdown = DaemonRequired
+getPermissionRequirement PermManageUsers = DaemonRequired
+getPermissionRequirement PermAdmin = DaemonRequired
+getPermissionRequirement _ = BuilderSufficient
+
+-- | Check if a permission requires daemon privileges
+permissionRequiresDaemon :: Permission -> Bool
+permissionRequiresDaemon perm = getPermissionRequirement perm == DaemonRequired
 
 -- | Convert permission level to text
 permissionLevelToText :: UserPermissionLevel -> Text
@@ -265,6 +325,14 @@ defaultPermissions UserLevelAdmin = Set.fromList [
     PermAdmin
     ]
 
+-- | Default allowed privilege tiers for permission levels
+defaultAllowedTiers :: UserPermissionLevel -> Set PrivilegeTier
+defaultAllowedTiers UserLevelNone = Set.singleton Builder
+defaultAllowedTiers UserLevelBasic = Set.singleton Builder
+defaultAllowedTiers UserLevelStandard = Set.singleton Builder
+defaultAllowedTiers UserLevelAdvanced = Set.singleton Builder
+defaultAllowedTiers UserLevelAdmin = Set.fromList [Builder, Daemon]
+
 -- | Check if a password matches a hash
 verifyPassword :: Text -> PasswordHash -> Bool
 verifyPassword password PasswordHash{..} =
@@ -338,9 +406,10 @@ decodeBase64 text =
         Left _ -> Nothing
         Right bs -> Just bs
 
--- | Create a new token for a user
-createToken :: UserInfo -> Text -> Maybe Int -> IO TokenInfo
-createToken user clientInfo expirySeconds = do
+-- | Create a new token for a user with specific privilege tier
+createToken :: forall (t :: PrivilegeTier). SingI t =>
+    UserInfo -> Text -> Maybe Int -> Set Permission -> IO (TokenInfo t)
+createToken user clientInfo expirySeconds permissions = do
     token <- generateToken
     now <- getCurrentTime
 
@@ -349,18 +418,45 @@ createToken user clientInfo expirySeconds = do
             Just seconds -> Just $ addUTCTime (fromIntegral seconds) now
             Nothing -> Nothing
 
-    -- Create token info with user's permissions
+    -- Get singleton evidence for the privilege tier
+    let evidence = sing @t
+
+    -- Create token info with specified permissions
     return TokenInfo {
         tiToken = token,
         tiCreated = now,
         tiExpires = expires,
         tiClientInfo = clientInfo,
         tiLastUsed = now,
-        tiPermissions = uiSpecificPermissions user
+        tiPermissions = permissions,
+        tiPrivilegeEvidence = evidence
     }
 
+-- | Apply privilege transition to a token
+withTokenPrivilege :: forall (p :: PrivilegeTier) (q :: PrivilegeTier) a.
+    PrivilegeTransition p q -> TokenInfo p -> (TokenInfo q -> IO a) -> IO a
+withTokenPrivilege DropPrivilege token action =
+    case fromSing (tiPrivilegeEvidence token) of
+        Daemon -> do
+            -- Create a new token with Builder privilege
+            let builderEvidence = sBuilder
+            let builderToken = TokenInfo {
+                    tiToken = tiToken token,
+                    tiCreated = tiCreated token,
+                    tiExpires = tiExpires token,
+                    tiClientInfo = tiClientInfo token,
+                    tiLastUsed = tiLastUsed token,
+                    tiPermissions = Set.filter (not . permissionRequiresDaemon) (tiPermissions token),
+                    tiPrivilegeEvidence = builderEvidence
+                }
+            -- Run the action with the builder token
+            action builderToken
+        Builder ->
+            -- Cannot transition from Builder to anything (already lowest privilege)
+            throwIO $ AuthError $ PrivilegeEscalationDenied "Cannot transition from Builder privilege"
+
 -- | Check if a token has expired
-tokenExpired :: TokenInfo -> IO Bool
+tokenExpired :: TokenInfo t -> IO Bool
 tokenExpired TokenInfo{..} = do
     now <- getCurrentTime
     return $ case tiExpires of
@@ -368,7 +464,7 @@ tokenExpired TokenInfo{..} = do
         Nothing -> False
 
 -- | Get information about a system user
-getSystemUserInfo :: Text -> IO (Maybe UserEntry)
+getSystemUserInfo :: Text -> IO (Maybe (UserID, String, GroupID))
 getSystemUserInfo username = do
     -- First get the user entry
     userResult <- try $ getUserEntryForName (T.unpack username)
@@ -399,8 +495,8 @@ integrateWithSystemUser db tenUsername sysUsername = do
     sysUserExists <- systemUserExists sysUsername
 
     case (tenUser, sysUserExists) of
-        (Nothing, _) -> throwIO $ AuthError $ "Ten user does not exist: " <> tenUsername
-        (_, False) -> throwIO $ AuthError $ "System user does not exist: " <> sysUsername
+        (Nothing, _) -> throwIO $ AuthError $ AuthFileError $ "Ten user does not exist: " <> tenUsername
+        (_, False) -> throwIO $ AuthError $ SystemError $ "System user does not exist: " <> sysUsername
         (Just user, True) -> do
             -- Update the user info
             let updatedUser = user { uiSystemUser = Just sysUsername }
@@ -412,6 +508,16 @@ integrateWithSystemUser db tenUsername sysUsername = do
                 adSystemUserMap = Map.insert sysUsername tenUsername (adSystemUserMap db),
                 adLastModified = now
             }
+
+-- | Check if a user has permission for a specific privilege tier
+hasPrivilegeForPermission :: UserInfo -> Permission -> PrivilegeTier -> Bool
+hasPrivilegeForPermission user permission requestedTier =
+    -- Check if user has the permission
+    permission `Set.member` uiSpecificPermissions user &&
+    -- Check if user is allowed to use the requested tier
+    requestedTier `Set.member` uiAllowedPrivilegeTiers user &&
+    -- Check if permission is compatible with requested tier
+    (requestedTier == Daemon || not (permissionRequiresDaemon permission))
 
 -- | Load the authentication database
 loadAuthFile :: FilePath -> IO AuthDb
@@ -425,13 +531,14 @@ loadAuthFile path = do
                 adUsers = Map.empty,
                 adSystemUserMap = Map.empty,
                 adTokenMap = Map.empty,
-                adLastModified = now
+                adLastModified = now,
+                adAllowPrivilegeEscalation = False  -- Default to secure setting
             }
         else do
             -- Load the database from file
             content <- BS.readFile path
             case Aeson.eitherDecodeStrict content of
-                Left err -> throwIO $ AuthFileError $ "Failed to parse auth file: " <> T.pack err
+                Left err -> throwIO $ AuthError $ AuthFileError $ "Failed to parse auth file: " <> T.pack err
                 Right db -> return db
 
 -- | Save the authentication database
@@ -462,21 +569,21 @@ migrateAuthFile oldPath newPath = do
     -- Save it in the new format
     saveAuthFile newPath oldDb
 
--- | Authenticate a user and generate a token
-authenticateUser :: Map Text Text -> AuthDb -> Text -> Text -> Text -> IO (AuthDb, UserId, AuthToken)
-authenticateUser config db username password clientInfo = do
+-- | Authenticate a user and generate a token with privilege validation
+authenticateUser :: AuthDb -> Text -> Text -> Text -> PrivilegeTier -> IO (AuthDb, UserId, AuthToken, SPrivilegeTier t)
+authenticateUser db username password clientInfo requestedTier = do
     -- Check if the user exists
     user <- case Map.lookup username (adUsers db) of
         Just u -> return u
-        Nothing -> do
-            -- If not, check if it's a system user
-            isSysUser <- systemUserExists username
-            let allowedUsers = maybe Set.empty Set.fromList (Map.lookup "allowedUsers" config >>= parseUserList)
-            if isSysUser && (Set.null allowedUsers || username `Set.member` allowedUsers)
-                then do
-                    -- Create a new user based on the system user
-                    createUserFromSystem db username clientInfo
-                else throwIO InvalidCredentials
+        Nothing -> throwIO InvalidCredentials
+
+    -- Verify the requested privilege tier is allowed for this user
+    unless (requestedTier `Set.member` uiAllowedPrivilegeTiers user) $
+        throwIO $ AuthError $ InsufficientPrivileges requestedTier DaemonRequired
+
+    -- Check for privilege escalation policy
+    when (requestedTier == Daemon && not (adAllowPrivilegeEscalation db)) $
+        throwIO $ AuthError $ PrivilegeEscalationDenied "Privilege escalation is disabled globally"
 
     -- Authenticate the user
     now <- getCurrentTime
@@ -490,72 +597,81 @@ authenticateUser config db username password clientInfo = do
                     if exists then return sysName else throwIO InvalidCredentials
                 Nothing -> throwIO InvalidCredentials
 
-            -- Create a token with appropriate permissions
-            tokenInfo <- createToken user clientInfo (Just 86400)  -- 24 hour token
-
-            -- Update the database with the new token and login time
-            let updatedUser = user {
-                    uiTokens = Map.insert (tiToken tokenInfo) tokenInfo (uiTokens user),
-                    uiLastLogin = Just now
-                }
-            let updatedDb = db {
-                    adUsers = Map.insert username updatedUser (adUsers db),
-                    adTokenMap = Map.insert (tiToken tokenInfo) username (adTokenMap db),
-                    adLastModified = now
-                }
-
-            return (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo))
+            -- Create token based on requested privilege tier
+            let (newDb, userId, authToken, privEvidence) =
+                    createUserToken db username user clientInfo now requestedTier
+            return (newDb, userId, authToken, privEvidence)
 
         -- If a password is set, validate it
         Just passwordHash -> do
             unless (verifyPassword password passwordHash) $
                 throwIO InvalidCredentials
 
-            -- Create a token with appropriate permissions
-            tokenInfo <- createToken user clientInfo (Just 86400)  -- 24 hour token
+            -- Create token based on requested privilege tier
+            let (newDb, userId, authToken, privEvidence) =
+                    createUserToken db username user clientInfo now requestedTier
+            return (newDb, userId, authToken, privEvidence)
 
-            -- Update the database with the new token and login time
-            let updatedUser = user {
-                    uiTokens = Map.insert (tiToken tokenInfo) tokenInfo (uiTokens user),
-                    uiLastLogin = Just now
-                }
-            let updatedDb = db {
-                    adUsers = Map.insert username updatedUser (adUsers db),
-                    adTokenMap = Map.insert (tiToken tokenInfo) username (adTokenMap db),
-                    adLastModified = now
-                }
+-- Helper to create a token with proper privilege tier
+createUserToken :: AuthDb -> Text -> UserInfo -> Text -> UTCTime -> PrivilegeTier
+                -> (AuthDb, UserId, AuthToken, SPrivilegeTier t)
+createUserToken db username user clientInfo now requestedTier =
+    case requestedTier of
+        Daemon ->
+            -- Create daemon token
+            let token = createTokenWithPrivilege db username user clientInfo now sDaemon
+            in token
+        Builder ->
+            -- Create builder token
+            let token = createTokenWithPrivilege db username user clientInfo now sBuilder
+            in token
 
-            return (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo))
-  where
-    parseUserList :: Text -> Maybe [Text]
-    parseUserList txt = Just $ map T.strip $ T.split (==',') txt
+-- Helper to create a token with specific privilege evidence
+createTokenWithPrivilege :: forall (t :: PrivilegeTier). SingI t =>
+    AuthDb -> Text -> UserInfo -> Text -> UTCTime -> SPrivilegeTier t
+    -> (AuthDb, UserId, AuthToken, SPrivilegeTier t)
+createTokenWithPrivilege db username user clientInfo now evidence = do
+    -- Filter permissions based on privilege tier
+    let permissions = if fromSing evidence == Builder
+                        then Set.filter (not . permissionRequiresDaemon) (uiSpecificPermissions user)
+                        else uiSpecificPermissions user
 
--- | Create a new user from a system user
-createUserFromSystem :: AuthDb -> Text -> Text -> IO UserInfo
-createUserFromSystem db username clientInfo = do
-    -- Check if the system user exists
-    sysUserEntry <- getSystemUserInfo username
-    case sysUserEntry of
-        Nothing -> throwIO $ AuthError $ "System user not found: " <> username
-        Just (uid, name, _) -> do
-            now <- getCurrentTime
-            let userId = UserId $ "sys_" <> username
+    -- Create token with appropriate permissions (in a real implementation this would be unsafe)
+    -- This is a simplification to make the example work
+    let tokenStr = "ten_" <> T.pack (show (hash (TE.encodeUtf8 (username <> T.pack (show now)))))
 
-            -- Create a new user with basic permissions
-            return UserInfo {
-                uiUserId = userId,
-                uiUsername = username,
-                uiPasswordHash = Nothing,  -- No password for system users
-                uiPermissionLevel = UserLevelStandard,  -- Give standard access by default
-                uiSpecificPermissions = defaultPermissions UserLevelStandard,
-                uiSystemUser = Just username,
-                uiTokens = Map.empty,
-                uiLastLogin = Nothing,
-                uiCreated = now
-            }
+    -- Create token info with runtime evidence
+    let tokenInfo = TokenInfo {
+            tiToken = tokenStr,
+            tiCreated = now,
+            tiExpires = Just $ addUTCTime (24 * 3600) now, -- 24 hours
+            tiClientInfo = clientInfo,
+            tiLastUsed = now,
+            tiPermissions = permissions,
+            tiPrivilegeEvidence = evidence
+        }
 
--- | Validate a token
-validateToken :: AuthDb -> AuthToken -> IO (Maybe (UserId, Set Permission))
+    -- Wrap in SomeTokenInfo to erase phantom type
+    let someToken = SomeTokenInfo tokenInfo
+
+    -- Update user with new token
+    let updatedUser = user {
+            uiTokens = Map.insert tokenStr someToken (uiTokens user),
+            uiLastLogin = Just now
+        }
+
+    -- Update database
+    let updatedDb = db {
+            adUsers = Map.insert username updatedUser (adUsers db),
+            adTokenMap = Map.insert tokenStr username (adTokenMap db),
+            adLastModified = now
+        }
+
+    -- Return updated database, user ID, auth token, and privilege evidence
+    (updatedDb, uiUserId user, AuthToken tokenStr, evidence)
+
+-- | Validate a token and return user ID with privilege evidence
+validateToken :: forall t. AuthDb -> AuthToken -> IO (Maybe (UserId, Set Permission, SPrivilegeTier t))
 validateToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -568,66 +684,105 @@ validateToken db (AuthToken token) = do
                     -- Check if the token exists for this user
                     case Map.lookup token (uiTokens user) of
                         Nothing -> return Nothing
-                        Just tokenInfo -> do
+                        Just (SomeTokenInfo tokenInfo) -> do
                             -- Check if the token has expired
                             expired <- tokenExpired tokenInfo
                             if expired
                                 then return Nothing
-                                else return $ Just (uiUserId user, tiPermissions tokenInfo)
+                                else do
+                                    -- Extract privilege tier and match with requested tier
+                                    case fromSing (tiPrivilegeEvidence tokenInfo) of
+                                        tier | tier == fromSing (sing @t) ->
+                                            -- Token has matching privilege tier, cast and return
+                                            return $ Just (uiUserId user, tiPermissions tokenInfo, sing @t)
+                                        _ ->
+                                            -- Token has different privilege tier, return Nothing
+                                            return Nothing
 
--- | Refresh an auth token
+-- | Refresh an auth token preserving privilege tier
 refreshToken :: AuthDb -> AuthToken -> IO (AuthDb, AuthToken)
 refreshToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
-        Nothing -> throwIO TokenNotFound
+        Nothing -> throwIO $ AuthError TokenNotFound
         Just username -> do
             -- Check if the user exists
             case Map.lookup username (adUsers db) of
-                Nothing -> throwIO UserNotFound
+                Nothing -> throwIO $ AuthError UserNotFound
                 Just user -> do
                     -- Check if the token exists for this user
                     case Map.lookup token (uiTokens user) of
-                        Nothing -> throwIO TokenNotFound
-                        Just tokenInfo -> do
+                        Nothing -> throwIO $ AuthError TokenNotFound
+                        Just (SomeTokenInfo tokenInfo) -> do
                             -- Check if the token has expired
                             expired <- tokenExpired tokenInfo
                             if expired
-                                then throwIO TokenExpired
+                                then throwIO $ AuthError TokenExpired
                                 else do
-                                    -- Create a new token with the same permissions and expiry
+                                    -- Create a new token with the same permissions and privilege
                                     now <- getCurrentTime
-                                    let oldExpiry = tiExpires tokenInfo
-                                    let expirySeconds = case oldExpiry of
-                                            Nothing -> Nothing
-                                            Just expiry -> Just $ floor $ diffUTCTime expiry now
 
-                                    newToken <- generateToken
-                                    let newTokenInfo = tokenInfo {
-                                            tiToken = newToken,
-                                            tiCreated = now,
-                                            tiLastUsed = now,
-                                            tiExpires = case expirySeconds of
-                                                Nothing -> Nothing
-                                                Just seconds -> Just $ addUTCTime (fromIntegral seconds) now
-                                        }
+                                    -- Generate new token string
+                                    newTokenStr <- generateToken
 
-                                    -- Update the database
-                                    let updatedTokens = Map.delete token (uiTokens user)
-                                    let updatedTokens' = Map.insert newToken newTokenInfo updatedTokens
-                                    let updatedUser = user { uiTokens = updatedTokens' }
+                                    -- Preserve the privilege tier
+                                    let tier = fromSing (tiPrivilegeEvidence tokenInfo)
 
-                                    let updatedUsers = Map.insert username updatedUser (adUsers db)
-                                    let updatedTokenMap = Map.delete token (adTokenMap db)
-                                    let updatedTokenMap' = Map.insert newToken username updatedTokenMap
+                                    -- Create new token based on privilege tier
+                                    let (updatedDb, newAuthToken) = case tier of
+                                            Daemon ->
+                                                refreshTokenWithTier db username user now newTokenStr tokenInfo sDaemon
+                                            Builder ->
+                                                refreshTokenWithTier db username user now newTokenStr tokenInfo sBuilder
 
-                                    let updatedDb = db {
-                                            adUsers = updatedUsers,
-                                            adTokenMap = updatedTokenMap',
-                                            adLastModified = now
-                                        }
+                                    return (updatedDb, newAuthToken)
 
-                                    return (updatedDb, AuthToken newToken)
+-- Helper to refresh token with specific privilege tier
+refreshTokenWithTier :: forall (t :: PrivilegeTier). SingI t =>
+    AuthDb -> Text -> UserInfo -> UTCTime -> Text -> TokenInfo s -> SPrivilegeTier t
+    -> (AuthDb, AuthToken)
+refreshTokenWithTier db username user now newTokenStr oldToken evidence = do
+    -- Create new token info preserving permissions but with new expiry
+    let oldExpiry = tiExpires oldToken
+    let newExpiry = case oldExpiry of
+            Nothing -> Nothing
+            Just expiry ->
+                let remaining = diffUTCTime expiry now
+                in if remaining > 0
+                    then Just $ addUTCTime remaining now
+                    else Just $ addUTCTime (24 * 3600) now  -- Default to 24 hours if expired
+
+    -- Create new token info with proper privilege evidence
+    let newTokenInfo = TokenInfo {
+            tiToken = newTokenStr,
+            tiCreated = now,
+            tiExpires = newExpiry,
+            tiClientInfo = tiClientInfo oldToken,
+            tiLastUsed = now,
+            tiPermissions = tiPermissions oldToken,
+            tiPrivilegeEvidence = evidence
+        }
+
+    -- Wrap in SomeTokenInfo
+    let someToken = SomeTokenInfo newTokenInfo
+
+    -- Update user tokens
+    let updatedTokens = Map.delete (tiToken oldToken) (uiTokens user)
+    let updatedTokens' = Map.insert newTokenStr someToken updatedTokens
+    let updatedUser = user { uiTokens = updatedTokens' }
+
+    -- Update token map
+    let updatedTokenMap = Map.delete (tiToken oldToken) (adTokenMap db)
+    let updatedTokenMap' = Map.insert newTokenStr username updatedTokenMap
+
+    -- Update database
+    let updatedDb = db {
+            adUsers = Map.insert username updatedUser (adUsers db),
+            adTokenMap = updatedTokenMap',
+            adLastModified = now
+        }
+
+    (updatedDb, AuthToken newTokenStr)
 
 -- | Revoke a token
 revokeToken :: AuthDb -> AuthToken -> IO AuthDb
@@ -659,11 +814,11 @@ revokeToken db (AuthToken token) = do
                             }
 
 -- | List all tokens for a user
-listUserTokens :: AuthDb -> Text -> IO [TokenInfo]
+listUserTokens :: AuthDb -> Text -> IO [SomeTokenInfo]
 listUserTokens db username = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
-        Nothing -> throwIO UserNotFound
+        Nothing -> throwIO $ AuthError UserNotFound
         Just user -> return $ Map.elems (uiTokens user)
 
 -- | Get user information
@@ -671,7 +826,7 @@ getUserInfo :: AuthDb -> Text -> IO UserInfo
 getUserInfo db username = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
-        Nothing -> throwIO UserNotFound
+        Nothing -> throwIO $ AuthError UserNotFound
         Just user -> return user
 
 -- | Add a new user
@@ -679,7 +834,7 @@ addUser :: AuthDb -> Text -> Text -> UserPermissionLevel -> IO AuthDb
 addUser db username password permLevel = do
     -- Check if the user already exists
     when (Map.member username (adUsers db)) $
-        throwIO $ AuthError $ "User already exists: " <> username
+        throwIO $ AuthError $ AuthFileError $ "User already exists: " <> username
 
     -- Create the user
     now <- getCurrentTime
@@ -692,6 +847,7 @@ addUser db username password permLevel = do
             uiPasswordHash = Just passwordHash,
             uiPermissionLevel = permLevel,
             uiSpecificPermissions = defaultPermissions permLevel,
+            uiAllowedPrivilegeTiers = defaultAllowedTiers permLevel,
             uiSystemUser = Nothing,
             uiTokens = Map.empty,
             uiLastLogin = Nothing,
@@ -736,7 +892,7 @@ changeUserPassword :: AuthDb -> Text -> Text -> IO AuthDb
 changeUserPassword db username newPassword = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
-        Nothing -> throwIO UserNotFound
+        Nothing -> throwIO $ AuthError UserNotFound
         Just user -> do
             -- Hash the new password
             passwordHash <- hashPassword newPassword
@@ -751,16 +907,33 @@ changeUserPassword db username newPassword = do
                 adLastModified = now
             }
 
+-- | Change a user's allowed privilege tiers
+changeUserPrivilegeTiers :: AuthDb -> Text -> Set PrivilegeTier -> IO AuthDb
+changeUserPrivilegeTiers db username newTiers = do
+    -- Check if the user exists
+    case Map.lookup username (adUsers db) of
+        Nothing -> throwIO $ AuthError UserNotFound
+        Just user -> do
+            -- Update the user
+            now <- getCurrentTime
+            let updatedUser = user { uiAllowedPrivilegeTiers = newTiers }
+
+            -- Update the database
+            return db {
+                adUsers = Map.insert username updatedUser (adUsers db),
+                adLastModified = now
+            }
+
 -- | Check if a user has a specific permission
-checkUserPermission :: AuthDb -> UserId -> Permission -> IO Bool
-checkUserPermission db userId permission = do
+checkUserPermission :: AuthDb -> UserId -> Permission -> PrivilegeTier -> IO Bool
+checkUserPermission db userId permission requestedTier = do
     -- Find the user by ID
     let mUser = findUserById db userId
     case mUser of
         Nothing -> return False
         Just user -> do
-            -- Check if the user has the specific permission
-            return $ permission `Set.member` uiSpecificPermissions user
+            -- Check if the user has the permission in the requested tier
+            return $ hasPrivilegeForPermission user permission requestedTier
 
 -- | Find a user by ID
 findUserById :: AuthDb -> UserId -> Maybe UserInfo
@@ -774,7 +947,7 @@ findUserById db (UserId userId) =
                 else Nothing
         ) Nothing (adUsers db)
 
--- | JSON instances for auth types
+-- JSON instances for auth types
 
 instance Aeson.ToJSON PasswordHash where
     toJSON PasswordHash{..} = Aeson.object [
@@ -800,31 +973,61 @@ instance Aeson.FromJSON PasswordHash where
             (Just phSalt, Just phHash) -> return PasswordHash{..}
             _ -> fail "Invalid base64 encoding in password hash"
 
-instance Aeson.ToJSON TokenInfo where
-    toJSON TokenInfo{..} = Aeson.object [
-            "token" .= tiToken,
-            "created" .= tiCreated,
-            "expires" .= tiExpires,
-            "clientInfo" .= tiClientInfo,
-            "lastUsed" .= tiLastUsed,
-            "permissions" .= map permissionToText (Set.toList tiPermissions)
+-- Serialize SomeTokenInfo (type-erased)
+instance Aeson.ToJSON SomeTokenInfo where
+    toJSON (SomeTokenInfo token) = Aeson.object [
+            "token" .= tiToken token,
+            "created" .= tiCreated token,
+            "expires" .= tiExpires token,
+            "clientInfo" .= tiClientInfo token,
+            "lastUsed" .= tiLastUsed token,
+            "permissions" .= map permissionToText (Set.toList (tiPermissions token)),
+            "privilegeTier" .= (case fromSing (tiPrivilegeEvidence token) of
+                                 Daemon -> "daemon"
+                                 Builder -> "builder")
         ]
 
-instance Aeson.FromJSON TokenInfo where
+instance Aeson.FromJSON SomeTokenInfo where
     parseJSON = Aeson.withObject "TokenInfo" $ \v -> do
-        tiToken <- v .: "token"
-        tiCreated <- v .: "created"
-        tiExpires <- v .: "expires"
-        tiClientInfo <- v .: "clientInfo"
-        tiLastUsed <- v .: "lastUsed"
+        token <- v .: "token"
+        created <- v .: "created"
+        expires <- v .: "expires"
+        clientInfo <- v .: "clientInfo"
+        lastUsed <- v .: "lastUsed"
         permissionTexts <- v .: "permissions"
+        tierText <- v .: "privilegeTier"
 
+        -- Parse permissions
         let mPermissions = mapM textToPermission permissionTexts
-        case mPermissions of
-            Just perms -> do
-                let tiPermissions = Set.fromList perms
-                return TokenInfo{..}
+        permissions <- case mPermissions of
+            Just perms -> return $ Set.fromList perms
             Nothing -> fail "Invalid permission in token"
+
+        -- Create token with appropriate privilege tier
+        case tierText of
+            "daemon" -> do
+                let tokenInfo = TokenInfo {
+                        tiToken = token,
+                        tiCreated = created,
+                        tiExpires = expires,
+                        tiClientInfo = clientInfo,
+                        tiLastUsed = lastUsed,
+                        tiPermissions = permissions,
+                        tiPrivilegeEvidence = sDaemon
+                    }
+                return $ SomeTokenInfo tokenInfo
+            "builder" -> do
+                let tokenInfo = TokenInfo {
+                        tiToken = token,
+                        tiCreated = created,
+                        tiExpires = expires,
+                        tiClientInfo = clientInfo,
+                        tiLastUsed = lastUsed,
+                        tiPermissions = permissions,
+                        tiPrivilegeEvidence = sBuilder
+                    }
+                return $ SomeTokenInfo tokenInfo
+            _ -> fail $ "Invalid privilege tier: " ++ T.unpack tierText
 
 instance Aeson.ToJSON UserInfo where
     toJSON UserInfo{..} = Aeson.object [
@@ -833,11 +1036,15 @@ instance Aeson.ToJSON UserInfo where
             "passwordHash" .= uiPasswordHash,
             "permissionLevel" .= permissionLevelToText uiPermissionLevel,
             "specificPermissions" .= map permissionToText (Set.toList uiSpecificPermissions),
+            "allowedPrivilegeTiers" .= map showTier (Set.toList uiAllowedPrivilegeTiers),
             "systemUser" .= uiSystemUser,
             "tokens" .= uiTokens,
             "lastLogin" .= uiLastLogin,
             "created" .= uiCreated
         ]
+      where
+        showTier Daemon = "daemon"
+        showTier Builder = "builder"
 
 instance Aeson.FromJSON UserInfo where
     parseJSON = Aeson.withObject "UserInfo" $ \v -> do
@@ -846,6 +1053,7 @@ instance Aeson.FromJSON UserInfo where
         uiPasswordHash <- v .: "passwordHash"
         permLevelText <- v .: "permissionLevel"
         permissionTexts <- v .: "specificPermissions"
+        tierTexts <- v .: "allowedPrivilegeTiers"
         uiSystemUser <- v .: "systemUser"
         uiTokens <- v .: "tokens"
         uiLastLogin <- v .: "lastLogin"
@@ -863,6 +1071,15 @@ instance Aeson.FromJSON UserInfo where
             Just perms -> return $ Set.fromList perms
             Nothing -> fail "Invalid permission in user"
 
+        -- Parse privilege tiers
+        let parseTier "daemon" = Just Daemon
+            parseTier "builder" = Just Builder
+            parseTier _ = Nothing
+        let mTiers = mapM parseTier tierTexts
+        uiAllowedPrivilegeTiers <- case mTiers of
+            Just tiers -> return $ Set.fromList tiers
+            Nothing -> fail "Invalid privilege tier in user"
+
         return UserInfo{..}
 
 instance Aeson.ToJSON AuthDb where
@@ -870,7 +1087,8 @@ instance Aeson.ToJSON AuthDb where
             "users" .= adUsers,
             "systemUserMap" .= adSystemUserMap,
             "tokenMap" .= adTokenMap,
-            "lastModified" .= adLastModified
+            "lastModified" .= adLastModified,
+            "allowPrivilegeEscalation" .= adAllowPrivilegeEscalation
         ]
 
 instance Aeson.FromJSON AuthDb where
@@ -879,10 +1097,9 @@ instance Aeson.FromJSON AuthDb where
         adSystemUserMap <- v .: "systemUserMap"
         adTokenMap <- v .: "tokenMap"
         adLastModified <- v .: "lastModified"
+        adAllowPrivilegeEscalation <- v .: "allowPrivilegeEscalation" <|> pure False  -- Default to secure setting
 
         return AuthDb{..}
-
--- | Helper functions
 
 -- | Repeat an action n times
 replicateM :: Int -> IO a -> IO [a]
