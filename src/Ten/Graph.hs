@@ -56,7 +56,7 @@ import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (get, gets, modify, put)
-import Control.Monad.Except (throwError)
+import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -601,8 +601,11 @@ deserializeGraph json =
                 path <- parsePath pathObj
                 hash <- maybe (Left "Missing derivation hash in output node") parseText $
                        KeyMap.lookup "derivation" obj
-                name <- maybe (Left "Missing derivation name in output node") (return "unknown") $
-                       KeyMap.lookup "name" obj
+                -- Fix the issue with the ambiguous string literal by properly handling the 'maybe'
+                nameVal <- KeyMap.lookup "name" obj
+                name <- case nameVal of
+                    Just nameValue -> parseText nameValue
+                    Nothing -> pure "unknown"
 
                 -- Construct minimal derivation for graph purposes
                 let drv = Derivation {
