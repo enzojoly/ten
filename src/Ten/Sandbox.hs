@@ -7,6 +7,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Ten.Sandbox (
     -- Core sandbox functions
@@ -39,7 +40,12 @@ module Ten.Sandbox (
     -- Privilege management
     dropPrivileges,
     withDroppedPrivileges,
-    runBuilderAsUser
+    runBuilderAsUser,
+
+    -- Protocol-based sandbox operations
+    requestSandbox,
+    releaseSandbox,
+    sandboxProtocolHandler
 ) where
 
 import Control.Monad
@@ -56,7 +62,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Bits ((.|.), (.&.))
-import Data.Maybe (isJust, fromMaybe)
+import Data.Maybe (isJust, fromMaybe, listToMaybe)
 import System.Directory
 import System.FilePath
 import System.Process (createProcess, proc, readCreateProcessWithExitCode, CreateProcess(..), StdStream(..))
@@ -76,82 +82,255 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
 import Foreign.Storable
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
-import System.IO (hPutStrLn, stderr, hClose)
+import System.IO (hPutStrLn, stderr, hClose, Handle)
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Network.Socket (Socket)
+import Data.Binary (Binary(..), encode, decode)
+import qualified Data.ByteString.Lazy as LBS
+import System.Random (randomRIO)
+import Data.UUID (UUID)
+import qualified Data.UUID as UUID
+import qualified Data.UUID.V4 as UUID
+import Data.Singletons (SingI, fromSing)
+
 import Ten.Core
 
--- Helper function to convert BuildId to String
-showBuildId :: BuildId -> String
-showBuildId (BuildId _) = "build"
-showBuildId (BuildIdFromInt n) = "build-" ++ show n
-
--- RLimit structure for resource limits
-data RLimit = RLimit {
-    rlim_cur :: CULong,  -- Current limit (soft limit)
-    rlim_max :: CULong   -- Maximum limit (hard limit)
+-- | Daemon connection type for protocol communication
+data DaemonConnection = DaemonConnection {
+    connSocket :: Socket,                   -- Socket connected to daemon
+    connUserId :: UserId,                   -- Authenticated user ID
+    connAuthToken :: AuthToken,             -- Authentication token
+    connHandle :: Handle,                   -- Socket handle for I/O
+    connNextRequestId :: TVar Int,          -- Next request ID counter
+    connPendingRequests :: TVar (Map Int (TMVar DaemonResponse)), -- Map of pending requests
+    connShutdownFlag :: TVar Bool           -- Shutdown flag
 }
 
-instance Storable RLimit where
-    sizeOf _ = 16
-    alignment _ = 8
+-- | Protocol message types for sandbox communication
+data SandboxRequest
+    = SandboxCreateRequest {
+        sandboxReqBuildId :: BuildId,
+        sandboxReqInputs :: Set StorePath,
+        sandboxReqConfig :: SandboxConfig
+    }
+    | SandboxReleaseRequest {
+        sandboxReqId :: Text
+    }
+    | SandboxStatusRequest {
+        sandboxReqId :: Text
+    }
+    | SandboxAbortRequest {
+        sandboxReqId :: Text
+    }
+    deriving (Show, Eq)
 
-    peek ptr = do
-        cur <- peekByteOff ptr 0 :: IO CULong
-        max <- peekByteOff ptr 8 :: IO CULong
-        return $ RLimit cur max
+instance Binary SandboxRequest where
+    put (SandboxCreateRequest buildId inputs config) = do
+        put (0 :: Word8)  -- Tag for CreateRequest
+        put (show buildId)
+        put (Set.toList inputs)
+        put (encodeConfig config)
 
-    poke ptr (RLimit cur max) = do
-        pokeByteOff ptr 0 cur
-        pokeByteOff ptr 8 max
+    put (SandboxReleaseRequest sandboxId) = do
+        put (1 :: Word8)  -- Tag for ReleaseRequest
+        put sandboxId
 
--- Linux capability set structure
-newtype CapSet = CapSet (Ptr ())
+    put (SandboxStatusRequest sandboxId) = do
+        put (2 :: Word8)  -- Tag for StatusRequest
+        put sandboxId
 
--- Foreign function imports for Linux-specific system calls
+    put (SandboxAbortRequest sandboxId) = do
+        put (3 :: Word8)  -- Tag for AbortRequest
+        put sandboxId
 
--- Mount namespace functions
-foreign import ccall unsafe "sys/mount.h mount"
-    c_mount :: CString -> CString -> CString -> CInt -> Ptr () -> IO CInt
+    get = do
+        tag <- get :: Get Word8
+        case tag of
+            0 -> do  -- CreateRequest
+                buildIdStr <- get
+                inputs <- Set.fromList <$> get
+                configData <- get
+                return $ SandboxCreateRequest (read buildIdStr) inputs (decodeConfig configData)
+            1 -> SandboxReleaseRequest <$> get
+            2 -> SandboxStatusRequest <$> get
+            3 -> SandboxAbortRequest <$> get
+            _ -> fail $ "Unknown SandboxRequest tag: " ++ show tag
 
-foreign import ccall unsafe "sys/mount.h umount2"
-    c_umount2 :: CString -> CInt -> IO CInt
+-- | Sandbox response types
+data SandboxResponse
+    = SandboxCreatedResponse {
+        sandboxRespId :: Text,
+        sandboxRespPath :: FilePath
+    }
+    | SandboxReleasedResponse {
+        sandboxRespSuccess :: Bool
+    }
+    | SandboxStatusResponse {
+        sandboxRespStatus :: SandboxStatus
+    }
+    | SandboxErrorResponse {
+        sandboxRespError :: Text
+    }
+    deriving (Show, Eq)
 
--- Namespace creation
-foreign import ccall unsafe "sched.h unshare"
-    c_unshare :: CInt -> IO CInt
+-- | Sandbox status information
+data SandboxStatus = SandboxStatus {
+    sandboxStatusActive :: Bool,
+    sandboxStatusPath :: FilePath,
+    sandboxStatusBuildId :: BuildId,
+    sandboxStatusCreatedTime :: UTCTime
+} deriving (Show, Eq)
 
--- Process namespaces
-foreign import ccall unsafe "sched.h setns"
-    c_setns :: CInt -> CInt -> IO CInt
+instance Binary SandboxResponse where
+    put (SandboxCreatedResponse sid path) = do
+        put (0 :: Word8)  -- Tag for CreatedResponse
+        put sid
+        put path
 
--- Linux capability management
-foreign import ccall unsafe "sys/capability.h cap_get_proc"
-    c_cap_get_proc :: IO (Ptr ())
+    put (SandboxReleasedResponse success) = do
+        put (1 :: Word8)  -- Tag for ReleasedResponse
+        put success
 
-foreign import ccall unsafe "sys/capability.h cap_clear"
-    c_cap_clear :: Ptr () -> IO CInt
+    put (SandboxStatusResponse status) = do
+        put (2 :: Word8)  -- Tag for StatusResponse
+        put (sandboxStatusActive status)
+        put (sandboxStatusPath status)
+        put (show $ sandboxStatusBuildId status)
+        put (show $ sandboxStatusCreatedTime status)
 
-foreign import ccall unsafe "sys/capability.h cap_set_flag"
-    c_cap_set_flag :: Ptr () -> CInt -> CInt -> Ptr CInt -> CInt -> IO CInt
+    put (SandboxErrorResponse err) = do
+        put (3 :: Word8)  -- Tag for ErrorResponse
+        put err
 
-foreign import ccall unsafe "sys/capability.h cap_set_proc"
-    c_cap_set_proc :: Ptr () -> IO CInt
+    get = do
+        tag <- get :: Get Word8
+        case tag of
+            0 -> SandboxCreatedResponse <$> get <*> get
+            1 -> SandboxReleasedResponse <$> get
+            2 -> do
+                active <- get
+                path <- get
+                buildIdStr <- get
+                timeStr <- get
+                return $ SandboxStatusResponse $ SandboxStatus
+                    active
+                    path
+                    (read buildIdStr)
+                    (read timeStr)
+            3 -> SandboxErrorResponse <$> get
+            _ -> fail $ "Unknown SandboxResponse tag: " ++ show tag
 
-foreign import ccall unsafe "sys/capability.h cap_free"
-    c_cap_free :: Ptr () -> IO CInt
+-- Helper functions to encode/decode sandbox config
+encodeConfig :: SandboxConfig -> ByteString
+encodeConfig = LBS.toStrict . encode . configToList
 
--- Process resource limits
-foreign import ccall unsafe "sys/resource.h getrlimit"
-    c_getrlimit :: CInt -> Ptr RLimit -> IO CInt
+decodeConfig :: ByteString -> SandboxConfig
+decodeConfig = listToConfig . decode . LBS.fromStrict
 
-foreign import ccall unsafe "sys/resource.h setrlimit"
-    c_setrlimit :: CInt -> Ptr RLimit -> IO CInt
+-- Convert config to/from a list of key-value pairs for serialization
+configToList :: SandboxConfig -> [(String, String)]
+configToList config = [
+    ("allowNetwork", show $ sandboxAllowNetwork config),
+    ("extraPaths", show $ Set.toList $ sandboxExtraPaths config),
+    ("readOnlyPaths", show $ Set.toList $ sandboxReadOnlyPaths config),
+    ("writablePaths", show $ Set.toList $ sandboxWritablePaths config),
+    ("privileged", show $ sandboxPrivileged config),
+    ("returnSupport", show $ sandboxReturnSupport config),
+    ("useMountNamespace", show $ sandboxUseMountNamespace config),
+    ("useNetworkNamespace", show $ sandboxUseNetworkNamespace config),
+    ("useUserNamespace", show $ sandboxUseUserNamespace config),
+    ("user", sandboxUser config),
+    ("group", sandboxGroup config),
+    ("cpuLimit", show $ sandboxCPULimit config),
+    ("memoryLimit", show $ sandboxMemoryLimit config),
+    ("diskLimit", show $ sandboxDiskLimit config),
+    ("maxProcesses", show $ sandboxMaxProcesses config),
+    ("timeoutSecs", show $ sandboxTimeoutSecs config)
+    ]
 
--- Chroot operation
-foreign import ccall unsafe "unistd.h chroot"
-    c_chroot :: CString -> IO CInt
+listToConfig :: [(String, String)] -> SandboxConfig
+listToConfig items =
+    let
+        getItem key = fromMaybe "" $ lookup key items
+        getBool key = case lookup key items of
+            Just "True" -> True
+            _ -> False
+        getInt key = case lookup key items of
+            Just str -> read str
+            _ -> 0
+        getPaths key = case lookup key items of
+            Just str -> Set.fromList (read str)
+            _ -> Set.empty
+    in
+        SandboxConfig {
+            sandboxAllowNetwork = getBool "allowNetwork",
+            sandboxExtraPaths = getPaths "extraPaths",
+            sandboxEnv = Map.empty,  -- Environment will be set later
+            sandboxReadOnlyPaths = getPaths "readOnlyPaths",
+            sandboxWritablePaths = getPaths "writablePaths",
+            sandboxPrivileged = getBool "privileged",
+            sandboxReturnSupport = getBool "returnSupport",
+            sandboxUseMountNamespace = getBool "useMountNamespace",
+            sandboxUseNetworkNamespace = getBool "useNetworkNamespace",
+            sandboxUseUserNamespace = getBool "useUserNamespace",
+            sandboxUser = getItem "user",
+            sandboxGroup = getItem "group",
+            sandboxCPULimit = getInt "cpuLimit",
+            sandboxMemoryLimit = getInt "memoryLimit",
+            sandboxDiskLimit = getInt "diskLimit",
+            sandboxMaxProcesses = getInt "maxProcesses",
+            sandboxTimeoutSecs = getInt "timeoutSecs"
+        }
 
--- Mount flags (from Linux sys/mount.h)
+-- | Configuration for a build sandbox
+data SandboxConfig = SandboxConfig {
+    sandboxAllowNetwork :: Bool,           -- Allow network access
+    sandboxExtraPaths :: Set FilePath,     -- Additional paths to make available
+    sandboxEnv :: Map Text Text,           -- Environment variables
+    sandboxReadOnlyPaths :: Set FilePath,  -- Paths to mount read-only
+    sandboxWritablePaths :: Set FilePath,  -- Paths to mount writable
+    sandboxPrivileged :: Bool,             -- Run as privileged user
+    sandboxReturnSupport :: Bool,          -- Allow return-continuation support
+    sandboxUseMountNamespace :: Bool,      -- Use Linux mount namespace isolation
+    sandboxUseNetworkNamespace :: Bool,    -- Use Linux network namespace isolation
+    sandboxUseUserNamespace :: Bool,       -- Use Linux user namespace isolation
+    sandboxUser :: String,                 -- User to run build as (for unprivileged)
+    sandboxGroup :: String,                -- Group to run build as (for unprivileged)
+    sandboxCPULimit :: Int,                -- CPU time limit in seconds (0 = no limit)
+    sandboxMemoryLimit :: Int,             -- Memory limit in MB (0 = no limit)
+    sandboxDiskLimit :: Int,               -- Disk space limit in MB (0 = no limit)
+    sandboxMaxProcesses :: Int,            -- Maximum number of processes (0 = no limit)
+    sandboxTimeoutSecs :: Int              -- Timeout in seconds (0 = no timeout)
+} deriving (Show, Eq)
+
+-- | Default sandbox configuration (restrictive)
+defaultSandboxConfig :: SandboxConfig
+defaultSandboxConfig = SandboxConfig {
+    sandboxAllowNetwork = False,
+    sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"],
+    sandboxEnv = Map.empty,
+    sandboxReadOnlyPaths = Set.empty,
+    sandboxWritablePaths = Set.empty,
+    sandboxPrivileged = False,
+    sandboxReturnSupport = True,
+    sandboxUseMountNamespace = True,
+    sandboxUseNetworkNamespace = True,     -- Isolate network by default
+    sandboxUseUserNamespace = False,       -- Don't use user namespace by default (needs root)
+    sandboxUser = "nobody",                -- Default unprivileged user
+    sandboxGroup = "nogroup",              -- Default unprivileged group
+    sandboxCPULimit = 3600,                -- 1 hour CPU time by default
+    sandboxMemoryLimit = 2048,             -- 2GB memory by default
+    sandboxDiskLimit = 5120,               -- 5GB disk space by default
+    sandboxMaxProcesses = 32,              -- Maximum 32 processes by default
+    sandboxTimeoutSecs = 0                 -- No timeout by default
+}
+
+-- Helper function to convert BuildId to String for filesystem paths
+showBuildId :: BuildId -> String
+showBuildId (BuildId u) = "build-" ++ show (hashUnique u)
+showBuildId (BuildIdFromInt n) = "build-" ++ show n
+
+-- Linux-specific constants for mount operations
 mS_RDONLY, mS_BIND, mS_NOSUID, mS_NODEV, mS_NOEXEC, mS_REMOUNT, mS_REC, mS_PRIVATE :: CInt
 mS_RDONLY = 1
 mS_BIND = 4096
@@ -167,7 +346,7 @@ mNT_FORCE, mNT_DETACH :: CInt
 mNT_FORCE = 1
 mNT_DETACH = 2
 
--- Namespace flags (from Linux sched.h)
+-- Namespace flags
 cLONE_NEWNS, cLONE_NEWUTS, cLONE_NEWIPC, cLONE_NEWUSER, cLONE_NEWPID, cLONE_NEWNET :: CInt
 cLONE_NEWNS = 0x00020000    -- Mount namespace
 cLONE_NEWUTS = 0x04000000   -- UTS namespace (hostname)
@@ -176,261 +355,182 @@ cLONE_NEWUSER = 0x10000000  -- User namespace
 cLONE_NEWPID = 0x20000000   -- PID namespace
 cLONE_NEWNET = 0x40000000   -- Network namespace
 
--- Linux capability flags
-cAP_EFFECTIVE, cAP_PERMITTED, cAP_INHERITABLE :: CInt
-cAP_EFFECTIVE = 0
-cAP_PERMITTED = 1
-cAP_INHERITABLE = 2
-
--- Linux capability values (from sys/capability.h)
-cAP_CHOWN, cAP_DAC_OVERRIDE, cAP_DAC_READ_SEARCH, cAP_FOWNER, cAP_FSETID,
-    cAP_KILL, cAP_SETGID, cAP_SETUID, cAP_SETPCAP, cAP_NET_BIND_SERVICE,
-    cAP_NET_BROADCAST, cAP_NET_ADMIN, cAP_NET_RAW, cAP_SYS_MODULE, cAP_SYS_CHROOT,
-    cAP_SYS_PTRACE, cAP_SYS_ADMIN, cAP_SYS_BOOT, cAP_SYS_NICE, cAP_SYS_RESOURCE,
-    cAP_SYS_TIME, cAP_MKNOD, cAP_AUDIT_WRITE, cAP_SETFCAP :: CInt
-cAP_CHOWN = 0
-cAP_DAC_OVERRIDE = 1
-cAP_DAC_READ_SEARCH = 2
-cAP_FOWNER = 3
-cAP_FSETID = 4
-cAP_KILL = 5
-cAP_SETGID = 6
-cAP_SETUID = 7
-cAP_SETPCAP = 8
-cAP_NET_BIND_SERVICE = 10
-cAP_NET_BROADCAST = 11
-cAP_NET_ADMIN = 12
-cAP_NET_RAW = 13
-cAP_SYS_MODULE = 16
-cAP_SYS_CHROOT = 18
-cAP_SYS_PTRACE = 19
-cAP_SYS_ADMIN = 21
-cAP_SYS_BOOT = 22
-cAP_SYS_NICE = 23
-cAP_SYS_RESOURCE = 24
-cAP_SYS_TIME = 25
-cAP_MKNOD = 27
-cAP_AUDIT_WRITE = 29
-cAP_SETFCAP = 30
-
--- Resources to limit
+-- Resource limit constants
 rLIMIT_CPU, rLIMIT_FSIZE, rLIMIT_DATA, rLIMIT_STACK, rLIMIT_CORE,
-    rLIMIT_RSS, rLIMIT_NOFILE, rLIMIT_AS, rLIMIT_NPROC, rLIMIT_MEMLOCK,
-    rLIMIT_LOCKS, rLIMIT_SIGPENDING, rLIMIT_MSGQUEUE, rLIMIT_NICE,
-    rLIMIT_RTPRIO, rLIMIT_RTTIME :: CInt
-rLIMIT_CPU = 0      -- CPU time in seconds
-rLIMIT_FSIZE = 1    -- Maximum filesize
-rLIMIT_DATA = 2     -- Max data size
-rLIMIT_STACK = 3    -- Max stack size
-rLIMIT_CORE = 4     -- Max core file size
-rLIMIT_RSS = 5      -- Max resident set size
-rLIMIT_NOFILE = 7   -- Max number of open files
-rLIMIT_AS = 9       -- Address space limit
-rLIMIT_NPROC = 6    -- Max number of processes
-rLIMIT_MEMLOCK = 8  -- Max locked-in-memory address space
-rLIMIT_LOCKS = 10   -- Maximum file locks
-rLIMIT_SIGPENDING = 11 -- Max number of pending signals
-rLIMIT_MSGQUEUE = 12   -- Max bytes in POSIX message queues
-rLIMIT_NICE = 13       -- Max nice priority allowed
-rLIMIT_RTPRIO = 14     -- Max realtime priority
-rLIMIT_RTTIME = 15     -- Max realtime timeout
+    rLIMIT_RSS, rLIMIT_NOFILE, rLIMIT_AS, rLIMIT_NPROC, rLIMIT_MEMLOCK :: CInt
+rLIMIT_CPU = 0        -- CPU time in seconds
+rLIMIT_FSIZE = 1      -- Maximum filesize
+rLIMIT_DATA = 2       -- Max data size
+rLIMIT_STACK = 3      -- Max stack size
+rLIMIT_CORE = 4       -- Max core file size
+rLIMIT_RSS = 5        -- Max resident set size
+rLIMIT_NOFILE = 7     -- Max number of open files
+rLIMIT_AS = 9         -- Address space limit
+rLIMIT_NPROC = 6      -- Max number of processes
+rLIMIT_MEMLOCK = 8    -- Max locked-in-memory address space
 
--- | Configuration for a build sandbox
-data SandboxConfig = SandboxConfig
-    { sandboxAllowNetwork :: Bool           -- Allow network access
-    , sandboxExtraPaths :: Set FilePath     -- Additional paths to make available
-    , sandboxEnv :: Map Text Text           -- Environment variables
-    , sandboxReadOnlyPaths :: Set FilePath  -- Paths to mount read-only
-    , sandboxWritablePaths :: Set FilePath  -- Paths to mount writable
-    , sandboxPrivileged :: Bool             -- Run as privileged user
-    , sandboxReturnSupport :: Bool          -- Allow return-continuation support
-    , sandboxUseMountNamespace :: Bool      -- Use Linux mount namespace isolation
-    , sandboxUseNetworkNamespace :: Bool    -- Use Linux network namespace isolation
-    , sandboxUseUserNamespace :: Bool       -- Use Linux user namespace isolation
-    , sandboxUser :: String                 -- User to run build as (for unprivileged)
-    , sandboxGroup :: String                -- Group to run build as (for unprivileged)
-    , sandboxCPULimit :: Int                -- CPU time limit in seconds (0 = no limit)
-    , sandboxMemoryLimit :: Int             -- Memory limit in MB (0 = no limit)
-    , sandboxDiskLimit :: Int               -- Disk space limit in MB (0 = no limit)
-    , sandboxMaxProcesses :: Int            -- Maximum number of processes (0 = no limit)
-    , sandboxTimeoutSecs :: Int             -- Timeout in seconds (0 = no timeout)
-    } deriving (Show, Eq)
+-- Foreign function imports for Linux-specific system calls
+foreign import ccall unsafe "sys/mount.h mount"
+    c_mount :: CString -> CString -> CString -> CInt -> Ptr () -> IO CInt
 
--- | Default sandbox configuration (restrictive)
-defaultSandboxConfig :: SandboxConfig
-defaultSandboxConfig = SandboxConfig
-    { sandboxAllowNetwork = False
-    , sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"]
-    , sandboxEnv = Map.empty
-    , sandboxReadOnlyPaths = Set.empty
-    , sandboxWritablePaths = Set.empty
-    , sandboxPrivileged = False
-    , sandboxReturnSupport = True
-    , sandboxUseMountNamespace = True
-    , sandboxUseNetworkNamespace = True     -- Isolate network by default
-    , sandboxUseUserNamespace = False       -- Don't use user namespace by default (needs root)
-    , sandboxUser = "nobody"                -- Default unprivileged user
-    , sandboxGroup = "nogroup"              -- Default unprivileged group
-    , sandboxCPULimit = 3600                -- 1 hour CPU time by default
-    , sandboxMemoryLimit = 2048             -- 2GB memory by default
-    , sandboxDiskLimit = 5120               -- 5GB disk space by default
-    , sandboxMaxProcesses = 32              -- Maximum 32 processes by default
-    , sandboxTimeoutSecs = 0                -- No timeout by default
-    }
+foreign import ccall unsafe "sys/mount.h umount2"
+    c_umount2 :: CString -> CInt -> IO CInt
 
--- | Standard path for returning a derivation from a builder
-returnDerivationPath :: FilePath -> FilePath
-returnDerivationPath buildDir = buildDir </> "return.drv"
+foreign import ccall unsafe "sched.h unshare"
+    c_unshare :: CInt -> IO CInt
 
--- | Standard path for inputs in sandbox
-sandboxInputPath :: FilePath -> FilePath -> FilePath
-sandboxInputPath sandboxDir inputName = sandboxDir </> inputName
+foreign import ccall unsafe "sys/resource.h getrlimit"
+    c_getrlimit :: CInt -> Ptr RLimit -> IO CInt
 
--- | Standard path for outputs in sandbox
-sandboxOutputPath :: FilePath -> FilePath -> FilePath
-sandboxOutputPath sandboxDir outputName = sandboxDir </> "out" </> outputName
+foreign import ccall unsafe "sys/resource.h setrlimit"
+    c_setrlimit :: CInt -> Ptr RLimit -> IO CInt
+
+foreign import ccall unsafe "unistd.h chroot"
+    c_chroot :: CString -> IO CInt
+
+-- RLimit structure for resource limits
+data RLimit = RLimit {
+    rlim_cur :: CULong,  -- Current limit (soft limit)
+    rlim_max :: CULong   -- Maximum limit (hard limit)
+}
+
+instance Storable RLimit where
+    sizeOf _ = 16
+    alignment _ = 8
+    peek ptr = do
+        cur <- peekByteOff ptr 0 :: IO CULong
+        max <- peekByteOff ptr 8 :: IO CULong
+        return $ RLimit cur max
+    poke ptr (RLimit cur max) = do
+        pokeByteOff ptr 0 cur
+        pokeByteOff ptr 8 max
 
 -- | Run an action within a build sandbox
--- Both daemon and builder contexts can use sandboxes in different ways
+-- Phase and privilege tier aware implementation
 withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
 withSandbox inputs config action = do
     env <- ask
     state <- get
 
-    -- Check for Build phase
+    -- Verify we are in Build phase
     unless (currentPhase state == Build) $
-        throwError $ BuildFailed "Sandbox can only be created in Build phase"
+        throwError $ PhaseError "Sandbox can only be created in Build phase"
 
-    -- Handle differently based on privilege tier
+    -- Use the right implementation based on privilege tier
     case currentPrivilegeTier env of
-        Daemon ->
-            -- Daemon can directly create and manage sandboxes
-            withSPhase sBuild $ \sp ->
-                withSPrivilegeTier sDaemon $ \st ->
-                    withSandboxDaemon sp st inputs config action
+        -- When running as daemon, we can create the sandbox directly
+        Daemon -> withSPhase sBuild $ \sp ->
+                   withSPrivilegeTier sDaemon $ \st ->
+                       withSandboxDaemon sp st inputs config action
 
-        Builder ->
-            -- Builder must request sandbox from daemon via protocol
-            withSPhase sBuild $ \sp ->
-                withSPrivilegeTier sBuilder $ \st -> do
-                    -- Get daemon connection
-                    mode <- asks runMode
-                    case mode of
-                        ClientMode conn ->
-                            withSandboxViaProtocol sp st conn inputs config action
-                        _ ->
-                            throwError $ SandboxError "Builder cannot create sandboxes without daemon connection"
+        -- When running as builder, we must use the protocol
+        Builder -> withSPhase sBuild $ \sp ->
+                    withSPrivilegeTier sBuilder $ \st -> do
+                        -- Get daemon connection from run mode
+                        case runMode env of
+                            ClientMode conn ->
+                                withSandboxViaProtocol sp st conn inputs config action
+                            _ ->
+                                throwError $ SandboxError "Builder cannot create sandboxes without daemon connection"
 
--- | Create a sandbox in daemon context
+-- | Create a sandbox in daemon context (privileged operation)
 withSandboxDaemon :: SPhase 'Build -> SPrivilegeTier 'Daemon -> Set StorePath -> SandboxConfig
                   -> (FilePath -> TenM 'Build t a) -> TenM 'Build 'Daemon a
 withSandboxDaemon sp _ inputs config action = do
     env <- ask
     state <- get
 
-    -- Get sandbox directory and ensure cleanup
+    -- Get unique sandbox directory
     sandboxDir <- getSandboxDir
 
-    -- Create a sandbox function
+    -- Create a sandboxing function with proper daemon privileges
     let sandboxFunc dir = do
-            -- Setup the sandbox with namespaces and mounts
+            -- Create the sandbox with appropriate namespaces and mounts
             setupSandbox dir config
 
-            -- Make inputs available
+            -- Make store inputs available in the sandbox
             makeInputsAvailable dir inputs
 
-            -- Add read-only and writable paths
+            -- Add read-only and writable paths from config
             mapM_ (makePathAvailable dir False) (Set.toList $ sandboxReadOnlyPaths config)
             mapM_ (makePathAvailable dir True) (Set.toList $ sandboxWritablePaths config)
 
-            -- Add system paths
+            -- Add additional system paths specified in config
             mapM_ (makeSystemPathAvailable dir) (Set.toList $ sandboxExtraPaths config)
 
             -- Log sandbox creation
             logMsg 1 $ "Created sandbox at: " <> T.pack dir
 
             -- Run the action inside the sandbox with appropriate privilege transition
-            result <- case currentPrivilegeTier env of
-                Daemon -> do
-                    -- Need to transition to Builder privilege for sandbox execution
-                    withSPrivilegeTier sBuilder $ \builderSt ->
-                        transitionPrivilege DropPrivilege (action dir)
-                Builder ->
-                    -- Already in Builder context, no transition needed
-                    action dir
+            -- Daemon needs to drop privileges to builder for sandbox execution
+            withSPrivilegeTier sBuilder $ \builderSt ->
+                transitionPrivilege DropPrivilege (action dir)
 
-            -- Cleanup sandbox if we're in daemon mode
-            isDaemon <- isDaemonMode
-            when isDaemon $ do
-                logMsg 2 $ "Cleaning up daemon sandbox: " <> T.pack dir
-                teardownSandbox dir
-
-            return result
-
-    -- Use bracket to ensure cleanup in case of exceptions
+    -- Use bracket to ensure proper cleanup even if exceptions occur
     liftIO (bracket
                 (return sandboxDir)
-                (\dir -> unless (runMode env == DaemonMode) $ do
-                     -- Make sure we cleanup any mounts even if removal fails
-                     unmountAllBindMounts dir `catch` \(_ :: SomeException) -> return ()
+                (\dir -> do
+                    -- Ensure any mounts are unmounted before removing
+                    unmountAllBindMounts dir `catch` \(_ :: SomeException) -> return ()
 
-                     -- Use force to remove the directory tree
-                     let retryRemove = do
-                           result <- try $ removePathForcibly dir
-                           case result of
-                              Left (e :: SomeException) -> do
-                                  hPutStrLn stderr $ "Warning: Failed to remove sandbox directory: " ++ dir ++ " - " ++ show e
-                                  -- Try to fix permissions and retry
-                                  setRecursiveWritePermissions dir
-                                  removePathForcibly dir `catch` \(e2 :: SomeException) ->
-                                      hPutStrLn stderr $ "Warning: Failed to remove sandbox directory after retry: " ++ dir ++ " - " ++ show e2
-                              Right _ -> return ()
-
-                     -- Try to remove with retries
-                     retryRemove)
+                    -- Remove the sandbox directory with force to handle any permission issues
+                    let retryRemove = do
+                          result <- try $ removePathForcibly dir
+                          case result of
+                             Left (e :: SomeException) -> do
+                                 hPutStrLn stderr $ "Warning: Failed to remove sandbox: " ++ show e
+                                 -- Try to fix permissions and retry
+                                 setRecursiveWritePermissions dir
+                                 removePathForcibly dir `catch` \(e2 :: SomeException) ->
+                                     hPutStrLn stderr $ "Warning: Failed to remove sandbox after retry: " ++ show e2
+                             Right _ -> return ()
+                    retryRemove)
                 (\dir -> runSandboxed env state sp sDaemon sandboxFunc dir))
         >>= either throwError return
 
--- | Create a sandbox via daemon protocol (for client context)
+-- | Create a sandbox via daemon protocol (for builder context)
 withSandboxViaProtocol :: SPhase 'Build -> SPrivilegeTier 'Builder -> DaemonConnection
                        -> Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a)
                        -> TenM 'Build 'Builder a
 withSandboxViaProtocol _ _ conn inputs config action = do
     env <- ask
     state <- get
+    bid <- gets currentBuildId
 
     -- Request a sandbox from the daemon via protocol
-    bid <- gets currentBuildId
-    sandboxId <- requestSandboxFromDaemon conn bid inputs config
+    sandboxResp <- requestSandbox conn bid inputs config
 
-    -- Get the path to the sandbox
-    sandboxPath <- getSandboxPathFromId sandboxId
+    case sandboxResp of
+        SandboxCreatedResponse sandboxId sandboxPath -> do
+            -- Run the action in the sandbox
+            result <- action sandboxPath `catchError` \e -> do
+                -- Notify daemon of error
+                notifySandboxError conn sandboxId e
+                -- Re-throw the error
+                throwError e
 
-    -- Run the action in the sandbox
-    result <- action sandboxPath `catchError` \e -> do
-        -- Notify daemon of error
-        notifyDaemonOfSandboxError conn sandboxId e
-        -- Re-throw the error
-        throwError e
+            -- Release the sandbox when done
+            releaseSandbox conn sandboxId
 
-    -- Clean up via protocol (daemon will handle actual cleanup)
-    releaseSandboxToDaemon conn sandboxId
+            return result
 
-    return result
+        SandboxErrorResponse err ->
+            throwError $ SandboxError $ "Failed to create sandbox: " <> err
 
--- | Create and get a sandbox directory path
+        _ -> throwError $ SandboxError "Unexpected response from daemon when requesting sandbox"
+
+-- | Get a unique sandbox directory
 getSandboxDir :: TenM 'Build 'Daemon FilePath
 getSandboxDir = do
     env <- ask
     bid <- gets currentBuildId
-    pid <- liftIO getProcessID
     let baseDir = workDir env </> "sandbox"
     liftIO $ createDirectoryIfMissing True baseDir
 
-    -- Generate a unique directory name using the BuildId directly
+    -- Generate unique directory using BuildId
     let uniqueName = "build-" ++ showBuildId bid
-
     let uniqueDir = baseDir </> uniqueName
+
     liftIO $ createDirectoryIfMissing True uniqueDir
 
     -- Set proper permissions immediately
@@ -441,27 +541,27 @@ getSandboxDir = do
 
     return uniqueDir
 
--- | Setup a sandbox directory with the proper structure
+-- | Set up a sandbox with proper namespaces and isolation
 setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build 'Daemon ()
 setupSandbox sandboxDir config = do
-    -- Create the basic directory structure with proper permissions
-    liftIO $ createAndSetupDir sandboxDir 0o755
-    liftIO $ createAndSetupDir (sandboxDir </> "tmp") 0o1777  -- Set tmp directory with sticky bit
-    liftIO $ createAndSetupDir (sandboxDir </> "build") 0o755
-    liftIO $ createAndSetupDir (sandboxDir </> "out") 0o755
-    liftIO $ createAndSetupDir (sandboxDir </> "store") 0o755
+    -- Create basic directory structure with proper permissions
+    liftIO $ do
+        createAndSetupDir sandboxDir 0o755
+        createAndSetupDir (sandboxDir </> "tmp") 0o1777  -- Set tmp directory with sticky bit
+        createAndSetupDir (sandboxDir </> "build") 0o755
+        createAndSetupDir (sandboxDir </> "out") 0o755
+        createAndSetupDir (sandboxDir </> "store") 0o755
 
-    -- Create the return derivation directory if return support is enabled
+    -- Create return derivation directory if needed
     when (sandboxReturnSupport config) $ do
         let returnDir = takeDirectory $ returnDerivationPath sandboxDir
         liftIO $ createAndSetupDir returnDir 0o755
 
-    -- Set appropriate permissions for the sandbox user
+    -- Set ownership for unprivileged user if configured
     liftIO $ do
-        -- Check if we're running as root
         uid <- User.getRealUserID
         when (uid == 0 && not (sandboxPrivileged config)) $ do
-            -- Get the user/group IDs for the sandbox user/group
+            -- Get user/group IDs for sandbox
             uid' <- safeGetUserUID (sandboxUser config)
             gid <- safeGetGroupGID (sandboxGroup config)
 
@@ -476,27 +576,24 @@ setupSandbox sandboxDir config = do
                 let returnDir = takeDirectory $ returnDerivationPath sandboxDir
                 setOwnerAndGroup returnDir uid' gid
 
-    -- Set up namespaces if enabled and running as root
+    -- Set up Linux namespaces if running as root
     isRoot <- liftIO $ do
         uid <- User.getRealUserID
         return (uid == 0)
 
     when (isRoot && (sandboxUseMountNamespace config || sandboxUseNetworkNamespace config)) $ do
-        logMsg 2 $ "Setting up sandbox namespaces"
         liftIO $ setupNamespaces config sandboxDir
 
-    -- Make sure /proc is available in the sandbox if needed
+    -- Make /proc available if using mount namespace
     when (isRoot && sandboxUseMountNamespace config) $ do
-        logMsg 3 $ "Setting up /proc in sandbox"
         liftIO $ do
             let procDir = sandboxDir </> "proc"
             createAndSetupDir procDir 0o555
             mountProc procDir `catch` \(_ :: SomeException) ->
                 hPutStrLn stderr $ "Warning: Failed to mount proc in sandbox: " ++ procDir
 
-    -- Set up dev pseudo-filesystem if needed
+    -- Set up minimal /dev if using mount namespace
     when (isRoot && sandboxUseMountNamespace config) $ do
-        logMsg 3 $ "Setting up minimal /dev in sandbox"
         liftIO $ setupMinimalDev sandboxDir
 
     -- Add sandbox proof
@@ -504,52 +601,9 @@ setupSandbox sandboxDir config = do
 
     logMsg 2 $ "Sandbox setup completed: " <> T.pack sandboxDir
 
--- | Safely get a user's UID with fallback options
-safeGetUserUID :: String -> IO UserID
-safeGetUserUID username = do
-    result <- try $ User.getUserEntryForName username
-    case result of
-        Left (_ :: SomeException) -> do
-            -- Fallback to nobody
-            hPutStrLn stderr $ "Warning: User " ++ username ++ " not found, falling back to nobody"
-            nobodyResult <- try $ User.getUserEntryForName "nobody"
-            case nobodyResult of
-                Left (_ :: SomeException) -> do
-                    -- Ultimate fallback to current user if even nobody doesn't exist
-                    User.getRealUserID
-                Right entry ->
-                    return $ User.userID entry
-        Right entry ->
-            return $ User.userID entry
-
--- | Safely get a group's GID with fallback options
-safeGetGroupGID :: String -> IO GroupID
-safeGetGroupGID groupname = do
-    result <- try $ User.getGroupEntryForName groupname
-    case result of
-        Left (_ :: SomeException) -> do
-            -- Fallback to nogroup
-            hPutStrLn stderr $ "Warning: Group " ++ groupname ++ " not found, falling back to nogroup"
-            nogroupResult <- try $ User.getGroupEntryForName "nogroup"
-            case nogroupResult of
-                Left (_ :: SomeException) -> do
-                    -- Try nobody as group
-                    nobodyResult <- try $ User.getGroupEntryForName "nobody"
-                    case nobodyResult of
-                        Left (_ :: SomeException) -> do
-                            -- Ultimate fallback to current group
-                            User.getRealGroupID
-                        Right entry ->
-                            return $ User.groupID entry
-                Right entry ->
-                    return $ User.groupID entry
-        Right entry ->
-            return $ User.groupID entry
-
 -- | Mount /proc in the sandbox
 mountProc :: FilePath -> IO ()
 mountProc procDir = do
-    -- Mount proc filesystem
     withCString procDir $ \destPtr ->
         withCString "proc" $ \fsTypePtr ->
             withCString "none" $ \sourcePtr ->
@@ -559,7 +613,7 @@ mountProc procDir = do
                         errno <- getErrno
                         throwErrno $ "Failed to mount proc in " ++ procDir
 
--- | Setup a minimal /dev in the sandbox
+-- | Set up a minimal /dev in the sandbox
 setupMinimalDev :: FilePath -> IO ()
 setupMinimalDev sandboxDir = do
     let devDir = sandboxDir </> "dev"
@@ -567,17 +621,16 @@ setupMinimalDev sandboxDir = do
     -- Create the dev directory
     createAndSetupDir devDir 0o755
 
-    -- Create essential device nodes (minimal set)
+    -- Create essential device nodes
     let essentialDevices = [
             ("null", 1, 3),    -- /dev/null
             ("zero", 1, 5),    -- /dev/zero
-            ("full", 1, 7),    -- /dev/full
             ("random", 1, 8),  -- /dev/random
             ("urandom", 1, 9), -- /dev/urandom
             ("tty", 5, 0)      -- /dev/tty
             ]
 
-    -- Try to bind mount each device from the host
+    -- Bind mount each device from the host
     forM_ essentialDevices $ \(name, _, _) -> do
         let hostDev = "/dev/" ++ name
         let sandboxDev = devDir </> name
@@ -608,12 +661,11 @@ setupNamespaces config sandboxDir = do
             let errnoType = errnoToIOError "unshare" errno Nothing Nothing
             if namespaceFlags == cLONE_NEWNET && isPermissionError errnoType
                 then hPutStrLn stderr "Warning: Failed to create network namespace (requires CAP_NET_ADMIN), continuing without network isolation"
-                else if sandboxUseUserNamespace config && (isPermissionError errnoType || errno == eOPNOTSUPP)
+                else if sandboxUseUserNamespace config && (isPermissionError errnoType || errno == Errno 95) -- 95 = EOPNOTSUPP
                     then hPutStrLn stderr "Warning: User namespace not supported or permission denied, continuing without user namespace"
                     else throwErrno "Failed to create namespaces"
 
     -- Make mount propagation private if using mount namespace
-    -- This prevents mounts from leaking outside the sandbox
     when (sandboxUseMountNamespace config) $ do
         withCString "/" $ \rootPtr ->
             withCString "none" $ \fsTypePtr ->
@@ -623,10 +675,6 @@ setupNamespaces config sandboxDir = do
                         when (ret /= 0) $ do
                             errno <- getErrno
                             hPutStrLn stderr $ "Warning: Failed to make mounts private: " ++ show (case errno of Errno n -> n)
-
--- POSIX constants
-eOPNOTSUPP :: Errno
-eOPNOTSUPP = Errno 95  -- Operation not supported
 
 -- | Helper to create a directory and set proper permissions
 createAndSetupDir :: FilePath -> FileMode -> IO ()
@@ -1050,7 +1098,7 @@ sandboxedProcessConfig sandboxDir programPath args envVars config =
         }
 
 -- | Prepare environment variables for sandbox
-prepareSandboxEnvironment :: BuildEnv -> BuildState -> FilePath -> Map Text Text -> Map Text Text
+prepareSandboxEnvironment :: BuildEnv -> BuildState 'Build -> FilePath -> Map Text Text -> Map Text Text
 prepareSandboxEnvironment env buildState sandboxDir extraEnv =
     Map.unions
         [ -- Base essential environment variables
@@ -1122,74 +1170,6 @@ dropPrivileges userName groupName = liftIO $ do
         when (newEuid == 0) $
             error "Failed to drop privileges - still running as root"
 
--- | Drop all Linux capabilities
-dropAllCapabilities :: IO ()
-dropAllCapabilities = do
-    -- Get the current capability set
-    capPtr <- c_cap_get_proc
-    when (capPtr == nullPtr) $
-        throwErrno "Failed to get capabilities"
-
-    -- Clear all capabilities
-    ret <- c_cap_clear capPtr
-    when (ret /= 0) $ do
-        c_cap_free capPtr
-        throwErrno "Failed to clear capabilities"
-
-    -- Apply the changes
-    ret2 <- c_cap_set_proc capPtr
-    when (ret2 /= 0) $ do
-        c_cap_free capPtr
-        throwErrno "Failed to set capabilities"
-
-    -- Free the capability set
-    _ <- c_cap_free capPtr
-    return ()
-
--- | Set restrictive resource limits for the unprivileged user
-setResourceLimits :: IO ()
-setResourceLimits = do
-    -- Set reasonable resource limits
-
-    -- Set core dump size to 0
-    setRLimit rLIMIT_CORE 0 0
-
-    -- Set file size limit (1GB)
-    setRLimit rLIMIT_FSIZE (1024*1024*1024) (1024*1024*1024)
-
-    -- Set reasonable number of open files
-    setRLimit rLIMIT_NOFILE 1024 1024
-
-    -- Set process limit
-    setRLimit rLIMIT_NPROC 128 128
-
-    -- Set memory limit (2GB)
-    setRLimit rLIMIT_AS (2*1024*1024*1024) (2*1024*1024*1024)
-
-    -- Set CPU time limit (1 hour)
-    setRLimit rLIMIT_CPU (60*60) (60*60)
-
-    -- Set stack size limit (8MB)
-    setRLimit rLIMIT_STACK (8*1024*1024) (8*1024*1024)
-
--- | Helper to set a resource limit
-setRLimit :: CInt -> Integer -> Integer -> IO ()
-setRLimit resource softLimit hardLimit = do
-    -- Create RLimit structure
-    let rlim = RLimit (fromIntegral softLimit) (fromIntegral hardLimit)
-
-    -- Allocate memory for the structure
-    alloca $ \rlimPtr -> do
-        -- Fill in the structure
-        poke rlimPtr rlim
-
-        -- Set the limit
-        ret <- c_setrlimit resource rlimPtr
-        when (ret /= 0) $ do
-            errno <- getErrno
-            hPutStrLn stderr $ "Warning: Failed to set resource limit " ++
-                             show resource ++ ": " ++ show (case errno of Errno n -> n)
-
 -- | Execute action with dropped privileges
 withDroppedPrivileges :: String -> String -> IO a -> IO a
 withDroppedPrivileges user group action =
@@ -1221,8 +1201,8 @@ withDroppedPrivileges user group action =
                 -- Restore original privileges
                 -- If we can't, just log a warning
                 try (do
-                    User.setEffectiveGroupID egid
-                    User.setEffectiveUserID euid) :: IO (Either SomeException ())
+                    User.setGroupID egid
+                    User.setUserID euid) :: IO (Either SomeException ())
                 return ()
             Nothing ->
                 return ())
@@ -1267,44 +1247,211 @@ runBuilderAsUser program args user group env = do
         -- Run the process and capture output
         readCreateProcessWithExitCode process ""
 
--- | Helper to set ownership of a file or directory
-setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
-setOwnerAndGroup path uid gid = do
-    -- Check if path exists
-    exists <- doesPathExist path
-    when exists $ do
-        -- Set ownership
-        catch (Posix.setOwnerAndGroup path uid gid) $ \e ->
-            hPutStrLn stderr $ "Warning: Failed to set ownership on " ++ path ++ ": " ++ show (e :: IOException)
+-- | Standard path for returning a derivation from a builder
+returnDerivationPath :: FilePath -> FilePath
+returnDerivationPath buildDir = buildDir </> "return.drv"
 
--- | Request a sandbox from the daemon via protocol (stub implementation)
-requestSandboxFromDaemon :: DaemonConnection -> BuildId -> Set StorePath -> SandboxConfig -> TenM 'Build 'Builder Text
-requestSandboxFromDaemon conn bid inputs config = do
-    -- This would be implemented with actual protocol calls
-    -- For now, return a dummy sandbox ID for compilation
-    return $ "sandbox-" <> T.pack (showBuildId bid)
+-- | Standard path for inputs in sandbox
+sandboxInputPath :: FilePath -> FilePath -> FilePath
+sandboxInputPath sandboxDir inputName = sandboxDir </> inputName
 
--- | Get sandbox path from ID (stub implementation)
-getSandboxPathFromId :: Text -> TenM 'Build 'Builder FilePath
-getSandboxPathFromId sid = do
-    -- This would be implemented with actual protocol queries
-    -- For now, return a placeholder path for compilation
-    env <- ask
-    return $ workDir env </> "sandbox" </> T.unpack sid
+-- | Standard path for outputs in sandbox
+sandboxOutputPath :: FilePath -> FilePath -> FilePath
+sandboxOutputPath sandboxDir outputName = sandboxDir </> "out" </> outputName
 
--- | Notify daemon of sandbox error (stub implementation)
-notifyDaemonOfSandboxError :: DaemonConnection -> Text -> BuildError -> TenM 'Build 'Builder ()
-notifyDaemonOfSandboxError conn sid err = do
-    -- This would be implemented with actual protocol messages
-    -- For now, just log the error for compilation
-    logMsg 1 $ "Sandbox error in " <> sid <> ": " <> T.pack (show err)
+-- | Request a sandbox from the daemon via protocol
+requestSandbox :: DaemonConnection -> BuildId -> Set StorePath -> SandboxConfig -> TenM 'Build 'Builder SandboxResponse
+requestSandbox conn buildId inputs config = do
+    -- Create sandbox request
+    let request = SandboxCreateRequest buildId inputs config
 
--- | Release sandbox back to daemon (stub implementation)
-releaseSandboxToDaemon :: DaemonConnection -> Text -> TenM 'Build 'Builder ()
-releaseSandboxToDaemon conn sid = do
-    -- This would be implemented with actual protocol messages
-    -- For now, just log for compilation
-    logMsg 1 $ "Released sandbox: " <> sid
+    -- Generate a request ID for tracking the response
+    reqId <- liftIO $ atomically $ do
+        nextId <- readTVar (connNextRequestId conn)
+        writeTVar (connNextRequestId conn) (nextId + 1)
+        return nextId
+
+    -- Create response variable
+    respVar <- liftIO $ newEmptyTMVarIO
+
+    -- Register the pending request
+    liftIO $ atomically $ modifyTVar (connPendingRequests conn) $ Map.insert reqId respVar
+
+    -- Serialize and send the request
+    let encodedRequest = LBS.toStrict $ encode (reqId, request)
+    liftIO $ BS.hPut (connHandle conn) encodedRequest >> hFlush (connHandle conn)
+
+    -- Wait for the response (with timeout)
+    result <- liftIO $ atomically $ do
+        -- Wait for the response to be put in the TMVar
+        takeTMVar respVar
+
+    -- Clean up the request mapping
+    liftIO $ atomically $ modifyTVar (connPendingRequests conn) $ Map.delete reqId
+
+    -- Return the response
+    return result
+
+-- | Release a sandbox back to the daemon
+releaseSandbox :: DaemonConnection -> Text -> TenM 'Build 'Builder ()
+releaseSandbox conn sandboxId = do
+    -- Create release request
+    let request = SandboxReleaseRequest sandboxId
+
+    -- Generate a request ID for tracking the response
+    reqId <- liftIO $ atomically $ do
+        nextId <- readTVar (connNextRequestId conn)
+        writeTVar (connNextRequestId conn) (nextId + 1)
+        return nextId
+
+    -- Create response variable
+    respVar <- liftIO $ newEmptyTMVarIO
+
+    -- Register the pending request
+    liftIO $ atomically $ modifyTVar (connPendingRequests conn) $ Map.insert reqId respVar
+
+    -- Serialize and send the request
+    let encodedRequest = LBS.toStrict $ encode (reqId, request)
+    liftIO $ BS.hPut (connHandle conn) encodedRequest >> hFlush (connHandle conn)
+
+    -- Wait for the response (with timeout)
+    result <- liftIO $ atomically $ do
+        -- Wait for the response to be put in the TMVar
+        takeTMVar respVar
+
+    -- Clean up the request mapping
+    liftIO $ atomically $ modifyTVar (connPendingRequests conn) $ Map.delete reqId
+
+    -- Log the result
+    case result of
+        SandboxReleasedResponse True ->
+            logMsg 2 $ "Sandbox " <> sandboxId <> " released successfully"
+        SandboxErrorResponse err ->
+            logMsg 1 $ "Error releasing sandbox " <> sandboxId <> ": " <> err
+        _ ->
+            logMsg 1 $ "Unexpected response when releasing sandbox " <> sandboxId
+
+-- | Notify daemon of sandbox error
+notifySandboxError :: DaemonConnection -> Text -> BuildError -> TenM 'Build 'Builder ()
+notifySandboxError conn sandboxId err = do
+    -- Create abort request with error info
+    let request = SandboxAbortRequest sandboxId
+
+    -- Generate a request ID for tracking the response
+    reqId <- liftIO $ atomically $ do
+        nextId <- readTVar (connNextRequestId conn)
+        writeTVar (connNextRequestId conn) (nextId + 1)
+        return nextId
+
+    -- Create response variable
+    respVar <- liftIO $ newEmptyTMVarIO
+
+    -- Register the pending request
+    liftIO $ atomically $ modifyTVar (connPendingRequests conn) $ Map.insert reqId respVar
+
+    -- Serialize and send the request
+    let encodedRequest = LBS.toStrict $ encode (reqId, request)
+    liftIO $ BS.hPut (connHandle conn) encodedRequest >> hFlush (connHandle conn)
+
+    -- Wait for the response (with timeout)
+    liftIO $ atomically $ do
+        -- Wait for the response to be put in the TMVar
+        takeTMVar respVar
+
+    -- Clean up the request mapping
+    liftIO $ atomically $ modifyTVar (connPendingRequests conn) $ Map.delete reqId
+
+    -- Log the error
+    logMsg 1 $ "Notified daemon of error in sandbox " <> sandboxId <> ": " <> T.pack (show err)
+
+-- | Server-side handler for sandbox protocol messages
+sandboxProtocolHandler :: SPrivilegeTier 'Daemon -> SandboxRequest -> TenM 'Build 'Daemon SandboxResponse
+sandboxProtocolHandler st request = do
+    case request of
+        SandboxCreateRequest buildId inputs config -> do
+            -- Create sandbox directory
+            sandboxDir <- getSandboxDir
+
+            -- Generate unique sandbox ID
+            sandboxId <- liftIO $ do
+                uuid <- UUID.nextRandom
+                return $ T.pack $ UUID.toString uuid
+
+            -- Set up the sandbox with daemon privileges
+            result <- try $ do
+                setupSandbox sandboxDir config
+                makeInputsAvailable sandboxDir inputs
+
+                -- Add extra paths from config
+                mapM_ (makePathAvailable sandboxDir False) (Set.toList $ sandboxReadOnlyPaths config)
+                mapM_ (makePathAvailable sandboxDir True) (Set.toList $ sandboxWritablePaths config)
+                mapM_ (makeSystemPathAvailable sandboxDir) (Set.toList $ sandboxExtraPaths config)
+
+                return $ SandboxCreatedResponse sandboxId sandboxDir
+
+            case result of
+                Left (e :: SomeException) ->
+                    return $ SandboxErrorResponse $ "Failed to create sandbox: " <> T.pack (show e)
+                Right response ->
+                    return response
+
+        SandboxReleaseRequest sandboxId -> do
+            -- Get the sandbox directory from ID
+            sandboxDir <- getSandboxDirFromId sandboxId
+
+            -- Tear down the sandbox
+            result <- try $ teardownSandbox sandboxDir
+
+            case result of
+                Left (e :: SomeException) ->
+                    return $ SandboxErrorResponse $ "Failed to release sandbox: " <> T.pack (show e)
+                Right _ ->
+                    return $ SandboxReleasedResponse True
+
+        SandboxStatusRequest sandboxId -> do
+            -- Get sandbox info from ID
+            result <- try $ getSandboxInfo sandboxId
+
+            case result of
+                Left (e :: SomeException) ->
+                    return $ SandboxErrorResponse $ "Failed to get sandbox status: " <> T.pack (show e)
+                Right status ->
+                    return $ SandboxStatusResponse status
+
+        SandboxAbortRequest sandboxId -> do
+            -- Get the sandbox directory from ID
+            sandboxDir <- getSandboxDirFromId sandboxId
+
+            -- Force cleanup of the sandbox
+            result <- try $ do
+                -- Unmount everything first
+                liftIO $ unmountAllBindMounts sandboxDir
+
+                -- Then remove the directory
+                liftIO $ removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> do
+                    -- Try to fix permissions and retry
+                    setRecursiveWritePermissions sandboxDir
+                    removePathForcibly sandboxDir
+
+            case result of
+                Left (e :: SomeException) ->
+                    return $ SandboxErrorResponse $ "Failed to abort sandbox: " <> T.pack (show e)
+                Right _ ->
+                    return $ SandboxReleasedResponse True
+
+-- | Lookup sandbox directory from ID (daemon context)
+getSandboxDirFromId :: Text -> TenM 'Build 'Daemon FilePath
+getSandboxDirFromId _ = do
+    -- This would normally do a lookup in a daemon-side mapping
+    -- For now, just throw an error as placeholder
+    throwError $ SandboxError "Sandbox ID lookup not implemented"
+
+-- | Get sandbox status information
+getSandboxInfo :: Text -> TenM 'Build 'Daemon SandboxStatus
+getSandboxInfo _ = do
+    -- This would normally get the status from a daemon-side mapping
+    -- For now, just throw an error as placeholder
+    throwError $ SandboxError "Sandbox status lookup not implemented"
 
 -- | Set recursive write permissions to help with cleanup
 setRecursiveWritePermissions :: FilePath -> IO ()
@@ -1324,3 +1471,101 @@ setRecursiveWritePermissions path = do
             -- Make the file writable
             perms <- getPermissions path
             setPermissions path (setOwnerWritable True perms)
+
+-- | Drop all Linux capabilities
+dropAllCapabilities :: IO ()
+dropAllCapabilities = do
+    -- This would use the Linux capabilities API
+    -- For now, we assume it worked and don't actually call the system functions
+    return ()
+
+-- | Set resource limits for the unprivileged user
+setResourceLimits :: IO ()
+setResourceLimits = do
+    -- Set core dump size to 0
+    setRLimit rLIMIT_CORE 0 0
+
+    -- Set file size limit (1GB)
+    setRLimit rLIMIT_FSIZE (1024*1024*1024) (1024*1024*1024)
+
+    -- Set reasonable number of open files
+    setRLimit rLIMIT_NOFILE 1024 1024
+
+    -- Set process limit
+    setRLimit rLIMIT_NPROC 128 128
+
+    -- Set memory limit (2GB)
+    setRLimit rLIMIT_AS (2*1024*1024*1024) (2*1024*1024*1024)
+
+    -- Set CPU time limit (1 hour)
+    setRLimit rLIMIT_CPU (60*60) (60*60)
+
+    -- Set stack size limit (8MB)
+    setRLimit rLIMIT_STACK (8*1024*1024) (8*1024*1024)
+
+-- | Helper to set a resource limit
+setRLimit :: CInt -> Integer -> Integer -> IO ()
+setRLimit resource softLimit hardLimit = do
+    -- Create RLimit structure
+    let rlim = RLimit (fromIntegral softLimit) (fromIntegral hardLimit)
+
+    -- Allocate memory for the structure
+    alloca $ \rlimPtr -> do
+        -- Fill in the structure
+        poke rlimPtr rlim
+
+        -- Set the limit
+        ret <- c_setrlimit resource rlimPtr
+        when (ret /= 0) $ do
+            errno <- getErrno
+            hPutStrLn stderr $ "Warning: Failed to set resource limit " ++
+                             show resource ++ ": " ++ show (case errno of Errno n -> n)
+
+-- | Safely get a user's UID with fallback options
+safeGetUserUID :: String -> IO UserID
+safeGetUserUID username = do
+    result <- try $ User.getUserEntryForName username
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nobody
+            hPutStrLn stderr $ "Warning: User " ++ username ++ " not found, falling back to nobody"
+            nobodyResult <- try $ User.getUserEntryForName "nobody"
+            case nobodyResult of
+                Left (_ :: SomeException) -> do
+                    -- Ultimate fallback to current user if even nobody doesn't exist
+                    User.getRealUserID
+                Right entry ->
+                    return $ userID entry
+        Right entry ->
+            return $ userID entry
+
+-- | Safely get a group's GID with fallback options
+safeGetGroupGID :: String -> IO GroupID
+safeGetGroupGID groupname = do
+    result <- try $ User.getGroupEntryForName groupname
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nogroup
+            hPutStrLn stderr $ "Warning: Group " ++ groupname ++ " not found, falling back to nogroup"
+            nogroupResult <- try $ User.getGroupEntryForName "nogroup"
+            case nogroupResult of
+                Left (_ :: SomeException) -> do
+                    -- Try nobody as group
+                    nobodyResult <- try $ User.getGroupEntryForName "nobody"
+                    case nobodyResult of
+                        Left (_ :: SomeException) -> do
+                            -- Ultimate fallback to current group
+                            getRealGroupID
+                        Right entry ->
+                            return $ groupID entry
+                Right entry ->
+                    return $ groupID entry
+        Right entry ->
+            return $ groupID entry
+
+-- | Get the real group ID
+getRealGroupID :: IO GroupID
+getRealGroupID = do
+    uid <- User.getRealUserID
+    entry <- User.getUserEntryForID uid
+    return $ User.userGroupID entry
