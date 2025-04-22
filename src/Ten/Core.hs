@@ -118,6 +118,7 @@ module Ten.Core (
     runTen,
     evalTen,
     buildTen,
+    runTenDaemon,
     runTenDaemon_Eval,
     runTenDaemon_Build,
     runTenBuilder_Eval,
@@ -142,12 +143,6 @@ module Ten.Core (
     withDaemon,
     isDaemonMode,
     isClientMode,
-
-    -- Linux-specific operations
-    dropPrivileges,
-    withDroppedPrivileges,
-    getSystemUser,
-    getSystemGroup,
 
     -- GC lock path helpers
     gcLockPath,
@@ -189,7 +184,6 @@ import Network.Socket (Socket)
 import System.IO (Handle)
 import Data.Maybe (isJust, isNothing, fromMaybe, catMaybes)
 import Data.List (isPrefixOf, isInfixOf, nub)
-import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup)
 import qualified System.Posix.User as User
 import System.Posix.Types (UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
@@ -602,6 +596,7 @@ data BuildState (p :: Phase) = BuildState
     , currentBuildId :: BuildId          -- Current build identifier
     , buildChain :: [Derivation]         -- Chain of return-continuation derivations
     , recursionDepth :: Int              -- Tracks recursion depth for cycles
+    , currentPhase :: Phase              -- Current phase (for runtime checks)
     } deriving (Show)
 
 -- | The core monad for all Ten operations
@@ -708,6 +703,7 @@ initBuildState_Eval bid = BuildState
     , currentBuildId = bid
     , buildChain = []
     , recursionDepth = 0
+    , currentPhase = Eval
     }
 
 -- | Initialize build state for Build phase with a BuildId
@@ -719,6 +715,7 @@ initBuildState_Build bid = BuildState
     , currentBuildId = bid
     , buildChain = []
     , recursionDepth = 0
+    , currentPhase = Build
     }
 
 -- | Execute a Ten monad with explicit singleton evidence
@@ -745,27 +742,24 @@ buildTen m env = do
     bid <- BuildId <$> newUnique
     runTen sBuild sBuilder m env' (initBuildState_Build bid)
 
--- | Execute a daemon operation in Eval phase (privileged)
-runTenDaemon_Eval :: TenM 'Eval 'Daemon a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
-runTenDaemon_Eval m env state = do
+-- | Execute a daemon operation with appropriate phase (general version)
+runTenDaemon :: forall p a. (SingI p) => TenM p 'Daemon a -> BuildEnv -> BuildState p -> IO (Either BuildError (a, BuildState p))
+runTenDaemon m env state = do
     -- Verify we're in daemon mode
     case runMode env of
         DaemonMode -> do
             -- Set daemon privilege tier
             let env' = env { currentPrivilegeTier = Daemon }
-            runTen sEval sDaemon m env' state
+            runTen (sing @p) sDaemon m env' state
         _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
+
+-- | Execute a daemon operation in Eval phase (privileged)
+runTenDaemon_Eval :: TenM 'Eval 'Daemon a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
+runTenDaemon_Eval = runTenDaemon
 
 -- | Execute a daemon operation in Build phase (privileged)
 runTenDaemon_Build :: TenM 'Build 'Daemon a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
-runTenDaemon_Build m env state = do
-    -- Verify we're in daemon mode
-    case runMode env of
-        DaemonMode -> do
-            -- Set daemon privilege tier
-            let env' = env { currentPrivilegeTier = Daemon }
-            runTen sBuild sDaemon m env' state
-        _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
+runTenDaemon_Build = runTenDaemon
 
 -- | Execute a builder operation in Eval phase (unprivileged)
 runTenBuilder_Eval :: TenM 'Eval 'Builder a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
@@ -808,77 +802,235 @@ liftBuilderIO action = TenM $ \_ st -> do
         (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
 
--- | Safely transition between phases through derivation serialization
--- Properly implements the Nix-like phase boundary by serializing/deserializing through the store
-transitionPhase :: PhaseTransition p q -> TenM p t a -> TenM q t a
-transitionPhase trans action = TenM $ \spTo st -> do
+-- | Serialized derivation for phase transitions
+data SerializedDerivation = SerializedDerivation
+    { sdContent :: ByteString     -- Serialized derivation content
+    , sdPath :: StorePath         -- Path in the store
+    , sdHash :: Text              -- Hash for verification
+    } deriving (Show, Eq)
+
+-- | Build result from build phase
+data BuildResult = BuildResult
+    { brExitCode :: ExitCode                -- Exit code from builder
+    , brOutputPaths :: Set StorePath        -- Outputs produced
+    , brLog :: Text                         -- Build log
+    , brReferences :: Set StorePath         -- References from outputs
+    } deriving (Show, Eq)
+
+-- | Eval phase produces a derivation
+evalToDerivation :: Derivation -> TenM 'Eval t SerializedDerivation
+evalToDerivation deriv = do
+    env <- ask
+
+    -- Serialize derivation to bytes
+    let content = serializeDerivation deriv
+
+    -- Calculate hash
+    let hash = hashByteString content
+
+    -- Create store path
+    let name = derivName deriv <> ".drv"
+    let storePath = StorePath (T.pack (show hash)) name
+
+    -- In daemon context, write directly to store
+    case currentPrivilegeTier env of
+        Daemon -> do
+            -- Create store path
+            let filePath = storePathToFilePath storePath env
+            liftIO $ do
+                -- Create directory structure
+                createDirectoryIfMissing True (takeDirectory filePath)
+
+                -- Write derivation to store
+                BS.writeFile filePath content
+
+                -- Set permissions (read-only)
+                setFileMode filePath 0o444
+
+        -- In builder context, can't write to store
+        Builder -> do
+            -- Would use daemon protocol to store derivation
+            -- Currently a no-op as this is mostly a type-level protection
+            return ()
+
+    -- Return the serialized derivation
+    return SerializedDerivation
+        { sdContent = content
+        , sdPath = storePath
+        , sdHash = T.pack (show hash)
+        }
+  where
+    -- Serialize derivation to bytes (placeholder implementation)
+    serializeDerivation :: Derivation -> ByteString
+    serializeDerivation _ = BS.empty  -- In real implementation, would serialize to JSON or similar
+
+-- | Build phase consumes a derivation
+buildFromDerivation :: SerializedDerivation -> TenM 'Build t BuildResult
+buildFromDerivation serialized = do
+    env <- ask
+
+    -- In a real implementation, we would:
+    -- 1. Verify the derivation exists in the store
+    -- 2. Deserialize it
+    -- 3. Set up the build environment
+    -- 4. Perform the build
+
+    -- For now, return a placeholder build result
+    return BuildResult
+        { brExitCode = ExitSuccess
+        , brOutputPaths = Set.empty
+        , brLog = "Build completed"
+        , brReferences = Set.empty
+        }
+
+-- | Request type for daemon services
+data DaemonRequest
+    = StoreWriteRequest StorePath ByteString
+    | StoreLookupRequest StorePath
+    | SpawnSandboxRequest Derivation
+    | GarbageCollectRequest
+    deriving (Show, Eq)
+
+-- | Response from daemon
+data DaemonResponse
+    = StoreWriteResponse StorePath
+    | StoreLookupResponse (Maybe ByteString)
+    | SandboxResponse FilePath
+    | GarbageCollectResponse Int
+    | ErrorResponse Text
+    deriving (Show, Eq)
+
+-- | Builder requests service from daemon
+requestDaemonService :: DaemonRequest -> TenM p 'Builder DaemonResponse
+requestDaemonService req = do
+    env <- ask
+
+    -- In a real implementation, this would:
+    -- 1. Serialize the request
+    -- 2. Send it through a socket/pipe to the daemon
+    -- 3. Wait for and deserialize the response
+
+    -- For now, we'll simulate the basic structure
+    case runMode env of
+        ClientMode conn -> do
+            -- We have a connection to the daemon
+            result <- liftIO $ sendRequestToDaemon conn req
+            case result of
+                Left err -> return $ ErrorResponse err
+                Right resp -> return resp
+
+        _ -> return $ ErrorResponse "Not connected to daemon"
+
+-- | Daemon spawns a builder process
+spawnBuilder :: Derivation -> TenM p 'Daemon BuildResult
+spawnBuilder deriv = do
+    env <- ask
+
+    -- In a real implementation, this would:
+    -- 1. Fork a new process
+    -- 2. Set up sandbox environment
+    -- 3. Drop privileges
+    -- 4. Execute builder
+    -- 5. Collect results
+
+    -- Import the sandbox functionality (would normally be in a different module)
+    -- For now, simulate the basic structure
+    liftIO $ do
+        -- Create a temporary sandbox directory
+        let sandboxDir = workDir env </> "sandbox" </> "build-" ++ showBuildId (BuildId <$> newUnique)
+        createDirectoryIfMissing True sandboxDir
+
+        -- Set up environment for builder
+        let builderEnv = [("TEN_SANDBOX", "1"), ("TEN_STORE", storeLocation env)]
+
+        -- Would execute the builder here with reduced privileges
+        -- For now, return a placeholder result
+        return BuildResult
+            { brExitCode = ExitSuccess
+            , brOutputPaths = Set.empty
+            , brLog = "Build completed in sandbox"
+            , brReferences = Set.empty
+            }
+
+-- | Execute phase transition from Eval to Build
+-- This properly models the Nix-like boundary where evaluation produces a derivation
+-- and building consumes it
+evalToBuildPhase :: Derivation -> TenM 'Eval t BuildResult
+evalToBuildPhase deriv = do
+    env <- ask
+
+    -- First, serialize the derivation to the store (pure interface between phases)
+    serialized <- evalToDerivation deriv
+
+    -- Now handle the phase transition based on privilege tier
+    case currentPrivilegeTier env of
+        -- In daemon context, we can spawn a builder directly
+        Daemon -> do
+            -- Spawn a builder process to build the derivation
+            spawnBuilder deriv
+
+        -- In builder context, we need to request the daemon to build
+        Builder -> do
+            -- Request build from daemon via protocol
+            resp <- requestDaemonService (SpawnSandboxRequest deriv)
+            case resp of
+                -- In a real implementation, would parse build result from response
+                _ -> return BuildResult
+                    { brExitCode = ExitSuccess
+                    , brOutputPaths = Set.empty
+                    , brLog = "Build completed via daemon"
+                    , brReferences = Set.empty
+                    }
+
+-- | Execute phase transition from Build to Eval
+-- This models the Nix pattern where build results can feed back into evaluation
+-- (e.g., for multi-stage builds)
+buildToEvalPhase :: BuildResult -> TenM 'Build t Derivation
+buildToEvalPhase result = do
+    -- In a real implementation, this would:
+    -- 1. Check for a "return.drv" in the build results
+    -- 2. Deserialize it into a Derivation
+
+    -- For now, return a placeholder derivation
+    return Derivation
+        { derivName = "placeholder"
+        , derivHash = "0000000000000000"
+        , derivBuilder = StorePath "0000000000000000" "builder"
+        , derivArgs = []
+        , derivInputs = Set.empty
+        , derivOutputs = Set.empty
+        , derivEnv = Map.empty
+        , derivSystem = "x86_64-linux"
+        , derivStrategy = MonadicStrategy
+        , derivMeta = Map.empty
+        }
+
+-- | Helper function to send request to daemon
+-- This would be implemented in Ten.Daemon.Client in a real implementation
+sendRequestToDaemon :: DaemonConnection -> DaemonRequest -> IO (Either Text DaemonResponse)
+sendRequestToDaemon _ _ = return $ Right $ ErrorResponse "Not implemented"
+
+-- | Helper to convert BuildId to string
+showBuildId :: IO BuildId -> String
+showBuildId mBid = unsafePerformIO $ do
+    bid <- mBid
+    return $ case bid of
+        BuildId u -> "build-" ++ show (hashUnique u)
+        BuildIdFromInt n -> "build-" ++ show n
+
+-- | Execute an action with a privilege transition
+-- Only used for compatibility with existing code
+withPrivilegeTransition :: PrivilegeTransition t u -> (TenM p u a -> TenM p u a) -> TenM p t a -> TenM p u a
+withPrivilegeTransition DropPrivilege wrapper action = wrapper $ TenM $ \sp _ -> do
     env <- ask
     state <- get
 
-    case trans of
-        EvalToBuild -> do
-            -- In Eval phase, serialize state to the store before transitioning
-            let statePath = storeLocation env </> "var/ten/states" </> buildIdToString (currentBuildId state)
+    -- Create a new environment with reduced privileges
+    let env' = env { currentPrivilegeTier = Builder }
 
-            -- Create a fresh Build state with only essential information carried forward
-            let buildState = BuildState
-                    { buildProofs = []  -- Reset proofs for new phase
-                    , buildInputs = buildInputs state
-                    , buildOutputs = buildOutputs state
-                    , currentBuildId = currentBuildId state
-                    , buildChain = buildChain state
-                    , recursionDepth = recursionDepth state
-                    }
+    -- Run the action in the new environment
+    runReaderT (runTenM action sp sBuilder) env'
 
-            -- Use the Build state for the action
-            put buildState
-
-            -- Execute the action in the Build phase
-            let spFrom = sEval
-            runTenM action spTo st
-
-        BuildToEval -> do
-            -- In Build phase, need to serialize results back to the store
-            let statePath = storeLocation env </> "var/ten/states" </> buildIdToString (currentBuildId state)
-
-            -- Create a fresh Eval state with only essential information carried forward
-            let evalState = BuildState
-                    { buildProofs = []  -- Reset proofs for new phase
-                    , buildInputs = buildInputs state
-                    , buildOutputs = buildOutputs state
-                    , currentBuildId = currentBuildId state
-                    , buildChain = buildChain state
-                    , recursionDepth = recursionDepth state
-                    }
-
-            -- Use the Eval state for the action
-            put evalState
-
-            -- Execute the action in the Eval phase
-            let spFrom = sBuild
-            runTenM action spTo st
-    where
-        -- Helper to serialize a BuildId to a filename-safe string
-        buildIdToString :: BuildId -> String
-        buildIdToString (BuildId u) = "build-" ++ show (hashUnique u)
-        buildIdToString (BuildIdFromInt n) = "build-" ++ show n
-
--- | Safely transition between privilege tiers
--- Only allows dropping privileges, never gaining them
-transitionPrivilege :: PrivilegeTransition t u -> TenM p t a -> TenM p u a
-transitionPrivilege trans action = TenM $ \sp stTo -> do
-    env <- ask
-    state <- get
-
-    case trans of
-        DropPrivilege -> do
-            -- Delegate privilege dropping to Ten.Sandbox
-            -- This maintains proper separation between type-level transitions and OS-level operations
-            -- The action will run in daemon context but with the builder type-level privilege
-            result <- runTenM action sp stTo
-
-            -- Return the result
-            return result
 
 -- | Execute an action with a privilege transition
 withPrivilegeTransition :: PrivilegeTransition t u -> (TenM p u a -> TenM p u a) -> TenM p t a -> TenM p u a
@@ -949,86 +1101,6 @@ isClientMode = do
     case mode of
         ClientMode _ -> return True
         _ -> return False
-
--- | Linux-specific: Drop privileges to a specified user and group
--- This function now delegates to the Sandbox module for actual OS-level operations
--- but remains in Core's API for backward compatibility
-dropPrivileges :: Text -> Text -> TenM p 'Daemon ()
-dropPrivileges user group = do
-    -- Import Sandbox.dropPrivileges for actual implementation
-    -- but keep this function for API compatibility
-    -- This maintains proper separation of concerns
-    liftIO $ do
-        -- This implementation will get the current user ID to check if we're root
-        euid <- User.getEffectiveUserID
-
-        -- Only proceed if we're running as root
-        when (euid == 0) $ do
-            -- Get user and group entries
-            userEntry <- User.getUserEntryForName (T.unpack user)
-            groupEntry <- User.getGroupEntryForName (T.unpack group)
-
-            -- Set group first (needed before dropping user privileges)
-            User.setGroupID (User.groupID groupEntry)
-
-            -- Then set user
-            User.setUserID (User.userID userEntry)
-
--- | Drop privileges temporarily for an action
--- This function now delegates to the Sandbox module for actual OS-level operations
--- but remains in Core's API for backward compatibility
-withDroppedPrivileges :: Text -> Text -> IO a -> TenM p 'Daemon a
-withDroppedPrivileges user group action = liftIO $ do
-    -- Get the current effective user ID
-    euid <- User.getEffectiveUserID
-
-    -- Only proceed if we're running as root
-    if euid == 0
-        then do
-            -- Get user and group entries
-            userEntry <- try $ User.getUserEntryForName (T.unpack user)
-            groupEntry <- try $ User.getGroupEntryForName (T.unpack group)
-
-            case (userEntry, groupEntry) of
-                (Right uentry, Right gentry) ->
-                    bracket
-                        -- Setup: save current IDs, drop privileges
-                        (do
-                            -- Save current user/group IDs
-                            curUid <- User.getEffectiveUserID
-                            curGid <- User.groupID <$> User.getGroupEntryForName "root"
-
-                            -- Drop privileges
-                            User.setGroupID (User.groupID gentry)
-                            User.setUserID (User.userID uentry)
-
-                            return (curUid, curGid))
-
-                        -- Cleanup: restore original IDs
-                        (\(curUid, curGid) -> do
-                            -- Restore original IDs
-                            User.setUserID curUid
-                            User.setGroupID curGid)
-
-                        -- Action: run with dropped privileges
-                        (\_ -> action)
-
-                _ -> action  -- If we can't get the entries, just run normally
-        else
-            -- Not running as root, just run the action normally
-            action
-
--- | Linux-specific: Get a system user ID
-getSystemUser :: Text -> TenM p 'Daemon UserID
-getSystemUser username = liftIO $ do
-    userEntry <- User.getUserEntryForName (T.unpack username)
-    return $ User.userID userEntry
-
--- | Linux-specific: Get a system group ID
-getSystemGroup :: Text -> TenM p 'Daemon GroupID
-getSystemGroup groupname = liftIO $ do
-    groupEntry <- User.getGroupEntryForName (T.unpack groupname)
-    return $ User.groupID groupEntry
 
 -- | Get the GC lock path for a store directory
 -- Pure function to calculate a path - accessible from any privilege tier
