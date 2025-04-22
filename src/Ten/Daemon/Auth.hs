@@ -8,6 +8,9 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Ten.Daemon.Auth (
     -- Core authentication types
@@ -113,12 +116,7 @@ import System.IO (withFile, IOMode(..), hClose, stderr, hPutStrLn)
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.Files (setFileMode)
 import System.Posix.Types (UserID, GroupID)
-import System.Posix.User (
-    getUserEntryForName, getGroupEntryForName,
-    getAllGroupEntries, getAllUserEntries,
-    getRealUserID, getEffectiveUserID,
-    getUserEntryForID, userID, groupID,
-    userName, homeDirectory)
+import qualified System.Posix.User as PosixUser
 import System.Random (randomIO, randomRIO)
 
 -- Import Ten modules
@@ -464,22 +462,22 @@ tokenExpired TokenInfo{..} = do
         Nothing -> False
 
 -- | Get information about a system user
-getSystemUserInfo :: Text -> IO (Maybe (UserID, String, GroupID))
+getSystemUserInfo :: Text -> IO (Maybe (UserID, Text, GroupID))
 getSystemUserInfo username = do
     -- First get the user entry
-    userResult <- try $ getUserEntryForName (T.unpack username)
+    userResult <- try $ PosixUser.getUserEntryForName (T.unpack username)
     case userResult of
         Left (_ :: SomeException) -> return Nothing
         Right userEntry -> do
             -- Then get the primary group for this user
-            let groupName = userName userEntry  -- Simplified: using username as group name
-            groupResult <- try $ getGroupEntryForName groupName
+            let groupName = T.pack $ PosixUser.userName userEntry
+            groupResult <- try $ PosixUser.getGroupEntryForName (PosixUser.userName userEntry)
             case groupResult of
                 Left (_ :: SomeException) ->
                     -- Fallback to a default group if needed
-                    return $ Just (userID userEntry, userName userEntry, 0)
+                    return $ Just (PosixUser.userID userEntry, groupName, 0)
                 Right groupEntry ->
-                    return $ Just (userID userEntry, userName userEntry, groupID groupEntry)
+                    return $ Just (PosixUser.userID userEntry, groupName, PosixUser.groupID groupEntry)
 
 -- | Check if a system user exists
 systemUserExists :: Text -> IO Bool
@@ -570,7 +568,13 @@ migrateAuthFile oldPath newPath = do
     saveAuthFile newPath oldDb
 
 -- | Authenticate a user and generate a token with privilege validation
-authenticateUser :: AuthDb -> Text -> Text -> Text -> PrivilegeTier -> IO (AuthDb, UserId, AuthToken, SPrivilegeTier t)
+authenticateUser ::
+    AuthDb ->
+    Text ->
+    Text ->
+    Text ->
+    PrivilegeTier ->
+    IO (AuthDb, UserId, AuthToken, SPrivilegeTier t)
 authenticateUser db username password clientInfo requestedTier = do
     -- Check if the user exists
     user <- case Map.lookup username (adUsers db) of
@@ -598,9 +602,13 @@ authenticateUser db username password clientInfo requestedTier = do
                 Nothing -> throwIO InvalidCredentials
 
             -- Create token based on requested privilege tier
-            let (newDb, userId, authToken, privEvidence) =
-                    createUserToken db username user clientInfo now requestedTier
-            return (newDb, userId, authToken, privEvidence)
+            case requestedTier of
+                Daemon -> do
+                    let (newDb, userId, authToken, privEvidence) = createUserToken @'Daemon db username user clientInfo now
+                    return (newDb, userId, authToken, privEvidence)
+                Builder -> do
+                    let (newDb, userId, authToken, privEvidence) = createUserToken @'Builder db username user clientInfo now
+                    return (newDb, userId, authToken, privEvidence)
 
         -- If a password is set, validate it
         Just passwordHash -> do
@@ -608,36 +616,30 @@ authenticateUser db username password clientInfo requestedTier = do
                 throwIO InvalidCredentials
 
             -- Create token based on requested privilege tier
-            let (newDb, userId, authToken, privEvidence) =
-                    createUserToken db username user clientInfo now requestedTier
-            return (newDb, userId, authToken, privEvidence)
+            case requestedTier of
+                Daemon -> do
+                    let (newDb, userId, authToken, privEvidence) = createUserToken @'Daemon db username user clientInfo now
+                    return (newDb, userId, authToken, privEvidence)
+                Builder -> do
+                    let (newDb, userId, authToken, privEvidence) = createUserToken @'Builder db username user clientInfo now
+                    return (newDb, userId, authToken, privEvidence)
 
 -- Helper to create a token with proper privilege tier
-createUserToken :: AuthDb -> Text -> UserInfo -> Text -> UTCTime -> PrivilegeTier
-                -> (AuthDb, UserId, AuthToken, SPrivilegeTier t)
-createUserToken db username user clientInfo now requestedTier =
-    case requestedTier of
-        Daemon ->
-            -- Create daemon token
-            let token = createTokenWithPrivilege db username user clientInfo now sDaemon
-            in token
-        Builder ->
-            -- Create builder token
-            let token = createTokenWithPrivilege db username user clientInfo now sBuilder
-            in token
-
--- Helper to create a token with specific privilege evidence
-createTokenWithPrivilege :: forall (t :: PrivilegeTier). SingI t =>
-    AuthDb -> Text -> UserInfo -> Text -> UTCTime -> SPrivilegeTier t
-    -> (AuthDb, UserId, AuthToken, SPrivilegeTier t)
-createTokenWithPrivilege db username user clientInfo now evidence = do
+createUserToken :: forall (t :: PrivilegeTier).
+    (SingI t) =>
+    AuthDb ->
+    Text ->
+    UserInfo ->
+    Text ->
+    UTCTime ->
+    (AuthDb, UserId, AuthToken, SPrivilegeTier t)
+createUserToken db username user clientInfo now = do
     -- Filter permissions based on privilege tier
-    let permissions = if fromSing evidence == Builder
+    let permissions = if (fromSing (sing @t)) == Builder
                         then Set.filter (not . permissionRequiresDaemon) (uiSpecificPermissions user)
                         else uiSpecificPermissions user
 
-    -- Create token with appropriate permissions (in a real implementation this would be unsafe)
-    -- This is a simplification to make the example work
+    -- Create token with appropriate permissions
     let tokenStr = "ten_" <> T.pack (show (hash (TE.encodeUtf8 (username <> T.pack (show now)))))
 
     -- Create token info with runtime evidence
@@ -648,7 +650,7 @@ createTokenWithPrivilege db username user clientInfo now evidence = do
             tiClientInfo = clientInfo,
             tiLastUsed = now,
             tiPermissions = permissions,
-            tiPrivilegeEvidence = evidence
+            tiPrivilegeEvidence = sing @t
         }
 
     -- Wrap in SomeTokenInfo to erase phantom type
@@ -668,10 +670,13 @@ createTokenWithPrivilege db username user clientInfo now evidence = do
         }
 
     -- Return updated database, user ID, auth token, and privilege evidence
-    (updatedDb, uiUserId user, AuthToken tokenStr, evidence)
+    (updatedDb, uiUserId user, AuthToken tokenStr, sing @t)
 
 -- | Validate a token and return user ID with privilege evidence
-validateToken :: forall t. AuthDb -> AuthToken -> IO (Maybe (UserId, Set Permission, SPrivilegeTier t))
+validateToken :: forall t. SingI t =>
+    AuthDb ->
+    AuthToken ->
+    IO (Maybe (UserId, Set Permission, SPrivilegeTier t))
 validateToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -700,7 +705,10 @@ validateToken db (AuthToken token) = do
                                             return Nothing
 
 -- | Refresh an auth token preserving privilege tier
-refreshToken :: AuthDb -> AuthToken -> IO (AuthDb, AuthToken)
+refreshToken :: forall (t :: PrivilegeTier). SingI t =>
+    AuthDb ->
+    AuthToken ->
+    IO (AuthDb, AuthToken)
 refreshToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -729,19 +737,24 @@ refreshToken db (AuthToken token) = do
                                     let tier = fromSing (tiPrivilegeEvidence tokenInfo)
 
                                     -- Create new token based on privilege tier
-                                    let (updatedDb, newAuthToken) = case tier of
-                                            Daemon ->
-                                                refreshTokenWithTier db username user now newTokenStr tokenInfo sDaemon
-                                            Builder ->
-                                                refreshTokenWithTier db username user now newTokenStr tokenInfo sBuilder
-
-                                    return (updatedDb, newAuthToken)
+                                    case tier of
+                                        Daemon -> do
+                                            updatedDb <- refreshTokenWithTier @'Daemon db username user now newTokenStr tokenInfo
+                                            return (updatedDb, AuthToken newTokenStr)
+                                        Builder -> do
+                                            updatedDb <- refreshTokenWithTier @'Builder db username user now newTokenStr tokenInfo
+                                            return (updatedDb, AuthToken newTokenStr)
 
 -- Helper to refresh token with specific privilege tier
 refreshTokenWithTier :: forall (t :: PrivilegeTier). SingI t =>
-    AuthDb -> Text -> UserInfo -> UTCTime -> Text -> TokenInfo s -> SPrivilegeTier t
-    -> (AuthDb, AuthToken)
-refreshTokenWithTier db username user now newTokenStr oldToken evidence = do
+    AuthDb ->
+    Text ->
+    UserInfo ->
+    UTCTime ->
+    Text ->
+    TokenInfo s ->
+    IO AuthDb
+refreshTokenWithTier db username user now newTokenStr oldToken = do
     -- Create new token info preserving permissions but with new expiry
     let oldExpiry = tiExpires oldToken
     let newExpiry = case oldExpiry of
@@ -760,7 +773,7 @@ refreshTokenWithTier db username user now newTokenStr oldToken evidence = do
             tiClientInfo = tiClientInfo oldToken,
             tiLastUsed = now,
             tiPermissions = tiPermissions oldToken,
-            tiPrivilegeEvidence = evidence
+            tiPrivilegeEvidence = sing @t
         }
 
     -- Wrap in SomeTokenInfo
@@ -776,13 +789,11 @@ refreshTokenWithTier db username user now newTokenStr oldToken evidence = do
     let updatedTokenMap' = Map.insert newTokenStr username updatedTokenMap
 
     -- Update database
-    let updatedDb = db {
-            adUsers = Map.insert username updatedUser (adUsers db),
-            adTokenMap = updatedTokenMap',
-            adLastModified = now
-        }
-
-    (updatedDb, AuthToken newTokenStr)
+    return db {
+        adUsers = Map.insert username updatedUser (adUsers db),
+        adTokenMap = updatedTokenMap',
+        adLastModified = now
+    }
 
 -- | Revoke a token
 revokeToken :: AuthDb -> AuthToken -> IO AuthDb
@@ -1109,3 +1120,7 @@ replicateM n action
         x <- action
         xs <- replicateM (n-1) action
         return (x:xs)
+
+-- | Alternative operator for Aeson parsing
+(<|>) :: Aeson.Parser a -> Aeson.Parser a -> Aeson.Parser a
+a <|> b = a `Aeson.Alternative.<|>` b

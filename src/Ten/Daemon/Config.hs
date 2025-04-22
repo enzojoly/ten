@@ -5,6 +5,8 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Ten.Daemon.Config (
     -- Core configuration types
@@ -64,14 +66,18 @@ import System.FilePath ((</>), takeDirectory)
 import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName)
 import qualified System.IO.Error as IOE
 
+-- Import singletons properly
+import Data.Singletons
+import Data.Singletons.TH
+import Data.Kind (Type)
+
 import Ten.Core (BuildError(..), Phase(..), PrivilegeTier(..), SPrivilegeTier(..),
                  CanAccessStore, CanModifyStore, CanDropPrivileges, CanCreateSandbox,
-                 TenM(..), withSPrivilegeTier, sDaemon, sBuilder, privilegeError,
-                 SingI)
+                 TenM(..), withSPrivilegeTier, sDaemon, sBuilder, privilegeError)
 
--- | Privilege model for daemon operations
+-- | Privilege model for daemon operations - aligned with Nix architecture
 data PrivilegeModel
-    = PrivilegeAlwaysDrop     -- ^ Always drop privileges (safest)
+    = PrivilegeAlwaysDrop     -- ^ Always drop privileges (safest, like Nix)
     | PrivilegeDropSelective  -- ^ Drop privileges selectively based on operation
     | PrivilegeNoDrop         -- ^ Never drop privileges (dangerous, only for special cases)
     deriving (Show, Eq, Ord, Enum, Bounded)
@@ -158,10 +164,10 @@ defaultDaemonConfig = DaemonConfig {
     daemonAllowedUsers  = Set.empty,  -- Empty means all users are allowed
     daemonRequireAuth   = True,
 
-    -- Privilege model defaults
+    -- Privilege model defaults - aligned with Nix
     daemonAllowPrivilegeEscalation = False,  -- Default to disallowing privilege escalation
-    daemonPrivilegeModel = PrivilegeAlwaysDrop,  -- Default to safest model
-    daemonDefaultPrivilegeTier = Builder,  -- Default to unprivileged
+    daemonPrivilegeModel = PrivilegeAlwaysDrop,  -- Default to safest model, like Nix
+    daemonDefaultPrivilegeTier = Builder,  -- Default to unprivileged, like Nix
 
     -- Logging defaults
     daemonLogFile       = Just "/var/log/ten/daemon.log",
@@ -448,10 +454,6 @@ loadConfigFromEnv = do
         (chunk, []) -> [chunk]
         (chunk, _:rest) -> chunk : splitOn c rest
 
-    (<|>) :: Maybe a -> Maybe a -> Maybe a
-    Nothing <|> x = x
-    x <|> _ = x
-
 -- | Command-line option descriptions for daemon configuration
 configOptionDescriptions :: [OptDescr (DaemonConfig -> DaemonConfig)]
 configOptionDescriptions = [
@@ -597,8 +599,10 @@ validateConfig config = do
     return config
 
 -- | Execute a configuration operation with the required privilege level
+-- Now properly typed with explicit singleton evidence
 withConfigPrivilege ::
-    forall p a. (SingI p) =>
+    forall (p :: Phase) (a :: Type).
+    SingI p =>
     SPrivilegeTier 'Daemon ->
     DaemonConfig ->
     (DaemonConfig -> TenM p 'Daemon a) ->
@@ -610,6 +614,8 @@ withConfigPrivilege st config operation = TenM $ \sp _ -> do
 
 -- | Validate whether an operation is allowed with the current privilege model
 validatePrivilegeConfig ::
+    forall (p :: Phase) (t :: PrivilegeTier).
+    SingI p =>
     SPrivilegeTier t ->
     DaemonConfig ->
     PrivilegeTier ->
@@ -629,6 +635,8 @@ validatePrivilegeConfig st config requiredTier = TenM $ \sp _ -> do
 
 -- | Check if an operation requires a specific privilege tier
 requiresPrivilegeFor ::
+    forall (p :: Phase) (t :: PrivilegeTier).
+    SingI p =>
     SPrivilegeTier t ->
     DaemonConfig ->
     Text ->
@@ -645,7 +653,7 @@ requiresPrivilegeFor st config operation requiredTier = TenM $ \sp _ -> do
 
     -- Throw an error if not allowed
     unless allowed $
-        throwError $ PrivilegeError $ "Operation '" <> operation <> "' requires " <>
+        throwError $ privilegeError $ "Operation '" <> operation <> "' requires " <>
                                      T.pack (show requiredTier) <> " privileges"
 
 -- | Make the DaemonConfig type an instance of ToJSON and FromJSON
