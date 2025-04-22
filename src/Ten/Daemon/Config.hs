@@ -47,6 +47,10 @@ module Ten.Daemon.Config (
 import Control.Exception (try, SomeException)
 import Control.Monad (when, unless)
 import Control.Applicative ((<|>))
+import Control.Monad.IO.Class (MonadIO(..))
+import Control.Monad.Reader (ReaderT, runReaderT, ask, local)
+import Control.Monad.Except (ExceptT, runExceptT, throwError, catchError)
+import Control.Monad.State (StateT, runStateT, get, put, modify)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
@@ -73,7 +77,8 @@ import Data.Kind (Type)
 
 import Ten.Core (BuildError(..), Phase(..), PrivilegeTier(..), SPrivilegeTier(..),
                  CanAccessStore, CanModifyStore, CanDropPrivileges, CanCreateSandbox,
-                 TenM(..), withSPrivilegeTier, sDaemon, sBuilder, privilegeError)
+                 TenM(..), withSPrivilegeTier, sDaemon, sBuilder, privilegeError,
+                 runTenIO, liftTenIO)
 
 -- | Privilege model for daemon operations - aligned with Nix architecture
 data PrivilegeModel
@@ -296,18 +301,18 @@ loadConfigFromFile path = do
 -- | Save daemon configuration to a file
 -- This operation requires Daemon privileges
 saveConfigToFile :: FilePath -> DaemonConfig -> TenM 'Build 'Daemon (Either String ())
-saveConfigToFile path config = TenM $ \sp st -> do
+saveConfigToFile path config = do
     let dir = takeDirectory path
-    result <- try $ createDirectoryIfMissing True dir
-    case result of
+    -- Use runTenIO to properly lift IO operations
+    ioResult <- runTenIO $ try $ do
+        createDirectoryIfMissing True dir
+        LBS.writeFile path (Aeson.encode config)
+
+    case ioResult of
         Left (ex :: SomeException) ->
-            return $ Left $ "Error creating directory: " ++ show ex
-        Right () -> do
-            result' <- try $ LBS.writeFile path (Aeson.encode config)
-            case result' of
-                Left (ex :: SomeException) ->
-                    return $ Left $ "Error writing configuration: " ++ show ex
-                Right () -> return $ Right ()
+            return $ Left $ "Error writing configuration: " ++ show ex
+        Right () ->
+            return $ Right ()
 
 -- | Load configuration from environment variables
 loadConfigFromEnv :: IO DaemonConfig

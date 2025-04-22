@@ -50,7 +50,7 @@ module Ten.Sandbox (
 
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (get, gets, modify)
+import Control.Monad.State (get, gets, put, modify, State)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.List (isPrefixOf, isInfixOf, sort)
@@ -64,10 +64,17 @@ import qualified Data.Text as T
 import Data.Bits ((.|.), (.&.))
 import Data.Maybe (isJust, fromMaybe, listToMaybe, catMaybes)
 import Data.Binary (Binary(..), encode, decode)
+import Data.Binary.Get (Get)
+import Data.Binary.Put (Put)
+import qualified Data.Binary as Binary
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString as BS
-import System.Directory
-import System.FilePath
+import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMissing, getHomeDirectory,
+                        removeFile, getPermissions, setPermissions, removePathForcibly,
+                        listDirectory, copyFile, Permissions)
+import qualified System.Directory as Directory
+import System.FilePath ((</>), takeDirectory, takeFileName, makeRelative)
+import qualified System.FilePath as FilePath
 import System.Process (createProcess, proc, readCreateProcessWithExitCode, CreateProcess(..), StdStream(..))
 import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
@@ -77,6 +84,7 @@ import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
 import qualified System.Posix.IO as PosixIO
+import System.Posix.IO (LockRequest(WriteLock, Unlock))
 import Foreign.C.Error (throwErrno, throwErrnoIfMinus1_, throwErrnoIfMinus1, getErrno, Errno(..), errnoToIOError)
 import Foreign.C.String (CString, withCString, peekCString, newCString)
 import Foreign.C.Types (CInt(..), CULong(..), CLong(..), CSize(..))
@@ -88,11 +96,13 @@ import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExist
 import System.IO (hPutStrLn, stderr, hClose, Handle, hFlush)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (Socket)
+import qualified Network.Socket as Network
 import System.Random (randomRIO)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
 import Data.Singletons (SingI, fromSing)
+import Data.Word (Word8)
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Control.Concurrent.STM
 import Control.Concurrent.MVar
@@ -188,81 +198,90 @@ defaultSandboxConfig = SandboxConfig {
 -- | Binary instance for SandboxRequest for serialization
 instance Binary SandboxRequest where
     put (SandboxCreateRequest buildId inputs config) = do
-        put (0 :: Word8)  -- Tag for CreateRequest
-        put (show buildId)
-        put (Set.toList inputs)
-        put (encodeConfig config)
+        Binary.put (0 :: Word8)  -- Tag for CreateRequest
+        Binary.put (show buildId)
+        Binary.put (Set.toList inputs)
+        Binary.put (encodeConfig config)
 
     put (SandboxReleaseRequest sandboxId) = do
-        put (1 :: Word8)  -- Tag for ReleaseRequest
-        put sandboxId
+        Binary.put (1 :: Word8)  -- Tag for ReleaseRequest
+        Binary.put sandboxId
 
     put (SandboxStatusRequest sandboxId) = do
-        put (2 :: Word8)  -- Tag for StatusRequest
-        put sandboxId
+        Binary.put (2 :: Word8)  -- Tag for StatusRequest
+        Binary.put sandboxId
 
     put (SandboxAbortRequest sandboxId) = do
-        put (3 :: Word8)  -- Tag for AbortRequest
-        put sandboxId
+        Binary.put (3 :: Word8)  -- Tag for AbortRequest
+        Binary.put sandboxId
 
     get = do
-        tag <- get :: Get Word8
+        tag <- Binary.get :: Get Word8
         case tag of
             0 -> do  -- CreateRequest
-                buildIdStr <- get
-                inputs <- Set.fromList <$> get
-                configData <- get
+                buildIdStr <- Binary.get
+                inputs <- Set.fromList <$> Binary.get
+                configData <- Binary.get
                 return $ SandboxCreateRequest (read buildIdStr) inputs (decodeConfig configData)
-            1 -> SandboxReleaseRequest <$> get
-            2 -> SandboxStatusRequest <$> get
-            3 -> SandboxAbortRequest <$> get
+            1 -> SandboxReleaseRequest <$> Binary.get
+            2 -> SandboxStatusRequest <$> Binary.get
+            3 -> SandboxAbortRequest <$> Binary.get
             _ -> fail $ "Unknown SandboxRequest tag: " ++ show tag
 
 -- | Binary instance for SandboxResponse for serialization
 instance Binary SandboxResponse where
     put (SandboxCreatedResponse sid path) = do
-        put (0 :: Word8)  -- Tag for CreatedResponse
-        put sid
-        put path
+        Binary.put (0 :: Word8)  -- Tag for CreatedResponse
+        Binary.put sid
+        Binary.put path
 
     put (SandboxReleasedResponse success) = do
-        put (1 :: Word8)  -- Tag for ReleasedResponse
-        put success
+        Binary.put (1 :: Word8)  -- Tag for ReleasedResponse
+        Binary.put success
 
     put (SandboxStatusResponse status) = do
-        put (2 :: Word8)  -- Tag for StatusResponse
-        put (sandboxStatusActive status)
-        put (sandboxStatusPath status)
-        put (show $ sandboxStatusBuildId status)
-        put (show $ sandboxStatusCreatedTime status)
+        Binary.put (2 :: Word8)  -- Tag for StatusResponse
+        Binary.put (sandboxStatusActive status)
+        Binary.put (sandboxStatusPath status)
+        Binary.put (show $ sandboxStatusBuildId status)
+        Binary.put (show $ sandboxStatusCreatedTime status)
 
     put (SandboxErrorResponse err) = do
-        put (3 :: Word8)  -- Tag for ErrorResponse
-        put err
+        Binary.put (3 :: Word8)  -- Tag for ErrorResponse
+        Binary.put err
 
     get = do
-        tag <- get :: Get Word8
+        tag <- Binary.get :: Get Word8
         case tag of
-            0 -> SandboxCreatedResponse <$> get <*> get
-            1 -> SandboxReleasedResponse <$> get
+            0 -> SandboxCreatedResponse <$> Binary.get <*> Binary.get
+            1 -> SandboxReleasedResponse <$> Binary.get
             2 -> do
-                active <- get
-                path <- get
-                buildIdStr <- get
-                timeStr <- get
+                active <- Binary.get
+                path <- Binary.get
+                buildIdStr <- Binary.get
+                timeStr <- Binary.get
                 return $ SandboxStatusResponse $ SandboxStatus
                     active
                     path
                     (read buildIdStr)
                     (read timeStr)
-            3 -> SandboxErrorResponse <$> get
+            3 -> SandboxErrorResponse <$> Binary.get
             _ -> fail $ "Unknown SandboxResponse tag: " ++ show tag
 
+-- | Daemon connection for IPC
+data DaemonConnection = DaemonConnection {
+    daemonConnSocket :: Socket,                     -- Socket for communicating with daemon
+    daemonConnAuthToken :: AuthToken,               -- Authentication token
+    daemonConnUserId :: UserId,                     -- User ID
+    daemonConnRequestCounter :: TVar Int,           -- Request counter for tracking requests
+    daemonConnPendingResponses :: TVar (Map Int (MVar SandboxResponse)) -- Pending responses
+}
+
 -- Helper functions to encode/decode sandbox config
-encodeConfig :: SandboxConfig -> ByteString
+encodeConfig :: SandboxConfig -> BS.ByteString
 encodeConfig = LBS.toStrict . encode . configToList
 
-decodeConfig :: ByteString -> SandboxConfig
+decodeConfig :: BS.ByteString -> SandboxConfig
 decodeConfig = listToConfig . decode . LBS.fromStrict
 
 -- Convert config to/from a list of key-value pairs for serialization
@@ -493,24 +512,13 @@ withSandboxDaemon inputs config action = do
                 Right setupDir -> do
                     -- Run the action inside the sandbox
                     -- This now requires a separate unprivileged process
-                    actionResult <- runActionInSandbox env state bid setupDir action
-
-                    case actionResult of
-                        Left err -> throwIO err
-                        Right val -> return val
+                    runTen sBuild sDaemon (action setupDir) env state
         )
 
     -- Handle result
     case result of
         Left err -> throwError err
-        Right val -> return val
-
--- | Run an action in a sandbox with proper process separation
-runActionInSandbox :: BuildEnv -> BuildState 'Build -> BuildId -> FilePath -> (FilePath -> TenM 'Build 'Daemon a) -> IO (Either BuildError a)
-runActionInSandbox env state bid sandboxDir action = do
-    -- Execute the action in the current process, but we'll ensure privilege separation
-    -- by properly setting up the environment
-    runTen sBuild sDaemon (action sandboxDir) env state
+        Right (val, _) -> return val
 
 -- | Create a sandbox via daemon protocol (for builder context)
 withSandboxViaProtocol :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Builder a) -> TenM 'Build 'Builder a
@@ -714,9 +722,9 @@ createAndSetupDir dir mode = do
 
     -- Set standard permissions
     perms <- getPermissions dir
-    setPermissions dir (setOwnerExecutable True $
-                        setOwnerWritable True $
-                        setOwnerReadable True $ perms)
+    setPermissions dir (Directory.setOwnerExecutable True $
+                        Directory.setOwnerWritable True $
+                        Directory.setOwnerReadable True $ perms)
 
     -- Set Unix permissions directly with the specified mode
     Posix.setFileMode dir mode
@@ -731,7 +739,7 @@ makePathAvailable sandboxDir writable sourcePath = do
 makePathAvailable' :: BuildEnv -> FilePath -> Bool -> FilePath -> IO ()
 makePathAvailable' env sandboxDir writable sourcePath = do
     -- Sanitize and normalize source path
-    let sourcePath' = normalise sourcePath
+    let sourcePath' = FilePath.normalise sourcePath
 
     -- Security check - prevent escaping the sandbox through .. paths
     when (".." `isInfixOf` sourcePath') $
@@ -745,10 +753,10 @@ makePathAvailable' env sandboxDir writable sourcePath = do
 
     -- Determine destination path within sandbox
     let relPath = makeRelative "/" sourcePath'
-    let destPath = normalise $ sandboxDir </> relPath
+    let destPath = FilePath.normalise $ sandboxDir </> relPath
 
     -- Security check - ensure destination is within sandbox
-    let sandboxPath' = normalise sandboxDir
+    let sandboxPath' = FilePath.normalise sandboxDir
     when (not $ sandboxPath' `isPrefixOf` destPath) $
         throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack destPath
 
@@ -785,7 +793,7 @@ makePathAvailable' env sandboxDir writable sourcePath = do
                 when (not writable) $ do
                     -- Make read-only
                     perms <- getPermissions destPath
-                    setPermissions destPath $ setOwnerWritable False perms
+                    setPermissions destPath $ Directory.setOwnerWritable False perms
 
 -- | Recursively copy a directory (fallback when bind mount fails)
 copyDirectoryRecursive :: FilePath -> FilePath -> IO ()
@@ -835,11 +843,11 @@ makeInputsAvailable' env sandboxDir inputs = do
         let nameDest = sandboxDir </> T.unpack (storeName input)
 
         -- Validate and normalize paths
-        let storeDest' = normalise storeDest
-        let nameDest' = normalise nameDest
+        let storeDest' = FilePath.normalise storeDest
+        let nameDest' = FilePath.normalise nameDest
 
         -- Security checks
-        let sandboxPath' = normalise sandboxDir
+        let sandboxPath' = FilePath.normalise sandboxDir
         when (not $ sandboxPath' `isPrefixOf` storeDest') $
             throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack storeDest'
         when (not $ sandboxPath' `isPrefixOf` nameDest') $
@@ -897,7 +905,7 @@ makeSystemPathAvailable sandboxDir systemPath = do
 makeSystemPathAvailable' :: BuildEnv -> FilePath -> FilePath -> IO ()
 makeSystemPathAvailable' env sandboxDir systemPath = do
     -- Sanitize and normalize system path
-    let systemPath' = normalise systemPath
+    let systemPath' = FilePath.normalise systemPath
 
     -- Security check - prevent escaping the sandbox through .. paths
     when (".." `isInfixOf` systemPath') $
@@ -911,10 +919,10 @@ makeSystemPathAvailable' env sandboxDir systemPath = do
 
     -- Determine the relative path in the sandbox
     let relPath = makeRelative "/" systemPath'
-    let sandboxPath = normalise $ sandboxDir </> relPath
+    let sandboxPath = FilePath.normalise $ sandboxDir </> relPath
 
     -- Security check - ensure destination is within sandbox
-    let sandboxPath' = normalise sandboxDir
+    let sandboxPath' = FilePath.normalise sandboxDir
     when (not $ sandboxPath' `isPrefixOf` sandboxPath) $
         throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack sandboxPath
 
@@ -962,8 +970,8 @@ makeSystemPathAvailable' env sandboxDir systemPath = do
 bindMount :: FilePath -> FilePath -> Bool -> IO ()
 bindMount source dest writable = do
     -- Sanitize and normalize paths
-    let source' = normalise source
-    let dest' = normalise dest
+    let source' = FilePath.normalise source
+    let dest' = FilePath.normalise dest
 
     -- Verify paths
     sourceExists <- doesPathExist source'
@@ -1026,7 +1034,7 @@ unmountAllBindMounts :: FilePath -> IO ()
 unmountAllBindMounts dir = do
     -- Get the normalized and absolute path
     absDir <- canonicalizePath dir `catch` \(_ :: SomeException) -> return dir
-    let dir' = normalise absDir
+    let dir' = FilePath.normalise absDir
 
     -- Try to read /proc/mounts
     entries <- readMounts dir'
@@ -1103,7 +1111,7 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
                 setupNamespaces config sandboxDir
 
             -- Change to sandbox directory
-            setCurrentDirectory sandboxDir
+            Directory.setCurrentDirectory sandboxDir
 
             -- Drop privileges if running as root and unprivileged mode is requested
             when (uid == 0 && not (sandboxPrivileged config)) $ do
@@ -1145,60 +1153,71 @@ runBuilderProcess program args env uid gid = do
         then do
             -- Need to execute with dropped privileges
             -- Use createProcess but drop privileges in the forked child
-            mask $ \restore -> do
-                -- Create pipes for stdin/stdout/stderr
-                (readFd, writeFd) <- PosixIO.createPipe
-                (readErrFd, writeErrFd) <- PosixIO.createPipe
-
-                -- Fork a child process
-                pid <- forkProcess $ do
-                    -- Close read ends of pipes
+            bracket
+                (do
+                    -- Create pipes for stdin/stdout/stderr
+                    (readFd, writeFd) <- PosixIO.createPipe
+                    (readErrFd, writeErrFd) <- PosixIO.createPipe
+                    return (readFd, writeFd, readErrFd, writeErrFd)
+                )
+                (\(readFd, writeFd, readErrFd, writeErrFd) -> do
+                    -- Close file descriptors
                     PosixIO.closeFd readFd
+                    PosixIO.closeFd writeFd
                     PosixIO.closeFd readErrFd
+                    PosixIO.closeFd writeErrFd
+                )
+                (\(readFd, writeFd, readErrFd, writeErrFd) -> do
+                    -- Fork a child process
+                    pid <- forkProcess $ do
+                        -- Close read ends of pipes
+                        PosixIO.closeFd readFd
+                        PosixIO.closeFd readErrFd
 
-                    -- Redirect stdout/stderr
-                    PosixIO.dup2 writeFd 1
-                    PosixIO.dup2 writeErrFd 2
+                        -- Redirect stdout/stderr
+                        PosixIO.dupTo writeFd 1
+                        PosixIO.dupTo writeErrFd 2
 
-                    -- Close write ends after dup
+                        -- Close write ends after dup
+                        PosixIO.closeFd writeFd
+                        PosixIO.closeFd writeErrFd
+
+                        -- Drop privileges to specified user/group
+                        -- Set group first (must be done before dropping user privileges)
+                        User.setGroupID gid
+                        -- Then set user ID
+                        User.setUserID uid
+
+                        -- Execute the program
+                        executeFile program True args (Just env)
+                        -- Should never reach here
+                        exitImmediately (ExitFailure 127)
+
+                    -- Close write ends of pipes in parent
                     PosixIO.closeFd writeFd
                     PosixIO.closeFd writeErrFd
 
-                    -- Drop privileges to specified user/group
-                    -- Set group first (must be done before dropping user privileges)
-                    User.setGroupID gid
-                    -- Then set user ID
-                    User.setUserID uid
+                    -- Create handles from file descriptors
+                    stdoutHandle <- PosixIO.fdToHandle readFd
+                    stderrHandle <- PosixIO.fdToHandle readErrFd
 
-                    -- Execute the program
-                    executeFile program True args (Just env)
-                    -- Should never reach here
-                    exitImmediately (ExitFailure 127)
+                    -- Read stdout and stderr
+                    stdoutContent <- hGetContents' stdoutHandle
+                    stderrContent <- hGetContents' stderrHandle
 
-                -- Close write ends of pipes in parent
-                PosixIO.closeFd writeFd
-                PosixIO.closeFd writeErrFd
+                    -- Wait for process to exit
+                    exitStatus <- getProcessStatus True True pid
+                    exitCode <- case exitStatus of
+                        Just (Exited code) -> return $
+                            if code == ExitSuccess then ExitSuccess else ExitFailure (fromIntegral code)
+                        _ -> return $ ExitFailure 1
 
-                -- Create handles from file descriptors
-                stdoutHandle <- PosixIO.fdToHandle readFd
-                stderrHandle <- PosixIO.fdToHandle readErrFd
+                    -- Close handles
+                    hClose stdoutHandle
+                    hClose stderrHandle
 
-                -- Read stdout and stderr
-                stdoutContent <- hGetContents' stdoutHandle
-                stderrContent <- hGetContents' stderrHandle
-
-                -- Wait for process to exit
-                exitStatus <- getProcessStatus True True pid
-                exitCode <- case exitStatus of
-                    Just (Exited code) -> return $
-                        if code == ExitSuccess then ExitSuccess else ExitFailure (fromIntegral code)
-                    _ -> return $ ExitFailure 1
-
-                -- Close handles
-                hClose stdoutHandle
-                hClose stderrHandle
-
-                return (exitCode, stdoutContent, stderrContent)
+                    return (exitCode, stdoutContent, stderrContent)
+                )
         else do
             -- Just run normally if we're not root
             readCreateProcessWithExitCode process ""
@@ -1315,20 +1334,130 @@ sandboxOutputPath sandboxDir outputName = sandboxDir </> "out" </> outputName
 requestSandbox :: DaemonConnection -> BuildId -> Set StorePath -> SandboxConfig ->
                 TenM 'Build 'Builder SandboxResponse
 requestSandbox conn buildId inputs config = do
-    -- This would typically use the actual client protocol implementation
-    -- Here we just define the interface
-    return $ SandboxErrorResponse "Sandbox protocol not implemented"
+    -- Create the request
+    let request = SandboxCreateRequest buildId inputs config
+
+    -- Create a new request ID
+    reqId <- liftIO $ atomically $ do
+        currentId <- readTVar (daemonConnRequestCounter conn)
+        let newId = currentId + 1
+        writeTVar (daemonConnRequestCounter conn) newId
+        return newId
+
+    -- Create a place to store the response
+    responseMVar <- liftIO $ newEmptyMVar
+
+    -- Register the request
+    liftIO $ atomically $ do
+        modifyTVar' (daemonConnPendingResponses conn) $
+            Map.insert reqId responseMVar
+
+    -- Serialize the request
+    let requestData = encode request
+
+    -- Send the request to the daemon
+    liftIO $ do
+        -- Create a header with the request ID and size
+        let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
+
+        -- Send header followed by request data through the socket
+        Network.sendAll (daemonConnSocket conn) header
+        Network.sendAll (daemonConnSocket conn) (LBS.toStrict requestData)
+
+        -- Wait for response with a reasonable timeout (30 seconds)
+        response <- timeout 30000000 $ takeMVar responseMVar
+
+        -- Clean up the request entry
+        atomically $ modifyTVar' (daemonConnPendingResponses conn) $
+            Map.delete reqId
+
+        -- Return the response or error
+        case response of
+            Just r -> return r
+            Nothing -> return $ SandboxErrorResponse "Timeout waiting for daemon response"
 
 -- | Release a sandbox back to the daemon
 releaseSandbox :: DaemonConnection -> Text -> IO ()
 releaseSandbox conn sandboxId = do
-    -- This would typically use the actual client protocol implementation
+    -- Create the release request
+    let request = SandboxReleaseRequest sandboxId
+
+    -- Create a new request ID
+    reqId <- atomically $ do
+        currentId <- readTVar (daemonConnRequestCounter conn)
+        let newId = currentId + 1
+        writeTVar (daemonConnRequestCounter conn) newId
+        return newId
+
+    -- Create a place to store the response
+    responseMVar <- newEmptyMVar
+
+    -- Register the request
+    atomically $ do
+        modifyTVar' (daemonConnPendingResponses conn) $
+            Map.insert reqId responseMVar
+
+    -- Serialize the request
+    let requestData = encode request
+
+    -- Send the request to the daemon
+    -- Create a header with the request ID and size
+    let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
+
+    -- Send header followed by request data through the socket
+    Network.sendAll (daemonConnSocket conn) header
+    Network.sendAll (daemonConnSocket conn) (LBS.toStrict requestData)
+
+    -- Wait for response with a timeout (10 seconds)
+    _ <- timeout 10000000 $ takeMVar responseMVar
+
+    -- Clean up the request entry
+    atomically $ modifyTVar' (daemonConnPendingResponses conn) $
+        Map.delete reqId
+
+    -- We don't care about the response for release operations
     return ()
 
 -- | Notify daemon of sandbox error
 notifySandboxError :: DaemonConnection -> Text -> BuildError -> IO ()
 notifySandboxError conn sandboxId err = do
-    -- This would typically use the actual client protocol implementation
+    -- Create the error request
+    let request = SandboxAbortRequest sandboxId
+
+    -- Create a new request ID
+    reqId <- atomically $ do
+        currentId <- readTVar (daemonConnRequestCounter conn)
+        let newId = currentId + 1
+        writeTVar (daemonConnRequestCounter conn) newId
+        return newId
+
+    -- Create a place to store the response
+    responseMVar <- newEmptyMVar
+
+    -- Register the request
+    atomically $ do
+        modifyTVar' (daemonConnPendingResponses conn) $
+            Map.insert reqId responseMVar
+
+    -- Serialize the request
+    let requestData = encode request
+
+    -- Send the request to the daemon
+    -- Create a header with the request ID and size
+    let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
+
+    -- Send header followed by request data through the socket
+    Network.sendAll (daemonConnSocket conn) header
+    Network.sendAll (daemonConnSocket conn) (LBS.toStrict requestData)
+
+    -- Wait for response with a timeout (5 seconds)
+    _ <- timeout 5000000 $ takeMVar responseMVar
+
+    -- Clean up the request entry
+    atomically $ modifyTVar' (daemonConnPendingResponses conn) $
+        Map.delete reqId
+
+    -- We don't care about the response for error notifications
     return ()
 
 -- | Server-side handler for sandbox protocol messages
@@ -1428,7 +1557,7 @@ getSandboxDir = do
     liftIO $ do
         Posix.setFileMode uniqueDir 0o755
         perms <- getPermissions uniqueDir
-        setPermissions uniqueDir $ setOwnerWritable True perms
+        setPermissions uniqueDir $ Directory.setOwnerWritable True perms
 
     return uniqueDir
 
@@ -1473,7 +1602,7 @@ setRecursiveWritePermissions path = do
         then do
             -- Make the directory writable
             perms <- getPermissions path
-            setPermissions path (setOwnerWritable True perms)
+            setPermissions path (Directory.setOwnerWritable True perms)
 
             -- Process all entries
             entries <- listDirectory path
@@ -1482,7 +1611,7 @@ setRecursiveWritePermissions path = do
         else do
             -- Make the file writable
             perms <- getPermissions path
-            setPermissions path (setOwnerWritable True perms)
+            setPermissions path (Directory.setOwnerWritable True perms)
 
 -- | Safely get a user's UID with fallback options
 safeGetUserUID :: String -> IO UserID
@@ -1533,20 +1662,43 @@ getRealGroupID = do
     entry <- User.getUserEntryForID uid
     return $ User.userGroupID entry
 
--- | Helper functions for managing permissions
-setOwnerReadable :: Bool -> System.Directory.Permissions -> System.Directory.Permissions
-setOwnerReadable = System.Directory.setOwnerReadable
-
-setOwnerWritable :: Bool -> System.Directory.Permissions -> System.Directory.Permissions
-setOwnerWritable = System.Directory.setOwnerWritable
-
-setOwnerExecutable :: Bool -> System.Directory.Permissions -> System.Directory.Permissions
-setOwnerExecutable = System.Directory.setOwnerExecutable
-
 -- | Set owner and group of a file
 setOwnerAndGroup :: FilePath -> UserID -> GroupID -> IO ()
 setOwnerAndGroup path uid gid = Posix.setOwnerAndGroup path uid gid
 
--- Helper function to normalize file paths
-normalise :: FilePath -> FilePath
-normalise = System.FilePath.normalise
+-- | Check if a path exists (file or directory)
+doesPathExist :: FilePath -> IO Bool
+doesPathExist path = do
+    fileExists <- doesFileExist path
+    if fileExists
+        then return True
+        else doesDirectoryExist path
+
+-- | Create a symbolic link
+createFileLink :: FilePath -> FilePath -> IO ()
+createFileLink target link =
+    Posix.createSymbolicLink target link
+
+-- | Get the absolute path of a file
+canonicalizePath :: FilePath -> IO FilePath
+canonicalizePath = Directory.canonicalizePath
+
+-- | Helper function for timeouts
+timeout :: Int -> IO a -> IO (Maybe a)
+timeout micros action = do
+    result <- newEmptyMVar
+    tid <- forkIO $ do
+        r <- try action
+        case r of
+            Left (e :: SomeException) -> return ()
+            Right v -> putMVar result v
+
+    -- Wait for result or timeout
+    threadDelay micros
+    filled <- isJust <$> tryTakeMVar result
+
+    unless filled $ killThread tid
+
+    if filled
+        then Just <$> readMVar result
+        else return Nothing

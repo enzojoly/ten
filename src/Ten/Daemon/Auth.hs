@@ -97,7 +97,7 @@ import Crypto.Hash (hash, digestFromByteString, Digest, SHA256, SHA512)
 import qualified Crypto.Hash as Crypto
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
 import qualified Crypto.Random as CryptoRandom
-import Data.Aeson ((.:), (.=), eitherDecode, encode)
+import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteArray as BA
@@ -133,6 +133,13 @@ import System.Random (randomRIO)
 
 -- Import Ten modules
 import Ten.Core
+
+-- | Instance to make PrivilegeTier orderable, needed for Set operations
+-- This is a critical fix to ensure privilege tiers can be properly stored in ordered collections
+instance Ord PrivilegeTier where
+    compare Daemon Builder = GT  -- Daemon has higher privilege
+    compare Builder Daemon = LT  -- Builder has lower privilege
+    compare _ _ = EQ            -- Same privilege level
 
 -- | Authentication errors
 data AuthError
@@ -594,7 +601,7 @@ migrateAuthFile oldPath newPath = do
     -- Save it in the new format
     saveAuthFile newPath oldDb
 
--- | Replicating an action n times (similar to the missing replicateM)
+-- | Replicating an action n times (helper function)
 replicateM :: Int -> IO a -> IO [a]
 replicateM n action
     | n <= 0 = return []
@@ -655,8 +662,8 @@ proceedWithAuthentication ::
 proceedWithAuthentication db username user clientInfo now requestedTier =
     case requestedTier of
         Daemon -> do
-            let expiry = Just $ addUTCTime (24 * 3600) now -- 24 hours
-            tokenInfo <- createDaemonToken user clientInfo (Just 86400) (uiSpecificPermissions user)
+            let expirySeconds = Just 86400 -- 24 hours
+            tokenInfo <- createDaemonToken user clientInfo expirySeconds (uiSpecificPermissions user)
             let someToken = SomeTokenInfo tokenInfo
 
             -- Update user with new token
@@ -675,11 +682,11 @@ proceedWithAuthentication db username user clientInfo now requestedTier =
             return $ Right (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo), Daemon)
 
         Builder -> do
-            let expiry = Just $ addUTCTime (24 * 3600) now -- 24 hours
+            let expirySeconds = Just 86400 -- 24 hours
 
             -- For Builder tier, filter out daemon-only permissions
             let builderPermissions = Set.filter (not . permissionRequiresDaemon) (uiSpecificPermissions user)
-            tokenInfo <- createBuilderToken user clientInfo (Just 86400) builderPermissions
+            tokenInfo <- createBuilderToken user clientInfo expirySeconds builderPermissions
             let someToken = SomeTokenInfo tokenInfo
 
             -- Update user with new token
@@ -879,7 +886,7 @@ refreshWithTier db username user oldTokenStr someToken tier = do
         Daemon -> do
             -- Create new daemon token
             newTokenInfo <- createDaemonToken user clientInfo
-                            (fmap (ceiling . realToFrac) newExpiry)
+                            (fmap (fromInteger . ceiling . fromRational . toRational) $ fmap diffUTCTime newExpiry now)
                             perms
 
             -- Update database
@@ -891,7 +898,7 @@ refreshWithTier db username user oldTokenStr someToken tier = do
 
             -- Create new builder token
             newTokenInfo <- createBuilderToken user clientInfo
-                            (fmap (ceiling . realToFrac) newExpiry)
+                            (fmap (fromInteger . ceiling . fromRational . toRational) $ fmap diffUTCTime newExpiry now)
                             builderPermissions
 
             -- Update database
@@ -1141,10 +1148,10 @@ instance Aeson.ToJSON SomeTokenInfo where
             "expires" .= tiExpires token,
             "clientInfo" .= tiClientInfo token,
             "lastUsed" .= tiLastUsed token,
-            "permissions" .= map permissionToText (Set.toList (tiPermissions token)),
+            "permissions" .= (map permissionToText (Set.toList (tiPermissions token)) :: [Text]),
             "privilegeTier" .= (case fromSing (tiPrivilegeEvidence token) of
-                                 Daemon -> "daemon"
-                                 Builder -> "builder")
+                                 Daemon -> ("daemon" :: Text)
+                                 Builder -> ("builder" :: Text))
         ]
 
 instance Aeson.FromJSON SomeTokenInfo where
@@ -1154,8 +1161,8 @@ instance Aeson.FromJSON SomeTokenInfo where
         expires <- v .: "expires"
         clientInfo <- v .: "clientInfo"
         lastUsed <- v .: "lastUsed"
-        permissionTexts <- v .: "permissions"
-        tierText <- v .: "privilegeTier"
+        permissionTexts <- v .: "permissions" :: Aeson.Parser [Text]
+        tierText <- v .: "privilegeTier" :: Aeson.Parser Text
 
         -- Parse permissions
         let mPermissions = mapM textToPermission permissionTexts
@@ -1195,14 +1202,15 @@ instance Aeson.ToJSON UserInfo where
             "username" .= uiUsername,
             "passwordHash" .= uiPasswordHash,
             "permissionLevel" .= permissionLevelToText uiPermissionLevel,
-            "specificPermissions" .= map permissionToText (Set.toList uiSpecificPermissions),
-            "allowedPrivilegeTiers" .= map showTier (Set.toList uiAllowedPrivilegeTiers),
+            "specificPermissions" .= (map permissionToText (Set.toList uiSpecificPermissions) :: [Text]),
+            "allowedPrivilegeTiers" .= (map showTier (Set.toList uiAllowedPrivilegeTiers) :: [Text]),
             "systemUser" .= uiSystemUser,
             "tokens" .= uiTokens,
             "lastLogin" .= uiLastLogin,
             "created" .= uiCreated
         ]
       where
+        showTier :: PrivilegeTier -> Text
         showTier Daemon = "daemon"
         showTier Builder = "builder"
 
@@ -1212,8 +1220,8 @@ instance Aeson.FromJSON UserInfo where
         uiUsername <- v .: "username"
         uiPasswordHash <- v .: "passwordHash"
         permLevelText <- v .: "permissionLevel"
-        permissionTexts <- v .: "specificPermissions"
-        tierTexts <- v .: "allowedPrivilegeTiers"
+        permissionTexts <- v .: "specificPermissions" :: Aeson.Parser [Text]
+        tierTexts <- v .: "allowedPrivilegeTiers" :: Aeson.Parser [Text]
         uiSystemUser <- v .: "systemUser"
         uiTokens <- v .: "tokens"
         uiLastLogin <- v .: "lastLogin"
@@ -1232,7 +1240,8 @@ instance Aeson.FromJSON UserInfo where
             Nothing -> fail "Invalid permission in user"
 
         -- Parse privilege tiers
-        let parseTier "daemon" = Just Daemon
+        let parseTier :: Text -> Maybe PrivilegeTier
+            parseTier "daemon" = Just Daemon
             parseTier "builder" = Just Builder
             parseTier _ = Nothing
         let mTiers = mapM parseTier tierTexts

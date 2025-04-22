@@ -204,7 +204,7 @@ import qualified System.Posix.User as User
 import System.Posix.Files (setFileMode)
 import System.Posix.Types (ProcessID, UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
-import Control.Exception (bracket, try, catch, throwIO, finally, Exception, ErrorCall(..), SomeException)
+import Control.Exception (bracket, try, catch, throwIO, finally, mask, Exception, ErrorCall(..), SomeException)
 import System.Environment (lookupEnv, getEnvironment)
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
 import qualified System.Posix.IO as PosixIO
@@ -217,7 +217,7 @@ import Data.Char (isHexDigit)
 import Data.Singletons
 import Data.Singletons.TH
 import Data.Kind (Type)
-import Data.Aeson ((.=), (.:))
+import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Aeson.Encoding as Aeson
@@ -232,6 +232,14 @@ data Phase = Eval | Build
 -- | Privilege tiers for type-level separation between daemon and builder processes
 data PrivilegeTier = Daemon | Builder
     deriving (Show, Eq)
+
+-- Add explicit Ord instance to enable PrivilegeTier to be used in Sets
+-- This instance reflects the hierarchical nature of privileges: Daemon > Builder
+instance Ord PrivilegeTier where
+    compare Daemon Daemon = EQ
+    compare Builder Builder = EQ
+    compare Daemon Builder = GT  -- Daemon has higher privileges
+    compare Builder Daemon = LT  -- Builder has lower privileges
 
 -- Generate singletons for Phase and PrivilegeTier
 $(genSingletons [''Phase, ''PrivilegeTier])
