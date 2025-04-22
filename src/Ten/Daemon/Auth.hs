@@ -59,7 +59,7 @@ module Ten.Daemon.Auth (
     tokenExpired,
 
     -- Privilege transitions
-    withTokenPrivilege,
+    withDaemonPrivilegeAsBuilder,
     hasPrivilegeForPermission,
 
     -- Auth file management
@@ -81,6 +81,7 @@ import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Reader (ReaderT, runReaderT, ask, local)
 import Control.Monad.Except (ExceptT, runExceptT, throwError, catchError)
 import Control.Monad.State (StateT, runStateT, get, put, modify)
+import Control.Applicative (Alternative(..))
 import Crypto.Hash (hash, digestFromByteString, Digest, SHA256, SHA512)
 import qualified Crypto.Hash as Crypto
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
@@ -430,28 +431,23 @@ createToken user clientInfo expirySeconds permissions = do
         tiPrivilegeEvidence = evidence
     }
 
--- | Apply privilege transition to a token
-withTokenPrivilege :: forall (p :: PrivilegeTier) (q :: PrivilegeTier) a.
-    PrivilegeTransition p q -> TokenInfo p -> (TokenInfo q -> IO a) -> IO a
-withTokenPrivilege DropPrivilege token action =
-    case fromSing (tiPrivilegeEvidence token) of
-        Daemon -> do
-            -- Create a new token with Builder privilege
-            let builderEvidence = sBuilder
-            let builderToken = TokenInfo {
-                    tiToken = tiToken token,
-                    tiCreated = tiCreated token,
-                    tiExpires = tiExpires token,
-                    tiClientInfo = tiClientInfo token,
-                    tiLastUsed = tiLastUsed token,
-                    tiPermissions = Set.filter (not . permissionRequiresDaemon) (tiPermissions token),
-                    tiPrivilegeEvidence = builderEvidence
-                }
-            -- Run the action with the builder token
-            action builderToken
-        Builder ->
-            -- Cannot transition from Builder to anything (already lowest privilege)
-            throwIO $ AuthError $ PrivilegeEscalationDenied "Cannot transition from Builder privilege"
+-- | Create a builder token from a daemon token (privilege downgrade only)
+withDaemonPrivilegeAsBuilder :: forall a.
+    TokenInfo 'Daemon -> (TokenInfo 'Builder -> IO a) -> IO a
+withDaemonPrivilegeAsBuilder token action = do
+    -- Create a new token with Builder privilege
+    let builderEvidence = sBuilder
+    let builderToken = TokenInfo {
+            tiToken = tiToken token,
+            tiCreated = tiCreated token,
+            tiExpires = tiExpires token,
+            tiClientInfo = tiClientInfo token,
+            tiLastUsed = tiLastUsed token,
+            tiPermissions = Set.filter (not . permissionRequiresDaemon) (tiPermissions token),
+            tiPrivilegeEvidence = builderEvidence
+        }
+    -- Run the action with the builder token
+    action builderToken
 
 -- | Check if a token has expired
 tokenExpired :: TokenInfo t -> IO Bool
@@ -746,7 +742,7 @@ refreshToken db (AuthToken token) = do
                                             return (updatedDb, AuthToken newTokenStr)
 
 -- Helper to refresh token with specific privilege tier
-refreshTokenWithTier :: forall (t :: PrivilegeTier). SingI t =>
+refreshTokenWithTier :: forall (t :: PrivilegeTier) (s :: PrivilegeTier). SingI t =>
     AuthDb ->
     Text ->
     UserInfo ->
@@ -1108,7 +1104,7 @@ instance Aeson.FromJSON AuthDb where
         adSystemUserMap <- v .: "systemUserMap"
         adTokenMap <- v .: "tokenMap"
         adLastModified <- v .: "lastModified"
-        adAllowPrivilegeEscalation <- v .: "allowPrivilegeEscalation" <|> pure False  -- Default to secure setting
+        adAllowPrivilegeEscalation <- v .: "allowPrivilegeEscalation" Control.Applicative.<|> pure False  -- Default to secure setting
 
         return AuthDb{..}
 
@@ -1121,6 +1117,4 @@ replicateM n action
         xs <- replicateM (n-1) action
         return (x:xs)
 
--- | Alternative operator for Aeson parsing
-(<|>) :: Aeson.Parser a -> Aeson.Parser a -> Aeson.Parser a
-a <|> b = a `Aeson.Alternative.<|>` b
+-- We use Control.Applicative.<|> directly for Aeson parsing
