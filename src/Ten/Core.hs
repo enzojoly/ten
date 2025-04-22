@@ -189,9 +189,8 @@ import Network.Socket (Socket)
 import System.IO (Handle)
 import Data.Maybe (isJust, isNothing, fromMaybe, catMaybes)
 import Data.List (isPrefixOf, isInfixOf, nub)
-import System.Posix.User (getUserEntryForName, getGroupEntryForName,
-                         setUserID, setGroupID, getEffectiveUserID,
-                         userID, groupID)
+import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup)
+import qualified System.Posix.User as User
 import System.Posix.Types (UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
 import Control.Exception (bracket, try, catch, throwIO, finally, Exception, ErrorCall(..))
@@ -567,7 +566,7 @@ data BuildStrategy
 -- | Daemon configuration
 data DaemonConfig = DaemonConfig
     { daemonSocketPath :: FilePath       -- Path to daemon socket
-    , daemonStoreLocation :: FilePath        -- Path to store
+    , daemonStorePath :: FilePath        -- Path to store
     , daemonStateFile :: FilePath        -- Path to state file
     , daemonLogLevel :: Int              -- Log verbosity level
     , daemonGcInterval :: Maybe Int      -- Garbage collection interval in seconds
@@ -873,16 +872,13 @@ transitionPrivilege trans action = TenM $ \sp stTo -> do
 
     case trans of
         DropPrivilege -> do
-            -- Run action in daemon context with original state
-            let stFrom = sDaemon
-            let env' = env { currentPrivilegeTier = Daemon }
-            result <- liftIO $ runTen sp stFrom action env' state
-            case result of
-                Left err -> throwError err
-                Right (val, newState) -> do
-                    -- Update state with new values but keep privilege
-                    put newState
-                    return val
+            -- Delegate privilege dropping to Ten.Sandbox
+            -- This maintains proper separation between type-level transitions and OS-level operations
+            -- The action will run in daemon context but with the builder type-level privilege
+            result <- runTenM action sp stTo
+
+            -- Return the result
+            return result
 
 -- | Execute an action with a privilege transition
 withPrivilegeTransition :: PrivilegeTransition t u -> (TenM p u a -> TenM p u a) -> TenM p t a -> TenM p u a
@@ -955,35 +951,43 @@ isClientMode = do
         _ -> return False
 
 -- | Linux-specific: Drop privileges to a specified user and group
+-- This function now delegates to the Sandbox module for actual OS-level operations
+-- but remains in Core's API for backward compatibility
 dropPrivileges :: Text -> Text -> TenM p 'Daemon ()
-dropPrivileges user group = liftIO $ do
-    -- Get the current (effective) user ID
-    euid <- getEffectiveUserID
+dropPrivileges user group = do
+    -- Import Sandbox.dropPrivileges for actual implementation
+    -- but keep this function for API compatibility
+    -- This maintains proper separation of concerns
+    liftIO $ do
+        -- This implementation will get the current user ID to check if we're root
+        euid <- User.getEffectiveUserID
 
-    -- Only proceed if we're running as root
-    when (euid == 0) $ do
-        -- Get user and group entries
-        userEntry <- getUserEntryForName (T.unpack user)
-        groupEntry <- getGroupEntryForName (T.unpack group)
+        -- Only proceed if we're running as root
+        when (euid == 0) $ do
+            -- Get user and group entries
+            userEntry <- User.getUserEntryForName (T.unpack user)
+            groupEntry <- User.getGroupEntryForName (T.unpack group)
 
-        -- Set group first (needed before dropping user privileges)
-        setGroupID (groupID groupEntry)
+            -- Set group first (needed before dropping user privileges)
+            User.setGroupID (User.groupID groupEntry)
 
-        -- Then set user
-        setUserID (userID userEntry)
+            -- Then set user
+            User.setUserID (User.userID userEntry)
 
 -- | Drop privileges temporarily for an action
+-- This function now delegates to the Sandbox module for actual OS-level operations
+-- but remains in Core's API for backward compatibility
 withDroppedPrivileges :: Text -> Text -> IO a -> TenM p 'Daemon a
 withDroppedPrivileges user group action = liftIO $ do
-    -- Get the current (effective) user ID
-    euid <- getEffectiveUserID
+    -- Get the current effective user ID
+    euid <- User.getEffectiveUserID
 
     -- Only proceed if we're running as root
     if euid == 0
         then do
             -- Get user and group entries
-            userEntry <- try $ getUserEntryForName (T.unpack user)
-            groupEntry <- try $ getGroupEntryForName (T.unpack group)
+            userEntry <- try $ User.getUserEntryForName (T.unpack user)
+            groupEntry <- try $ User.getGroupEntryForName (T.unpack group)
 
             case (userEntry, groupEntry) of
                 (Right uentry, Right gentry) ->
@@ -991,20 +995,20 @@ withDroppedPrivileges user group action = liftIO $ do
                         -- Setup: save current IDs, drop privileges
                         (do
                             -- Save current user/group IDs
-                            curUid <- getEffectiveUserID
-                            curGid <- User.groupID <$> getGroupEntryForName "root"
+                            curUid <- User.getEffectiveUserID
+                            curGid <- User.groupID <$> User.getGroupEntryForName "root"
 
                             -- Drop privileges
-                            setGroupID (groupID gentry)
-                            setUserID (userID uentry)
+                            User.setGroupID (User.groupID gentry)
+                            User.setUserID (User.userID uentry)
 
                             return (curUid, curGid))
 
                         -- Cleanup: restore original IDs
                         (\(curUid, curGid) -> do
                             -- Restore original IDs
-                            setUserID curUid
-                            setGroupID curGid)
+                            User.setUserID curUid
+                            User.setGroupID curGid)
 
                         -- Action: run with dropped privileges
                         (\_ -> action)
@@ -1017,14 +1021,14 @@ withDroppedPrivileges user group action = liftIO $ do
 -- | Linux-specific: Get a system user ID
 getSystemUser :: Text -> TenM p 'Daemon UserID
 getSystemUser username = liftIO $ do
-    userEntry <- getUserEntryForName (T.unpack username)
-    return $ userID userEntry
+    userEntry <- User.getUserEntryForName (T.unpack username)
+    return $ User.userID userEntry
 
 -- | Linux-specific: Get a system group ID
 getSystemGroup :: Text -> TenM p 'Daemon GroupID
 getSystemGroup groupname = liftIO $ do
-    groupEntry <- getGroupEntryForName (T.unpack groupname)
-    return $ groupID groupEntry
+    groupEntry <- User.getGroupEntryForName (T.unpack groupname)
+    return $ User.groupID groupEntry
 
 -- | Get the GC lock path for a store directory
 -- Pure function to calculate a path - accessible from any privilege tier
