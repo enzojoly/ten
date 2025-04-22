@@ -164,7 +164,11 @@ module Ten.Core (
     waitForBuilderProcess,
 
     -- Process isolation utilities
-    withStore
+    withStore,
+
+    -- State access helpers (needed by DB module)
+    currentBuildId,
+    verbosity
 ) where
 
 import Control.Concurrent.STM

@@ -45,7 +45,7 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (bracket, catch, throwIO, finally, Exception, SomeException)
 import Control.Monad (when, void, unless)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Reader (MonadReader, ask, local, ReaderT, runReaderT)
+import Control.Monad.Reader (MonadReader, ask, local, ReaderT, runReaderT, asks)
 import Control.Monad.Except (MonadError, throwError, catchError, ExceptT, runExceptT)
 import Control.Monad.State (StateT, runStateT, get, put, gets)
 import Data.Int (Int64)
@@ -59,10 +59,11 @@ import System.FilePath (takeDirectory, (</>))
 import System.Posix.Files (setFileMode)
 import System.IO (withFile, IOMode(..), hPutStrLn, stderr)
 
--- Import from Ten.Core, but NOT importing ensureDBDirectories
+-- Import from Ten.Core, including all necessary items for database operations
 import Ten.Core (
     TenM, BuildEnv(..), BuildError(..), privilegeError, StorePath, Phase(..),
-    PrivilegeTier(..), SPrivilegeTier(..), sDaemon, defaultDBPath)
+    PrivilegeTier(..), SPrivilegeTier(..), sDaemon, defaultDBPath, BuildState(..),
+    currentBuildId, initBuildState_Build, runTen, sBuild, verbosity, logMsg)
 
 -- | Database error types
 data DBError
@@ -408,12 +409,6 @@ ensureDBDirectories storeDir = do
         setFileMode dbDir 0o700
 
     logMsg 2 $ "Created database directory: " <> T.pack dbDir
-
--- | Log a message with a given level
-logMsg :: Int -> Text -> TenM p t ()
-logMsg level msg = do
-    v <- asks verbosity
-    when (v >= level) $ liftIO $ putStrLn $ T.unpack msg
 
 -- | Retry an operation if the database is busy
 retryOnBusy :: Database -> IO a -> IO a
