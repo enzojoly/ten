@@ -707,7 +707,8 @@ liftUnprivilegedIO action = do
         Unprivileged -> liftIO action
 
 -- | Safely transition between phases
-transitionPhase :: PhaseTransition p q -> TenM p ctx a -> TenM q ctx a
+transitionPhase :: forall p q ctx a. GetContextFromType ctx
+                => PhaseTransition p q -> TenM p ctx a -> TenM q ctx a
 transitionPhase trans action = TenM $ do
     env <- ask
     state <- get
