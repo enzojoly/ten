@@ -43,6 +43,7 @@ module Ten.Daemon.Protocol (
 
     -- Request privilege types
     RequestPrivilege(..),
+    ResponsePrivilege(..),
     PrivilegeRequirement(..),
     PrivilegeError(..),
 
@@ -74,8 +75,8 @@ module Ten.Daemon.Protocol (
 
     -- GC status request/response
     GCStats(..),
-    GCStatusRequestData(..),
-    GCStatusResponseData(..),
+    GCStatusRequest(..),
+    GCStatusResponse(..),
 
     -- Type families for permissions
     CanAccessStore,
@@ -122,11 +123,16 @@ module Ten.Daemon.Protocol (
     responseToText,
 
     -- Exception types
-    ProtocolError(..)
+    ProtocolError(..),
+
+    -- Response conversion helpers
+    responseToResponseData,
+    responsePrivilegeRequirement
 ) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay, myThreadId)
 import Control.Concurrent.MVar
+import Control.Concurrent.STM
 import Control.Exception (Exception, throwIO, bracket, try, SomeException)
 import Control.Monad (unless, when, foldM)
 import Data.Aeson ((.:), (.=))
@@ -146,7 +152,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import GHC.Generics (Generic)
 import Network.Socket (Socket, close)
 import qualified Network.Socket.ByteString as NByte
@@ -158,6 +164,7 @@ import Data.Kind (Type)
 import Data.Singletons
 import Data.Singletons.TH
 import Data.Proxy (Proxy(..))
+import Data.Binary (Binary(..), Get, put, get, encode, decode)
 
 -- Import Ten modules
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
@@ -218,9 +225,9 @@ deriving instance Show (SPrivilegeTier p)
 deriving instance Eq (SPrivilegeTier p)
 
 -- | Convert from singleton to the value
-fromSPrivilegeTier :: SPrivilegeTier t -> PrivilegeTier
-fromSPrivilegeTier SDaemon = Daemon
-fromSPrivilegeTier SBuilder = Builder
+fromSing :: SPrivilegeTier t -> PrivilegeTier
+fromSing SDaemon = Daemon
+fromSing SBuilder = Builder
 
 -- | Existential wrapper for privilege tier singletons
 data SomePrivilegeTier where
@@ -310,6 +317,12 @@ data PrivilegeRequirement =
 data RequestPrivilege =
     PrivilegedRequest   -- Must be run in daemon context
   | UnprivilegedRequest -- Can be run in either context
+  deriving (Show, Eq)
+
+-- | Response privilege tagging
+data ResponsePrivilege =
+    PrivilegedResponse   -- Contains privileged information
+  | UnprivilegedResponse -- Can be received in any context
   deriving (Show, Eq)
 
 -- | User authentication credentials
@@ -543,39 +556,31 @@ instance Aeson.FromJSON DerivationOutputMappingResponse where
 
 -- | Build request information
 data BuildRequestInfo = BuildRequestInfo {
-    buildArgs :: [(Text, Text)],  -- Extra build arguments
     buildTimeout :: Maybe Int,    -- Build timeout in seconds
-    buildPriority :: Int,         -- Build priority (higher = more important)
-    buildNotifyURL :: Maybe Text, -- URL to notify on completion (e.g., webhook)
-    buildAllowRecursive :: Bool   -- Whether build is allowed to use return-continuation
+    buildEnv :: Map Text Text,    -- Extra environment variables
+    buildFlags :: [Text]          -- Build flags (e.g., --keep-failed, --no-out-link)
 } deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON BuildRequestInfo where
     toJSON BuildRequestInfo{..} = Aeson.object [
-            "args" .= buildArgs,
             "timeout" .= buildTimeout,
-            "priority" .= buildPriority,
-            "notifyURL" .= buildNotifyURL,
-            "allowRecursive" .= buildAllowRecursive
+            "env" .= buildEnv,
+            "flags" .= buildFlags
         ]
 
 instance Aeson.FromJSON BuildRequestInfo where
     parseJSON = Aeson.withObject "BuildRequestInfo" $ \v -> do
-        buildArgs <- v .: "args"
         buildTimeout <- v .: "timeout"
-        buildPriority <- v .: "priority"
-        buildNotifyURL <- v .: "notifyURL"
-        buildAllowRecursive <- v .: "allowRecursive"
+        buildEnv <- v .: "env"
+        buildFlags <- v .: "flags"
         return BuildRequestInfo{..}
 
 -- | Default build request info
 defaultBuildRequestInfo :: BuildRequestInfo
 defaultBuildRequestInfo = BuildRequestInfo {
-    buildArgs = [],
     buildTimeout = Nothing,
-    buildPriority = 50,  -- Medium priority
-    buildNotifyURL = Nothing,
-    buildAllowRecursive = True
+    buildEnv = Map.empty,
+    buildFlags = []
 }
 
 -- | Parse a BuildId from Text
@@ -659,41 +664,41 @@ instance Aeson.FromJSON BuildStatusUpdate where
                 _ -> fail $ "Unknown status type: " ++ T.unpack statusType
             ) obj
 
--- | GC Status Request Data
-data GCStatusRequestData = GCStatusRequestData {
-    forceCheck :: Bool  -- Whether to force recheck the lock file
+-- | GC Status Request
+data GCStatusRequest = GCStatusRequest {
+    gcForceCheck :: Bool  -- Whether to force recheck the lock file
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusRequestData where
-    toJSON GCStatusRequestData{..} = Aeson.object [
-            "forceCheck" .= forceCheck
+instance Aeson.ToJSON GCStatusRequest where
+    toJSON GCStatusRequest{..} = Aeson.object [
+            "forceCheck" .= gcForceCheck
         ]
 
-instance Aeson.FromJSON GCStatusRequestData where
-    parseJSON = Aeson.withObject "GCStatusRequestData" $ \v -> do
-        forceCheck <- v .: "forceCheck"
-        return GCStatusRequestData{..}
+instance Aeson.FromJSON GCStatusRequest where
+    parseJSON = Aeson.withObject "GCStatusRequest" $ \v -> do
+        gcForceCheck <- v .: "forceCheck"
+        return GCStatusRequest{..}
 
--- | GC Status Response Data
-data GCStatusResponseData = GCStatusResponseData {
+-- | GC Status Response
+data GCStatusResponse = GCStatusResponse {
     gcRunning :: Bool,           -- Whether GC is currently running
     gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
     gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusResponseData where
-    toJSON GCStatusResponseData{..} = Aeson.object [
+instance Aeson.ToJSON GCStatusResponse where
+    toJSON GCStatusResponse{..} = Aeson.object [
             "running" .= gcRunning,
             "owner" .= gcOwner,
             "lockTime" .= gcLockTime
         ]
 
-instance Aeson.FromJSON GCStatusResponseData where
-    parseJSON = Aeson.withObject "GCStatusResponseData" $ \v -> do
+instance Aeson.FromJSON GCStatusResponse where
+    parseJSON = Aeson.withObject "GCStatusResponse" $ \v -> do
         gcRunning <- v .: "running"
         gcOwner <- v .: "owner"
         gcLockTime <- v .: "lockTime"
-        return GCStatusResponseData{..}
+        return GCStatusResponse{..}
 
 -- | Request tags to distinguish different types of requests
 data RequestTag
@@ -811,7 +816,7 @@ data ResponseMessage = ResponseMessage {
     respTag :: ResponseTag,
     respPayload :: Aeson.Value,
     respRequiresAuth :: Bool,  -- Whether this response type is for authenticated requests
-    respPrivilege :: RequestPrivilege  -- Whether this response contains privileged information
+    respPrivilege :: ResponsePrivilege  -- Whether this response contains privileged information
 } deriving (Show, Eq)
 
 instance Aeson.ToJSON ResponseMessage where
@@ -829,7 +834,7 @@ instance Aeson.FromJSON ResponseMessage where
         tagStr <- v .: "tag" :: Aeson.Parser String
         respPayload <- v .: "payload"
         respRequiresAuth <- v .: "requiresAuth"
-        privStr <- v .:? "privilege" .!= "UnprivilegedRequest" :: Aeson.Parser String
+        privStr <- v .:? "privilege" .!= "UnprivilegedResponse" :: Aeson.Parser String
         return $ ResponseMessage {
             respId = respId,
             respTag = read tagStr,
@@ -838,9 +843,46 @@ instance Aeson.FromJSON ResponseMessage where
             respPrivilege = parsePrivilege privStr
         }
       where
-        parsePrivilege :: String -> RequestPrivilege
-        parsePrivilege "PrivilegedRequest" = PrivilegedRequest
-        parsePrivilege _ = UnprivilegedRequest  -- Default to unprivileged
+        parsePrivilege :: String -> ResponsePrivilege
+        parsePrivilege "PrivilegedResponse" = PrivilegedResponse
+        parsePrivilege _ = UnprivilegedResponse  -- Default to unprivileged
+
+-- | Wrappers for messages to simplify serialization
+data MessageWrapper
+    = RequestWrapper RequestMessage
+    | ResponseWrapper ResponseMessage
+    | AuthRequestWrapper AuthRequest
+    | AuthResponseWrapper AuthResult
+    deriving (Show, Eq)
+
+instance Aeson.ToJSON MessageWrapper where
+    toJSON (RequestWrapper req) = Aeson.object [
+            "type" .= ("request" :: Text),
+            "data" .= req
+        ]
+    toJSON (ResponseWrapper resp) = Aeson.object [
+            "type" .= ("response" :: Text),
+            "data" .= resp
+        ]
+    toJSON (AuthRequestWrapper auth) = Aeson.object [
+            "type" .= ("auth_request" :: Text),
+            "data" .= auth
+        ]
+    toJSON (AuthResponseWrapper result) = Aeson.object [
+            "type" .= ("auth_response" :: Text),
+            "data" .= result
+        ]
+
+instance Aeson.FromJSON MessageWrapper where
+    parseJSON = Aeson.withObject "MessageWrapper" $ \v -> do
+        msgType <- v .: "type" :: Aeson.Parser Text
+        msgData <- v .: "data"
+        case msgType of
+            "request" -> RequestWrapper <$> Aeson.parseJSON msgData
+            "response" -> ResponseWrapper <$> Aeson.parseJSON msgData
+            "auth_request" -> AuthRequestWrapper <$> Aeson.parseJSON msgData
+            "auth_response" -> AuthResponseWrapper <$> Aeson.parseJSON msgData
+            _ -> fail $ "Unknown message type: " ++ T.unpack msgType
 
 -- | Phase and privilege-aware message type
 data Message (t :: PrivilegeTier) where
@@ -855,6 +897,9 @@ data Message (t :: PrivilegeTier) where
     AuthRequestMsg :: AuthRequest -> Message t
     AuthResponseMsg :: AuthResult -> Message t
 
+deriving instance Show (Message t)
+deriving instance Eq (Message t)
+
 -- | Response with privilege awareness
 data Response (t :: PrivilegeTier) where
     -- Responses that include privileged data
@@ -867,10 +912,16 @@ data Response (t :: PrivilegeTier) where
     -- Error responses are always available
     ErrorResp :: BuildError -> Response t
 
+deriving instance Show (Response t)
+deriving instance Eq (Response t)
+
 -- | Daemon request types
 data DaemonRequest
     -- Authentication
-    = AuthCmd ProtocolVersion UserCredentials
+    = AuthRequest {
+        authVersion :: ProtocolVersion,
+        authCredentials :: UserCredentials
+      }
 
     -- Build operations
     | BuildRequest {
@@ -916,8 +967,7 @@ data DaemonRequest
 
     -- Derivation operations
     | StoreDerivationRequest {
-        derivationContent :: BS.ByteString,  -- Serialized derivation
-        registerOutputs :: Bool              -- Whether to register outputs in DB
+        derivationContent :: BS.ByteString  -- Serialized derivation
       }
     | RetrieveDerivationRequest {
         derivationPath :: StorePath
@@ -960,10 +1010,10 @@ data DaemonRequest
 
 instance Aeson.ToJSON DaemonRequest where
     toJSON req = case req of
-        AuthCmd ver creds -> Aeson.object [
+        AuthRequest{..} -> Aeson.object [
                 "type" .= ("auth" :: Text),
-                "version" .= ver,
-                "credentials" .= creds
+                "version" .= authVersion,
+                "credentials" .= authCredentials
             ]
 
         BuildRequest{..} -> Aeson.object [
@@ -1029,8 +1079,7 @@ instance Aeson.ToJSON DaemonRequest where
 
         StoreDerivationRequest{..} -> Aeson.object [
                 "type" .= ("store-derivation" :: Text),
-                "derivation" .= TE.decodeUtf8 derivationContent,
-                "registerOutputs" .= registerOutputs
+                "derivation" .= TE.decodeUtf8 derivationContent
             ]
 
         RetrieveDerivationRequest{..} -> Aeson.object [
@@ -1109,7 +1158,7 @@ instance Aeson.FromJSON DaemonRequest where
             "auth" -> do
                 ver <- v .: "version"
                 creds <- v .: "credentials"
-                return $ AuthCmd ver creds
+                return $ AuthRequest ver creds
 
             "build" -> do
                 path <- v .: "path"
@@ -1177,8 +1226,7 @@ instance Aeson.FromJSON DaemonRequest where
 
             "store-derivation" -> do
                 content <- v .: "derivation" :: Aeson.Parser Text
-                registerOutputs <- v .:? "registerOutputs" .!= True
-                return $ StoreDerivationRequest (TE.encodeUtf8 content) registerOutputs
+                return $ StoreDerivationRequest (TE.encodeUtf8 content)
 
             "retrieve-derivation" -> do
                 pathObj <- v .: "path"
@@ -1403,9 +1451,9 @@ data DaemonResponse
 
     -- Store responses
     | StoreAddResponse StorePath
-    | StoreVerifyResponse StorePath Bool
+    | StoreVerifyResponse Bool
     | StorePathResponse StorePath
-    | StoreContentsResponse [StorePath]
+    | StoreListResponse [StorePath]
 
     -- Derivation responses
     | DerivationResponse Derivation
@@ -1418,7 +1466,7 @@ data DaemonResponse
     -- Garbage collection responses
     | GCResponse GCStats
     | GCStartedResponse
-    | GCStatusResponse GCStatusResponseData
+    | GCStatusResponse GCStatusResponse
     | GCRootAddedResponse Text
     | GCRootRemovedResponse Text
     | GCRootsListResponse [(StorePath, Text, Bool)]
@@ -1482,9 +1530,8 @@ instance Aeson.ToJSON DaemonResponse where
                 "path" .= encodePath path
             ]
 
-        StoreVerifyResponse path valid -> Aeson.object [
+        StoreVerifyResponse valid -> Aeson.object [
                 "type" .= ("store-verify" :: Text),
-                "path" .= encodePath path,
                 "valid" .= valid
             ]
 
@@ -1493,7 +1540,7 @@ instance Aeson.ToJSON DaemonResponse where
                 "path" .= encodePath path
             ]
 
-        StoreContentsResponse paths -> Aeson.object [
+        StoreListResponse paths -> Aeson.object [
                 "type" .= ("store-list" :: Text),
                 "paths" .= map encodePath paths
             ]
@@ -1711,10 +1758,8 @@ instance Aeson.FromJSON DaemonResponse where
                 return $ StoreAddResponse path
 
             "store-verify" -> do
-                pathObj <- v .: "path"
-                path <- decodePath pathObj
                 valid <- v .: "valid"
-                return $ StoreVerifyResponse path valid
+                return $ StoreVerifyResponse valid
 
             "store-path" -> do
                 pathObj <- v .: "path"
@@ -1724,7 +1769,7 @@ instance Aeson.FromJSON DaemonResponse where
             "store-list" -> do
                 pathsJson <- v .: "paths"
                 paths <- mapM decodePath pathsJson
-                return $ StoreContentsResponse paths
+                return $ StoreListResponse paths
 
             "derivation" -> do
                 derivText <- v .: "derivation" :: Aeson.Parser Text
@@ -1862,7 +1907,7 @@ data ProtocolHandle = ProtocolHandle {
 -- | Check if a request has the necessary capabilities
 verifyCapabilities :: SPrivilegeTier t -> Set DaemonCapability -> Either PrivilegeError ()
 verifyCapabilities st capabilities =
-    case fromSPrivilegeTier st of
+    case fromSing st of
         -- Daemon context can perform any operation
         Daemon -> Right ()
 
@@ -1886,7 +1931,7 @@ verifyCapabilities st capabilities =
 -- | Check if a request can be performed with given privilege tier
 checkPrivilegeRequirement :: SPrivilegeTier t -> RequestPrivilege -> Either PrivilegeError ()
 checkPrivilegeRequirement st reqPriv =
-    case (fromSPrivilegeTier st, reqPriv) of
+    case (fromSing st, reqPriv) of
         (Daemon, _) ->
             -- Daemon can perform any operation
             Right ()
@@ -1976,18 +2021,18 @@ sendRequest st handle req authToken = do
                         }
 
                     -- Serialize and send based on privilege tier
-                    case fromSPrivilegeTier st of
+                    case fromSing st of
                         Daemon -> do
                             -- Send as privileged message
                             withMVar (protocolLock handle) $ \_ -> do
-                                let serialized = encodeMessage reqMsg
+                                let serialized = encodeMessage (PrivilegedMsg reqMsg)
                                 NByte.sendAll (protocolSocket handle) serialized
                                 return $ Right reqId
 
                         Builder -> do
                             -- Send as unprivileged message
                             withMVar (protocolLock handle) $ \_ -> do
-                                let serialized = encodeMessage reqMsg
+                                let serialized = encodeMessage (UnprivilegedMsg reqMsg)
                                 NByte.sendAll (protocolSocket handle) serialized
                                 return $ Right reqId
 
@@ -2006,13 +2051,28 @@ requestCapabilities req = case req of
     BuildDerivationRequest{} -> Set.singleton DerivationBuild
     BuildStatusRequest{} -> Set.singleton BuildQuery
     CancelBuildRequest{} -> Set.singleton BuildQuery
+    QueryBuildOutputRequest{} -> Set.singleton BuildQuery
+    ListBuildsRequest{} -> Set.singleton BuildQuery
 
     -- GC operations
     GCRequest{} -> Set.singleton GarbageCollection
+    GCStatusRequest{} -> Set.singleton BuildQuery
+    AddGCRootRequest{} -> Set.singleton GarbageCollection
+    RemoveGCRootRequest{} -> Set.singleton GarbageCollection
+    ListGCRootsRequest -> Set.singleton BuildQuery
 
     -- Derivation operations
     StoreDerivationRequest{} -> Set.fromList [DerivationRegistration, StoreAccess]
     RetrieveDerivationRequest{} -> Set.singleton StoreQuery
+    QueryDerivationRequest{} -> Set.singleton StoreQuery
+    GetDerivationForOutputRequest{} -> Set.singleton StoreQuery
+    ListDerivationsRequest{} -> Set.singleton StoreQuery
+
+    -- Administrative operations
+    StatusRequest -> Set.singleton BuildQuery
+    ConfigRequest -> Set.singleton BuildQuery
+    ShutdownRequest -> Set.singleton GarbageCollection
+    PingRequest -> Set.singleton BuildQuery
 
     -- Default
     _ -> Set.singleton BuildQuery
@@ -2022,8 +2082,10 @@ requestPrivilegeRequirement :: DaemonRequest -> RequestPrivilege
 requestPrivilegeRequirement req = case req of
     -- Operations requiring daemon privileges
     StoreAddRequest{} -> PrivilegedRequest
-    GCRequest{} -> PrivilegedRequest
     StoreDerivationRequest{} -> PrivilegedRequest
+    GCRequest{} -> PrivilegedRequest
+    AddGCRootRequest{} -> PrivilegedRequest
+    RemoveGCRootRequest{} -> PrivilegedRequest
     ShutdownRequest -> PrivilegedRequest
 
     -- Operations that can be done from either context
@@ -2031,20 +2093,32 @@ requestPrivilegeRequirement req = case req of
     EvalRequest{} -> UnprivilegedRequest
     BuildDerivationRequest{} -> UnprivilegedRequest
     BuildStatusRequest{} -> UnprivilegedRequest
+    CancelBuildRequest{} -> UnprivilegedRequest
+    QueryBuildOutputRequest{} -> UnprivilegedRequest
+    ListBuildsRequest{} -> UnprivilegedRequest
     StoreVerifyRequest{} -> UnprivilegedRequest
+    StorePathRequest{} -> UnprivilegedRequest
     StoreListRequest -> UnprivilegedRequest
+    RetrieveDerivationRequest{} -> UnprivilegedRequest
+    QueryDerivationRequest{} -> UnprivilegedRequest
+    GetDerivationForOutputRequest{} -> UnprivilegedRequest
+    ListDerivationsRequest{} -> UnprivilegedRequest
+    GCStatusRequest{} -> UnprivilegedRequest
+    ListGCRootsRequest -> UnprivilegedRequest
     StatusRequest -> UnprivilegedRequest
+    ConfigRequest -> UnprivilegedRequest
+    PingRequest -> UnprivilegedRequest
 
-    -- Default to privileged for safety
-    _ -> PrivilegedRequest
+    -- Default to unprivileged
+    _ -> UnprivilegedRequest
 
 -- | Receive a response from a protocol handle
 receiveResponse :: ProtocolHandle -> Int -> Int -> IO (Either ProtocolError DaemonResponse)
 receiveResponse handle reqId timeoutMicros = do
     -- Take the lock for thread safety
     withMVar (protocolLock handle) $ \_ -> do
-        -- Read a message
-        msgBytes <- try $ readMessageWithTimeout (protocolSocket handle) timeoutMicros
+        -- Read a message with timeout
+        msgBytes <- try $ readResponseWithTimeout handle timeoutMicros
         case msgBytes of
             Left (e :: SomeException) ->
                 return $ Left ConnectionClosed
@@ -2053,14 +2127,13 @@ receiveResponse handle reqId timeoutMicros = do
                 Left err ->
                     return $ Left (ProtocolParseError err)
 
-                Right msg -> case msg of
-                    ResponseWrapper (ResponseMessage respId respTag respPayload _ _) | respId == reqId ->
-                        case responseToResponseData respPayload of
-                            Right respData -> return $ Right respData
-                            Left err -> return $ Left (ProtocolParseError err)
+                Right (ResponseWrapper resp) | respId resp == reqId ->
+                    case responseToResponseData (respPayload resp) of
+                        Right respData -> return $ Right respData
+                        Left err -> return $ Left (ProtocolParseError err)
 
-                    _ ->
-                        return $ Left (InvalidRequest "Expected response message with matching ID")
+                _ ->
+                    return $ Left (InvalidRequest "Expected response message with matching ID")
 
 -- | Convert from Response payload to DaemonResponse
 responseToResponseData :: Aeson.Value -> Either Text DaemonResponse
@@ -2101,16 +2174,37 @@ responseRequiresAuth (ConfigResponse _) = False
 responseRequiresAuth _ = True  -- Most operations require authentication
 
 -- | Determine privilege requirement for a response
-responsePrivilegeRequirement :: DaemonResponse -> RequestPrivilege
+responsePrivilegeRequirement :: DaemonResponse -> ResponsePrivilege
 responsePrivilegeRequirement resp = case resp of
     -- Privileged responses (contain sensitive information)
-    StoreAddResponse{} -> PrivilegedRequest
-    GCResponse{} -> PrivilegedRequest
-    DerivationStoredResponse{} -> PrivilegedRequest
-    ConfigResponse{} -> PrivilegedRequest
+    StoreAddResponse{} -> PrivilegedResponse
+    GCResponse{} -> PrivilegedResponse
+    DerivationStoredResponse{} -> PrivilegedResponse
+    GCRootAddedResponse{} -> PrivilegedResponse
+    GCRootRemovedResponse{} -> PrivilegedResponse
 
-    -- Unprivileged responses
-    _ -> UnprivilegedRequest
+    -- Responses that can be received in any context
+    BuildResponse{} -> UnprivilegedResponse
+    BuildStatusResponse{} -> UnprivilegedResponse
+    StoreVerifyResponse{} -> UnprivilegedResponse
+    StoreListResponse{} -> UnprivilegedResponse
+    DerivationResponse{} -> UnprivilegedResponse
+    DerivationRetrievedResponse{} -> UnprivilegedResponse
+    BuildOutputResponse{} -> UnprivilegedResponse
+    BuildListResponse{} -> UnprivilegedResponse
+    DerivationOutputResponse{} -> UnprivilegedResponse
+    DerivationListResponse{} -> UnprivilegedResponse
+    GCStatusResponse{} -> UnprivilegedResponse
+    GCRootsListResponse{} -> UnprivilegedResponse
+    CancelBuildResponse{} -> UnprivilegedResponse
+    StatusResponse{} -> UnprivilegedResponse
+    ConfigResponse{} -> UnprivilegedResponse
+    ShutdownResponse -> UnprivilegedResponse
+    PongResponse -> UnprivilegedResponse
+    ErrorResponse{} -> UnprivilegedResponse
+
+    -- By default, treat as unprivileged
+    _ -> UnprivilegedResponse
 
 -- | Receive a request from a protocol handle
 receiveRequest :: ProtocolHandle -> IO (Either ProtocolError (Int, DaemonRequest, Maybe AuthToken))
@@ -2127,14 +2221,16 @@ receiveRequest handle = do
                 Left err ->
                     return $ Left (ProtocolParseError err)
 
-                Right msg -> case msg of
-                    RequestWrapper (RequestMessage reqId _ reqPayload _ _ authToken) ->
-                        case Aeson.fromJSON reqPayload of
-                            Aeson.Success reqData -> return $ Right (reqId, reqData, authToken)
-                            Aeson.Error err -> return $ Left (ProtocolParseError (T.pack err))
+                Right (RequestWrapper req) ->
+                    case Aeson.fromJSON (reqPayload req) of
+                        Aeson.Success reqData -> return $ Right (reqId req, reqData, reqAuth req)
+                        Aeson.Error err -> return $ Left (ProtocolParseError (T.pack err))
 
-                    _ ->
-                        return $ Left (InvalidRequest "Expected request message")
+                Right (AuthRequestWrapper authReq) ->
+                    return $ Right (0, AuthRequest (authVersion authReq) (UserCredentials (authUser authReq) (authToken authReq) (authRequestedTier authReq)), Nothing)
+
+                _ ->
+                    return $ Left (InvalidRequest "Expected request message")
 
 -- | Execute an action with a protocol handle and clean up after
 withProtocolHandle :: Socket -> PrivilegeTier -> (ProtocolHandle -> IO a) -> IO a
@@ -2144,34 +2240,44 @@ withProtocolHandle socket tier action =
         closeHandle
         action
 
--- | Read a message from a socket with timeout
-readMessageWithTimeout :: Socket -> Int -> IO BS.ByteString
-readMessageWithTimeout sock timeoutMicros = do
-    -- Read length header with timeout
-    lenBytes <- timeout timeoutMicros $ NByte.recv sock 4
-    case lenBytes of
-        Nothing -> throwIO (MessageTooLarge 0)
-        Just bytes
-            | BS.length bytes /= 4 -> throwIO ConnectionClosed
-            | otherwise -> do
-                -- Decode message length
-                let len = fromIntegral $
-                          (fromIntegral (BS.index bytes 0) `shiftL` 24) .|.
-                          (fromIntegral (BS.index bytes 1) `shiftL` 16) .|.
-                          (fromIntegral (BS.index bytes 2) `shiftL` 8) .|.
-                          (fromIntegral (BS.index bytes 3))
+-- | Read a message with timeout
+readResponseWithTimeout :: ProtocolHandle -> Int -> IO BS.ByteString
+readResponseWithTimeout handle timeoutMicros = do
+    -- Use the socket directly for more control
+    sock <- return $ protocolSocket handle
 
-                -- Check if message is too large
-                when (len > 100 * 1024 * 1024) $ -- 100 MB limit
-                    throwIO (MessageTooLarge (fromIntegral len))
+    -- Set up timeout mechanism using a thread
+    resultVar <- newEmptyMVar
+    timeoutVar <- newMVar False
 
-                -- Read message body with timeout
-                body <- timeout timeoutMicros $ recvExactly sock len
-                case body of
-                    Nothing -> throwIO ConnectionClosed
-                    Just bytes
-                        | BS.length bytes /= len -> throwIO ConnectionClosed
-                        | otherwise -> return bytes
+    -- Spawn a worker thread to read the message
+    worker <- forkIO $ do
+        -- Try to read the message
+        result <- try $ readMessage sock
+        -- Put the result in the MVar
+        putMVar resultVar (result :: Either SomeException BS.ByteString)
+
+    -- Set up timeout thread
+    timeout <- forkIO $ do
+        -- Sleep for the timeout duration
+        threadDelay timeoutMicros
+        -- If we reach here, the timeout has occurred
+        modifyMVar_ timeoutVar (const $ return True)
+        -- Put an error in the result var to unblock the main thread
+        void $ tryPutMVar resultVar (Left (userError "Timeout") :: Either SomeException BS.ByteString)
+        -- Kill the worker thread
+        killThread worker
+
+    -- Wait for either the result or the timeout
+    result <- takeMVar resultVar
+
+    -- Clean up the timeout thread if it's still running
+    killThread timeout
+
+    -- Check the result
+    case result of
+        Left e -> throwIO e
+        Right msg -> return msg
 
 -- | Read a message from a socket
 readMessage :: Socket -> IO BS.ByteString
@@ -2193,11 +2299,7 @@ readMessage sock = do
         throwIO (MessageTooLarge (fromIntegral len))
 
     -- Read message body
-    body <- recvExactly sock len
-    when (BS.length body /= len) $
-        throwIO ConnectionClosed
-
-    return body
+    recvExactly sock len
 
 -- | Read exactly n bytes from a socket
 recvExactly :: Socket -> Int -> IO BS.ByteString
@@ -2214,7 +2316,7 @@ recvExactly sock n = go n []
 -- | Convert a request to human-readable text
 requestToText :: DaemonRequest -> Text
 requestToText req = case req of
-    AuthCmd ver _ ->
+    AuthRequest ver _ ->
         T.pack $ "Auth request (protocol version " ++ show ver ++ ")"
 
     BuildRequest{..} ->
@@ -2325,13 +2427,13 @@ responseToText resp = case resp of
     StoreAddResponse path ->
         "Added to store: " <> T.pack (show path)
 
-    StoreVerifyResponse path valid ->
-        "Path verification: " <> T.pack (show path) <> " is " <> if valid then "valid" else "invalid"
+    StoreVerifyResponse valid ->
+        "Path verification: " <> (if valid then "valid" else "invalid")
 
     StorePathResponse path ->
         "Store path: " <> T.pack (show path)
 
-    StoreContentsResponse paths ->
+    StoreListResponse paths ->
         "Store contents: " <> T.pack (show (length paths)) <> " paths"
 
     DerivationResponse _ ->
@@ -2426,49 +2528,87 @@ responseToText resp = case resp of
 getCurrentMillis :: IO Int
 getCurrentMillis = do
     time <- getCurrentTime
-    return $ round $ 1000 * realToFrac (diffUTCTime time (read "1970-01-01 00:00:00 UTC"))
+    return $ round $ 1000 * realToFrac (diffUTCTime time (read "1970-01-01 00:00:00 UTC" :: UTCTime))
 
--- | Timeout implementation
-timeout :: Int -> IO a -> IO (Maybe a)
-timeout micros action = do
-    result <- newEmptyMVar
-    tid <- forkIO $ do
-        r <- try action
-        putMVar result r
-    threadDelay micros
-    filled <- isJust <$> tryTakeMVar result
-    unless filled $ killThread tid
-    if filled
-        then do
-            r <- readMVar result
-            case r of
-                Left (e :: SomeException) -> throwIO e
-                Right x -> return (Just x)
-        else return Nothing
+-- | Map protocol request type to tag
+requestTypeToTag :: DaemonRequest -> RequestTag
+requestTypeToTag = \case
+    AuthRequest {} -> TagAuth
+    BuildRequest {} -> TagBuild
+    EvalRequest {} -> TagEval
+    BuildDerivationRequest {} -> TagBuildDerivation
+    BuildStatusRequest {} -> TagBuildStatus
+    CancelBuildRequest {} -> TagCancelBuild
+    QueryBuildOutputRequest {} -> TagQueryBuildOutput
+    ListBuildsRequest {} -> TagListBuilds
+    StoreAddRequest {} -> TagStoreAdd
+    StoreVerifyRequest {} -> TagStoreVerify
+    StorePathRequest {} -> TagStorePath
+    StoreListRequest -> TagStoreList
+    StoreDerivationRequest {} -> TagStoreDerivation
+    RetrieveDerivationRequest {} -> TagRetrieveDerivation
+    QueryDerivationRequest {} -> TagQueryDerivation
+    GetDerivationForOutputRequest {} -> TagGetDerivationForOutput
+    ListDerivationsRequest {} -> TagListDerivations
+    GCRequest {} -> TagGC
+    GCStatusRequest {} -> TagGCStatus
+    AddGCRootRequest {} -> TagAddGCRoot
+    RemoveGCRootRequest {} -> TagRemoveGCRoot
+    ListGCRootsRequest -> TagListGCRoots
+    PingRequest -> TagPing
+    ShutdownRequest -> TagShutdown
+    StatusRequest -> TagStatus
+    ConfigRequest -> TagConfig
+
+-- | Map protocol response type to tag
+responseTypeToTag :: DaemonResponse -> ResponseTag
+responseTypeToTag = \case
+    AuthResponse {} -> TagAuthResponse
+    BuildStartedResponse {} -> TagBuildStartedResponse
+    BuildResponse {} -> TagBuildResponse
+    BuildStatusResponse {} -> TagBuildStatusResponse
+    CancelBuildResponse {} -> TagBuildCancelledResponse
+    BuildOutputResponse {} -> TagBuildOutputResponse
+    BuildListResponse {} -> TagBuildListResponse
+    StoreAddResponse {} -> TagStoreAddResponse
+    StoreVerifyResponse {} -> TagStoreVerifyResponse
+    StorePathResponse {} -> TagStorePathResponse
+    StoreListResponse {} -> TagStoreListResponse
+    DerivationResponse {} -> TagDerivationResponse
+    DerivationStoredResponse {} -> TagDerivationStoredResponse
+    DerivationRetrievedResponse {} -> TagDerivationRetrievedResponse
+    DerivationQueryResponse {} -> TagDerivationQueryResponse
+    DerivationOutputResponse {} -> TagDerivationOutputResponse
+    DerivationListResponse {} -> TagDerivationListResponse
+    GCResponse {} -> TagGCResponse
+    GCStartedResponse {} -> TagGCStartedResponse
+    GCStatusResponse {} -> TagGCStatusResponse
+    GCRootAddedResponse {} -> TagGCRootAddedResponse
+    GCRootRemovedResponse {} -> TagGCRootRemovedResponse
+    GCRootsListResponse {} -> TagGCRootsListResponse
+    PongResponse -> TagPongResponse
+    ShutdownResponse -> TagShutdownResponse
+    StatusResponse {} -> TagStatusResponse
+    ConfigResponse {} -> TagConfigResponse
+    ErrorResponse {} -> TagErrorResponse
+    EvalResponse {} -> TagEvalResponse
 
 -- | Encode a message for transmission
-encodeMessage :: Message t -> BS.ByteString
+encodeMessage :: MessageWrapper -> BS.ByteString
 encodeMessage msg =
     -- Create content with length prefix
-    createRequestFrame $ LBS.toStrict $ Aeson.encode msg'
-  where
-    -- Convert to non-GADT type for serialization
-    msg' = case msg of
-        PrivilegedMsg req -> RequestWrapper req
-        UnprivilegedMsg req -> RequestWrapper req
-        AuthRequestMsg req -> AuthRequestWrapper req
-        AuthResponseMsg resp -> AuthResponseWrapper resp
+    createRequestFrame $ LBS.toStrict $ Aeson.encode msg
 
 -- | Serialize a message with length prefix
-serializeMessage :: Message t -> BS.ByteString
+serializeMessage :: MessageWrapper -> BS.ByteString
 serializeMessage = encodeMessage
 
 -- | Deserialize a message
-deserializeMessage :: BS.ByteString -> Either Text (Message t)
+deserializeMessage :: BS.ByteString -> Either Text MessageWrapper
 deserializeMessage bs =
     case Aeson.eitherDecodeStrict bs of
         Left err -> Left $ "Failed to parse message: " <> T.pack err
-        Right msg -> Right $ msg
+        Right msg -> Right msg
 
 -- | Serialize a request
 serializeRequest :: DaemonRequest -> BS.ByteString
@@ -2497,7 +2637,28 @@ shiftL :: Int -> Int -> Int
 shiftL x n = x * (2 ^ n)
 
 (.|.) :: Int -> Int -> Int
-a .|. b = a + b
+(.|.) a b = a + b
 
 -- | Int64 type for database IDs
 type Int64 = Int
+
+-- | Helper for tryPutMVar that doesn't exist in older versions
+tryPutMVar :: MVar a -> a -> IO Bool
+tryPutMVar mv x = do
+  empty <- isEmptyMVar mv
+  if empty
+    then do
+      putMVar mv x
+      return True
+    else
+      return False
+
+-- | Check if an MVar is empty
+isEmptyMVar :: MVar a -> IO Bool
+isEmptyMVar mv = do
+  full <- tryTakeMVar mv
+  case full of
+    Nothing -> return True
+    Just x  -> do
+      putMVar mv x
+      return False

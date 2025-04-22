@@ -522,13 +522,15 @@ runBuilder env = do
     liftIO $ createDirectoryIfMissing True (builderOutputDir env)
 
     -- Create pipes for stdout and stderr
-    (stdoutRead, stdoutWrite) <- liftIO $ createPipe
-    (stderrRead, stderrWrite) <- liftIO $ createPipe
+    (stdoutRead, stdoutWrite) <- liftIO $ System.Posix.IO.createPipe
+    (stderrRead, stderrWrite) <- liftIO $ System.Posix.IO.createPipe
 
     -- Set buffer mode to line buffering for better streaming of output
+    stdoutHandle <- liftIO $ fdToHandle stdoutRead
+    stderrHandle <- liftIO $ fdToHandle stderrRead
     liftIO $ do
-        hSetBuffering stdoutRead LineBuffering
-        hSetBuffering stderrRead LineBuffering
+        hSetBuffering stdoutHandle LineBuffering
+        hSetBuffering stderrHandle LineBuffering
 
     -- Convert environment variables
     let envList = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList (builderEnvVars env)
@@ -565,10 +567,10 @@ runBuilder env = do
                     handle (\(_ :: SomeException) -> return ()) $ signalProcess sigKILL pid
 
                 -- Close the pipes
-                hClose stdoutRead
-                hClose stderrRead
-                hClose stdoutWrite
-                hClose stderrWrite
+                hClose stdoutHandle
+                hClose stderrHandle
+                closeFd stdoutWrite
+                closeFd stderrWrite
 
                 -- Clean up temporary files
                 forM_ tmpFiles $ \(path, mHandle) -> do
@@ -587,19 +589,15 @@ runBuilder env = do
                     setpgid 0 0
 
                     -- Redirect stdout and stderr
-                    hClose stdoutRead
-                    hClose stderrRead
+                    closeFd stdoutRead
+                    closeFd stderrRead
 
                     -- Connect stdout and stderr
-                    stdoutFd <- handleToFd stdoutWrite
-                    stderrFd <- handleToFd stderrWrite
+                    dup2 stdoutWrite 1  -- 1 is stdout
+                    dup2 stderrWrite 2  -- 2 is stderr
 
-                    -- Use the proper dup2 call to redirect file descriptors
-                    void $ dup2 stdoutFd 1  -- 1 is stdout
-                    void $ dup2 stderrFd 2  -- 2 is stderr
-
-                    hClose stdoutWrite
-                    hClose stderrWrite
+                    closeFd stdoutWrite
+                    closeFd stderrWrite
 
                     -- Change to build directory
                     setCurrentDirectory buildDir
@@ -628,12 +626,12 @@ runBuilder env = do
 
                 -- Set up background threads to read output
                 stdoutThread <- forkIO $ do
-                    contents <- hGetContents stdoutRead
+                    contents <- hGetContents stdoutHandle
                     evaluate (length contents)
                     putMVar stdoutVar contents
 
                 stderrThread <- forkIO $ do
-                    contents <- hGetContents stderrRead
+                    contents <- hGetContents stderrHandle
                     evaluate (length contents)
                     putMVar stderrVar contents
 
@@ -678,21 +676,13 @@ runBuilder env = do
 
     -- Close the pipes (should be done by cleanup, but ensure it's done)
     liftIO $ do
-        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutRead
-        handle (\(_ :: SomeException) -> return ()) $ hClose stderrRead
-        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutWrite
-        handle (\(_ :: SomeException) -> return ()) $ hClose stderrWrite
+        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutHandle
+        handle (\(_ :: SomeException) -> return ()) $ hClose stderrHandle
+        handle (\(_ :: SomeException) -> return ()) $ closeFd stdoutWrite
+        handle (\(_ :: SomeException) -> return ()) $ closeFd stderrWrite
 
     -- Return the result
     return result
-
--- | Create a pipe for process communication
-createPipe :: IO (Handle, Handle)
-createPipe = do
-    (readFd, writeFd) <- System.Posix.IO.createPipe
-    readHandle <- fdToHandle readFd
-    writeHandle <- fdToHandle writeFd
-    return (readHandle, writeHandle)
 
 -- | Set process group ID
 setpgid :: ProcessID -> ProcessID -> IO ()
@@ -1069,6 +1059,15 @@ handleReturnedDerivation result = do
 
             return innerDrv
 
+-- | Check if a derivation is a return-continuation derivation
+isReturnContinuationDerivation :: Text -> [Text] -> Map Text Text -> Bool
+isReturnContinuationDerivation name args env =
+    -- This is a simple heuristic - in a real implementation you would check
+    -- if the derivation is designed to return another derivation
+    "return" `T.isInfixOf` name ||
+    any ("return" `T.isInfixOf`) args ||
+    Map.member "TEN_RETURN_SUPPORTED" env
+
 -- | Build a graph of derivations
 buildDerivationGraph :: BuildGraph -> TenM 'Build t (Map Text BuildResult)
 buildDerivationGraph graph = do
@@ -1101,6 +1100,12 @@ buildInDependencyOrder derivations = do
 
     -- Build each derivation in order
     mapM buildDerivation derivations
+
+-- | Detect recursive cycles in a list of derivations
+detectRecursionCycle :: [Derivation] -> Bool
+detectRecursionCycle derivations =
+    -- Check if any derivation appears more than once in the list
+    length (nub (map derivHash derivations)) /= length derivations
 
 -- | Build dependencies concurrently
 buildDependenciesConcurrently :: [Derivation] -> TenM 'Build 'Daemon (Map String (Either BuildError BuildResult))
@@ -1164,9 +1169,9 @@ waitForDependencies depIds = do
     checkDependencies :: Set BuildId -> TenM 'Build t Bool
     checkDependencies deps = do
         statuses <- forM (Set.toList deps) $ \bid -> do
-            stat <- try $ getBuildStatus bid
+            stat <- getBuildStatus bid
             return $ case stat of
-                Right BuildCompleted -> True
+                BuildCompleted -> True
                 _ -> False
         return $ and statuses
 
@@ -1363,8 +1368,8 @@ readMaybe s = case reads s of
 
 -- Default build request info
 defaultBuildRequestInfo :: BuildRequestInfo
-defaultBuildRequestInfo = BuildRequestInfo
-    { buildRequestTimeout = Nothing
-    , buildRequestEnv = Map.empty
-    , buildRequestFlags = []
-    }
+defaultBuildRequestInfo = BuildRequestInfo {
+    buildRequestTimeout = Nothing,
+    buildRequestEnv = Map.empty,
+    buildRequestFlags = []
+}

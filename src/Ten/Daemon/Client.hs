@@ -276,7 +276,7 @@ createSocketAndConnect socketPath = do
         (return sock)
         close
         (\s -> do
-            connect s (SockAddrUnix socketPath)
+            connect s (SockAddr​Unix socketPath)
             handle <- socketToHandle s ReadWriteMode
             return (s, handle))
 
@@ -416,10 +416,10 @@ responseReaderThread handle requestMap shutdownFlag lastError = do
                                 atomically $ writeTVar lastError $ Just $ DaemonError $ "Protocol error: " <> err
                                 loop
 
-                            Right (ResponseMsg reqId resp) -> do
+                            Right (ResponseMsg respId resp) -> do
                                 -- Look up request
                                 reqMap <- atomically $ readTVar requestMap
-                                case Map.lookup reqId reqMap of
+                                case Map.lookup respId reqMap of
                                     Nothing ->
                                         -- Unknown request ID, ignore and continue
                                         loop
@@ -878,6 +878,7 @@ storeDerivation conn derivation = do
     -- Create store derivation request
     let request = StoreDerivationRequest
             { derivationContent = serialized
+            , registerOutputs = True
             }
 
     -- Send request and wait for response
@@ -1200,137 +1201,6 @@ unlessM :: Monad m => m Bool -> m () -> m ()
 unlessM cond action = do
     result <- cond
     unless result action
-
--- | Map protocol request type to tag
-requestTypeToTag :: DaemonRequest -> RequestTag
-requestTypeToTag = \case
-    BuildRequest {} -> TagBuild
-    EvalRequest {} -> TagEval
-    BuildDerivationRequest {} -> TagBuildDerivation
-    BuildStatusRequest {} -> TagBuildStatus
-    CancelBuildRequest {} -> TagCancelBuild
-    QueryBuildOutputRequest {} -> TagQueryBuildOutput
-    ListBuildsRequest {} -> TagListBuilds
-    StoreAddRequest {} -> TagStoreAdd
-    StoreVerifyRequest {} -> TagStoreVerify
-    StorePathRequest {} -> TagStorePath
-    StoreListRequest -> TagStoreList
-    StoreDerivationRequest {} -> TagStoreDerivation
-    RetrieveDerivationRequest {} -> TagRetrieveDerivation
-    QueryDerivationRequest {} -> TagQueryDerivation
-    GetDerivationForOutputRequest {} -> TagGetDerivationForOutput
-    ListDerivationsRequest {} -> TagListDerivations
-    GCRequest {} -> TagGC
-    GCStatusRequest {} -> TagGCStatus
-    AddGCRootRequest {} -> TagAddGCRoot
-    RemoveGCRootRequest {} -> TagRemoveGCRoot
-    ListGCRootsRequest -> TagListGCRoots
-    PingRequest -> TagPing
-    ShutdownRequest -> TagShutdown
-    StatusRequest -> TagStatus
-    ConfigRequest -> TagConfig
-
--- | Check if a response requires privileged context
-responsePrivilegeRequirement :: Response -> ResponsePrivilege
-responsePrivilegeRequirement = \case
-    -- Responses containing privileged information
-    StoreAddResponse {} -> PrivilegedResponse
-    GCResponse {} -> PrivilegedResponse
-    DerivationStoredResponse {} -> PrivilegedResponse
-    GCRootAddedResponse {} -> PrivilegedResponse
-    GCRootRemovedResponse {} -> PrivilegedResponse
-
-    -- Responses that can be received in any context
-    BuildResponse {} -> UnprivilegedResponse
-    BuildStatusResponse {} -> UnprivilegedResponse
-    StoreVerifyResponse {} -> UnprivilegedResponse
-    StoreListResponse {} -> UnprivilegedResponse
-    DerivationResponse {} -> UnprivilegedResponse
-    DerivationRetrievedResponse {} -> UnprivilegedResponse
-    BuildOutputResponse {} -> UnprivilegedResponse
-    BuildListResponse {} -> UnprivilegedResponse
-    DerivationOutputResponse {} -> UnprivilegedResponse
-    DerivationListResponse {} -> UnprivilegedResponse
-    GCStatusResponse {} -> UnprivilegedResponse
-    GCRootsListResponse {} -> UnprivilegedResponse
-    CancelBuildResponse {} -> UnprivilegedResponse
-    StatusResponse {} -> UnprivilegedResponse
-    ConfigResponse {} -> UnprivilegedResponse
-    ShutdownResponse -> UnprivilegedResponse
-    PongResponse -> UnprivilegedResponse
-
-    -- By default, treat as unprivileged
-    _ -> UnprivilegedResponse
-
--- | Required capabilities for requests
-requestCapabilities :: DaemonRequest -> Set DaemonCapability
-requestCapabilities = \case
-    -- Store operations
-    StoreAddRequest {} -> Set.singleton StoreAccess
-    StoreVerifyRequest {} -> Set.singleton StoreQuery
-    StorePathRequest {} -> Set.singleton StoreQuery
-    StoreListRequest -> Set.singleton StoreQuery
-
-    -- Build operations
-    BuildRequest {} -> Set.singleton DerivationBuild
-    EvalRequest {} -> Set.singleton DerivationBuild
-    BuildDerivationRequest {} -> Set.singleton DerivationBuild
-    BuildStatusRequest {} -> Set.singleton BuildQuery
-    CancelBuildRequest {} -> Set.singleton BuildQuery
-    QueryBuildOutputRequest {} -> Set.singleton BuildQuery
-    ListBuildsRequest {} -> Set.singleton BuildQuery
-
-    -- GC operations
-    GCRequest {} -> Set.singleton GarbageCollection
-    GCStatusRequest {} -> Set.singleton BuildQuery
-    AddGCRootRequest {} -> Set.singleton GarbageCollection
-    RemoveGCRootRequest {} -> Set.singleton GarbageCollection
-    ListGCRootsRequest -> Set.singleton BuildQuery
-
-    -- Derivation operations
-    StoreDerivationRequest {} -> Set.fromList [DerivationRegistration, StoreAccess]
-    RetrieveDerivationRequest {} -> Set.singleton StoreQuery
-    QueryDerivationRequest {} -> Set.singleton StoreQuery
-    GetDerivationForOutputRequest {} -> Set.singleton StoreQuery
-    ListDerivationsRequest {} -> Set.singleton StoreQuery
-
-    -- Administrative operations
-    StatusRequest -> Set.singleton BuildQuery
-    ConfigRequest -> Set.singleton BuildQuery
-    ShutdownRequest -> Set.singleton GarbageCollection
-    PingRequest -> Set.singleton BuildQuery
-
--- | Privilege requirement for requests
-requestPrivilegeRequirement :: DaemonRequest -> RequestPrivilege
-requestPrivilegeRequirement = \case
-    -- Operations requiring daemon privileges
-    StoreAddRequest {} -> PrivilegedRequest
-    StoreDerivationRequest {} -> PrivilegedRequest
-    GCRequest {} -> PrivilegedRequest
-    AddGCRootRequest {} -> PrivilegedRequest
-    RemoveGCRootRequest {} -> PrivilegedRequest
-    ShutdownRequest -> PrivilegedRequest
-
-    -- Operations that can be done from either context
-    BuildRequest {} -> UnprivilegedRequest
-    EvalRequest {} -> UnprivilegedRequest
-    BuildDerivationRequest {} -> UnprivilegedRequest
-    BuildStatusRequest {} -> UnprivilegedRequest
-    CancelBuildRequest {} -> UnprivilegedRequest
-    QueryBuildOutputRequest {} -> UnprivilegedRequest
-    ListBuildsRequest {} -> UnprivilegedRequest
-    StoreVerifyRequest {} -> UnprivilegedRequest
-    StorePathRequest {} -> UnprivilegedRequest
-    StoreListRequest -> UnprivilegedRequest
-    RetrieveDerivationRequest {} -> UnprivilegedRequest
-    QueryDerivationRequest {} -> UnprivilegedRequest
-    GetDerivationForOutputRequest {} -> UnprivilegedRequest
-    ListDerivationsRequest {} -> UnprivilegedRequest
-    GCStatusRequest {} -> UnprivilegedRequest
-    ListGCRootsRequest -> UnprivilegedRequest
-    StatusRequest -> UnprivilegedRequest
-    ConfigRequest -> UnprivilegedRequest
-    PingRequest -> UnprivilegedRequest
 
 -- | Bitwise operations for message length encoding/decoding
 shiftL :: Int -> Int -> Int
