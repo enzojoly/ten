@@ -3,6 +3,8 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE GADTs #-}
 
 module Ten.DB.Core (
     -- Database types
@@ -74,7 +76,7 @@ data DBError
     | DBInvalidStateError Text
     | DBPhaseError Text
     | DBPermissionError Text
-    | DBPrivilegeError Text  -- New error type for privilege violations
+    | DBPrivilegeError Text  -- Error type for privilege violations
     deriving (Show, Eq)
 
 instance Exception DBError
@@ -95,7 +97,7 @@ data Database = Database {
     dbMaxRetries :: Int           -- ^ Maximum number of retries for busy operations
 }
 
--- | Initialize the database - this is a privileged operation
+-- | Initialize the database - this is a daemon operation
 initDatabase :: FilePath -> Int -> IO Database
 initDatabase dbPath busyTimeout = do
     -- Create directory if needed
@@ -146,42 +148,42 @@ closeDatabase db = catch
     (\(e :: SomeException) ->
         putStrLn $ "Warning: Error closing database: " ++ show e)
 
--- | Run an action with a database connection - requires privileged context
-withDatabase :: FilePath -> Int -> (Database -> TenM 'Privileged p a) -> TenM 'Privileged p a
+-- | Run an action with a database connection - requires daemon privileges
+withDatabase :: FilePath -> Int -> (Database -> TenM p 'Daemon a) -> TenM p 'Daemon a
 withDatabase dbPath busyTimeout action = do
-    -- Create a bracket-like operation in the privileged TenM context
-    privilegedBracket
+    -- Create a bracket-like operation in the daemon TenM context
+    daemonBracket
         (liftIO $ initDatabase dbPath busyTimeout)
         (liftIO . closeDatabase)
         action
 
--- | Run an action with a database in the privileged TenM monad
-withDB :: (Database -> TenM 'Privileged p a) -> TenM 'Privileged p a
+-- | Run an action with a database in the daemon TenM monad
+withDB :: (Database -> TenM p 'Daemon a) -> TenM p 'Daemon a
 withDB action = do
     env <- ask
     let dbPath = defaultDBPath (storeLocation env)
     let busyTimeout = 5000  -- 5 seconds
 
-    -- Create a bracket-like operation in the privileged TenM monad
-    privilegedBracket
+    -- Create a bracket-like operation in the daemon TenM monad
+    daemonBracket
         (liftIO $ initDatabase dbPath busyTimeout)
         (liftIO . closeDatabase)
         action
 
--- | Bracket operation for privileged context
-privilegedBracket :: TenM 'Privileged p a -> (a -> TenM 'Privileged p b) -> (a -> TenM 'Privileged p c) -> TenM 'Privileged p c
-privilegedBracket acquire release action = do
+-- | Bracket operation for daemon context
+daemonBracket :: TenM p 'Daemon a -> (a -> TenM p 'Daemon b) -> (a -> TenM p 'Daemon c) -> TenM p 'Daemon c
+daemonBracket acquire release action = do
     resource <- acquire
     result <- action resource `onError` release resource
     _ <- release resource
     return result
   where
-    onError :: TenM 'Privileged p a -> TenM 'Privileged p b -> TenM 'Privileged p a
+    onError :: TenM p 'Daemon a -> TenM p 'Daemon b -> TenM p 'Daemon a
     onError op cleanup =
       catchError op (\e -> cleanup >> throwError e)
 
--- | Run a transaction with the specified mode - requires privileged context
-dbWithTransaction :: Database -> TransactionMode -> (Database -> TenM 'Privileged p a) -> TenM 'Privileged p a
+-- | Run a transaction with the specified mode - requires daemon privileges
+dbWithTransaction :: Database -> TransactionMode -> (Database -> TenM p 'Daemon a) -> TenM p 'Daemon a
 dbWithTransaction db mode action = do
     -- Start transaction with appropriate mode
     let beginStmt = case mode of
@@ -207,22 +209,22 @@ dbWithTransaction db mode action = do
         return result
 
 -- | Alias for dbWithTransaction for backward compatibility
-withTransaction :: Database -> TransactionMode -> (Database -> TenM 'Privileged p a) -> TenM 'Privileged p a
+withTransaction :: Database -> TransactionMode -> (Database -> TenM p 'Daemon a) -> TenM p 'Daemon a
 withTransaction = dbWithTransaction
 
--- | Run a transaction in the TenM monad - requires privileged context
-withTenTransaction :: Database -> TransactionMode -> (Database -> TenM 'Privileged p a) -> TenM 'Privileged p a
+-- | Run a transaction in the TenM monad - requires daemon privileges
+withTenTransaction :: Database -> TransactionMode -> (Database -> TenM p 'Daemon a) -> TenM p 'Daemon a
 withTenTransaction = dbWithTransaction
 
 -- | Roll back transaction on error
 rollbackOnError :: Database -> IO ()
 rollbackOnError db = catch
-    (dbExecuteSimple_ db "ROLLBACK;")
+    (void $ SQLite.execute_ (dbConn db) "ROLLBACK;")
     (\(e :: SomeException) ->
         putStrLn $ "Warning: Error rolling back transaction: " ++ show e)
 
--- | Execute a statement with parameters, returning the number of rows affected - requires privileged context
-dbExecute :: ToRow q => Database -> Query -> q -> TenM 'Privileged p Int64
+-- | Execute a statement with parameters, returning the number of rows affected - requires daemon privileges
+dbExecute :: ToRow q => Database -> Query -> q -> TenM p 'Daemon Int64
 dbExecute db query params = do
     -- Execute the query with retry on busy
     rows <- liftIO $ retryOnBusy db $ do
@@ -232,88 +234,104 @@ dbExecute db query params = do
         fromIntegral <$> SQLite.changes (dbConn db)
     return rows
 
--- | Execute a statement with parameters, discarding the result - requires privileged context
-dbExecute_ :: ToRow q => Database -> Query -> q -> TenM 'Privileged p ()
+-- | Execute a statement with parameters, discarding the result - requires daemon privileges
+dbExecute_ :: ToRow q => Database -> Query -> q -> TenM p 'Daemon ()
 dbExecute_ db query params = void $ dbExecute db query params
 
--- | Execute a simple SQL statement without parameters - requires privileged context
-dbExecuteSimple_ :: Database -> Query -> TenM 'Privileged p ()
+-- | Execute a simple SQL statement without parameters - requires daemon privileges
+dbExecuteSimple_ :: Database -> Query -> TenM p 'Daemon ()
 dbExecuteSimple_ db query = liftIO $
     retryOnBusy db $ SQLite.execute_ (dbConn db) query
 
--- | Execute a query with parameters - requires privileged context
-dbQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> TenM 'Privileged p [r]
+-- | Execute a query with parameters - requires daemon privileges
+dbQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> TenM p 'Daemon [r]
 dbQuery db q params = liftIO $
     retryOnBusy db $ SQLite.query (dbConn db) q params
 
--- | Execute a query without parameters - requires privileged context
-dbQuery_ :: FromRow r => Database -> Query -> TenM 'Privileged p [r]
+-- | Execute a query without parameters - requires daemon privileges
+dbQuery_ :: FromRow r => Database -> Query -> TenM p 'Daemon [r]
 dbQuery_ db q = liftIO $
     retryOnBusy db $ SQLite.query_ (dbConn db) q
 
--- | TenM-integrated query with parameters - requires privileged context
-tenQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> TenM 'Privileged p [r]
+-- | TenM-integrated query with parameters - requires daemon privileges
+tenQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> TenM p 'Daemon [r]
 tenQuery db query params = do
-    result <- liftIO $ try $ dbQuery db query params
+    result <- liftIO $ try $ runTenDaemonDB $ dbQuery db query params
     case result of
         Left e -> throwError $ DBError $ T.pack $ "Database query error: " ++ show e
         Right rows -> return rows
   where
-    try :: TenM 'Privileged p a -> IO (Either BuildError a)
-    try action = do
-        result <- runTenPrivileged action
+    runTenDaemonDB :: TenM p 'Daemon a -> IO a
+    runTenDaemonDB action = do
+        env <- initDaemonEnv "/tmp" "/nix/store" Nothing
+        let state = initBuildState (case undefined :: p of
+                      'Eval -> Eval
+                      'Build -> Build) (BuildIdFromInt 0)
+        result <- runTenDaemon action env state
         case result of
-            Left err -> return $ Left err
-            Right (val, _) -> return $ Right val
+            Left err -> throwIO err
+            Right (val, _) -> return val
 
--- | TenM-integrated query without parameters - requires privileged context
-tenQuery_ :: FromRow r => Database -> Query -> TenM 'Privileged p [r]
+-- | TenM-integrated query without parameters - requires daemon privileges
+tenQuery_ :: FromRow r => Database -> Query -> TenM p 'Daemon [r]
 tenQuery_ db query = do
-    result <- liftIO $ try $ dbQuery_ db query
+    result <- liftIO $ try $ runTenDaemonDB $ dbQuery_ db query
     case result of
         Left e -> throwError $ DBError $ T.pack $ "Database query error: " ++ show e
         Right rows -> return rows
   where
-    try :: TenM 'Privileged p a -> IO (Either BuildError a)
-    try action = do
-        result <- runTenPrivileged action
+    runTenDaemonDB :: TenM p 'Daemon a -> IO a
+    runTenDaemonDB action = do
+        env <- initDaemonEnv "/tmp" "/nix/store" Nothing
+        let state = initBuildState (case undefined :: p of
+                      'Eval -> Eval
+                      'Build -> Build) (BuildIdFromInt 0)
+        result <- runTenDaemon action env state
         case result of
-            Left err -> return $ Left err
-            Right (val, _) -> return $ Right val
+            Left err -> throwIO err
+            Right (val, _) -> return val
 
--- | TenM-integrated execute with parameters - requires privileged context
-tenExecute :: (ToRow q) => Database -> Query -> q -> TenM 'Privileged p Int64
+-- | TenM-integrated execute with parameters - requires daemon privileges
+tenExecute :: (ToRow q) => Database -> Query -> q -> TenM p 'Daemon Int64
 tenExecute db query params = do
-    result <- liftIO $ try $ dbExecute db query params
+    result <- liftIO $ try $ runTenDaemonDB $ dbExecute db query params
     case result of
         Left e -> throwError $ DBError $ T.pack $ "Database execute error: " ++ show e
         Right count -> return count
   where
-    try :: TenM 'Privileged p a -> IO (Either BuildError a)
-    try action = do
-        result <- runTenPrivileged action
+    runTenDaemonDB :: TenM p 'Daemon a -> IO a
+    runTenDaemonDB action = do
+        env <- initDaemonEnv "/tmp" "/nix/store" Nothing
+        let state = initBuildState (case undefined :: p of
+                      'Eval -> Eval
+                      'Build -> Build) (BuildIdFromInt 0)
+        result <- runTenDaemon action env state
         case result of
-            Left err -> return $ Left err
-            Right (val, _) -> return $ Right val
+            Left err -> throwIO err
+            Right (val, _) -> return val
 
--- | TenM-integrated execute with parameters, discarding result - requires privileged context
-tenExecute_ :: (ToRow q) => Database -> Query -> q -> TenM 'Privileged p ()
+-- | TenM-integrated execute with parameters, discarding result - requires daemon privileges
+tenExecute_ :: (ToRow q) => Database -> Query -> q -> TenM p 'Daemon ()
 tenExecute_ db query params = void $ tenExecute db query params
 
--- | TenM-integrated simple execute - requires privileged context
-tenExecuteSimple_ :: Database -> Query -> TenM 'Privileged p ()
+-- | TenM-integrated simple execute - requires daemon privileges
+tenExecuteSimple_ :: Database -> Query -> TenM p 'Daemon ()
 tenExecuteSimple_ db query = do
-    result <- liftIO $ try $ dbExecuteSimple_ db query
+    result <- liftIO $ try $ runTenDaemonDB $ dbExecuteSimple_ db query
     case result of
         Left e -> throwError $ DBError $ T.pack $ "Database execute error: " ++ show e
         Right () -> return ()
   where
-    try :: TenM 'Privileged p a -> IO (Either BuildError a)
-    try action = do
-        result <- runTenPrivileged action
+    runTenDaemonDB :: TenM p 'Daemon a -> IO a
+    runTenDaemonDB action = do
+        env <- initDaemonEnv "/tmp" "/nix/store" Nothing
+        let state = initBuildState (case undefined :: p of
+                      'Eval -> Eval
+                      'Build -> Build) (BuildIdFromInt 0)
+        result <- runTenDaemon action env state
         case result of
-            Left err -> return $ Left err
-            Right (val, _) -> return $ Right val
+            Left err -> throwIO err
+            Right (val, _) -> return val
 
 -- | Execute a raw SQL statement (for pragmas)
 executeRaw :: Connection -> Text -> IO ()
@@ -354,25 +372,25 @@ retryOnBusy db action = retryWithCount 0
                 _ -> throwIO e)
 
 -- | Get the current schema version
-getSchemaVersion :: Database -> TenM 'Privileged p Int
+getSchemaVersion :: Database -> TenM p 'Daemon Int
 getSchemaVersion db = do
     -- Check if the version table exists
-    hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM 'Privileged p [Only Int]
+    hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
 
     case hasVersionTable of
         [Only count] | count > 0 -> do
             -- Table exists, get the version
-            results <- tenQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM 'Privileged p [Only Int]
+            results <- tenQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM p 'Daemon [Only Int]
             case results of
                 [Only version] -> return version
                 _ -> return 0  -- No version record found
         _ -> return 0  -- Table doesn't exist
 
 -- | Update the schema version
-updateSchemaVersion :: Database -> Int -> TenM 'Privileged p ()
+updateSchemaVersion :: Database -> Int -> TenM p 'Daemon ()
 updateSchemaVersion db version = do
     -- Check if the version table exists
-    hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM 'Privileged p [Only Int]
+    hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
 
     case hasVersionTable of
         [Only count] | count > 0 -> do
@@ -385,19 +403,19 @@ updateSchemaVersion db version = do
 
 -- | Initialize the database schema
 initializeSchema :: Database -> IO ()
-initializeSchema db = runDBAction db $ withTransaction db Exclusive $ \_ -> do
+initializeSchema db = runDBAction db $ withTransactionIO db Exclusive $ \_ -> do
     -- Create schema version tracking table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
 
     -- Create Derivations table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS Derivations (\
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS Derivations (\
                 \id INTEGER PRIMARY KEY, \
                 \hash TEXT NOT NULL UNIQUE, \
                 \store_path TEXT NOT NULL UNIQUE, \
                 \timestamp INTEGER NOT NULL DEFAULT (strftime('%s','now')));"
 
     -- Create Outputs table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS Outputs (\
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS Outputs (\
                 \derivation_id INTEGER NOT NULL, \
                 \output_name TEXT NOT NULL, \
                 \path TEXT NOT NULL UNIQUE, \
@@ -405,13 +423,13 @@ initializeSchema db = runDBAction db $ withTransaction db Exclusive $ \_ -> do
                 \FOREIGN KEY (derivation_id) REFERENCES Derivations(id));"
 
     -- Create References table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS References (\
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS References (\
                 \referrer TEXT NOT NULL, \
                 \reference TEXT NOT NULL, \
                 \PRIMARY KEY (referrer, reference));"
 
     -- Create ValidPaths table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS ValidPaths (\
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS ValidPaths (\
                 \path TEXT PRIMARY KEY, \
                 \hash TEXT NOT NULL, \
                 \registration_time INTEGER NOT NULL DEFAULT (strftime('%s','now')), \
@@ -419,7 +437,7 @@ initializeSchema db = runDBAction db $ withTransaction db Exclusive $ \_ -> do
                 \is_valid INTEGER NOT NULL DEFAULT 1);"
 
     -- Create ActiveBuilds table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS ActiveBuilds (\
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS ActiveBuilds (\
                 \build_id TEXT PRIMARY KEY, \
                 \path TEXT NOT NULL, \
                 \status TEXT NOT NULL, \
@@ -427,7 +445,7 @@ initializeSchema db = runDBAction db $ withTransaction db Exclusive $ \_ -> do
                 \update_time INTEGER NOT NULL DEFAULT (strftime('%s','now')));"
 
     -- Create GCRoots table
-    dbExecuteSimple_ db "CREATE TABLE IF NOT EXISTS GCRoots (\
+    SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS GCRoots (\
                 \path TEXT NOT NULL, \
                 \name TEXT NOT NULL, \
                 \type TEXT NOT NULL, \
@@ -436,21 +454,35 @@ initializeSchema db = runDBAction db $ withTransaction db Exclusive $ \_ -> do
                 \PRIMARY KEY (path, name));"
 
     -- Create indices for performance
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_activebuilds_status ON ActiveBuilds(status);"
-    dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_gcroots_active ON GCRoots(active);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_activebuilds_status ON ActiveBuilds(status);"
+    SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_gcroots_active ON GCRoots(active);"
 
-    -- Set schema version
-    liftIO $ runTenPrivileged $ updateSchemaVersion db 1
+    -- Set schema version (using direct DB access since we're in IO)
+    SQLite.execute (dbConn db) "INSERT OR REPLACE INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [1 :: Int]
     return ()
 
--- | Run a TenM operation in privileged context
-runTenPrivileged :: TenM 'Privileged p a -> IO (Either BuildError (a, BuildState))
-runTenPrivileged action = do
-    -- This is a placeholder until we update Ten.Core with the actual implementation
-    -- Here we're assuming the Core will provide this function which runs TenM in privileged context
-    error "runTenPrivileged not yet implemented in Ten.Core"
+-- | Helper function for direct IO-level transactions
+withTransactionIO :: Database -> TransactionMode -> (Database -> IO a) -> IO a
+withTransactionIO db mode action = do
+    -- Start transaction with appropriate mode
+    let beginStmt = case mode of
+            ReadOnly -> "BEGIN TRANSACTION READONLY;"
+            ReadWrite -> "BEGIN TRANSACTION;"
+            Exclusive -> "BEGIN EXCLUSIVE TRANSACTION;"
+
+    -- Execute transaction with proper error handling
+    bracket
+        (do SQLite.execute_ (dbConn db) (Query beginStmt)
+            return db)
+        (\_ -> catch
+                (SQLite.execute_ (dbConn db) "ROLLBACK;")
+                (\(_ :: SomeException) -> return ()))
+        (\_ -> do
+            result <- action db
+            SQLite.execute_ (dbConn db) "COMMIT;"
+            return result)

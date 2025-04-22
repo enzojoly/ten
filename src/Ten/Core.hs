@@ -12,11 +12,17 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE EmptyCase #-}
 
 module Ten.Core (
     -- Core types
     Phase(..),
-    PrivilegeContext(..),
+    SPhase(..),
+    PrivilegeTier(..),
+    SPrivilegeTier(..),
     TenM(..),
     BuildEnv(..),
     BuildState(..),
@@ -30,15 +36,35 @@ module Ten.Core (
     UserId(..),
     AuthToken(..),
 
-    -- Type classes for type-level context mapping
-    GetContextFromType(..),
-    GetPhaseFromType(..),
+    -- Singletons and witnesses
+    withSPhase,
+    withSPrivilegeTier,
+    sDaemon,
+    sBuilder,
+    sEval,
+    sBuild,
+
+    -- Type families for permissions
+    CanAccessStore,
+    CanCreateSandbox,
+    CanDropPrivileges,
+    CanModifyStore,
+    CanAccessDatabase,
+
+    -- Type classes for privilege and phase constraints
+    RequiresDaemon,
+    RequiresBuilder,
+    RequiresPhase,
+    RequiresEval,
+    RequiresBuild,
+    AnyPrivilegeTier,
+    AnyPhase,
 
     -- Return-Continuation types
     PhaseTransition(..),
     transitionPhase,
 
-    -- Privilege context transitions
+    -- Privilege tier transitions
     PrivilegeTransition(..),
     transitionPrivilege,
     withPrivilegeTransition,
@@ -93,16 +119,10 @@ module Ten.Core (
     runTenBuilder,
     runTenIO,
     liftTenIO,
-    liftPrivilegedIO,
-    liftUnprivilegedIO,
+    liftDaemonIO,
+    liftBuilderIO,
     logMsg,
     assertTen,
-
-    -- Type class constraints
-    EvalPhase(..),
-    BuildPhase(..),
-    DaemonContext(..),
-    BuilderContext(..),
 
     -- Build chain handling
     newBuildId,
@@ -124,6 +144,7 @@ module Ten.Core (
     getSystemGroup,
 
     -- GC lock path helpers
+    gcLockPath,
     getGCLockPath,
     ensureLockDirExists,
 
@@ -178,34 +199,64 @@ import System.Posix.Files (setFileMode)
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Char (isHexDigit)
+import Data.Singletons
+import Data.Singletons.TH
+import Data.Kind (Type)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
     deriving (Show, Eq)
 
--- | Privilege context for type-level separation between daemon and builder
-data PrivilegeContext = Privileged | Unprivileged
+-- | Privilege tiers for type-level separation between daemon and builder processes
+data PrivilegeTier = Daemon | Builder
     deriving (Show, Eq)
 
--- | Type class for mapping context types to runtime values
-class GetContextFromType (ctx :: PrivilegeContext) where
-    getContextFromType :: Proxy ctx -> PrivilegeContext
+-- Generate singletons for Phase and PrivilegeTier
+$(genSingletons [''Phase, ''PrivilegeTier])
+$(singDecideInstances [''Phase, ''PrivilegeTier])
 
-instance GetContextFromType 'Privileged where
-    getContextFromType _ = Privileged
+-- | Type families for permission checking
+type family CanAccessStore (t :: PrivilegeTier) :: Bool where
+    CanAccessStore 'Daemon = 'True
+    CanAccessStore 'Builder = 'False
 
-instance GetContextFromType 'Unprivileged where
-    getContextFromType _ = Unprivileged
+type family CanCreateSandbox (t :: PrivilegeTier) :: Bool where
+    CanCreateSandbox 'Daemon = 'True
+    CanCreateSandbox 'Builder = 'False
 
--- | Type class for mapping phase types to runtime values
-class GetPhaseFromType (p :: Phase) where
-    getPhaseFromType :: Proxy p -> Phase
+type family CanDropPrivileges (t :: PrivilegeTier) :: Bool where
+    CanDropPrivileges 'Daemon = 'True
+    CanDropPrivileges 'Builder = 'False
 
-instance GetPhaseFromType 'Eval where
-    getPhaseFromType _ = Eval
+type family CanModifyStore (t :: PrivilegeTier) :: Bool where
+    CanModifyStore 'Daemon = 'True
+    CanModifyStore 'Builder = 'False
 
-instance GetPhaseFromType 'Build where
-    getPhaseFromType _ = Build
+type family CanAccessDatabase (t :: PrivilegeTier) :: Bool where
+    CanAccessDatabase 'Daemon = 'True
+    CanAccessDatabase 'Builder = 'False
+
+-- | Singleton values for convenient use
+sDaemon :: SPrivilegeTier 'Daemon
+sDaemon = SDaemon
+
+sBuilder :: SPrivilegeTier 'Builder
+sBuilder = SBuilder
+
+sEval :: SPhase 'Eval
+sEval = SEval
+
+sBuild :: SPhase 'Build
+sBuild = SBuild
+
+-- | Constraint types for privilege and phase requirements
+type RequiresDaemon t = (t ~ 'Daemon)
+type RequiresBuilder t = (t ~ 'Builder)
+type RequiresPhase p q = (p ~ q)
+type RequiresEval p = RequiresPhase p 'Eval
+type RequiresBuild p = RequiresPhase p 'Build
+type AnyPrivilegeTier t = ()
+type AnyPhase p = ()
 
 -- | Build identifier type
 data BuildId
@@ -258,6 +309,7 @@ data BuildError
     | PhaseError Text                    -- Error with phase transition/operation
     | PrivilegeError Text                -- Error with privilege context violation
     | ProtocolError Text                 -- Error in protocol communication
+    | InternalError Text                 -- Internal implementation error
     deriving (Show, Eq)
 
 instance Exception BuildError
@@ -442,8 +494,8 @@ deriving instance Show (PhaseTransition p q)
 deriving instance Eq (PhaseTransition p q)
 
 -- | Privilege transition type
-data PrivilegeTransition (p :: PrivilegeContext) (q :: PrivilegeContext) where
-    DropPrivilege :: PrivilegeTransition 'Privileged 'Unprivileged
+data PrivilegeTransition (p :: PrivilegeTier) (q :: PrivilegeTier) where
+    DropPrivilege :: PrivilegeTransition 'Daemon 'Builder
     -- No constructor for gaining privilege - can only drop
 
 deriving instance Show (PrivilegeTransition p q)
@@ -548,7 +600,7 @@ data BuildEnv = BuildEnv
     , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
     , maxConcurrentBuilds :: Maybe Int   -- Maximum concurrent builds
     , gcLockPath :: FilePath             -- Path to GC lock file
-    , privilegeContext :: PrivilegeContext -- Current privilege context
+    , currentPrivilegeTier :: PrivilegeTier  -- Current privilege tier (Daemon/Builder)
     } deriving (Show, Eq)
 
 -- | State carried through build operations
@@ -563,21 +615,58 @@ data BuildState = BuildState
     } deriving (Show)
 
 -- | The core monad for all Ten operations
-newtype TenM (p :: Phase) (ctx :: PrivilegeContext) a = TenM
-    { runTenM :: ReaderT BuildEnv (StateT BuildState (ExceptT BuildError IO)) a }
-    deriving
-        ( Functor
-        , Applicative
-        , Monad
-        , MonadReader BuildEnv
-        , MonadState BuildState
-        , MonadError BuildError
-        , MonadIO
-        )
+-- Now parameterized by phase and privilege tier with singleton evidence passing
+newtype TenM (p :: Phase) (t :: PrivilegeTier) a = TenM
+    { runTenM :: SPhase p -> SPrivilegeTier t -> ReaderT BuildEnv (StateT BuildState (ExceptT BuildError IO)) a }
 
--- Add MonadFail instance for TenM - critical for pattern matching in do-notation
-instance MonadFail (TenM p ctx) where
+-- Standard instances for TenM
+instance Functor (TenM p t) where
+    fmap f (TenM g) = TenM $ \sp st -> fmap f (g sp st)
+
+instance Applicative (TenM p t) where
+    pure x = TenM $ \_ _ -> pure x
+    (TenM f) <*> (TenM g) = TenM $ \sp st -> f sp st <*> g sp st
+
+instance Monad (TenM p t) where
+    (TenM m) >>= f = TenM $ \sp st -> do
+        a <- m sp st
+        let (TenM m') = f a
+        m' sp st
+
+-- MonadError instance allows throwError and catchError
+instance MonadError BuildError (TenM p t) where
+    throwError e = TenM $ \_ _ -> throwError e
+    catchError (TenM m) h = TenM $ \sp st ->
+        catchError (m sp st) (\e -> let (TenM m') = h e in m' sp st)
+
+-- MonadReader instance allows ask and local
+instance MonadReader BuildEnv (TenM p t) where
+    ask = TenM $ \_ _ -> ask
+    local f (TenM m) = TenM $ \sp st -> local f (m sp st)
+
+-- MonadState instance allows get and put
+instance MonadState BuildState (TenM p t) where
+    get = TenM $ \_ _ -> get
+    put s = TenM $ \_ _ -> put s
+
+-- MonadIO instance allows liftIO
+instance MonadIO (TenM p t) where
+    liftIO m = TenM $ \_ _ -> liftIO m
+
+-- MonadFail instance for pattern matching in do-notation
+instance MonadFail (TenM p t) where
     fail msg = throwError $ BuildFailed $ T.pack msg
+
+-- | Helper functions to work with singletons
+withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a
+withSPhase sp f = TenM $ \_ st -> do
+    let (TenM g) = f sp
+    g sp st
+
+withSPrivilegeTier :: SPrivilegeTier t -> (forall u. SPrivilegeTier u -> TenM p u a) -> TenM p t a
+withSPrivilegeTier st f = TenM $ \sp _ -> do
+    let (TenM g) = f st
+    g sp st
 
 -- | Get the default path for the Ten database
 defaultDBPath :: FilePath -> FilePath
@@ -603,14 +692,14 @@ initBuildEnv wd sp = BuildEnv
     , maxRecursionDepth = 100
     , maxConcurrentBuilds = Nothing
     , gcLockPath = sp </> "var/ten/gc.lock"
-    , privilegeContext = Unprivileged  -- Default to unprivileged for safety
+    , currentPrivilegeTier = Builder  -- Default to Builder for safety
     }
 
 -- | Initialize client build environment
 initClientEnv :: FilePath -> FilePath -> DaemonConnection -> BuildEnv
 initClientEnv wd sp conn = (initBuildEnv wd sp)
     { runMode = ClientMode conn
-    , privilegeContext = Unprivileged  -- Clients are always unprivileged
+    , currentPrivilegeTier = Builder  -- Clients are always Builder privilege tier
     }
 
 -- | Initialize daemon build environment
@@ -618,7 +707,7 @@ initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
 initDaemonEnv wd sp user = (initBuildEnv wd sp)
     { runMode = DaemonMode
     , userName = user
-    , privilegeContext = Privileged  -- Daemon runs in privileged context
+    , currentPrivilegeTier = Daemon  -- Daemon runs in Daemon privilege tier
     }
 
 -- | Initialize build state for a given phase with a BuildId
@@ -633,90 +722,92 @@ initBuildState phase bid = BuildState
     , recursionDepth = 0
     }
 
--- | Execute a Ten monad in the given environment and state
-runTen :: forall p ctx a. GetContextFromType ctx
-       => TenM p ctx a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
-runTen m env state = do
-    -- Validate privilege context matches
-    if privilegeContext env == getContextFromType (Proxy :: Proxy ctx)
-        then runExceptT $ runStateT (runReaderT (runTenM m) env) state
-        else return $ Left $ PrivilegeError "Privilege context mismatch"
+-- | Execute a Ten monad with explicit singleton evidence
+runTen :: SPhase p -> SPrivilegeTier t -> TenM p t a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTen sp st (TenM m) env state = do
+    -- Validate privilege tier matches environment
+    if currentPrivilegeTier env == fromSing st
+        then runExceptT $ runStateT (runReaderT (m sp st) env) state
+        else return $ Left $ PrivilegeError "Privilege tier mismatch"
 
--- | Execute an evaluation-phase computation in privileged mode
-evalTen :: TenM 'Eval 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+-- | Execute an evaluation-phase computation in daemon mode
+evalTen :: TenM 'Eval 'Daemon a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 evalTen m env = do
-    -- Ensure environment is privileged
-    let env' = env { privilegeContext = Privileged }
+    -- Ensure environment is daemon tier
+    let env' = env { currentPrivilegeTier = Daemon }
     bid <- BuildId <$> newUnique
-    runTen m env' (initBuildState Eval bid)
+    runTen sEval sDaemon m env' (initBuildState Eval bid)
 
--- | Execute a build-phase computation in unprivileged mode
-buildTen :: TenM 'Build 'Unprivileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+-- | Execute a build-phase computation in builder mode
+buildTen :: TenM 'Build 'Builder a -> BuildEnv -> IO (Either BuildError (a, BuildState))
 buildTen m env = do
-    -- Ensure environment is unprivileged
-    let env' = env { privilegeContext = Unprivileged }
+    -- Ensure environment is builder tier
+    let env' = env { currentPrivilegeTier = Builder }
     bid <- BuildId <$> newUnique
-    runTen m env' (initBuildState Build bid)
+    runTen sBuild sBuilder m env' (initBuildState Build bid)
 
 -- | Execute a daemon operation (privileged)
-runTenDaemon :: forall p a. GetPhaseFromType p
-             => TenM p 'Privileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
-runTenDaemon m env = do
+runTenDaemon :: TenM p 'Daemon a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTenDaemon m env state = do
     -- Verify we're in daemon mode
     case runMode env of
         DaemonMode -> do
-            -- Set privileged context
-            let env' = env { privilegeContext = Privileged }
-            bid <- BuildId <$> newUnique
-            runTen m env' (initBuildState (getPhaseFromType (Proxy :: Proxy p)) bid)
+            -- Set daemon privilege tier
+            let env' = env { currentPrivilegeTier = Daemon }
+            let sp = case currentPhase state of
+                    Eval -> sEval
+                    Build -> sBuild
+            runTen sp sDaemon m env' state
         _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
 
 -- | Execute a builder operation (unprivileged)
-runTenBuilder :: forall p a. GetPhaseFromType p
-              => TenM p 'Unprivileged a -> BuildEnv -> IO (Either BuildError (a, BuildState))
-runTenBuilder m env = do
-    -- Set unprivileged context
-    let env' = env { privilegeContext = Unprivileged }
-    bid <- BuildId <$> newUnique
-    runTen m env' (initBuildState (getPhaseFromType (Proxy :: Proxy p)) bid)
+runTenBuilder :: TenM p 'Builder a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTenBuilder m env state = do
+    -- Set builder privilege tier
+    let env' = env { currentPrivilegeTier = Builder }
+    let sp = case currentPhase state of
+            Eval -> sEval
+            Build -> sBuild
+    runTen sp sBuilder m env' state
 
 -- | Run an IO operation within the TenM monad
-runTenIO :: IO a -> TenM p ctx a
-runTenIO = liftIO
+runTenIO :: IO a -> TenM p t a
+runTenIO act = TenM $ \_ _ -> liftIO act
 
 -- | Lift an IO action that returns (Either BuildError a) into TenM
-liftTenIO :: IO (Either BuildError a) -> TenM p ctx a
-liftTenIO action = do
+liftTenIO :: IO (Either BuildError a) -> TenM p t a
+liftTenIO action = TenM $ \_ _ -> do
     result <- liftIO action
     case result of
         Left err -> throwError err
         Right val -> return val
 
--- | Lift an IO action into the privileged context
--- This will fail at runtime if executed in an unprivileged context
-liftPrivilegedIO :: IO a -> TenM p 'Privileged a
-liftPrivilegedIO = liftIO
+-- | Lift an IO action into the daemon context
+-- This will fail at runtime if executed in a builder context
+liftDaemonIO :: IO a -> TenM p 'Daemon a
+liftDaemonIO = liftIO
 
--- | Lift an IO action into the unprivileged context
+-- | Lift an IO action into the builder context
 -- This is safer since it works in both contexts
-liftUnprivilegedIO :: IO a -> TenM p ctx a
-liftUnprivilegedIO action = do
-    ctx <- asks privilegeContext
-    case ctx of
-        Privileged -> liftIO action
-        Unprivileged -> liftIO action
+liftBuilderIO :: IO a -> TenM p t a
+liftBuilderIO action = TenM $ \_ st -> do
+    env <- ask
+    case (fromSing st, currentPrivilegeTier env) of
+        (Builder, _) -> liftIO action  -- Always allowed for Builder
+        (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
+        _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
 
 -- | Safely transition between phases
-transitionPhase :: forall p q ctx a. GetContextFromType ctx
-                => PhaseTransition p q -> TenM p ctx a -> TenM q ctx a
-transitionPhase trans action = TenM $ do
+transitionPhase :: PhaseTransition p q -> TenM p t a -> TenM q t a
+transitionPhase trans action = TenM $ \spTo st -> do
     env <- ask
     state <- get
 
     case trans of
         EvalToBuild -> do
             -- Run action in eval phase with original state
-            result <- liftIO $ runTen action env state
+            let spFrom = sEval
+            result <- liftIO $ runTen spFrom st action env state
             case result of
                 Left err -> throwError err
                 Right (val, newState) -> do
@@ -726,7 +817,8 @@ transitionPhase trans action = TenM $ do
 
         BuildToEval -> do
             -- Run action in build phase with original state
-            result <- liftIO $ runTen action env state
+            let spFrom = sBuild
+            result <- liftIO $ runTen spFrom st action env state
             case result of
                 Left err -> throwError err
                 Right (val, newState) -> do
@@ -734,18 +826,19 @@ transitionPhase trans action = TenM $ do
                     put newState { currentPhase = Eval }
                     return val
 
--- | Safely transition between privilege contexts
+-- | Safely transition between privilege tiers
 -- Only allows dropping privileges, never gaining them
-transitionPrivilege :: PrivilegeTransition ctx ctx' -> TenM p ctx a -> TenM p ctx' a
-transitionPrivilege trans action = TenM $ do
+transitionPrivilege :: PrivilegeTransition t u -> TenM p t a -> TenM p u a
+transitionPrivilege trans action = TenM $ \sp stTo -> do
     env <- ask
     state <- get
 
     case trans of
         DropPrivilege -> do
-            -- Run action in privileged context with original state
-            let env' = env { privilegeContext = Unprivileged }
-            result <- liftIO $ runTen action env state
+            -- Run action in daemon context with original state
+            let stFrom = sDaemon
+            let env' = env { currentPrivilegeTier = Daemon }
+            result <- liftIO $ runTen sp stFrom action env' state
             case result of
                 Left err -> throwError err
                 Right (val, newState) -> do
@@ -754,19 +847,19 @@ transitionPrivilege trans action = TenM $ do
                     return val
 
 -- | Execute an action with a privilege transition
-withPrivilegeTransition :: PrivilegeTransition ctx ctx' -> (TenM p ctx' a -> TenM p ctx' a) -> TenM p ctx a -> TenM p ctx' a
+withPrivilegeTransition :: PrivilegeTransition t u -> (TenM p u a -> TenM p u a) -> TenM p t a -> TenM p u a
 withPrivilegeTransition trans wrapper action = wrapper (transitionPrivilege trans action)
 
 -- | Generate a new unique build ID
-newBuildId :: TenM p ctx BuildId
+newBuildId :: TenM p t BuildId
 newBuildId = liftIO $ BuildId <$> newUnique
 
 -- | Set the current build ID
-setCurrentBuildId :: BuildId -> TenM p ctx ()
+setCurrentBuildId :: BuildId -> TenM p t ()
 setCurrentBuildId bid = modify $ \s -> s { currentBuildId = bid }
 
 -- | Add a derivation to the build chain
-addToDerivationChain :: Derivation -> TenM p ctx ()
+addToDerivationChain :: Derivation -> TenM p t ()
 addToDerivationChain drv = do
     depth <- gets recursionDepth
     maxDepth <- asks maxRecursionDepth
@@ -775,19 +868,19 @@ addToDerivationChain drv = do
     modify $ \s -> s { buildChain = drv : buildChain s, recursionDepth = depth + 1 }
 
 -- | Check if a derivation is in the build chain (cycle detection)
-isInDerivationChain :: Derivation -> TenM p ctx Bool
+isInDerivationChain :: Derivation -> TenM p t Bool
 isInDerivationChain drv = do
     chain <- gets buildChain
     return $ any (derivationEquals drv) chain
 
 -- | Logging function
-logMsg :: Int -> Text -> TenM p ctx ()
+logMsg :: Int -> Text -> TenM p t ()
 logMsg level msg = do
     v <- asks verbosity
     when (v >= level) $ liftIO $ putStrLn $ T.unpack msg
 
 -- | Record a proof in the build state
-addProof :: Proof p -> TenM ph ctx ()
+addProof :: Proof p -> TenM ph t ()
 addProof proof = case proof of
     p@BuildProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
     p@OutputProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
@@ -801,65 +894,15 @@ addProof proof = case proof of
     _ -> return () -- Other proofs don't affect build state
 
 -- | Assert that a condition holds, or throw an error
-assertTen :: Bool -> BuildError -> TenM p ctx ()
+assertTen :: Bool -> BuildError -> TenM p t ()
 assertTen condition err = unless condition $ throwError err
 
--- | Operations only allowed in evaluation phase
-class EvalPhase (p :: Phase) (ctx :: PrivilegeContext) where
-    evalOnly :: TenM 'Eval ctx a -> TenM p ctx a
-
--- Only actual evaluation phase can run evaluation operations
-instance EvalPhase 'Eval ctx where
-    evalOnly = id
-
--- | Operations only allowed in build phase
-class BuildPhase (p :: Phase) (ctx :: PrivilegeContext) where
-    buildOnly :: TenM 'Build ctx a -> TenM p ctx a
-
--- Only actual build phase can run build operations
-instance BuildPhase 'Build ctx where
-    buildOnly = id
-
--- | Operations only allowed in daemon context
-class DaemonContext (ctx :: PrivilegeContext) where
-    daemonOnly :: TenM p 'Privileged a -> TenM p ctx a
-
--- Only daemon context can run privileged operations
-instance DaemonContext 'Privileged where
-    daemonOnly = id
-
--- | Operations only allowed in builder context
-class BuilderContext (ctx :: PrivilegeContext) where
-    builderOnly :: TenM p 'Unprivileged a -> TenM p ctx a
-
--- Both contexts can run unprivileged operations, but differently
-instance BuilderContext 'Unprivileged where
-    builderOnly = id
-
-instance BuilderContext 'Privileged where
-    builderOnly action = TenM $ do
-        env <- ask
-        state <- get
-
-        -- Create environment with dropped privileges
-        let env' = env { privilegeContext = Unprivileged }
-
-        -- Run the unprivileged action in that environment
-        result <- liftIO $ runTen action env' state
-
-        -- Bring the result back to the privileged context
-        case result of
-            Left err -> throwError err
-            Right (val, newState) -> do
-                put newState
-                return val
-
 -- | Run an STM transaction from Ten monad
-atomicallyTen :: STM a -> TenM p ctx a
+atomicallyTen :: STM a -> TenM p t a
 atomicallyTen = liftIO . atomically
 
 -- | Execute a build operation using the daemon (if in client mode)
-withDaemon :: (DaemonConnection -> IO (Either BuildError a)) -> TenM p ctx a
+withDaemon :: (DaemonConnection -> IO (Either BuildError a)) -> TenM p t a
 withDaemon f = do
     mode <- asks runMode
     case mode of
@@ -871,11 +914,11 @@ withDaemon f = do
         _ -> throwError $ DaemonError "Operation requires daemon connection"
 
 -- | Check if running in daemon mode
-isDaemonMode :: TenM p ctx Bool
+isDaemonMode :: TenM p t Bool
 isDaemonMode = (== DaemonMode) <$> asks runMode
 
 -- | Check if connected to daemon
-isClientMode :: TenM p ctx Bool
+isClientMode :: TenM p t Bool
 isClientMode = do
     mode <- asks runMode
     case mode of
@@ -883,7 +926,7 @@ isClientMode = do
         _ -> return False
 
 -- | Linux-specific: Drop privileges to a specified user and group
-dropPrivileges :: Text -> Text -> TenM p 'Privileged ()
+dropPrivileges :: Text -> Text -> TenM p 'Daemon ()
 dropPrivileges user group = liftIO $ do
     -- Get the current (effective) user ID
     euid <- getEffectiveUserID
@@ -901,20 +944,24 @@ dropPrivileges user group = liftIO $ do
         setUserID (userID userEntry)
 
 -- | Linux-specific: Get a system user ID
-getSystemUser :: Text -> TenM p 'Privileged UserID
+getSystemUser :: Text -> TenM p 'Daemon UserID
 getSystemUser username = liftIO $ do
     userEntry <- getUserEntryForName (T.unpack username)
     return $ userID userEntry
 
 -- | Linux-specific: Get a system group ID
-getSystemGroup :: Text -> TenM p 'Privileged GroupID
+getSystemGroup :: Text -> TenM p 'Daemon GroupID
 getSystemGroup groupname = liftIO $ do
     groupEntry <- getGroupEntryForName (T.unpack groupname)
     return $ groupID groupEntry
 
+-- | Get the GC lock path for a store directory
+gcLockPath :: FilePath -> FilePath
+gcLockPath storeDir = storeDir </> "var/ten/gc.lock"
+
 -- | Get the GC lock path from the BuildEnv
 getGCLockPath :: BuildEnv -> FilePath
-getGCLockPath = gcLockPath
+getGCLockPath = gcLockPath . storeLocation
 
 -- | Ensure the directory for a lock file exists
 ensureLockDirExists :: FilePath -> IO ()

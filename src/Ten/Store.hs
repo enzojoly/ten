@@ -5,6 +5,9 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ConstraintKinds #-}
 
 module Ten.Store
     ( -- Store path types
@@ -33,13 +36,13 @@ module Ten.Store
     , verifyStorePath
     , listStorePaths
 
-    -- Privileged store operations (daemon only)
+    -- Daemon-only store operations
     , addToStore
     , storeFile
     , storeDirectory
     , removeFromStore
 
-    -- Store reading (available to both contexts)
+    -- Store reading (available to both tiers)
     , readFromStore
     , readPathFromStore
 
@@ -47,14 +50,13 @@ module Ten.Store
     , StoreRequest(..)
     , StoreResponse(..)
 
-    -- Protocol operations (for unprivileged builders)
+    -- Protocol operations (for builder tier)
     , requestAddToStore
     , requestReadFromStore
     , requestVerifyPath
 
     -- Garbage collection support
     , collectGarbage
-    , gcLockPath
     , isGCRoot
     , collectGarbageCandidate
     , findPathReferences
@@ -104,6 +106,8 @@ import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Encode.Pretty as Aeson
+import Data.Singletons
+import Data.Singletons.TH
 
 import Ten.Core
 
@@ -127,10 +131,11 @@ data StoreResponse
     deriving (Show, Eq)
 
 -- | Initialize the content-addressable store
-initializeStore :: FilePath -> TenM p 'Privileged ()
-initializeStore storeDir = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "initializeStore"
+-- Requires daemon privileges
+initializeStore :: RequiresDaemon t => TenM p t ()
+initializeStore = do
+    env <- ask
+    let storeDir = storeLocation env
 
     -- Create the basic store structure
     liftIO $ createDirectoryIfMissing True storeDir
@@ -138,7 +143,7 @@ initializeStore storeDir = do
     liftIO $ createDirectoryIfMissing True (storeDir </> "var/ten")
 
     -- Create lock directory for GC
-    liftIO $ createDirectoryIfMissing True (takeDirectory $ gcLockPath storeDir)
+    liftIO $ createDirectoryIfMissing True (takeDirectory $ getGCLockPath env)
 
     -- Set appropriate permissions
     -- Store root: read-execute for all, write for owner only
@@ -151,11 +156,9 @@ initializeStore storeDir = do
     verifyStore storeDir
 
 -- | Create store directories with proper permissions
-createStoreDirectories :: FilePath -> TenM p 'Privileged ()
+-- Requires daemon privileges
+createStoreDirectories :: RequiresDaemon t => FilePath -> TenM p t ()
 createStoreDirectories storeDir = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "createStoreDirectories"
-
     -- Core directories needed for store operation
     let coreDirs = [
             storeDir,
@@ -172,15 +175,14 @@ createStoreDirectories storeDir = do
         setFileMode dir 0o755
 
 -- | Ensure all store directories exist
-ensureStoreDirectories :: FilePath -> TenM p 'Privileged ()
+-- Requires daemon privileges
+ensureStoreDirectories :: RequiresDaemon t => FilePath -> TenM p t ()
 ensureStoreDirectories = createStoreDirectories
 
 -- | Verify the store structure and permissions
-verifyStore :: FilePath -> TenM p 'Privileged ()
+-- Requires daemon privileges
+verifyStore :: RequiresDaemon t => FilePath -> TenM p t ()
 verifyStore storeDir = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "verifyStore"
-
     -- Check if store directory exists
     storeExists <- liftIO $ doesDirectoryExist storeDir
     unless storeExists $
@@ -194,17 +196,10 @@ verifyStore storeDir = do
     -- Log successful verification
     logMsg 1 $ "Store verified: " <> T.pack storeDir
 
--- | Path to the GC lock file
-gcLockPath :: FilePath -> FilePath
-gcLockPath storeDir = storeDir </> "var/ten/gc.lock"
-
 -- | Add content to the store with a name hint
--- This is a privileged operation only available in daemon context
-addToStore :: Text -> ByteString -> TenM p 'Privileged StorePath
+-- This is a daemon-only operation
+addToStore :: RequiresDaemon t => Text -> ByteString -> TenM p t StorePath
 addToStore nameHint content = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "addToStore"
-
     env <- ask
     let storeDir = storeLocation env
 
@@ -251,12 +246,9 @@ addToStore nameHint content = do
             return path
 
 -- | Store a file in the content-addressable store
--- This is a privileged operation only available in daemon context
-storeFile :: FilePath -> TenM p 'Privileged StorePath
+-- This is a daemon-only operation
+storeFile :: RequiresDaemon t => FilePath -> TenM p t StorePath
 storeFile filePath = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "storeFile"
-
     -- Check if file exists
     exists <- liftIO $ doesFileExist filePath
     unless exists $
@@ -272,12 +264,9 @@ storeFile filePath = do
     addToStore nameHint content
 
 -- | Store a directory in the content-addressable store (as a tarball)
--- This is a privileged operation only available in daemon context
-storeDirectory :: FilePath -> TenM p 'Privileged StorePath
+-- This is a daemon-only operation
+storeDirectory :: RequiresDaemon t => FilePath -> TenM p t StorePath
 storeDirectory dirPath = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "storeDirectory"
-
     -- Check if directory exists
     exists <- liftIO $ doesDirectoryExist dirPath
     unless exists $
@@ -312,16 +301,16 @@ storeDirectory dirPath = do
             throwError $ StoreError $ "Failed to create tarball: " <> T.pack stderr
 
 -- | Check if a path exists in the store
--- Available in both privileged and unprivileged contexts
-storePathExists :: StorePath -> TenM p ctx Bool
+-- Available in both daemon and builder tiers
+storePathExists :: StorePath -> TenM p t Bool
 storePathExists path = do
     env <- ask
     let filePath = storePathToFilePath path env
     liftIO $ doesFileExist filePath
 
 -- | Verify that a store path exists and has the correct content hash
--- Available in both privileged and unprivileged contexts
-verifyStorePath :: StorePath -> TenM p ctx Bool
+-- Available in both daemon and builder tiers
+verifyStorePath :: StorePath -> TenM p t Bool
 verifyStorePath path = do
     -- First check if the path exists
     exists <- storePathExists path
@@ -336,14 +325,12 @@ verifyStorePath path = do
             let contentHash = hashByteString content
 
             -- Compare with the expected hash from the path
-            return $ contentHash == storeHash path
+            return $ T.pack (show contentHash) == storeHash path
 
 -- | List all paths in the store
-listStorePaths :: TenM p 'Privileged [StorePath]
+-- This is a daemon-only operation
+listStorePaths :: RequiresDaemon t => TenM p t [StorePath]
 listStorePaths = do
-    -- This is a privileged operation
-    ensurePrivilegedContext "listStorePaths"
-
     -- Get store directory
     env <- ask
     let storeDir = storeLocation env
@@ -359,12 +346,10 @@ listStorePaths = do
             -- Filter and parse valid store paths
             return $ catMaybes $ map (parseStorePath . T.pack) entries
 
--- | Remove a path from the store (privileged operation)
-removeFromStore :: StorePath -> TenM p 'Privileged ()
+-- | Remove a path from the store
+-- This is a daemon-only operation
+removeFromStore :: RequiresDaemon t => StorePath -> TenM p t ()
 removeFromStore path = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "removeFromStore"
-
     env <- ask
     let filePath = storePathToFilePath path env
 
@@ -385,8 +370,8 @@ removeFromStore path = do
     unregisterValidPath path
 
 -- | Read content from a store path
--- Available in both privileged and unprivileged contexts, but with validation
-readFromStore :: StorePath -> TenM p ctx ByteString
+-- Available in both daemon and builder tiers
+readFromStore :: StorePath -> TenM p t ByteString
 readFromStore path = do
     -- Validate the path format to prevent attacks
     unless (validateStorePath path) $
@@ -405,8 +390,8 @@ readFromStore path = do
     liftIO $ BS.readFile filePath
 
 -- | Read a file path from the store, making sure it's within the store boundaries
--- Available in both privileged and unprivileged contexts, but with validation
-readPathFromStore :: FilePath -> TenM p ctx ByteString
+-- Available in both daemon and builder tiers
+readPathFromStore :: FilePath -> TenM p t ByteString
 readPathFromStore filePath = do
     -- Convert to store path for validation
     env <- ask
@@ -426,7 +411,8 @@ isStoreSubPath storeDir path =
     in normalStore `isPrefixOf` normalPath
 
 -- | Check if a path is a GC root
-isGCRoot :: StorePath -> TenM p 'Privileged Bool
+-- This is a daemon-only operation
+isGCRoot :: RequiresDaemon t => StorePath -> TenM p t Bool
 isGCRoot path = do
     env <- ask
     let storeDir = storeLocation env
@@ -448,7 +434,8 @@ isGCRoot path = do
         ) False roots
 
 -- | Collect garbage candidate check
-collectGarbageCandidate :: StorePath -> TenM p 'Privileged Bool
+-- This is a daemon-only operation
+collectGarbageCandidate :: RequiresDaemon t => StorePath -> TenM p t Bool
 collectGarbageCandidate path = do
     -- Check if path is a GC root
     isRoot <- isGCRoot path
@@ -459,12 +446,10 @@ collectGarbageCandidate path = do
             refs <- getReferencesToPath path
             return $ Set.null refs
 
--- | Garbage collection (implementation would go here)
-collectGarbage :: TenM p 'Privileged ()
+-- | Garbage collection
+-- This is a daemon-only operation
+collectGarbage :: RequiresDaemon t => TenM p t ()
 collectGarbage = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "collectGarbage"
-
     -- Implementation would go here
     logMsg 1 "Starting garbage collection..."
 
@@ -477,7 +462,8 @@ collectGarbage = do
     logMsg 1 "Garbage collection completed"
 
 -- | Find all references in a path
-findPathReferences :: StorePath -> TenM p 'Privileged (Set StorePath)
+-- This is a daemon-only operation
+findPathReferences :: RequiresDaemon t => StorePath -> TenM p t (Set StorePath)
 findPathReferences path = do
     env <- ask
     let filePath = storePathToFilePath path env
@@ -494,7 +480,8 @@ findPathReferences path = do
             scanForReferences content
 
 -- | Scan content for references to other store paths
-scanForReferences :: ByteString -> TenM p 'Privileged (Set StorePath)
+-- This is a daemon-only operation
+scanForReferences :: RequiresDaemon t => ByteString -> TenM p t (Set StorePath)
 scanForReferences content = do
     env <- ask
     let storeDir = storeLocation env
@@ -545,12 +532,9 @@ findStorePaths content storeDir =
             parseStorePath text
 
 -- | Register a valid path in the database
--- This is a privileged operation only available in daemon context
-registerValidPath :: StorePath -> Maybe StorePath -> TenM p 'Privileged ()
+-- This is a daemon-only operation
+registerValidPath :: RequiresDaemon t => StorePath -> Maybe StorePath -> TenM p t ()
 registerValidPath path mDeriver = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "registerValidPath"
-
     -- In a real implementation, this would register the path in a database
     -- For now, we'll just ensure the path exists
     env <- ask
@@ -560,31 +544,32 @@ registerValidPath path mDeriver = do
         throwError $ StoreError $ "Cannot register non-existent path: " <> storePathToText path
 
 -- | Unregister a path
-unregisterValidPath :: StorePath -> TenM p 'Privileged ()
+-- This is a daemon-only operation
+unregisterValidPath :: RequiresDaemon t => StorePath -> TenM p t ()
 unregisterValidPath _ = do
-    -- Verify we're running in privileged context
-    ensurePrivilegedContext "unregisterValidPath"
-
     -- In a full implementation, this would unregister from a database
     return ()
 
 -- | Get references to a path (what refers to this path)
-getReferencesToPath :: StorePath -> TenM p ctx (Set StorePath)
+-- Available in both daemon and builder tiers
+getReferencesToPath :: StorePath -> TenM p t (Set StorePath)
 getReferencesToPath _ = do
     -- In a full implementation, this would query a reference database
     -- For now, we return empty set
     return Set.empty
 
 -- | Get references from a path (what this path refers to)
-getReferencesFromPath :: StorePath -> TenM p ctx (Set StorePath)
+-- Available in both daemon and builder tiers with different implementations
+getReferencesFromPath :: StorePath -> TenM p t (Set StorePath)
 getReferencesFromPath path = do
-    ctx <- asks privilegeContext
-    case ctx of
-        Privileged -> findPathReferences path
-        Unprivileged -> return Set.empty  -- Unprivileged can't scan
+    env <- ask
+    case currentPrivilegeTier env of
+        Daemon -> findPathReferences path
+        Builder -> return Set.empty  -- Builder tier can't scan
 
 -- | Find store paths with a specific prefix
-findPathsWithPrefix :: Text -> TenM p 'Privileged [StorePath]
+-- This is a daemon-only operation
+findPathsWithPrefix :: RequiresDaemon t => Text -> TenM p t [StorePath]
 findPathsWithPrefix prefix = do
     -- List all store paths
     allPaths <- listStorePaths
@@ -593,24 +578,27 @@ findPathsWithPrefix prefix = do
     return $ filter (\path -> prefix `T.isPrefixOf` storeName path) allPaths
 
 -- | Get all store paths
-getStorePaths :: TenM p 'Privileged [StorePath]
+-- This is a daemon-only operation
+getStorePaths :: RequiresDaemon t => TenM p t [StorePath]
 getStorePaths = listStorePaths
 
 -- | Calculate hash for a file path
-hashPath :: FilePath -> TenM p ctx Text
+-- Available in both daemon and builder tiers
+hashPath :: FilePath -> TenM p t Text
 hashPath path = do
     -- Read file content
     content <- liftIO $ BS.readFile path
     -- Calculate hash
-    return $ hashByteString content
+    return $ T.pack $ show $ hashByteString content
 
 -- | Get the hash part of a store path
+-- Available in both daemon and builder tiers
 getPathHash :: StorePath -> Text
 getPathHash = storeHash
 
 -- | Request to add content to the store via daemon protocol
--- For use in unprivileged builder context
-requestAddToStore :: Text -> ByteString -> TenM p 'Unprivileged StorePath
+-- For use in builder tier
+requestAddToStore :: RequiresBuilder t => Text -> ByteString -> TenM p t StorePath
 requestAddToStore nameHint content = do
     -- Create store add request
     let request = StoreAddRequest nameHint content
@@ -625,11 +613,11 @@ requestAddToStore nameHint content = do
         _ -> throwError $ ProtocolError "Unexpected response from daemon"
 
 -- | Request to read from the store via daemon protocol
--- For use in unprivileged builder context when direct read is not possible
-requestReadFromStore :: StorePath -> TenM p 'Unprivileged ByteString
+-- For use in builder tier when direct read is not possible
+requestReadFromStore :: RequiresBuilder t => StorePath -> TenM p t ByteString
 requestReadFromStore path = do
     -- First try direct read - this works if the file is readable
-    -- by the unprivileged user
+    -- by the builder tier
     env <- ask
     let filePath = storePathToFilePath path env
     fileExists <- liftIO $ doesFileExist filePath
@@ -645,7 +633,8 @@ requestReadFromStore path = do
                 _ -> throwError $ ProtocolError "Unexpected response from daemon"
 
 -- | Request to verify a path via daemon protocol
-requestVerifyPath :: StorePath -> TenM p 'Unprivileged Bool
+-- For use in builder tier
+requestVerifyPath :: RequiresBuilder t => StorePath -> TenM p t Bool
 requestVerifyPath path = do
     -- Create verify request
     let request = StoreVerifyRequest path
@@ -660,8 +649,8 @@ requestVerifyPath path = do
         _ -> throwError $ ProtocolError "Unexpected response from daemon"
 
 -- | Scan a file for references to store paths
--- Available in both privileged and unprivileged contexts
-scanFileForStoreReferences :: FilePath -> TenM p ctx (Set StorePath)
+-- Available in both daemon and builder tiers
+scanFileForStoreReferences :: FilePath -> TenM p t (Set StorePath)
 scanFileForStoreReferences filePath = do
     -- Check if file exists
     exists <- liftIO $ doesFileExist filePath
@@ -723,10 +712,8 @@ isPrintable :: Char -> Bool
 isPrintable c = c >= ' ' && c <= '~'
 
 -- | Calculate hash of ByteString content
-hashByteString :: ByteString -> Text
-hashByteString content =
-    let digest = hash content :: Digest SHA256
-    in T.pack $ show digest
+hashByteString :: ByteString -> Digest SHA256
+hashByteString = Crypto.hash
 
 -- | Sanitize a name for use in store paths
 sanitizeName :: Text -> Text
@@ -745,13 +732,9 @@ sanitizeName name =
                    (c >= 'A' && c <= 'Z') ||
                    (c >= '0' && c <= '9')
 
--- Helper to ensure a function is being called from privileged context
-ensurePrivilegedContext :: Text -> TenM p 'Privileged ()
-ensurePrivilegedContext _ = return ()
-
 -- | Send a store request to the daemon and get the response
 -- Helper for protocol-based store operations
-sendStoreDaemonRequest :: StoreRequest -> TenM p 'Unprivileged StoreResponse
+sendStoreDaemonRequest :: RequiresBuilder t => StoreRequest -> TenM p t StoreResponse
 sendStoreDaemonRequest request = do
     -- In a real implementation, this would use the daemon connection
     -- to send the request and receive a response.
@@ -763,7 +746,7 @@ sendStoreDaemonRequest request = do
         StoreAddRequest name content ->
             -- Simulate adding to store
             return $ StoreAddResponse $ StorePath
-                (hashByteString content)
+                (T.pack $ show $ hashByteString content)
                 (sanitizeName name)
 
         StoreReadRequest path ->
@@ -791,5 +774,5 @@ sendStoreDaemonRequest request = do
         StoreDerivationRequest content ->
             -- Simulate storing a derivation
             return $ StoreDerivationResponse $ StorePath
-                (hashByteString content)
+                (T.pack $ show $ hashByteString content)
                 "derivation.drv"
