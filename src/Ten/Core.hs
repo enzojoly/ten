@@ -109,14 +109,17 @@ module Ten.Core (
     initBuildEnv,
     initClientEnv,
     initDaemonEnv,
-    initBuildState,
+    initBuildState_Eval,
+    initBuildState_Build,
 
     -- Monad operations
     runTen,
     evalTen,
     buildTen,
-    runTenDaemon,
-    runTenBuilder,
+    runTenDaemon_Eval,
+    runTenDaemon_Build,
+    runTenBuilder_Eval,
+    runTenBuilder_Build,
     runTenIO,
     liftTenIO,
     liftDaemonIO,
@@ -310,6 +313,7 @@ data BuildError
     | PrivilegeError Text                -- Error with privilege context violation
     | ProtocolError Text                 -- Error in protocol communication
     | InternalError Text                 -- Internal implementation error
+    | ConfigError Text                   -- Configuration error
     deriving (Show, Eq)
 
 instance Exception BuildError
@@ -347,23 +351,6 @@ parseStorePathText = parseStorePath
 validateStorePath :: StorePath -> Bool
 validateStorePath (StorePath hash name) =
     T.length hash >= 8 && T.all isHexDigit hash && not (T.null name)
-
--- | Convert StorePath to a filesystem path (relative to store root)
-storePathToFilePath :: StorePath -> BuildEnv -> FilePath
-storePathToFilePath path env =
-    storeLocation env </> T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
-
--- | Try to parse a StorePath from a filesystem path
-filePathToStorePath :: FilePath -> Maybe StorePath
-filePathToStorePath path =
-    case break (== '-') (takeFileName path) of
-        (hashPart, '-':namePart) ->
-            Just $ StorePath (T.pack hashPart) (T.pack namePart)
-        _ -> Nothing
-
--- | Create a store path from hash and name components
-makeStorePath :: Text -> Text -> StorePath
-makeStorePath hash name = StorePath hash name
 
 -- | Reference between store paths
 data StoreReference = StoreReference
@@ -599,14 +586,12 @@ data BuildEnv = BuildEnv
     , buildStrategy :: BuildStrategy     -- How to build derivations
     , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
     , maxConcurrentBuilds :: Maybe Int   -- Maximum concurrent builds
-    , gcLockPath :: FilePath             -- Path to GC lock file
     , currentPrivilegeTier :: PrivilegeTier  -- Current privilege tier (Daemon/Builder)
     } deriving (Show, Eq)
 
--- | State carried through build operations
-data BuildState = BuildState
-    { currentPhase :: Phase              -- Current execution phase
-    , buildProofs :: [Proof 'Build]      -- Accumulated proofs
+-- | State carried through build operations - now parameterized by phase
+data BuildState (p :: Phase) = BuildState
+    { buildProofs :: [Proof p]           -- Accumulated proofs specific to this phase
     , buildInputs :: Set StorePath       -- Input paths for current build
     , buildOutputs :: Set StorePath      -- Output paths for current build
     , currentBuildId :: BuildId          -- Current build identifier
@@ -617,7 +602,7 @@ data BuildState = BuildState
 -- | The core monad for all Ten operations
 -- Now parameterized by phase and privilege tier with singleton evidence passing
 newtype TenM (p :: Phase) (t :: PrivilegeTier) a = TenM
-    { runTenM :: SPhase p -> SPrivilegeTier t -> ReaderT BuildEnv (StateT BuildState (ExceptT BuildError IO)) a }
+    { runTenM :: SPhase p -> SPrivilegeTier t -> ReaderT BuildEnv (StateT (BuildState p) (ExceptT BuildError IO)) a }
 
 -- Standard instances for TenM
 instance Functor (TenM p t) where
@@ -645,7 +630,7 @@ instance MonadReader BuildEnv (TenM p t) where
     local f (TenM m) = TenM $ \sp st -> local f (m sp st)
 
 -- MonadState instance allows get and put
-instance MonadState BuildState (TenM p t) where
+instance MonadState (BuildState p) (TenM p t) where
     get = TenM $ \_ _ -> get
     put s = TenM $ \_ _ -> put s
 
@@ -691,7 +676,6 @@ initBuildEnv wd sp = BuildEnv
     , buildStrategy = MonadicStrategy
     , maxRecursionDepth = 100
     , maxConcurrentBuilds = Nothing
-    , gcLockPath = sp </> "var/ten/gc.lock"
     , currentPrivilegeTier = Builder  -- Default to Builder for safety
     }
 
@@ -710,11 +694,21 @@ initDaemonEnv wd sp user = (initBuildEnv wd sp)
     , currentPrivilegeTier = Daemon  -- Daemon runs in Daemon privilege tier
     }
 
--- | Initialize build state for a given phase with a BuildId
-initBuildState :: Phase -> BuildId -> BuildState
-initBuildState phase bid = BuildState
-    { currentPhase = phase
-    , buildProofs = []
+-- | Initialize build state for Eval phase with a BuildId
+initBuildState_Eval :: BuildId -> BuildState 'Eval
+initBuildState_Eval bid = BuildState
+    { buildProofs = []
+    , buildInputs = Set.empty
+    , buildOutputs = Set.empty
+    , currentBuildId = bid
+    , buildChain = []
+    , recursionDepth = 0
+    }
+
+-- | Initialize build state for Build phase with a BuildId
+initBuildState_Build :: BuildId -> BuildState 'Build
+initBuildState_Build bid = BuildState
+    { buildProofs = []
     , buildInputs = Set.empty
     , buildOutputs = Set.empty
     , currentBuildId = bid
@@ -723,7 +717,7 @@ initBuildState phase bid = BuildState
     }
 
 -- | Execute a Ten monad with explicit singleton evidence
-runTen :: SPhase p -> SPrivilegeTier t -> TenM p t a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
+runTen :: SPhase p -> SPrivilegeTier t -> TenM p t a -> BuildEnv -> BuildState p -> IO (Either BuildError (a, BuildState p))
 runTen sp st (TenM m) env state = do
     -- Validate privilege tier matches environment
     if currentPrivilegeTier env == fromSing st
@@ -731,44 +725,56 @@ runTen sp st (TenM m) env state = do
         else return $ Left $ PrivilegeError "Privilege tier mismatch"
 
 -- | Execute an evaluation-phase computation in daemon mode
-evalTen :: TenM 'Eval 'Daemon a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+evalTen :: TenM 'Eval 'Daemon a -> BuildEnv -> IO (Either BuildError (a, BuildState 'Eval))
 evalTen m env = do
     -- Ensure environment is daemon tier
     let env' = env { currentPrivilegeTier = Daemon }
     bid <- BuildId <$> newUnique
-    runTen sEval sDaemon m env' (initBuildState Eval bid)
+    runTen sEval sDaemon m env' (initBuildState_Eval bid)
 
 -- | Execute a build-phase computation in builder mode
-buildTen :: TenM 'Build 'Builder a -> BuildEnv -> IO (Either BuildError (a, BuildState))
+buildTen :: TenM 'Build 'Builder a -> BuildEnv -> IO (Either BuildError (a, BuildState 'Build))
 buildTen m env = do
     -- Ensure environment is builder tier
     let env' = env { currentPrivilegeTier = Builder }
     bid <- BuildId <$> newUnique
-    runTen sBuild sBuilder m env' (initBuildState Build bid)
+    runTen sBuild sBuilder m env' (initBuildState_Build bid)
 
--- | Execute a daemon operation (privileged)
-runTenDaemon :: TenM p 'Daemon a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
-runTenDaemon m env state = do
+-- | Execute a daemon operation in Eval phase (privileged)
+runTenDaemon_Eval :: TenM 'Eval 'Daemon a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
+runTenDaemon_Eval m env state = do
     -- Verify we're in daemon mode
     case runMode env of
         DaemonMode -> do
             -- Set daemon privilege tier
             let env' = env { currentPrivilegeTier = Daemon }
-            let sp = case currentPhase state of
-                    Eval -> sEval
-                    Build -> sBuild
-            runTen sp sDaemon m env' state
+            runTen sEval sDaemon m env' state
         _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
 
--- | Execute a builder operation (unprivileged)
-runTenBuilder :: TenM p 'Builder a -> BuildEnv -> BuildState -> IO (Either BuildError (a, BuildState))
-runTenBuilder m env state = do
+-- | Execute a daemon operation in Build phase (privileged)
+runTenDaemon_Build :: TenM 'Build 'Daemon a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
+runTenDaemon_Build m env state = do
+    -- Verify we're in daemon mode
+    case runMode env of
+        DaemonMode -> do
+            -- Set daemon privilege tier
+            let env' = env { currentPrivilegeTier = Daemon }
+            runTen sBuild sDaemon m env' state
+        _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
+
+-- | Execute a builder operation in Eval phase (unprivileged)
+runTenBuilder_Eval :: TenM 'Eval 'Builder a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
+runTenBuilder_Eval m env state = do
     -- Set builder privilege tier
     let env' = env { currentPrivilegeTier = Builder }
-    let sp = case currentPhase state of
-            Eval -> sEval
-            Build -> sBuild
-    runTen sp sBuilder m env' state
+    runTen sEval sBuilder m env' state
+
+-- | Execute a builder operation in Build phase (unprivileged)
+runTenBuilder_Build :: TenM 'Build 'Builder a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
+runTenBuilder_Build m env state = do
+    -- Set builder privilege tier
+    let env' = env { currentPrivilegeTier = Builder }
+    runTen sBuild sBuilder m env' state
 
 -- | Run an IO operation within the TenM monad
 runTenIO :: IO a -> TenM p t a
@@ -807,23 +813,41 @@ transitionPhase trans action = TenM $ \spTo st -> do
         EvalToBuild -> do
             -- Run action in eval phase with original state
             let spFrom = sEval
+            -- Create new build state from eval state
+            let buildState = BuildState
+                    { buildProofs = []  -- Reset proofs for new phase
+                    , buildInputs = buildInputs state
+                    , buildOutputs = buildOutputs state
+                    , currentBuildId = currentBuildId state
+                    , buildChain = buildChain state
+                    , recursionDepth = recursionDepth state
+                    }
+
             result <- liftIO $ runTen spFrom st action env state
             case result of
                 Left err -> throwError err
-                Right (val, newState) -> do
-                    -- Update state with build phase
-                    put newState { currentPhase = Build }
+                Right (val, _) -> do
+                    -- Keep using our new build state
                     return val
 
         BuildToEval -> do
             -- Run action in build phase with original state
             let spFrom = sBuild
+            -- Create new eval state from build state
+            let evalState = BuildState
+                    { buildProofs = []  -- Reset proofs for new phase
+                    , buildInputs = buildInputs state
+                    , buildOutputs = buildOutputs state
+                    , currentBuildId = currentBuildId state
+                    , buildChain = buildChain state
+                    , recursionDepth = recursionDepth state
+                    }
+
             result <- liftIO $ runTen spFrom st action env state
             case result of
                 Left err -> throwError err
-                Right (val, newState) -> do
-                    -- Update state with eval phase
-                    put newState { currentPhase = Eval }
+                Right (val, _) -> do
+                    -- Keep using our new eval state
                     return val
 
 -- | Safely transition between privilege tiers
@@ -880,18 +904,9 @@ logMsg level msg = do
     when (v >= level) $ liftIO $ putStrLn $ T.unpack msg
 
 -- | Record a proof in the build state
-addProof :: Proof p -> TenM ph t ()
-addProof proof = case proof of
-    p@BuildProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
-    p@OutputProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
-    p@ReturnProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
-    p@RecursionProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
-    p@GCRootProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
-    p@ReachableProof{} -> modify $ \s -> s { buildProofs = p : buildProofs s }
-    p@(ComposeProof p1 p2) -> do
-        addProof p1
-        addProof p2
-    _ -> return () -- Other proofs don't affect build state
+addProof :: Proof p -> TenM p t ()
+addProof proof =
+    modify $ \s -> s { buildProofs = proof : buildProofs s }
 
 -- | Assert that a condition holds, or throw an error
 assertTen :: Bool -> BuildError -> TenM p t ()
@@ -956,12 +971,13 @@ getSystemGroup groupname = liftIO $ do
     return $ groupID groupEntry
 
 -- | Get the GC lock path for a store directory
+-- Pure function to calculate a path - accessible from any privilege tier
 gcLockPath :: FilePath -> FilePath
 gcLockPath storeDir = storeDir </> "var/ten/gc.lock"
 
 -- | Get the GC lock path from the BuildEnv
 getGCLockPath :: BuildEnv -> FilePath
-getGCLockPath = gcLockPath . storeLocation
+getGCLockPath env = gcLockPath (storeLocation env)
 
 -- | Ensure the directory for a lock file exists
 ensureLockDirExists :: FilePath -> IO ()
@@ -970,6 +986,23 @@ ensureLockDirExists lockPath = do
     createDirectoryIfMissing True dir
     -- Set appropriate permissions (0755 - rwxr-xr-x)
     setFileMode dir 0o755
+
+-- | Convert StorePath to a filesystem path (relative to store root)
+storePathToFilePath :: StorePath -> BuildEnv -> FilePath
+storePathToFilePath path env =
+    storeLocation env </> T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
+
+-- | Try to parse a StorePath from a filesystem path
+filePathToStorePath :: FilePath -> Maybe StorePath
+filePathToStorePath path =
+    case break (== '-') (takeFileName path) of
+        (hashPart, '-':namePart) ->
+            Just $ StorePath (T.pack hashPart) (T.pack namePart)
+        _ -> Nothing
+
+-- | Create a store path from hash and name components
+makeStorePath :: Text -> Text -> StorePath
+makeStorePath hash name = StorePath hash name
 
 -- | Compare two derivations for equality
 derivationEquals :: Derivation -> Derivation -> Bool
