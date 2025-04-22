@@ -36,9 +36,6 @@ module Ten.Daemon.Protocol (
     BuildResult(..),
 
     -- Derivation operations
-    StoreDerivationRequest(..),
-    RetrieveDerivationRequest(..),
-    QueryDerivationRequest(..),
     DerivationInfo(..),
     DerivationInfoResponse(..),
     DerivationOutputMappingResponse(..),
@@ -116,9 +113,11 @@ import System.IO (Handle, IOMode(..), withFile, hClose, hFlush)
 import System.IO.Error (isEOFError)
 import Text.Read (readMaybe)
 
--- Import Ten modules
-import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), UserId(..), AuthToken(..))
-import Ten.Derivation (Derivation, DerivationInput, DerivationOutput, hashDerivation, serializeDerivation, deserializeDerivation)
+-- Import Ten modules - removed Ten.Store dependency
+import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
+                 UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..))
+import Ten.Derivation (Derivation, DerivationInput, DerivationOutput,
+                      hashDerivation, serializeDerivation, deserializeDerivation)
 
 -- | Protocol version
 data ProtocolVersion = ProtocolVersion {
@@ -242,74 +241,6 @@ instance Aeson.FromJSON AuthResult where
                 reason <- v .: "reason"
                 return $ AuthRejected reason
             _ -> fail $ "Unknown auth status: " ++ T.unpack status
-
--- | Request to store a derivation
-data StoreDerivationRequest = StoreDerivationRequest {
-    derivationContent :: BS.ByteString,  -- Serialized derivation
-    registerOutputs :: Bool              -- Whether to register outputs in the DB
-} deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON StoreDerivationRequest where
-    toJSON StoreDerivationRequest{..} = Aeson.object [
-            "derivation" .= TE.decodeUtf8 derivationContent,
-            "registerOutputs" .= registerOutputs
-        ]
-
-instance Aeson.FromJSON StoreDerivationRequest where
-    parseJSON = Aeson.withObject "StoreDerivationRequest" $ \v -> do
-        derivText <- v .: "derivation" :: Aeson.Parser Text
-        registerOutputs <- v .: "registerOutputs"
-        return $ StoreDerivationRequest (TE.encodeUtf8 derivText) registerOutputs
-
--- | Request to retrieve a derivation
-data RetrieveDerivationRequest = RetrieveDerivationRequest {
-    derivationPath :: StorePath,
-    includeOutputs :: Bool  -- Whether to include output info in the response
-} deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON RetrieveDerivationRequest where
-    toJSON RetrieveDerivationRequest{..} = Aeson.object [
-            "path" .= encodePath derivationPath,
-            "includeOutputs" .= includeOutputs
-        ]
-      where
-        encodePath (StorePath hash name) = Aeson.object [
-                "hash" .= hash,
-                "name" .= name
-            ]
-
-instance Aeson.FromJSON RetrieveDerivationRequest where
-    parseJSON = Aeson.withObject "RetrieveDerivationRequest" $ \v -> do
-        pathObj <- v .: "path"
-        path <- decodePath pathObj
-        includeOutputs <- v .: "includeOutputs"
-        return $ RetrieveDerivationRequest path includeOutputs
-      where
-        decodePath = Aeson.withObject "StorePath" $ \p -> do
-            hash <- p .: "hash"
-            name <- p .: "name"
-            return $ StorePath hash name
-
--- | Request to query derivation information
-data QueryDerivationRequest = QueryDerivationRequest {
-    queryType :: Text,        -- "by-hash", "by-output", "by-name", etc.
-    queryValue :: Text,       -- Hash, output path, or name to search for
-    queryLimit :: Maybe Int   -- Optional limit on number of results
-} deriving (Show, Eq, Generic)
-
-instance Aeson.ToJSON QueryDerivationRequest where
-    toJSON QueryDerivationRequest{..} = Aeson.object [
-            "queryType" .= queryType,
-            "queryValue" .= queryValue,
-            "queryLimit" .= queryLimit
-        ]
-
-instance Aeson.FromJSON QueryDerivationRequest where
-    parseJSON = Aeson.withObject "QueryDerivationRequest" $ \v -> do
-        queryType <- v .: "queryType"
-        queryValue <- v .: "queryValue"
-        queryLimit <- v .: "queryLimit"
-        return $ QueryDerivationRequest queryType queryValue queryLimit
 
 -- | Full derivation information
 data DerivationInfo = DerivationInfo {
@@ -793,9 +724,17 @@ data DaemonRequest
     | StoreListRequest
 
     -- Derivation operations
-    | StoreDerivationCmd StoreDerivationRequest
-    | RetrieveDerivationCmd RetrieveDerivationRequest
-    | QueryDerivationCmd QueryDerivationRequest
+    | StoreDerivationRequest {
+        derivationContent :: BS.ByteString  -- Serialized derivation
+      }
+    | RetrieveDerivationRequest {
+        derivationPath :: StorePath
+      }
+    | QueryDerivationRequest {
+        queryType :: Text,        -- "by-hash", "by-output", "by-name", etc.
+        queryValue :: Text,       -- Hash, output path, or name to search for
+        queryLimit :: Maybe Int   -- Optional limit on number of results
+      }
     | GetDerivationForOutputRequest {
         getDerivationForPath :: Text
       }
@@ -807,7 +746,9 @@ data DaemonRequest
     | GCRequest {
         gcForce :: Bool  -- Force GC (run even if unsafe)
       }
-    | GCStatusCmd GCStatusRequestData
+    | GCStatusRequest {
+        gcForceCheck :: Bool  -- Force check GC status
+      }
     | AddGCRootRequest {
         rootPath :: StorePath,
         rootName :: Text,
@@ -894,19 +835,21 @@ instance Aeson.ToJSON DaemonRequest where
                 "type" .= ("store-list" :: Text)
             ]
 
-        StoreDerivationCmd req -> Aeson.object [
+        StoreDerivationRequest{..} -> Aeson.object [
                 "type" .= ("store-derivation" :: Text),
-                "request" .= req
+                "derivation" .= TE.decodeUtf8 derivationContent
             ]
 
-        RetrieveDerivationCmd req -> Aeson.object [
+        RetrieveDerivationRequest{..} -> Aeson.object [
                 "type" .= ("retrieve-derivation" :: Text),
-                "request" .= req
+                "path" .= encodePath derivationPath
             ]
 
-        QueryDerivationCmd req -> Aeson.object [
+        QueryDerivationRequest{..} -> Aeson.object [
                 "type" .= ("query-derivation" :: Text),
-                "request" .= req
+                "queryType" .= queryType,
+                "queryValue" .= queryValue,
+                "queryLimit" .= queryLimit
             ]
 
         GetDerivationForOutputRequest{..} -> Aeson.object [
@@ -924,9 +867,9 @@ instance Aeson.ToJSON DaemonRequest where
                 "force" .= gcForce
             ]
 
-        GCStatusCmd req -> Aeson.object [
+        GCStatusRequest{..} -> Aeson.object [
                 "type" .= ("gc-status" :: Text),
-                "request" .= req
+                "forceCheck" .= gcForceCheck
             ]
 
         AddGCRootRequest{..} -> Aeson.object [
@@ -1040,16 +983,19 @@ instance Aeson.FromJSON DaemonRequest where
             "store-list" -> return StoreListRequest
 
             "store-derivation" -> do
-                req <- v .: "request"
-                return $ StoreDerivationCmd req
+                content <- v .: "derivation" :: Aeson.Parser Text
+                return $ StoreDerivationRequest (TE.encodeUtf8 content)
 
             "retrieve-derivation" -> do
-                req <- v .: "request"
-                return $ RetrieveDerivationCmd req
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                return $ RetrieveDerivationRequest path
 
             "query-derivation" -> do
-                req <- v .: "request"
-                return $ QueryDerivationCmd req
+                queryType <- v .: "queryType"
+                queryValue <- v .: "queryValue"
+                queryLimit <- v .: "queryLimit"
+                return $ QueryDerivationRequest queryType queryValue queryLimit
 
             "get-derivation-for-output" -> do
                 path <- v .: "path"
@@ -1064,8 +1010,8 @@ instance Aeson.FromJSON DaemonRequest where
                 return $ GCRequest force
 
             "gc-status" -> do
-                req <- v .: "request"
-                return $ GCStatusCmd req
+                forceCheck <- v .: "forceCheck"
+                return $ GCStatusRequest forceCheck
 
             "add-gc-root" -> do
                 pathObj <- v .: "path"
@@ -1665,43 +1611,6 @@ instance Aeson.FromJSON DaemonResponse where
                 "gc" -> return $ GCError message
                 _ -> return $ BuildFailed $ "Unknown error: " <> message
 
--- | Serialize a message with length prefix
-serializeMessage :: Message -> BS.ByteString
-serializeMessage msg =
-    let body = LBS.toStrict $ Aeson.encode msg
-        len = fromIntegral $ BS.length body
-        lenBytes = LBS.toStrict $ Builder.toLazyByteString $ Builder.word32BE len
-    in lenBytes <> body
-
--- | Deserialize a message
-deserializeMessage :: BS.ByteString -> Either Text Message
-deserializeMessage bs =
-    case Aeson.eitherDecodeStrict bs of
-        Left err -> Left $ "Failed to parse message: " <> T.pack err
-        Right msg -> Right msg
-
--- | Serialize a request
-serializeRequest :: DaemonRequest -> BS.ByteString
-serializeRequest = LBS.toStrict . Aeson.encode
-
--- | Deserialize a request
-deserializeRequest :: BS.ByteString -> Either Text DaemonRequest
-deserializeRequest bs =
-    case Aeson.eitherDecodeStrict bs of
-        Left err -> Left $ "Failed to deserialize request: " <> T.pack err
-        Right req -> Right req
-
--- | Serialize a response
-serializeResponse :: DaemonResponse -> BS.ByteString
-serializeResponse = LBS.toStrict . Aeson.encode
-
--- | Deserialize a response
-deserializeResponse :: BS.ByteString -> Either Text DaemonResponse
-deserializeResponse bs =
-    case Aeson.eitherDecodeStrict bs of
-        Left err -> Left $ "Failed to deserialize response: " <> T.pack err
-        Right resp -> Right resp
-
 -- | Protocol handle type for managing connections
 data ProtocolHandle = ProtocolHandle {
     protocolSocket :: Socket,
@@ -1793,13 +1702,13 @@ requestTypeToTag (StoreAddRequest _ _) = StoreAddTag
 requestTypeToTag (StoreVerifyRequest _) = StoreVerifyTag
 requestTypeToTag (StorePathRequest _ _) = StorePathTag
 requestTypeToTag StoreListRequest = StoreListTag
-requestTypeToTag (StoreDerivationCmd _) = StoreDerivationTag
-requestTypeToTag (RetrieveDerivationCmd _) = RetrieveDerivationTag
-requestTypeToTag (QueryDerivationCmd _) = QueryDerivationTag
+requestTypeToTag (StoreDerivationRequest _) = StoreDerivationTag
+requestTypeToTag (RetrieveDerivationRequest _) = RetrieveDerivationTag
+requestTypeToTag (QueryDerivationRequest _ _ _) = QueryDerivationTag
 requestTypeToTag (GetDerivationForOutputRequest _) = GetDerivationForOutputTag
 requestTypeToTag (ListDerivationsRequest _) = ListDerivationsTag
 requestTypeToTag (GCRequest _) = GCTag
-requestTypeToTag (GCStatusCmd _) = GCStatusTag
+requestTypeToTag (GCStatusRequest _) = GCStatusTag
 requestTypeToTag (AddGCRootRequest _ _ _) = AddGCRootTag
 requestTypeToTag (RemoveGCRootRequest _) = RemoveGCRootTag
 requestTypeToTag ListGCRootsRequest = ListGCRootsTag
@@ -2033,14 +1942,14 @@ requestToText req = case req of
     StoreListRequest ->
         "List store contents"
 
-    StoreDerivationCmd _ ->
+    StoreDerivationRequest{..} ->
         "Store derivation"
 
-    RetrieveDerivationCmd _ ->
-        "Retrieve derivation"
+    RetrieveDerivationRequest{..} ->
+        "Retrieve derivation: " <> T.pack (show derivationPath)
 
-    QueryDerivationCmd _ ->
-        "Query derivation"
+    QueryDerivationRequest{..} ->
+        "Query derivation: " <> queryType <> " " <> queryValue
 
     GetDerivationForOutputRequest{..} ->
         "Get derivation for output: " <> getDerivationForPath
@@ -2051,11 +1960,11 @@ requestToText req = case req of
     GCRequest{..} ->
         "Collect garbage" <> if gcForce then " (force)" else ""
 
-    GCStatusCmd req ->
-        "Check GC status" <> if forceCheck req then " (force check)" else ""
+    GCStatusRequest{..} ->
+        "Check GC status" <> if gcForceCheck then " (force check)" else ""
 
     AddGCRootRequest{..} ->
-        "Add GC root: " <> rootName <> " -> " <> storeHash rootPath <> "-" <> storeName rootPath
+        "Add GC root: " <> rootName <> " -> " <> T.pack (show rootPath)
 
     RemoveGCRootRequest{..} ->
         "Remove GC root: " <> rootNameToRemove
@@ -2100,13 +2009,13 @@ responseToText resp = case resp of
         "Build list: " <> T.pack (show (length builds)) <> " builds"
 
     StoreAddResponse path ->
-        "Added to store: " <> storeHash path <> "-" <> storeName path
+        "Added to store: " <> T.pack (show path)
 
     StoreVerifyResponse valid ->
         "Path verification: " <> if valid then "valid" else "invalid"
 
     StorePathResponse path ->
-        "Store path: " <> storeHash path <> "-" <> storeName path
+        "Store path: " <> T.pack (show path)
 
     StoreListResponse paths ->
         "Store contents: " <> T.pack (show (length paths)) <> " paths"
@@ -2115,7 +2024,7 @@ responseToText resp = case resp of
         "Derivation"
 
     DerivationStoredResponse path ->
-        "Derivation stored: " <> storeHash path <> "-" <> storeName path
+        "Derivation stored: " <> T.pack (show path)
 
     DerivationRetrievedResponse Nothing ->
         "Derivation not found"
@@ -2223,3 +2132,40 @@ a .|. b = a + b
 
 -- | Int64 type for database IDs
 type Int64 = Int
+
+-- | Serialize a message with length prefix
+serializeMessage :: Message -> BS.ByteString
+serializeMessage msg =
+    let body = LBS.toStrict $ Aeson.encode msg
+        len = fromIntegral $ BS.length body
+        lenBytes = LBS.toStrict $ Builder.toLazyByteString $ Builder.word32BE len
+    in lenBytes <> body
+
+-- | Deserialize a message
+deserializeMessage :: BS.ByteString -> Either Text Message
+deserializeMessage bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "Failed to parse message: " <> T.pack err
+        Right msg -> Right msg
+
+-- | Serialize a request
+serializeRequest :: DaemonRequest -> BS.ByteString
+serializeRequest = LBS.toStrict . Aeson.encode
+
+-- | Deserialize a request
+deserializeRequest :: BS.ByteString -> Either Text DaemonRequest
+deserializeRequest bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "Failed to deserialize request: " <> T.pack err
+        Right req -> Right req
+
+-- | Serialize a response
+serializeResponse :: DaemonResponse -> BS.ByteString
+serializeResponse = LBS.toStrict . Aeson.encode
+
+-- | Deserialize a response
+deserializeResponse :: BS.ByteString -> Either Text DaemonResponse
+deserializeResponse bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "Failed to deserialize response: " <> T.pack err
+        Right resp -> Right resp

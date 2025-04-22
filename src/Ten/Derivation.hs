@@ -12,7 +12,6 @@ module Ten.Derivation (
     Derivation(..),
     DerivationInput(..),
     DerivationOutput(..),
-    PrivilegeContext(..),
 
     -- Derivation creation and inspection
     mkDerivation,
@@ -26,13 +25,9 @@ module Ten.Derivation (
     buildToGetInnerDerivation,
     isReturnContinuationDerivation,
 
-    -- Derivation storage - privileged operations
+    -- Context-aware derivation storage
     storeDerivation,
     retrieveDerivation,
-
-    -- Derivation storage - unprivileged operations
-    requestStoreDerivation,
-    requestRetrieveDerivation,
 
     -- Serialization
     serializeDerivation,
@@ -53,13 +48,8 @@ module Ten.Derivation (
     addToDerivationChain,
     isInDerivationChain,
     derivationChainLength,
-
-    -- Protocol helpers for privilege boundary crossing
-    sendDerivationRequest,
-    receiveDerivationResponse
 ) where
 
-import Control.Concurrent.STM
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (modify, gets, get)
@@ -78,28 +68,18 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
-import qualified Data.Aeson.Encoding as Aeson
 import qualified Data.Aeson.Key as Aeson
 import qualified Data.Aeson.KeyMap as Aeson.KeyMap
 import qualified Data.Vector as Vector
-import qualified Data.HashMap.Strict as HashMap
 import System.FilePath
 import System.Directory (doesFileExist)
 import qualified System.Posix.Files as Posix
-import System.IO (withFile, IOMode(..))
 import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode, StdStream(NoStream, CreatePipe))
 import System.Exit
-import Control.Exception (try, SomeException, finally, catch)
-import Database.SQLite.Simple (Only(..))
-import Data.Int (Int64)
-import Network.Socket (Socket)
+import Control.Exception (try, SomeException)
 
 import Ten.Core
-import qualified Ten.Hash as Hash
 import Ten.Store
-import Ten.Sandbox (returnDerivationPath, prepareSandboxEnvironment,
-                   SandboxConfig, withSandbox, defaultSandboxConfig)
-import Ten.DB.Core (initDatabase, closeDatabase, withDatabase)
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -120,11 +100,11 @@ detectRecursionCycle derivations =
 
 -- | Hash a derivation to get its textual representation
 hashDerivation :: Derivation -> Text
-hashDerivation drv = Hash.showHash $ Hash.hashDerivation (derivName drv) (derivArgs drv) (derivEnv drv)
+hashDerivation drv = hashByteString (serializeDerivation drv)
 
--- | Create a new derivation - allowed in both contexts
-mkDerivation :: (PrivilegeContext c) => Text -> StorePath -> [Text] -> Set DerivationInput
-             -> Set Text -> Map Text Text -> Text -> TenM 'Eval c Derivation
+-- | Create a new derivation - context-neutral implementation
+mkDerivation :: Text -> StorePath -> [Text] -> Set DerivationInput
+             -> Set Text -> Map Text Text -> Text -> TenM 'Eval ctx Derivation
 mkDerivation name builder args inputs outputNames env system = do
     -- First calculate a deterministic hash for the derivation
     let hashBase = T.concat
@@ -137,7 +117,7 @@ mkDerivation name builder args inputs outputNames env system = do
             , system
             ]
 
-    let derivHash' = T.pack $ show $ Hash.hashText hashBase
+    let derivHash' = hashByteString (TE.encodeUtf8 hashBase)
 
     -- Create output specifications with predicted paths
     let outputs = Set.map (\outName -> DerivationOutput
@@ -205,93 +185,88 @@ isReturnContinuationDerivation name args env =
         "--return" `T.isPrefixOf` arg ||
         "--output-derivation" `T.isPrefixOf` arg
 
--- | Store a derivation in the content-addressed store (privileged operation)
-storeDerivation :: Derivation -> TenM p 'Privileged StorePath
+-- | Store a derivation in the store - context-aware implementation
+storeDerivation :: Derivation -> TenM p ctx StorePath
 storeDerivation drv = do
     -- Validate the derivation before storing
     validateDerivation drv
 
     -- Serialize the derivation to a ByteString
     let serialized = serializeDerivation drv
+    let fileName = derivName drv <> ".drv"
 
-    -- Add to store with .drv extension (privileged operation)
-    addToStore (derivName drv <> ".drv") serialized
+    -- Check the privilege context and use appropriate method
+    ctx <- asks privilegeContext
+    case ctx of
+        Privileged ->
+            -- Direct store in privileged context
+            addToStore fileName serialized
 
--- | Request to store a derivation via daemon (unprivileged operation)
-requestStoreDerivation :: Derivation -> TenM p 'Unprivileged StorePath
-requestStoreDerivation drv = do
-    -- Ensure we have a daemon connection
-    conn <- getDaemonConnection
+        Unprivileged -> do
+            -- Use protocol to request storage in unprivileged context
+            let request = StoreDerivationRequest serialized
+            response <- sendStoreDaemonRequest request
+            case response of
+                StoreDerivationResponse path -> return path
+                StoreErrorResponse err -> throwError $ StoreError err
+                _ -> throwError $ ProtocolError "Unexpected response from daemon"
 
-    -- Validate the derivation before sending
-    validateDerivation drv
-
-    -- Send the derivation storage request via protocol
-    let serialized = serializeDerivation drv
-    let request = StoreDerivationRequest (derivName drv <> ".drv") serialized
-
-    -- Send request to daemon and receive response
-    response <- sendDerivationRequest conn request
-
-    case response of
-        StoreDerivationResponse path -> return path
-        ErrorResponse err -> throwError $ DaemonError $ "Failed to store derivation: " <> err
-        _ -> throwError $ DaemonError "Unexpected response from daemon"
-
--- | Retrieve a derivation from the store (privileged operation)
-retrieveDerivation :: StorePath -> TenM p 'Privileged (Maybe Derivation)
+-- | Retrieve a derivation from the store - context-aware implementation
+retrieveDerivation :: StorePath -> TenM p ctx (Maybe Derivation)
 retrieveDerivation path = do
-    -- Validate the path before retrieving
-    validateStorePath path
+    -- Validate the path before attempting to retrieve
+    unless (validateStorePath path) $
+        throwError $ StoreError $ "Invalid store path format: " <> storePathToText path
 
-    -- Check if the derivation exists in the store
+    -- Check if the path exists in the store
     exists <- storePathExists path
     if not exists
         then return Nothing
         else do
-            -- Read from store
-            content <- readFromStore path
+            -- Check privilege context and use appropriate method
+            ctx <- asks privilegeContext
+            content <- case ctx of
+                Privileged ->
+                    -- Direct read in privileged context
+                    readFromStore path
 
-            -- Deserialize
+                Unprivileged ->
+                    -- First try direct read (works if file is accessible)
+                    -- If that fails, use protocol request
+                    do
+                        env <- ask
+                        let filePath = storePathToFilePath path env
+                        fileExists <- liftIO $ doesFileExist filePath
+                        if fileExists
+                            then liftIO $ BS.readFile filePath `catch` \(_ :: SomeException) -> do
+                                -- If direct read fails due to permissions, use protocol
+                                let request = StoreReadRequest path
+                                response <- sendStoreDaemonRequest request
+                                case response of
+                                    StoreReadResponse content -> return content
+                                    _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
+                            else do
+                                -- File doesn't exist or isn't accessible, use protocol
+                                let request = StoreReadRequest path
+                                response <- sendStoreDaemonRequest request
+                                case response of
+                                    StoreReadResponse content -> return content
+                                    _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
+
+            -- Deserialize the content
             case deserializeDerivation content of
                 Left err -> do
                     logMsg 1 $ "Error deserializing derivation: " <> err
                     return Nothing
                 Right drv -> return $ Just drv
 
--- | Request to retrieve a derivation via daemon (unprivileged operation)
-requestRetrieveDerivation :: StorePath -> TenM p 'Unprivileged (Maybe Derivation)
-requestRetrieveDerivation path = do
-    -- Ensure we have a daemon connection
-    conn <- getDaemonConnection
-
-    -- Validate the path before sending
-    validateStorePath path
-
-    -- Create and send the request
-    let request = RetrieveDerivationRequest path
-    response <- sendDerivationRequest conn request
-
-    case response of
-        RetrieveDerivationResponse Nothing ->
-            return Nothing
-        RetrieveDerivationResponse (Just drv) ->
-            return $ Just drv
-        ErrorResponse err ->
-            throwError $ DaemonError $ "Failed to retrieve derivation: " <> err
-        _ ->
-            throwError $ DaemonError "Unexpected response from daemon"
-
 -- | Instantiate a derivation for building - context-aware implementation
-instantiateDerivation :: (PrivilegeContext c) => Derivation -> TenM 'Build c ()
+instantiateDerivation :: Derivation -> TenM 'Build ctx ()
 instantiateDerivation deriv = do
-    -- Store the derivation - use the appropriate method based on context
-    ctx <- getPrivilegeContext
-    derivPath <- case ctx of
-        Privileged -> storeDerivation deriv
-        Unprivileged -> requestStoreDerivation deriv
+    -- Store the derivation using the context-aware implementation
+    derivPath <- storeDerivation deriv
 
-    -- Verify inputs exist - works in both contexts
+    -- Verify inputs exist
     forM_ (derivInputs deriv) $ \input -> do
         exists <- storePathExists (inputPath input)
         unless exists $ throwError $
@@ -325,8 +300,8 @@ instantiateDerivation deriv = do
 
     logMsg 1 $ "Instantiated derivation: " <> derivName deriv
 
--- | The monadic join operation for Return-Continuation - context-aware
-joinDerivation :: (PrivilegeContext c) => Derivation -> TenM 'Build c Derivation
+-- | The monadic join operation for Return-Continuation - context-aware implementation
+joinDerivation :: Derivation -> TenM 'Build ctx Derivation
 joinDerivation outerDrv = do
     -- Build the outer derivation just enough to get inner derivation
     innerDrv <- buildToGetInnerDerivation outerDrv
@@ -337,22 +312,21 @@ joinDerivation outerDrv = do
     -- Return the inner derivation to be built
     return innerDrv
 
--- | Build a derivation to the point where it returns an inner derivation - context-aware
-buildToGetInnerDerivation :: (PrivilegeContext c) => Derivation -> TenM 'Build c Derivation
+-- | Build a derivation to the point where it returns an inner derivation
+buildToGetInnerDerivation :: Derivation -> TenM 'Build ctx Derivation
 buildToGetInnerDerivation drv = do
     env <- ask
     state <- get
-    ctx <- getPrivilegeContext
 
     -- Create a sandbox configuration with return-continuation support
     let sandboxConfig = defaultSandboxConfig {
             sandboxReturnSupport = True,
-            sandboxPrivileged = ctx == Privileged
+            sandboxPrivileged = privilegeContext env == Privileged
         }
 
     -- Use withSandbox which handles both contexts correctly
     withSandbox (Set.map inputPath $ derivInputs drv) sandboxConfig $ \sandboxDir -> do
-        -- Get the builder from the store - works in both contexts
+        -- Get the builder from the store - context-aware implementation
         builderContent <- readFromStore (derivBuilder drv)
 
         -- Write the builder to the sandbox
@@ -364,9 +338,9 @@ buildToGetInnerDerivation drv = do
         let buildEnv = prepareSandboxEnvironment env state sandboxDir (derivEnv drv)
 
         -- Add context-specific environment variables
-        let contextEnv = case ctx of
-                Privileged -> Map.singleton "TEN_PRIVILEGED" "1"
-                Unprivileged -> Map.singleton "TEN_UNPRIVILEGED" "1"
+        let contextEnv = if privilegeContext env == Privileged
+                         then Map.singleton "TEN_PRIVILEGED" "1"
+                         else Map.singleton "TEN_UNPRIVILEGED" "1"
 
         let fullEnv = Map.union buildEnv contextEnv
 
@@ -397,10 +371,8 @@ buildToGetInnerDerivation drv = do
                         -- Add proof that we successfully got a returned derivation
                         addProof RecursionProof
 
-                        -- Store the inner derivation - use the appropriate method based on context
-                        case ctx of
-                            Privileged -> void $ storeDerivation innerDrv
-                            Unprivileged -> void $ requestStoreDerivation innerDrv
+                        -- Store the inner derivation - context-aware implementation
+                        void $ storeDerivation innerDrv
 
                         return innerDrv
             else
@@ -410,19 +382,19 @@ buildToGetInnerDerivation drv = do
                     "\nStdout: " <> T.pack stdout <>
                     "\nStderr: " <> T.pack stderr
 
--- | Get output paths from a derivation - works in any context
+-- | Get output paths from a derivation
 derivationOutputPaths :: Derivation -> Set StorePath
 derivationOutputPaths = Set.map outputPath . derivOutputs
 
--- | Get input paths from a derivation - works in any context
+-- | Get input paths from a derivation
 derivationInputPaths :: Derivation -> Set StorePath
 derivationInputPaths = Set.map inputPath . derivInputs
 
--- | Serialize a derivation to a ByteString - works in any context
+-- | Serialize a derivation to a ByteString
 serializeDerivation :: Derivation -> BS.ByteString
 serializeDerivation = LBS.toStrict . Aeson.encode . derivationToJSON
 
--- | Convert derivation to JSON - works in any context
+-- | Convert derivation to JSON
 derivationToJSON :: Derivation -> Aeson.Value
 derivationToJSON Derivation{..} = Aeson.object
     [ "name" .= derivName
@@ -439,7 +411,7 @@ derivationToJSON Derivation{..} = Aeson.object
     , "meta" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList derivMeta)
     ]
 
--- Helper to convert StorePath to JSON - works in any context
+-- Helper to convert StorePath to JSON
 storePathToJSON :: StorePath -> Aeson.Value
 storePathToJSON (StorePath hash name) = Aeson.object
     [ "hash" .= hash
@@ -460,14 +432,14 @@ instance Aeson.ToJSON DerivationOutput where
         , "path" .= storePathToJSON path
         ]
 
--- | Deserialize a derivation from a ByteString - works in any context
+-- | Deserialize a derivation from a ByteString
 deserializeDerivation :: BS.ByteString -> Either Text Derivation
 deserializeDerivation bs =
     case Aeson.eitherDecode (LBS.fromStrict bs) of
-        Left err -> Left $ T.pack $ "JSON parse error: " ++ err
+        Left err -> Left $ "JSON parse error: " <> T.pack err
         Right json -> derivationFromJSON json
 
--- | Convert JSON to Derivation - works in any context
+-- | Convert JSON to Derivation
 derivationFromJSON :: Aeson.Value -> Either Text Derivation
 derivationFromJSON v =
     case Aeson.parseEither parseDerivation v of
@@ -550,14 +522,14 @@ derivationFromJSON v =
         convertKeyValue (k, Aeson.String v) = (Aeson.toText k, v)
         convertKeyValue _ = ("", "") -- Fallback for non-string values
 
--- | Hash a derivation's inputs for dependency tracking - works in any context
+-- | Hash a derivation's inputs for dependency tracking
 hashDerivationInputs :: Derivation -> Text
 hashDerivationInputs drv =
-    T.pack $ show $ Hash.hashText $ T.intercalate ":" $
+    T.pack $ show $ Aeson.encode $
         map (\input -> storeHash $ inputPath input) $
         Set.toList $ derivInputs drv
 
--- | Create a sandbox process configuration - works in any context
+-- | Create a sandbox process configuration
 sandboxedProcessConfig :: FilePath -> FilePath -> [String] -> Map Text Text -> SandboxConfig -> CreateProcess
 sandboxedProcessConfig sandboxDir programPath args envVars config =
     (proc programPath args)
@@ -568,8 +540,8 @@ sandboxedProcessConfig sandboxDir programPath args envVars config =
         , std_err = CreatePipe
         }
 
--- | Validate a derivation before storage or building - works in any context
-validateDerivation :: Derivation -> TenM p c ()
+-- | Validate a derivation before storage or building
+validateDerivation :: Derivation -> TenM p ctx ()
 validateDerivation drv = do
     -- Validate the hash
     unless (T.length (derivHash drv) >= 8 && T.all isHexDigit (derivHash drv)) $
@@ -595,195 +567,127 @@ validateDerivation drv = do
   where
     isHexDigit c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
--- | Get the daemon connection for unprivileged operations
-getDaemonConnection :: TenM p 'Unprivileged DaemonConnection
-getDaemonConnection = do
+-- | Check if a derivation is in the build chain
+isInDerivationChain :: Derivation -> DerivationChain -> Bool
+isInDerivationChain drv (DerivationChain hashes) =
+    derivHash drv `elem` hashes
+
+-- | Add a derivation to the chain
+addToDerivationChain :: Derivation -> DerivationChain -> DerivationChain
+addToDerivationChain drv (DerivationChain hashes) =
+    DerivationChain (derivHash drv : hashes)
+
+-- | Type for sandbox configuration
+data SandboxConfig = SandboxConfig {
+    sandboxReturnSupport :: Bool,
+    sandboxPrivileged :: Bool
+}
+
+-- | Default sandbox configuration
+defaultSandboxConfig :: SandboxConfig
+defaultSandboxConfig = SandboxConfig {
+    sandboxReturnSupport = False,
+    sandboxPrivileged = False
+}
+
+-- | Create sandbox environment for builder
+prepareSandboxEnvironment :: BuildEnv -> BuildState -> FilePath -> Map Text Text -> Map Text Text
+prepareSandboxEnvironment env state sandboxDir userEnv =
+    let
+        -- Basic environment variables
+        baseEnv = Map.fromList [
+            ("TEN_SANDBOX", T.pack sandboxDir),
+            ("TEN_BUILD_ID", T.pack $ show $ currentBuildId state),
+            ("TEN_STORE", T.pack $ storeLocation env)
+            ]
+
+        -- Add strategy information
+        strategyEnv = case buildStrategy env of
+            MonadicStrategy -> Map.singleton "TEN_STRATEGY" "monadic"
+            ApplicativeStrategy -> Map.singleton "TEN_STRATEGY" "applicative"
+
+        -- Merge all environments, with user env taking precedence
+        finalEnv = Map.unions [userEnv, strategyEnv, baseEnv]
+    in
+        finalEnv
+
+-- | Path where return-continuation derivations should be written
+returnDerivationPath :: FilePath -> FilePath
+returnDerivationPath sandboxDir = sandboxDir </> "result.drv"
+
+-- | Execute an operation in a sandbox
+withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build ctx a) -> TenM 'Build ctx a
+withSandbox inputs config action = do
     env <- ask
-    case runMode env of
-        ClientMode conn -> return conn
-        _ -> throwError $ DaemonError "No daemon connection available in unprivileged context"
 
--- | Get the current privilege context
-getPrivilegeContext :: TenM p c PrivilegeContext
-getPrivilegeContext = do
+    -- Create a temporary directory for the sandbox
+    let tmpDir = workDir env </> "sandbox"
+    liftIO $ createDirectoryIfMissing True tmpDir
+
+    -- Create a unique sandbox directory
+    sandboxDir <- liftIO $ do
+        -- In a real implementation, we'd use proper unique directory creation
+        uniqueId <- show <$> getCurrentTime
+        let dir = tmpDir </> ("sandbox-" ++ uniqueId)
+        createDirectory dir
+        return dir
+
+    -- Set up the sandbox
+    setupSandbox sandboxDir inputs
+
+    -- Run the action
+    result <- action sandboxDir `catchError` \err -> do
+        -- Clean up on error
+        liftIO $ removeDirectoryRecursive sandboxDir
+        throwError err
+
+    -- Clean up the sandbox
+    liftIO $ removeDirectoryRecursive sandboxDir
+
+    -- Return the result
+    return result
+
+-- | Set up a sandbox with input store paths
+setupSandbox :: FilePath -> Set StorePath -> TenM 'Build ctx ()
+setupSandbox sandboxDir inputs = do
     env <- ask
-    return $ privilegeContext env
 
--- | Protocol request type for derivation operations
-data DerivationRequest
-    = StoreDerivationRequest Text BS.ByteString
-    | RetrieveDerivationRequest StorePath
-    | ValidateDerivationRequest StorePath
-    deriving (Show, Eq)
-
--- | Protocol response type for derivation operations
-data DerivationResponse
-    = StoreDerivationResponse StorePath
-    | RetrieveDerivationResponse (Maybe Derivation)
-    | ValidateDerivationResponse Bool
-    | ErrorResponse Text
-    deriving (Show, Eq)
-
--- | Send a derivation request to the daemon
-sendDerivationRequest :: DaemonConnection -> DerivationRequest -> TenM p 'Unprivileged DerivationResponse
-sendDerivationRequest conn request = do
-    -- Convert to protocol message
-    let protocolMessage = case request of
-            StoreDerivationRequest name content ->
-                ProtocolRequest StoreDerivation (Aeson.object [
-                    "name" .= name,
-                    "content" .= TE.decodeUtf8 content
-                ])
-            RetrieveDerivationRequest path ->
-                ProtocolRequest RetrieveDerivation (Aeson.object [
-                    "path" .= storePathToText path
-                ])
-            ValidateDerivationRequest path ->
-                ProtocolRequest ValidateDerivation (Aeson.object [
-                    "path" .= storePathToText path
-                ])
-
-    -- Send via client interface and wait for response
-    result <- clientRequest conn protocolMessage
-
-    -- Process response
-    case result of
-        ProtocolResponse StoreDerivationOp (Aeson.Object obj) ->
-            case Aeson.KeyMap.lookup "path" obj of
-                Just (Aeson.String pathText) ->
-                    case parseStorePath pathText of
-                        Just path -> return $ StoreDerivationResponse path
-                        Nothing -> return $ ErrorResponse $ "Invalid path in response: " <> pathText
-                _ -> return $ ErrorResponse "Missing path in response"
-
-        ProtocolResponse RetrieveDerivationOp (Aeson.Object obj) ->
-            case Aeson.KeyMap.lookup "derivation" obj of
-                Just Aeson.Null ->
-                    return $ RetrieveDerivationResponse Nothing
-                Just derivObj ->
-                    case derivationFromJSON derivObj of
-                        Right drv -> return $ RetrieveDerivationResponse (Just drv)
-                        Left err -> return $ ErrorResponse $ "Failed to parse derivation: " <> err
-                _ -> return $ ErrorResponse "Missing derivation in response"
-
-        ProtocolResponse ValidateDerivationOp (Aeson.Object obj) ->
-            case Aeson.KeyMap.lookup "valid" obj of
-                Just (Aeson.Bool valid) -> return $ ValidateDerivationResponse valid
-                _ -> return $ ErrorResponse "Missing validity in response"
-
-        ProtocolResponse ErrorOp (Aeson.Object obj) ->
-            case Aeson.KeyMap.lookup "message" obj of
-                Just (Aeson.String msg) -> return $ ErrorResponse msg
-                _ -> return $ ErrorResponse "Unknown error"
-
-        _ -> return $ ErrorResponse "Unexpected response format"
-
--- | Receive and handle a derivation request from a client (daemon side)
-receiveDerivationResponse :: Socket -> ProtocolRequest -> TenM p 'Privileged ProtocolResponse
-receiveDerivationResponse clientSocket request = do
-    case request of
-        ProtocolRequest StoreDerivation (Aeson.Object obj) -> do
-            -- Extract name and content
-            case (Aeson.KeyMap.lookup "name" obj, Aeson.KeyMap.lookup "content" obj) of
-                (Just (Aeson.String name), Just (Aeson.String contentText)) -> do
-                    -- Deserialize the derivation
-                    let content = TE.encodeUtf8 contentText
-                    case deserializeDerivation content of
-                        Right drv -> do
-                            -- Store the derivation (privileged operation)
-                            path <- storeDerivation drv
-                            -- Return the resulting path
-                            return $ ProtocolResponse StoreDerivationOp $ Aeson.object [
-                                "path" .= storePathToText path
-                                ]
-                        Left err ->
-                            return $ ProtocolResponse ErrorOp $ Aeson.object [
-                                "message" .= ("Invalid derivation: " <> err)
-                                ]
-                _ ->
-                    return $ ProtocolResponse ErrorOp $ Aeson.object [
-                        "message" .= ("Missing required fields" :: Text)
-                        ]
-
-        ProtocolRequest RetrieveDerivation (Aeson.Object obj) ->
-            case Aeson.KeyMap.lookup "path" obj of
-                Just (Aeson.String pathText) ->
-                    case parseStorePath pathText of
-                        Just path -> do
-                            -- Retrieve the derivation (privileged operation)
-                            mDrv <- retrieveDerivation path
-                            -- Return the derivation or null
-                            return $ ProtocolResponse RetrieveDerivationOp $ Aeson.object [
-                                "derivation" .= maybe Aeson.Null derivationToJSON mDrv
-                                ]
-                        Nothing ->
-                            return $ ProtocolResponse ErrorOp $ Aeson.object [
-                                "message" .= ("Invalid path format" :: Text)
-                                ]
-                _ ->
-                    return $ ProtocolResponse ErrorOp $ Aeson.object [
-                        "message" .= ("Missing path field" :: Text)
-                        ]
-
-        ProtocolRequest ValidateDerivation (Aeson.Object obj) ->
-            case Aeson.KeyMap.lookup "path" obj of
-                Just (Aeson.String pathText) ->
-                    case parseStorePath pathText of
-                        Just path -> do
-                            -- Check if the path exists (privileged operation)
-                            exists <- storePathExists path
-                            -- Return the result
-                            return $ ProtocolResponse ValidateDerivationOp $ Aeson.object [
-                                "valid" .= exists
-                                ]
-                        Nothing ->
-                            return $ ProtocolResponse ErrorOp $ Aeson.object [
-                                "message" .= ("Invalid path format" :: Text)
-                                ]
-                _ ->
-                    return $ ProtocolResponse ErrorOp $ Aeson.object [
-                        "message" .= ("Missing path field" :: Text)
-                        ]
-        _ ->
-            return $ ProtocolResponse ErrorOp $ Aeson.object [
-                "message" .= ("Unsupported request type" :: Text)
-                ]
-
--- | Type for protocol request operations
-data ProtocolOp
-    = StoreDerivation
-    | RetrieveDerivation
-    | ValidateDerivation
-    | ErrorOp
-    deriving (Show, Eq)
-
--- | Type for protocol requests
-data ProtocolRequest
-    = ProtocolRequest ProtocolOp Aeson.Value
-    deriving (Show, Eq)
-
--- | Type for protocol responses
-data ProtocolResponse
-    = ProtocolResponse ProtocolOp Aeson.Value
-    deriving (Show, Eq)
-
--- | Send a request to the daemon (client-side)
-clientRequest :: DaemonConnection -> ProtocolRequest -> TenM p 'Unprivileged ProtocolResponse
-clientRequest conn request = do
-    -- In a real implementation, this would send the request over the socket
-    -- and wait for a response
+    -- Create necessary directories
     liftIO $ do
-        -- Simulate sending request
-        let requestStr = T.pack $ show request
+        -- Create input directory
+        createDirectoryIfMissing True (sandboxDir </> "inputs")
 
-        -- Simulate receiving response (for the example)
-        let responseStr = case request of
-                ProtocolRequest StoreDerivation _ ->
-                    "ProtocolResponse StoreDerivationOp {\"path\":\"abcdef1234-output.drv\"}"
-                ProtocolRequest RetrieveDerivation _ ->
-                    "ProtocolResponse RetrieveDerivationOp {\"derivation\":null}"
-                _ ->
-                    "ProtocolResponse ErrorOp {\"message\":\"Unimplemented\"}"
+        -- Create output directory
+        createDirectoryIfMissing True (sandboxDir </> "outputs")
 
-        -- Parse response (in a real implementation this would be proper protocol parsing)
-        return $ read $ T.unpack responseStr
+        -- Create tmp directory
+        createDirectoryIfMissing True (sandboxDir </> "tmp")
+
+    -- Symlink or copy input paths
+    forM_ (Set.toList inputs) $ \input -> do
+        let srcPath = storePathToFilePath input env
+        let destPath = sandboxDir </> "inputs" </> T.unpack (storeName input)
+
+        -- Create symlink/copy based on privilege level
+        ctx <- asks privilegeContext
+        case ctx of
+            Privileged ->
+                -- Can create symlinks in privileged mode
+                liftIO $ createFileLink srcPath destPath
+
+            Unprivileged -> do
+                -- Copy in unprivileged mode
+                content <- readFromStore input
+                liftIO $ BS.writeFile destPath content
+
+-- Helper for file linking
+createFileLink :: FilePath -> FilePath -> IO ()
+createFileLink src dest = do
+    -- Try to create a symlink first (more efficient)
+    result <- try $ createSymbolicLink src dest
+    case result of
+        Right () -> return ()
+        Left (_ :: SomeException) -> do
+            -- Fall back to file copy if symlink fails
+            content <- BS.readFile src
+            BS.writeFile dest content
