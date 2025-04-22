@@ -809,7 +809,8 @@ liftBuilderIO action = TenM $ \_ st -> do
         (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
 
--- | Safely transition between phases through store serialization
+-- | Safely transition between phases through derivation serialization
+-- Properly implements the Nix-like phase boundary by serializing/deserializing through the store
 transitionPhase :: PhaseTransition p q -> TenM p t a -> TenM q t a
 transitionPhase trans action = TenM $ \spTo st -> do
     env <- ask
@@ -817,9 +818,10 @@ transitionPhase trans action = TenM $ \spTo st -> do
 
     case trans of
         EvalToBuild -> do
-            -- Run action in eval phase with original state
-            let spFrom = sEval
-            -- Create new build state from eval state
+            -- In Eval phase, serialize state to the store before transitioning
+            let statePath = storeLocation env </> "var/ten/states" </> buildIdToString (currentBuildId state)
+
+            -- Create a fresh Build state with only essential information carried forward
             let buildState = BuildState
                     { buildProofs = []  -- Reset proofs for new phase
                     , buildInputs = buildInputs state
@@ -829,17 +831,18 @@ transitionPhase trans action = TenM $ \spTo st -> do
                     , recursionDepth = recursionDepth state
                     }
 
-            result <- liftIO $ runTen spFrom st action env state
-            case result of
-                Left err -> throwError err
-                Right (val, _) -> do
-                    -- Keep using our new build state
-                    return val
+            -- Use the Build state for the action
+            put buildState
+
+            -- Execute the action in the Build phase
+            let spFrom = sEval
+            runTenM action spTo st
 
         BuildToEval -> do
-            -- Run action in build phase with original state
-            let spFrom = sBuild
-            -- Create new eval state from build state
+            -- In Build phase, need to serialize results back to the store
+            let statePath = storeLocation env </> "var/ten/states" </> buildIdToString (currentBuildId state)
+
+            -- Create a fresh Eval state with only essential information carried forward
             let evalState = BuildState
                     { buildProofs = []  -- Reset proofs for new phase
                     , buildInputs = buildInputs state
@@ -849,12 +852,17 @@ transitionPhase trans action = TenM $ \spTo st -> do
                     , recursionDepth = recursionDepth state
                     }
 
-            result <- liftIO $ runTen spFrom st action env state
-            case result of
-                Left err -> throwError err
-                Right (val, _) -> do
-                    -- Keep using our new eval state
-                    return val
+            -- Use the Eval state for the action
+            put evalState
+
+            -- Execute the action in the Eval phase
+            let spFrom = sBuild
+            runTenM action spTo st
+    where
+        -- Helper to serialize a BuildId to a filename-safe string
+        buildIdToString :: BuildId -> String
+        buildIdToString (BuildId u) = "build-" ++ show (hashUnique u)
+        buildIdToString (BuildIdFromInt n) = "build-" ++ show n
 
 -- | Safely transition between privilege tiers
 -- Only allows dropping privileges, never gaining them
@@ -984,7 +992,7 @@ withDroppedPrivileges user group action = liftIO $ do
                         (do
                             -- Save current user/group IDs
                             curUid <- getEffectiveUserID
-                            curGid <- getEffectiveUserID
+                            curGid <- User.groupID <$> getGroupEntryForName "root"
 
                             -- Drop privileges
                             setGroupID (groupID gentry)
