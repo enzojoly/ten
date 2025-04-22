@@ -37,6 +37,8 @@ module Ten.Core (
     AuthToken(..),
 
     -- Singletons and witnesses
+    SingI(..),  -- Now properly exported
+    sing,
     withSPhase,
     withSPrivilegeTier,
     sDaemon,
@@ -143,6 +145,7 @@ module Ten.Core (
 
     -- Linux-specific operations
     dropPrivileges,
+    withDroppedPrivileges,
     getSystemUser,
     getSystemGroup,
 
@@ -191,7 +194,7 @@ import System.Posix.User (getUserEntryForName, getGroupEntryForName,
                          userID, groupID)
 import System.Posix.Types (UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
-import Control.Exception (bracket, try, catch, throwIO, SomeException, Exception, ErrorCall(..))
+import Control.Exception (bracket, try, catch, throwIO, finally, Exception, ErrorCall(..))
 import System.Environment (lookupEnv)
 import System.Posix.Types (ProcessID)
 import Text.Read (readPrec)
@@ -497,33 +500,36 @@ newtype AuthToken = AuthToken Text
     deriving (Show, Eq)
 
 -- | Daemon connection type
-data DaemonConnection = DaemonConnection
-    { connSocket :: Socket
-    , connUserId :: UserId
-    , connAuthToken :: AuthToken
-    , connectionState :: ConnectionState
-    }
-
--- | Connection state for daemon communication
-data ConnectionState = ConnectionState {
-    csSocket :: Socket,                     -- ^ Socket connected to daemon
-    csHandle :: Handle,                     -- ^ Handle for socket I/O
-    csUserId :: UserId,                     -- ^ Authenticated user ID
-    csToken :: AuthToken,                   -- ^ Authentication token
-    csRequestMap :: TVar (Map RequestId (MVar Response)), -- ^ Map of pending requests
-    csNextReqId :: TVar RequestId,          -- ^ Next request ID
-    csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
-    csShutdown :: TVar Bool                 -- ^ Flag to indicate connection shutdown
+data DaemonConnection = DaemonConnection {
+    connSocket :: Socket,                     -- ^ Socket connected to daemon
+    connHandle :: Handle,                     -- ^ Handle for socket I/O
+    connUserId :: UserId,                     -- ^ Authenticated user ID
+    connAuthToken :: AuthToken,               -- ^ Authentication token
+    connRequestMap :: TVar (Map RequestId (MVar Response)), -- ^ Map of pending requests
+    connNextReqId :: TVar RequestId,          -- ^ Next request ID
+    connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
+    connShutdown :: TVar Bool                 -- ^ Flag to indicate connection shutdown
 }
 
 -- | Request ID type
 type RequestId = Int
 
 -- | Request type (for communication with daemon)
-data Request = Request deriving (Show, Eq)
+data Request = Request {
+    reqId :: RequestId,                    -- ^ Unique request ID
+    reqType :: Text,                       -- ^ Request type
+    reqParams :: Map Text Text,            -- ^ Request parameters
+    reqPayload :: Maybe ByteString         -- ^ Optional binary payload
+} deriving (Show, Eq)
 
 -- | Response type (for communication with daemon)
-data Response = Response deriving (Show, Eq)
+data Response = Response {
+    respId :: RequestId,                   -- ^ Matching request ID
+    respStatus :: Text,                    -- ^ Status (ok, error)
+    respMessage :: Text,                   -- ^ Response message
+    respData :: Map Text Text,             -- ^ Response data
+    respPayload :: Maybe ByteString        -- ^ Optional binary payload
+} deriving (Show, Eq)
 
 -- | Running mode for Ten
 data RunMode
@@ -561,7 +567,7 @@ data BuildStrategy
 -- | Daemon configuration
 data DaemonConfig = DaemonConfig
     { daemonSocketPath :: FilePath       -- Path to daemon socket
-    , daemonStorePath :: FilePath        -- Path to store
+    , daemonStoreLocation :: FilePath        -- Path to store
     , daemonStateFile :: FilePath        -- Path to state file
     , daemonLogLevel :: Int              -- Log verbosity level
     , daemonGcInterval :: Maybe Int      -- Garbage collection interval in seconds
@@ -803,7 +809,7 @@ liftBuilderIO action = TenM $ \_ st -> do
         (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
 
--- | Safely transition between phases
+-- | Safely transition between phases through store serialization
 transitionPhase :: PhaseTransition p q -> TenM p t a -> TenM q t a
 transitionPhase trans action = TenM $ \spTo st -> do
     env <- ask
@@ -957,6 +963,48 @@ dropPrivileges user group = liftIO $ do
 
         -- Then set user
         setUserID (userID userEntry)
+
+-- | Drop privileges temporarily for an action
+withDroppedPrivileges :: Text -> Text -> IO a -> TenM p 'Daemon a
+withDroppedPrivileges user group action = liftIO $ do
+    -- Get the current (effective) user ID
+    euid <- getEffectiveUserID
+
+    -- Only proceed if we're running as root
+    if euid == 0
+        then do
+            -- Get user and group entries
+            userEntry <- try $ getUserEntryForName (T.unpack user)
+            groupEntry <- try $ getGroupEntryForName (T.unpack group)
+
+            case (userEntry, groupEntry) of
+                (Right uentry, Right gentry) ->
+                    bracket
+                        -- Setup: save current IDs, drop privileges
+                        (do
+                            -- Save current user/group IDs
+                            curUid <- getEffectiveUserID
+                            curGid <- getEffectiveUserID
+
+                            -- Drop privileges
+                            setGroupID (groupID gentry)
+                            setUserID (userID uentry)
+
+                            return (curUid, curGid))
+
+                        -- Cleanup: restore original IDs
+                        (\(curUid, curGid) -> do
+                            -- Restore original IDs
+                            setUserID curUid
+                            setGroupID curGid)
+
+                        -- Action: run with dropped privileges
+                        (\_ -> action)
+
+                _ -> action  -- If we can't get the entries, just run normally
+        else
+            -- Not running as root, just run the action normally
+            action
 
 -- | Linux-specific: Get a system user ID
 getSystemUser :: Text -> TenM p 'Daemon UserID
