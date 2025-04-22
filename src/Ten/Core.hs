@@ -33,7 +33,6 @@ module Ten.Core (
     BuildStrategy(..),
     RunMode(..),
     DaemonConfig(..),
-    UserCredentials(..),
     UserId(..),
     AuthToken(..),
 
@@ -203,6 +202,7 @@ import Data.List (isPrefixOf, isInfixOf, nub)
 import qualified System.Posix.User as User
 import System.Posix.Files (setFileMode)
 import System.Posix.Types (ProcessID, UserID, GroupID)
+import qualified System.Posix.IO as PosixIO
 import System.IO.Error (isDoesNotExistError)
 import Control.Exception (bracket, try, catch, throwIO, finally, mask, Exception, ErrorCall(..), SomeException)
 import System.Environment (lookupEnv, getEnvironment)
@@ -603,12 +603,6 @@ data DaemonConfig = DaemonConfig
     , daemonGcInterval :: Maybe Int      -- Garbage collection interval in seconds
     , daemonUser :: Maybe Text           -- User to run as
     , daemonAllowedUsers :: Set Text     -- Users allowed to connect
-    } deriving (Show, Eq)
-
--- | User credentials for daemon authentication
-data UserCredentials = UserCredentials
-    { username :: Text
-    , token :: Text
     } deriving (Show, Eq)
 
 -- | Environment for build operations

@@ -134,13 +134,6 @@ import System.Random (randomRIO)
 -- Import Ten modules
 import Ten.Core
 
--- | Instance to make PrivilegeTier orderable, needed for Set operations
--- This is a critical fix to ensure privilege tiers can be properly stored in ordered collections
-instance Ord PrivilegeTier where
-    compare Daemon Builder = GT  -- Daemon has higher privilege
-    compare Builder Daemon = LT  -- Builder has lower privilege
-    compare _ _ = EQ            -- Same privilege level
-
 -- | Authentication errors
 data AuthError
     = InvalidCredentials
@@ -872,24 +865,20 @@ refreshWithTier db username user oldTokenStr someToken tier = do
     -- Extract token info
     let (_, created, oldExpiry, clientInfo, _, perms, _) = unwrapTokenInfo someToken
 
-    -- Calculate new expiry
-    let newExpiry = case oldExpiry of
+    -- Calculate new expiry in seconds
+    let expirySeconds = case oldExpiry of
             Nothing -> Nothing
             Just expiry ->
                 let remaining = diffUTCTime expiry now
                 in if remaining > 0
-                    then Just $ addUTCTime remaining now
-                    else Just $ addUTCTime (24 * 3600) now  -- Default to 24 hours if expired
+                    then Just (ceiling remaining)
+                    else Just (24 * 3600)  -- Default to 24 hours if expired
 
     -- Create token based on requested tier
     newDb <- case tier of
         Daemon -> do
             -- Create new daemon token
-            newTokenInfo <- createDaemonToken user clientInfo
-                            (fmap (fromInteger . ceiling . fromRational . toRational) $ fmap diffUTCTime newExpiry now)
-                            perms
-
-            -- Update database
+            newTokenInfo <- createDaemonToken user clientInfo expirySeconds perms
             updateDbWithNewToken db username user oldTokenStr newTokenStr newTokenInfo
 
         Builder -> do
@@ -897,11 +886,7 @@ refreshWithTier db username user oldTokenStr someToken tier = do
             let builderPermissions = Set.filter (not . permissionRequiresDaemon) perms
 
             -- Create new builder token
-            newTokenInfo <- createBuilderToken user clientInfo
-                            (fmap (fromInteger . ceiling . fromRational . toRational) $ fmap diffUTCTime newExpiry now)
-                            builderPermissions
-
-            -- Update database
+            newTokenInfo <- createBuilderToken user clientInfo expirySeconds builderPermissions
             updateDbWithNewToken db username user oldTokenStr newTokenStr newTokenInfo
 
     return $ Right (newDb, AuthToken newTokenStr)

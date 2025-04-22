@@ -87,6 +87,21 @@ data PrivilegeModel
     | PrivilegeNoDrop         -- ^ Never drop privileges (dangerous, only for special cases)
     deriving (Show, Eq, Ord, Enum, Bounded)
 
+-- | FromJSON instance for PrivilegeModel
+instance Aeson.FromJSON PrivilegeModel where
+    parseJSON = Aeson.withText "PrivilegeModel" $ \t ->
+        case t of
+            "always-drop" -> pure PrivilegeAlwaysDrop
+            "selective" -> pure PrivilegeDropSelective
+            "no-drop" -> pure PrivilegeNoDrop
+            _ -> pure PrivilegeAlwaysDrop  -- Default to safest option
+
+-- | ToJSON instance for PrivilegeModel
+instance Aeson.ToJSON PrivilegeModel where
+    toJSON PrivilegeAlwaysDrop = Aeson.String "always-drop"
+    toJSON PrivilegeDropSelective = Aeson.String "selective"
+    toJSON PrivilegeNoDrop = Aeson.String "no-drop"
+
 -- | Log levels for daemon operations
 data LogLevel
     = LogQuiet     -- ^ Almost no logging (only critical errors)
@@ -94,6 +109,26 @@ data LogLevel
     | LogVerbose   -- ^ Verbose logging (detailed operation information)
     | LogDebug     -- ^ Debug logging (low-level details for troubleshooting)
     deriving (Show, Eq, Ord, Enum, Bounded)
+
+-- | FromJSON instance for LogLevel
+instance Aeson.FromJSON LogLevel where
+    parseJSON = Aeson.withText "LogLevel" $ \t ->
+        case t of
+            "quiet" -> pure LogQuiet
+            "normal" -> pure LogNormal
+            "verbose" -> pure LogVerbose
+            "debug" -> pure LogDebug
+            _ -> Aeson.withScientific "LogLevel" (\n ->
+                case round n of
+                    0 -> pure LogQuiet
+                    1 -> pure LogNormal
+                    2 -> pure LogVerbose
+                    3 -> pure LogDebug
+                    _ -> pure LogNormal) (Aeson.String t)
+
+-- | ToJSON instance for LogLevel
+instance Aeson.ToJSON LogLevel where
+    toJSON level = Aeson.Number (fromIntegral (fromEnum level))
 
 -- | Configuration for the Ten daemon
 data DaemonConfig = DaemonConfig {
@@ -680,20 +715,15 @@ instance Aeson.ToJSON DaemonConfig where
             "allowedUsers" .= Set.toList daemonAllowedUsers,
             "requireAuth" .= daemonRequireAuth,
             "allowPrivilegeEscalation" .= daemonAllowPrivilegeEscalation,
-            "privilegeModel" .= privilegeModelToText daemonPrivilegeModel,
+            "privilegeModel" .= daemonPrivilegeModel,
             "defaultPrivilegeTier" .= privilegeTierToText daemonDefaultPrivilegeTier,
             "logFile" .= daemonLogFile,
-            "logLevel" .= fromEnum daemonLogLevel,
+            "logLevel" .= daemonLogLevel,
             "foreground" .= daemonForeground,
             "autoStart" .= daemonAutoStart,
             "restrictive" .= daemonRestrictive
         ]
       where
-        privilegeModelToText :: PrivilegeModel -> Text
-        privilegeModelToText PrivilegeAlwaysDrop = "always-drop"
-        privilegeModelToText PrivilegeDropSelective = "selective"
-        privilegeModelToText PrivilegeNoDrop = "no-drop"
-
         privilegeTierToText :: PrivilegeTier -> Text
         privilegeTierToText Daemon = "daemon"
         privilegeTierToText Builder = "builder"
@@ -717,31 +747,43 @@ instance Aeson.FromJSON DaemonConfig where
         allowedUsersList <- v .: "allowedUsers"
         daemonRequireAuth <- v .: "requireAuth"
 
-        -- New privilege model fields, with fallbacks for older config files
-        daemonAllowPrivilegeEscalation <- v .: "allowPrivilegeEscalation" <|> pure False
-        privilegeModelText <- v .: "privilegeModel" <|> pure "always-drop"
-        defaultTierText <- v .: "defaultPrivilegeTier" <|> pure "builder"
+        -- Parse privilege model with explicit type
+        daemonPrivilegeModel <- (v .: "privilegeModel" :: Aeson.Parser PrivilegeModel)
+                              <|> pure PrivilegeAlwaysDrop
+
+        -- Parse privilege tier with explicit type
+        defaultTierText <- (v .: "defaultPrivilegeTier" :: Aeson.Parser Text)
+                         <|> pure "builder"
 
         daemonLogFile <- v .: "logFile"
-        logLevelInt <- v .: "logLevel"
+        logLevelVal <- v .: "logLevel"
         daemonForeground <- v .: "foreground"
         daemonAutoStart <- v .: "autoStart"
         daemonRestrictive <- v .: "restrictive"
 
+        -- Process allowedUsers
         let daemonAllowedUsers = Set.fromList allowedUsersList
-        let daemonLogLevel = toEnum $ min 3 $ max 0 logLevelInt
 
-        -- Parse privilege model
-        let daemonPrivilegeModel = case privilegeModelText of
-                "always-drop" -> PrivilegeAlwaysDrop
-                "selective" -> PrivilegeDropSelective
-                "no-drop" -> PrivilegeNoDrop
-                _ -> PrivilegeAlwaysDrop  -- Default to safest
+        -- Process logLevel
+        daemonLogLevel <- case logLevelVal of
+            Aeson.Number n ->
+                pure $ toEnum $ min 3 $ max 0 $ round n
+            Aeson.String s ->
+                case s of
+                    "quiet" -> pure LogQuiet
+                    "normal" -> pure LogNormal
+                    "verbose" -> pure LogVerbose
+                    "debug" -> pure LogDebug
+                    _ -> pure LogNormal
+            _ -> pure LogNormal
 
         -- Parse default privilege tier
         let daemonDefaultPrivilegeTier = case defaultTierText of
                 "daemon" -> Daemon
                 "builder" -> Builder
                 _ -> Builder  -- Default to safer
+
+        -- Allow privilege escalation field (defaulting to False for safety)
+        daemonAllowPrivilegeEscalation <- v .: "allowPrivilegeEscalation" <|> pure False
 
         return DaemonConfig{..}
