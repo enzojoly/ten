@@ -46,7 +46,7 @@ import Control.Exception (bracket, catch, throwIO, finally, Exception, SomeExcep
 import Control.Monad (when, void, unless)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (MonadReader, ask, local, ReaderT, runReaderT)
-import Control.Monad.Except (MonadError, throwError, ExceptT, runExceptT)
+import Control.Monad.Except (MonadError, throwError, catchError, ExceptT, runExceptT)
 import Control.Monad.State (StateT, runStateT, get, put, gets)
 import Data.Int (Int64)
 import Data.Text (Text)
@@ -114,7 +114,7 @@ initDatabase _ dbPath busyTimeout = do
     SQLite.execute_ conn "PRAGMA journal_mode = WAL;"
     SQLite.execute_ conn "PRAGMA synchronous = NORMAL;"
     SQLite.execute_ conn "PRAGMA foreign_keys = ON;"
-    SQLite.execute_ conn $ "PRAGMA busy_timeout = " <> T.pack (show busyTimeout) <> ";"
+    SQLite.execute_ conn $ Query $ "PRAGMA busy_timeout = " <> T.pack (show busyTimeout) <> ";"
 
     -- Create the database structure
     let db = Database {
@@ -153,6 +153,9 @@ withDatabase st dbPath busyTimeout action = do
     when (currentPrivilegeTier env /= Daemon) $
         throwError $ privilegeError "Database operations require daemon privileges"
 
+    -- Get the current build ID from the TenM context BEFORE entering IO
+    bid <- gets currentBuildId
+
     -- Create a bracket operation in the daemon TenM context
     liftIO (bracket
         (initDatabase st dbPath busyTimeout)
@@ -160,8 +163,7 @@ withDatabase st dbPath busyTimeout action = do
         (\db -> do
             -- Run the action with privilege verification inside IO
             let env' = env { currentPrivilegeTier = Daemon }
-            bid <- gets currentBuildId
-            let state = initBuildState_Build bid
+            let state = initBuildState_Build bid  -- Use the bid we extracted before
             result <- runTen sBuild st (action db) env' state
             case result of
                 Left err -> throwIO err
