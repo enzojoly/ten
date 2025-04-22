@@ -836,7 +836,22 @@ instance BuilderContext 'Unprivileged where
     builderOnly = id
 
 instance BuilderContext 'Privileged where
-    builderOnly = transitionPrivilege DropPrivilege
+    builderOnly action = TenM $ do
+        env <- ask
+        state <- get
+
+        -- Create environment with dropped privileges
+        let env' = env { privilegeContext = Unprivileged }
+
+        -- Run the unprivileged action in that environment
+        result <- liftIO $ runTen action env' state
+
+        -- Bring the result back to the privileged context
+        case result of
+            Left err -> throwError err
+            Right (val, newState) -> do
+                put newState
+                return val
 
 -- | Run an STM transaction from Ten monad
 atomicallyTen :: STM a -> TenM p ctx a
