@@ -104,6 +104,8 @@ import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Control.Concurrent.MVar
 
 import Ten.Core
+import Ten.Daemon.Protocol (DaemonConnection, DaemonRequest(..), DaemonResponse(..),
+                           sendDaemonRequest, encodeRequest, decodeResponse)
 
 -- | Lock information returned by daemon
 data GCLockInfo = GCLockInfo
@@ -175,7 +177,7 @@ requestAddRoot st path name permanent = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case buildEnvRunMode env of
+    case runMode env of
         ClientMode conn -> do
             -- Create a request message
             let requestMsg = AddGCRootRequest path name permanent
@@ -223,7 +225,7 @@ requestRemoveRoot st root = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case buildEnvRunMode env of
+    case runMode env of
         ClientMode conn -> do
             -- Create a request message
             let requestMsg = RemoveGCRootRequest root
@@ -283,7 +285,7 @@ requestListRoots st = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case buildEnvRunMode env of
+    case runMode env of
         ClientMode conn -> do
             -- Create a request message
             let requestMsg = ListGCRootsRequest
@@ -390,7 +392,7 @@ requestGarbageCollection st force = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case buildEnvRunMode env of
+    case runMode env of
         ClientMode conn -> do
             -- Create a request message
             let requestMsg = GCRequest force
@@ -558,13 +560,13 @@ getFileSystemRootPaths rootsDir = do
 
             -- Process each symlink to get target
             foldM (\acc file -> do
-                let path = rootsDir </> file
-                isLink <- Posix.isSymbolicLink <$> Posix.getFileStatus path `catch`
+                let srcPath = rootsDir </> file
+                isLink <- Posix.isSymbolicLink <$> Posix.getFileStatus srcPath `catch`
                     \(_ :: SomeException) -> return False
 
                 if isLink
                     then do
-                        target <- try $ Posix.readSymbolicLink path
+                        target <- try $ Posix.readSymbolicLink srcPath
                         case target of
                             Left (_ :: SomeException) -> return acc
                             Right targetPath ->
@@ -651,7 +653,7 @@ requestPathReachability st path = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case buildEnvRunMode env of
+    case runMode env of
         ClientMode conn -> do
             -- Create a request message
             let requestMsg = PathReachabilityRequest path
@@ -1106,15 +1108,15 @@ getReferencesFromDB path = do
     let dbPath = defaultDBPath (storeLocation env)
 
     -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+    conn <- liftIO $ SQLite.open dbPath
 
     -- Query for references
-    rows <- liftIO $ SQL.query conn
+    rows <- liftIO $ SQLite.query conn
         "SELECT reference FROM References WHERE referrer = ?"
         (Only (storePathToText path)) :: TenM p 'Daemon [Only Text]
 
     -- Close connection
-    liftIO $ SQL.close conn
+    liftIO $ SQLite.close conn
 
     -- Convert to StorePath objects
     let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
@@ -1127,19 +1129,19 @@ registerReference referrer reference = do
     let dbPath = defaultDBPath (storeLocation env)
 
     -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+    conn <- liftIO $ SQLite.open dbPath
 
     -- Insert reference (ignore if already exists)
-    liftIO $ SQL.execute conn
+    liftIO $ SQLite.execute conn
         "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'direct')"
         (storePathToText referrer, storePathToText reference)
 
     -- Close connection
-    liftIO $ SQL.close conn
+    liftIO $ SQLite.close conn
 
 -- | Scan content for references to other store paths
 -- This is a daemon-only operation
-scanForReferences :: ByteString -> TenM p 'Daemon (Set StorePath)
+scanForReferences :: BS.ByteString -> TenM p 'Daemon (Set StorePath)
 scanForReferences content = do
     env <- ask
     let storeDir = storeLocation env
@@ -1237,15 +1239,15 @@ isGCRootInDB path = do
     let dbPath = defaultDBPath (storeLocation env)
 
     -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+    conn <- liftIO $ SQLite.open dbPath
 
     -- Query for roots
-    rows <- liftIO $ SQL.query conn
+    rows <- liftIO $ SQLite.query conn
         "SELECT COUNT(*) FROM GCRoots WHERE path = ? AND active = 1"
         (Only (storePathToText path)) :: TenM p 'Daemon [Only Int]
 
     -- Close connection
-    liftIO $ SQL.close conn
+    liftIO $ SQLite.close conn
 
     -- Check if count > 0
     case rows of
@@ -1259,15 +1261,15 @@ registerGCRoot path name rootType = do
     let dbPath = defaultDBPath (storeLocation env)
 
     -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+    conn <- liftIO $ SQLite.open dbPath
 
     -- Insert or update root
-    liftIO $ SQL.execute conn
+    liftIO $ SQLite.execute conn
         "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
         (storePathToText path, name, rootType)
 
     -- Close connection
-    liftIO $ SQL.close conn
+    liftIO $ SQLite.close conn
 
 -- | Access the database with proper daemon privileges
 withDatabase :: SPrivilegeTier 'Daemon -> FilePath -> Int -> (Connection -> TenM p 'Daemon a) -> TenM p 'Daemon a
@@ -1362,58 +1364,23 @@ findPathsWithPrefix st prefix = do
     let dbPath = defaultDBPath (storeLocation env)
 
     -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+    conn <- liftIO $ SQLite.open dbPath
 
     -- Query for paths with prefix
-    rows <- liftIO $ SQL.query conn
-        "SELECT path FROM ValidPaths WHERE name LIKE ? || '%' AND is_valid = 1"
+    rows <- liftIO $ SQLite.query conn
+        "SELECT path FROM ValidPaths WHERE path LIKE ? || '%' AND is_valid = 1"
         (Only prefix) :: TenM 'Build 'Daemon [Only Text]
 
     -- Close connection
-    liftIO $ SQL.close conn
+    liftIO $ SQLite.close conn
 
     -- Convert to StorePath objects
     return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
 
 -- | Calculate hash of ByteString content
-hashByteString :: ByteString -> Digest SHA256
+hashByteString :: BS.ByteString -> Digest SHA256
 hashByteString = Crypto.hash
 
 -- | Convert hash to string representation
 showHash :: Digest SHA256 -> Text
 showHash = T.pack . show
-
--- | Helper to get the runMode field from BuildEnv to avoid ambiguity
-buildEnvRunMode :: BuildEnv -> RunMode
-buildEnvRunMode = runMode
-
--- | Protocol types for daemon communication
-data DaemonResponse
-    = GCRootResponse GCRoot
-    | GCRootListResponse [GCRoot]
-    | GCResultResponse GCStats
-    | PathReachabilityResponse Bool
-    | StoreVerifyResponse Bool
-    | SuccessResponse
-    | ErrorResponse BuildError
-    deriving (Show, Eq)
-
--- | Daemon request types for GC operations
-data DaemonRequest
-    = AddGCRootRequest StorePath Text Bool
-    | RemoveGCRootRequest GCRoot
-    | ListGCRootsRequest
-    | GCRequest Bool
-    | PathReachabilityRequest StorePath
-    | StoreVerifyRequest
-    | AbortGCRequest
-    deriving (Show, Eq)
-
--- | Send daemon request and get response
--- This is a builder-side function to communicate with daemon
-sendDaemonRequest :: DaemonConnection -> DaemonRequest -> TenM p 'Builder DaemonResponse
-sendDaemonRequest conn request =
-    -- Here we should use the daemon protocol module to send and receive
-    -- Since this is a refactoring of the GC module, we're only defining
-    -- the interface - the actual implementation would be in the Protocol module
-    throwError $ DaemonError "Protocol implementation required in Ten.Daemon.Protocol module"
