@@ -37,7 +37,7 @@ module Ten.Core (
     AuthToken(..),
 
     -- Singletons and witnesses
-    SingI(..),  -- Now properly exported
+    SingI(..),
     sing,
     withSPhase,
     withSPrivilegeTier,
@@ -62,14 +62,21 @@ module Ten.Core (
     AnyPrivilegeTier,
     AnyPhase,
 
-    -- Return-Continuation types
-    PhaseTransition(..),
-    transitionPhase,
+    -- Process boundary primitives
+    storeDerivation,
+    readDerivation,
+    storeBuildResult,
+    readBuildResult,
+    serializeDerivation,
+    deserializeDerivation,
+    serializeBuildResult,
+    deserializeBuildResult,
 
-    -- Privilege tier transitions
+    -- Privilege and process management
     PrivilegeTransition(..),
-    transitionPrivilege,
-    withPrivilegeTransition,
+    spawnBuilder,
+    runAsBuilder,
+    requestFromDaemon,
 
     -- Store types
     StorePath(..),
@@ -167,6 +174,7 @@ import Control.Monad.State
 import Control.Monad.IO.Class
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
 import Data.Unique (Unique, newUnique, hashUnique)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -174,6 +182,8 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import System.Directory
 import System.FilePath
 import System.Process
@@ -181,26 +191,33 @@ import System.Exit
 import Data.Unique (Unique, newUnique)
 import Data.Proxy (Proxy(..))
 import Network.Socket (Socket)
-import System.IO (Handle)
+import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr)
 import Data.Maybe (isJust, isNothing, fromMaybe, catMaybes)
 import Data.List (isPrefixOf, isInfixOf, nub)
 import qualified System.Posix.User as User
-import System.Posix.Types (UserID, GroupID)
+import System.Posix.Files (setFileMode)
+import System.Posix.Types (ProcessID, UserID, GroupID)
 import System.IO.Error (isDoesNotExistError)
 import Control.Exception (bracket, try, catch, throwIO, finally, Exception, ErrorCall(..))
-import System.Environment (lookupEnv)
-import System.Posix.Types (ProcessID)
+import System.Environment (lookupEnv, getEnvironment)
+import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
+import System.Posix.IO (createPipe, fdToHandle, closeFd)
 import Text.Read (readPrec)
 import qualified Text.Read as Read
-import System.IO.Unsafe (unsafePerformIO)
-import Control.Concurrent (ThreadId)
-import System.Posix.Files (setFileMode)
+import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay)
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Char (isHexDigit)
 import Data.Singletons
 import Data.Singletons.TH
 import Data.Kind (Type)
+import Data.Aeson ((.=), (.:))
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Types as Aeson
+import qualified Data.Aeson.Encoding as Aeson
+import Crypto.Hash (hash, SHA256(..), Digest)
+import qualified Crypto.Hash as Crypto
+import System.Random (randomRIO)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -411,6 +428,14 @@ data Derivation = Derivation
     , derivMeta :: !(Map Text Text)         -- Metadata for derivation
     } deriving (Show, Eq)
 
+-- | Build result - represents what comes out of the build phase
+data BuildResult = BuildResult
+    { brOutputPaths :: Set StorePath        -- Outputs produced
+    , brExitCode :: ExitCode                -- Exit code from builder
+    , brLog :: Text                         -- Build log
+    , brReferences :: Set StorePath         -- References from outputs
+    } deriving (Show, Eq)
+
 -- | Node in a build graph
 data BuildNode
     = InputNode !StorePath              -- An input that doesn't need to be built
@@ -468,14 +493,6 @@ data Proof (p :: Phase) where
 deriving instance Show (Proof p)
 deriving instance Eq (Proof p)
 
--- | Phase transition type for Return-Continuation
-data PhaseTransition p q where
-    EvalToBuild :: PhaseTransition 'Eval 'Build
-    BuildToEval :: PhaseTransition 'Build 'Eval
-
-deriving instance Show (PhaseTransition p q)
-deriving instance Eq (PhaseTransition p q)
-
 -- | Privilege transition type
 data PrivilegeTransition (p :: PrivilegeTier) (q :: PrivilegeTier) where
     DropPrivilege :: PrivilegeTransition 'Daemon 'Builder
@@ -492,7 +509,7 @@ newtype UserId = UserId Text
 newtype AuthToken = AuthToken Text
     deriving (Show, Eq)
 
--- | Daemon connection type
+-- | Daemon connection type for protocol communication
 data DaemonConnection = DaemonConnection {
     connSocket :: Socket,                     -- ^ Socket connected to daemon
     connHandle :: Handle,                     -- ^ Handle for socket I/O
@@ -802,239 +819,657 @@ liftBuilderIO action = TenM $ \_ st -> do
         (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
 
--- | Serialized derivation for phase transitions
-data SerializedDerivation = SerializedDerivation
-    { sdContent :: ByteString     -- Serialized derivation content
-    , sdPath :: StorePath         -- Path in the store
-    , sdHash :: Text              -- Hash for verification
-    } deriving (Show, Eq)
-
--- | Build result from build phase
-data BuildResult = BuildResult
-    { brExitCode :: ExitCode                -- Exit code from builder
-    , brOutputPaths :: Set StorePath        -- Outputs produced
-    , brLog :: Text                         -- Build log
-    , brReferences :: Set StorePath         -- References from outputs
-    } deriving (Show, Eq)
-
--- | Eval phase produces a derivation
-evalToDerivation :: Derivation -> TenM 'Eval t SerializedDerivation
-evalToDerivation deriv = do
-    env <- ask
-
-    -- Serialize derivation to bytes
-    let content = serializeDerivation deriv
-
-    -- Calculate hash
-    let hash = hashByteString content
-
-    -- Create store path
-    let name = derivName deriv <> ".drv"
-    let storePath = StorePath (T.pack (show hash)) name
-
-    -- In daemon context, write directly to store
-    case currentPrivilegeTier env of
-        Daemon -> do
-            -- Create store path
-            let filePath = storePathToFilePath storePath env
-            liftIO $ do
-                -- Create directory structure
-                createDirectoryIfMissing True (takeDirectory filePath)
-
-                -- Write derivation to store
-                BS.writeFile filePath content
-
-                -- Set permissions (read-only)
-                setFileMode filePath 0o444
-
-        -- In builder context, can't write to store
-        Builder -> do
-            -- Would use daemon protocol to store derivation
-            -- Currently a no-op as this is mostly a type-level protection
-            return ()
-
-    -- Return the serialized derivation
-    return SerializedDerivation
-        { sdContent = content
-        , sdPath = storePath
-        , sdHash = T.pack (show hash)
-        }
-  where
-    -- Serialize derivation to bytes (placeholder implementation)
-    serializeDerivation :: Derivation -> ByteString
-    serializeDerivation _ = BS.empty  -- In real implementation, would serialize to JSON or similar
-
--- | Build phase consumes a derivation
-buildFromDerivation :: SerializedDerivation -> TenM 'Build t BuildResult
-buildFromDerivation serialized = do
-    env <- ask
-
-    -- In a real implementation, we would:
-    -- 1. Verify the derivation exists in the store
-    -- 2. Deserialize it
-    -- 3. Set up the build environment
-    -- 4. Perform the build
-
-    -- For now, return a placeholder build result
-    return BuildResult
-        { brExitCode = ExitSuccess
-        , brOutputPaths = Set.empty
-        , brLog = "Build completed"
-        , brReferences = Set.empty
-        }
-
--- | Request type for daemon services
-data DaemonRequest
-    = StoreWriteRequest StorePath ByteString
-    | StoreLookupRequest StorePath
-    | SpawnSandboxRequest Derivation
-    | GarbageCollectRequest
+-- | Protocol message for daemon-builder communication
+data DaemonMessage
+    = BuildRequest StorePath              -- Request to build a derivation by path
+    | BuildResponse BuildResult           -- Response with build result
+    | StoreWriteRequest StorePath BS.ByteString  -- Request to write to store
+    | StoreWriteResponse StorePath        -- Response after store write
+    | StoreReadRequest StorePath          -- Request to read from store
+    | StoreReadResponse (Maybe BS.ByteString)  -- Response with store contents
+    | ErrorMessage Text                   -- Error message
     deriving (Show, Eq)
 
--- | Response from daemon
-data DaemonResponse
-    = StoreWriteResponse StorePath
-    | StoreLookupResponse (Maybe ByteString)
-    | SandboxResponse FilePath
-    | GarbageCollectResponse Int
-    | ErrorResponse Text
-    deriving (Show, Eq)
+-- JSON instances for secure serialization
+instance Aeson.ToJSON DaemonMessage where
+    toJSON (BuildRequest path) = Aeson.object [
+        "type" .= ("build" :: Text),
+        "path" .= storePathToText path
+        ]
+    toJSON (BuildResponse result) = Aeson.object [
+        "type" .= ("buildResult" :: Text),
+        "result" .= Aeson.toJSON result
+        ]
+    toJSON (StoreWriteRequest path content) = Aeson.object [
+        "type" .= ("storeWrite" :: Text),
+        "path" .= storePathToText path,
+        "contentLength" .= BS.length content
+        -- Content is sent separately as binary
+        ]
+    toJSON (StoreWriteResponse path) = Aeson.object [
+        "type" .= ("storeWriteResponse" :: Text),
+        "path" .= storePathToText path
+        ]
+    toJSON (StoreReadRequest path) = Aeson.object [
+        "type" .= ("storeRead" :: Text),
+        "path" .= storePathToText path
+        ]
+    toJSON (StoreReadResponse Nothing) = Aeson.object [
+        "type" .= ("storeReadResponse" :: Text),
+        "exists" .= False
+        ]
+    toJSON (StoreReadResponse (Just content)) = Aeson.object [
+        "type" .= ("storeReadResponse" :: Text),
+        "exists" .= True,
+        "contentLength" .= BS.length content
+        -- Content is sent separately as binary
+        ]
+    toJSON (ErrorMessage msg) = Aeson.object [
+        "type" .= ("error" :: Text),
+        "message" .= msg
+        ]
 
--- | Builder requests service from daemon
-requestDaemonService :: DaemonRequest -> TenM p 'Builder DaemonResponse
-requestDaemonService req = do
-    env <- ask
+instance Aeson.FromJSON DaemonMessage where
+    parseJSON = Aeson.withObject "DaemonMessage" $ \v -> do
+        msgType <- v .: "type" :: Aeson.Parser Text
+        case msgType of
+            "build" -> BuildRequest <$> (parseStorePath =<< v .: "path")
+            "buildResult" -> BuildResponse <$> v .: "result"
+            "storeWrite" -> do
+                path <- parseStorePath =<< v .: "path"
+                -- Content would be read separately as binary
+                return $ StoreWriteRequest path BS.empty
+            "storeWriteResponse" -> StoreWriteResponse <$> (parseStorePath =<< v .: "path")
+            "storeRead" -> StoreReadRequest <$> (parseStorePath =<< v .: "path")
+            "storeReadResponse" -> do
+                exists <- v .: "exists"
+                if exists
+                    then return $ StoreReadResponse (Just BS.empty) -- Content read separately
+                    else return $ StoreReadResponse Nothing
+            "error" -> ErrorMessage <$> v .: "message"
+            _ -> fail $ "Unknown message type: " ++ T.unpack msgType
+      where
+        parseStorePath txt = case textToStorePath txt of
+            Just p -> return p
+            Nothing -> fail $ "Invalid store path: " ++ T.unpack txt
 
-    -- In a real implementation, this would:
-    -- 1. Serialize the request
-    -- 2. Send it through a socket/pipe to the daemon
-    -- 3. Wait for and deserialize the response
+-- | JSON instance for BuildResult
+instance Aeson.ToJSON BuildResult where
+    toJSON BuildResult{..} = Aeson.object [
+        "outputPaths" .= map storePathToText (Set.toList brOutputPaths),
+        "exitCode" .= exitCodeToJSON brExitCode,
+        "log" .= brLog,
+        "references" .= map storePathToText (Set.toList brReferences)
+        ]
+      where
+        exitCodeToJSON ExitSuccess = Aeson.object [
+            "success" .= True,
+            "code" .= (0 :: Int)
+            ]
+        exitCodeToJSON (ExitFailure code) = Aeson.object [
+            "success" .= False,
+            "code" .= code
+            ]
 
-    -- For now, we'll simulate the basic structure
-    case runMode env of
-        ClientMode conn -> do
-            -- We have a connection to the daemon
-            result <- liftIO $ sendRequestToDaemon conn req
-            case result of
-                Left err -> return $ ErrorResponse err
-                Right resp -> return resp
-
-        _ -> return $ ErrorResponse "Not connected to daemon"
-
--- | Daemon spawns a builder process
-spawnBuilder :: Derivation -> TenM p 'Daemon BuildResult
-spawnBuilder deriv = do
-    env <- ask
-
-    -- In a real implementation, this would:
-    -- 1. Fork a new process
-    -- 2. Set up sandbox environment
-    -- 3. Drop privileges
-    -- 4. Execute builder
-    -- 5. Collect results
-
-    -- Import the sandbox functionality (would normally be in a different module)
-    -- For now, simulate the basic structure
-    liftIO $ do
-        -- Create a temporary sandbox directory
-        let sandboxDir = workDir env </> "sandbox" </> "build-" ++ showBuildId (BuildId <$> newUnique)
-        createDirectoryIfMissing True sandboxDir
-
-        -- Set up environment for builder
-        let builderEnv = [("TEN_SANDBOX", "1"), ("TEN_STORE", storeLocation env)]
-
-        -- Would execute the builder here with reduced privileges
-        -- For now, return a placeholder result
-        return BuildResult
-            { brExitCode = ExitSuccess
-            , brOutputPaths = Set.empty
-            , brLog = "Build completed in sandbox"
-            , brReferences = Set.empty
+instance Aeson.FromJSON BuildResult where
+    parseJSON = Aeson.withObject "BuildResult" $ \v -> do
+        paths <- v .: "outputPaths" :: Aeson.Parser [Text]
+        outputPaths <- mapM parseStorePath paths
+        exitCodeObj <- v .: "exitCode"
+        exitCode <- parseExitCode exitCodeObj
+        log <- v .: "log"
+        refs <- v .: "references" :: Aeson.Parser [Text]
+        references <- mapM parseStorePath refs
+        return BuildResult {
+            brOutputPaths = Set.fromList outputPaths,
+            brExitCode = exitCode,
+            brLog = log,
+            brReferences = Set.fromList references
             }
+      where
+        parseStorePath txt = case textToStorePath txt of
+            Just p -> return p
+            Nothing -> fail $ "Invalid store path: " ++ T.unpack txt
 
--- | Execute phase transition from Eval to Build
--- This properly models the Nix-like boundary where evaluation produces a derivation
--- and building consumes it
-evalToBuildPhase :: Derivation -> TenM 'Eval t BuildResult
-evalToBuildPhase deriv = do
-    env <- ask
+        parseExitCode = Aeson.withObject "ExitCode" $ \obj -> do
+            success <- obj .: "success"
+            if success
+                then return ExitSuccess
+                else ExitFailure <$> obj .: "code"
 
-    -- First, serialize the derivation to the store (pure interface between phases)
-    serialized <- evalToDerivation deriv
+-- | Implementation to serialize a derivation to JSON
+serializeDerivation :: Derivation -> BS.ByteString
+serializeDerivation deriv =
+    LBS.toStrict $ Aeson.encode $ Aeson.object [
+        "name" .= derivName deriv,
+        "hash" .= derivHash deriv,
+        "builder" .= storePathToText (derivBuilder deriv),
+        "args" .= derivArgs deriv,
+        "inputs" .= map serializeInput (Set.toList $ derivInputs deriv),
+        "outputs" .= map serializeOutput (Set.toList $ derivOutputs deriv),
+        "env" .= derivEnv deriv,
+        "system" .= derivSystem deriv,
+        "strategy" .= (if derivStrategy deriv == ApplicativeStrategy then "applicative" else "monadic" :: Text),
+        "meta" .= derivMeta deriv
+    ]
+  where
+    serializeInput (DerivationInput path name) = Aeson.object [
+        "path" .= storePathToText path,
+        "name" .= name
+        ]
+    serializeOutput (DerivationOutput name path) = Aeson.object [
+        "name" .= name,
+        "path" .= storePathToText path
+        ]
 
-    -- Now handle the phase transition based on privilege tier
-    case currentPrivilegeTier env of
-        -- In daemon context, we can spawn a builder directly
-        Daemon -> do
-            -- Spawn a builder process to build the derivation
-            spawnBuilder deriv
-
-        -- In builder context, we need to request the daemon to build
-        Builder -> do
-            -- Request build from daemon via protocol
-            resp <- requestDaemonService (SpawnSandboxRequest deriv)
-            case resp of
-                -- In a real implementation, would parse build result from response
-                _ -> return BuildResult
-                    { brExitCode = ExitSuccess
-                    , brOutputPaths = Set.empty
-                    , brLog = "Build completed via daemon"
-                    , brReferences = Set.empty
-                    }
-
--- | Execute phase transition from Build to Eval
--- This models the Nix pattern where build results can feed back into evaluation
--- (e.g., for multi-stage builds)
-buildToEvalPhase :: BuildResult -> TenM 'Build t Derivation
-buildToEvalPhase result = do
-    -- In a real implementation, this would:
-    -- 1. Check for a "return.drv" in the build results
-    -- 2. Deserialize it into a Derivation
-
-    -- For now, return a placeholder derivation
-    return Derivation
-        { derivName = "placeholder"
-        , derivHash = "0000000000000000"
-        , derivBuilder = StorePath "0000000000000000" "builder"
-        , derivArgs = []
-        , derivInputs = Set.empty
-        , derivOutputs = Set.empty
-        , derivEnv = Map.empty
-        , derivSystem = "x86_64-linux"
-        , derivStrategy = MonadicStrategy
-        , derivMeta = Map.empty
+-- | Implementation to deserialize a derivation from JSON
+deserializeDerivation :: BS.ByteString -> Either Text Derivation
+deserializeDerivation bs = case Aeson.eitherDecodeStrict bs of
+    Left err -> Left $ "JSON parse error: " <> T.pack err
+    Right obj -> parseDerivation obj
+  where
+    parseDerivation :: Aeson.Value -> Either Text Derivation
+    parseDerivation = Aeson.parseEither $ \obj -> do
+        name <- obj .: "name"
+        hash <- obj .: "hash"
+        builderText <- obj .: "builder"
+        builder <- case textToStorePath builderText of
+            Just p -> return p
+            Nothing -> fail "Invalid builder path"
+        args <- obj .: "args"
+        inputObjs <- obj .: "inputs"
+        inputs <- Set.fromList <$> mapM parseInput inputObjs
+        outputObjs <- obj .: "outputs"
+        outputs <- Set.fromList <$> mapM parseOutput outputObjs
+        env <- obj .: "env"
+        system <- obj .: "system"
+        strategyText <- obj .: "strategy"
+        let strategy = if strategyText == "applicative" then ApplicativeStrategy else MonadicStrategy
+        meta <- obj .: "meta"
+        return Derivation {
+            derivName = name,
+            derivHash = hash,
+            derivBuilder = builder,
+            derivArgs = args,
+            derivInputs = inputs,
+            derivOutputs = outputs,
+            derivEnv = env,
+            derivSystem = system,
+            derivStrategy = strategy,
+            derivMeta = meta
         }
 
--- | Helper function to send request to daemon
--- This would be implemented in Ten.Daemon.Client in a real implementation
-sendRequestToDaemon :: DaemonConnection -> DaemonRequest -> IO (Either Text DaemonResponse)
-sendRequestToDaemon _ _ = return $ Right $ ErrorResponse "Not implemented"
+    parseInput = Aeson.withObject "DerivationInput" $ \obj -> do
+        pathText <- obj .: "path"
+        path <- case textToStorePath pathText of
+            Just p -> return p
+            Nothing -> fail "Invalid input path"
+        name <- obj .: "name"
+        return $ DerivationInput path name
 
--- | Helper to convert BuildId to string
-showBuildId :: IO BuildId -> String
-showBuildId mBid = unsafePerformIO $ do
-    bid <- mBid
-    return $ case bid of
-        BuildId u -> "build-" ++ show (hashUnique u)
-        BuildIdFromInt n -> "build-" ++ show n
+    parseOutput = Aeson.withObject "DerivationOutput" $ \obj -> do
+        name <- obj .: "name"
+        pathText <- obj .: "path"
+        path <- case textToStorePath pathText of
+            Just p -> return p
+            Nothing -> fail "Invalid output path"
+        return $ DerivationOutput name path
 
--- | Execute an action with a privilege transition
--- Only used for compatibility with existing code
-withPrivilegeTransition :: PrivilegeTransition t u -> (TenM p u a -> TenM p u a) -> TenM p t a -> TenM p u a
-withPrivilegeTransition DropPrivilege wrapper action = wrapper $ TenM $ \sp _ -> do
+-- | Implementation to serialize a build result
+serializeBuildResult :: BuildResult -> BS.ByteString
+serializeBuildResult = LBS.toStrict . Aeson.encode
+
+-- | Implementation to deserialize a build result
+deserializeBuildResult :: BS.ByteString -> Either Text BuildResult
+deserializeBuildResult bs = case Aeson.eitherDecodeStrict bs of
+    Left err -> Left $ "JSON parse error: " <> T.pack err
+    Right result -> Right result
+
+-- | Store a derivation in the store (Daemon privilege)
+storeDerivation :: Derivation -> TenM 'Eval 'Daemon StorePath
+storeDerivation deriv = do
     env <- ask
-    state <- get
 
-    -- Create a new environment with reduced privileges
-    let env' = env { currentPrivilegeTier = Builder }
+    -- Serialize the derivation to JSON
+    let serialized = serializeDerivation deriv
 
-    -- Run the action in the new environment
-    runReaderT (runTenM action sp sBuilder) env'
+    -- Calculate a hash for the content
+    let contentHash = hashByteString serialized
+    let hashHex = T.pack $ showHex contentHash
 
+    -- Determine store path
+    let name = derivName deriv <> ".drv"
+    let storePath = StorePath hashHex name
 
--- | Execute an action with a privilege transition
-withPrivilegeTransition :: PrivilegeTransition t u -> (TenM p u a -> TenM p u a) -> TenM p t a -> TenM p u a
-withPrivilegeTransition trans wrapper action = wrapper (transitionPrivilege trans action)
+    -- Write to the store
+    let fullPath = storePathToFilePath storePath env
+
+    -- Create parent directories
+    liftIO $ createDirectoryIfMissing True (takeDirectory fullPath)
+
+    -- Write the file with proper permissions
+    liftIO $ BS.writeFile fullPath serialized
+    liftIO $ setFileMode fullPath 0o444  -- Read-only for everyone
+
+    logMsg 1 $ "Stored derivation at " <> storePathToText storePath
+
+    -- Return the store path
+    return storePath
+  where
+    showHex :: Int -> String
+    showHex n = if n < 0 then error "Cannot show negative hash" else show n
+
+    hashByteString :: BS.ByteString -> Int
+    hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
+
+-- | Read a derivation from the store (any privilege tier through protocol)
+readDerivation :: StorePath -> TenM p t (Either BuildError Derivation)
+readDerivation path = do
+    env <- ask
+
+    case currentPrivilegeTier env of
+        -- Direct store access in daemon context
+        Daemon -> do
+            let fullPath = storePathToFilePath path env
+
+            -- Check if file exists
+            exists <- liftIO $ doesFileExist fullPath
+            if not exists
+                then return $ Left $ StoreError $ "Derivation not found: " <> storePathToText path
+                else do
+                    -- Read and deserialize
+                    content <- liftIO $ BS.readFile fullPath
+                    case deserializeDerivation content of
+                        Left err -> return $ Left $ SerializationError $
+                                          "Failed to deserialize derivation: " <> err
+                        Right deriv -> return $ Right deriv
+
+        -- Must use protocol in builder context
+        Builder -> case runMode env of
+            ClientMode conn -> do
+                -- Use daemon protocol to read derivation
+                result <- requestFromDaemon conn (StoreReadRequest path)
+                case result of
+                    StoreReadResponse (Just content) ->
+                        case deserializeDerivation content of
+                            Left err -> return $ Left $ SerializationError $
+                                              "Failed to deserialize derivation: " <> err
+                            Right deriv -> return $ Right deriv
+                    StoreReadResponse Nothing ->
+                        return $ Left $ StoreError $ "Derivation not found: " <> storePathToText path
+                    ErrorMessage msg ->
+                        return $ Left $ StoreError msg
+                    _ -> return $ Left $ ProtocolError "Unexpected response from daemon"
+
+            _ -> return $ Left $ PrivilegeError
+                             "Cannot read derivation in builder context without daemon connection"
+
+-- | Store a build result (Daemon privilege)
+storeBuildResult :: BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
+storeBuildResult buildId result = do
+    env <- ask
+
+    -- Serialize the result to JSON
+    let serialized = serializeBuildResult result
+
+    -- Calculate a hash for the content
+    let contentHash = hashByteString serialized
+    let hashHex = T.pack $ showHex contentHash
+
+    -- Determine store path
+    let name = T.pack (show buildId) <> "-result.json"
+    let storePath = StorePath hashHex name
+
+    -- Write to the store
+    let fullPath = storePathToFilePath storePath env
+
+    -- Create parent directories
+    liftIO $ createDirectoryIfMissing True (takeDirectory fullPath)
+
+    -- Write the file with proper permissions
+    liftIO $ BS.writeFile fullPath serialized
+    liftIO $ setFileMode fullPath 0o444  -- Read-only for everyone
+
+    logMsg 1 $ "Stored build result at " <> storePathToText storePath
+
+    -- Return the store path
+    return storePath
+  where
+    showHex :: Int -> String
+    showHex n = if n < 0 then error "Cannot show negative hash" else show n
+
+    hashByteString :: BS.ByteString -> Int
+    hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
+
+-- | Read a build result from the store (any privilege tier through protocol)
+readBuildResult :: StorePath -> TenM p t (Either BuildError BuildResult)
+readBuildResult path = do
+    env <- ask
+
+    case currentPrivilegeTier env of
+        -- Direct store access in daemon context
+        Daemon -> do
+            let fullPath = storePathToFilePath path env
+
+            -- Check if file exists
+            exists <- liftIO $ doesFileExist fullPath
+            if not exists
+                then return $ Left $ StoreError $ "Build result not found: " <> storePathToText path
+                else do
+                    -- Read and deserialize
+                    content <- liftIO $ BS.readFile fullPath
+                    case deserializeBuildResult content of
+                        Left err -> return $ Left $ SerializationError $
+                                          "Failed to deserialize build result: " <> err
+                        Right result -> return $ Right result
+
+        -- Must use protocol in builder context
+        Builder -> case runMode env of
+            ClientMode conn -> do
+                -- Use daemon protocol to read build result
+                result <- requestFromDaemon conn (StoreReadRequest path)
+                case result of
+                    StoreReadResponse (Just content) ->
+                        case deserializeBuildResult content of
+                            Left err -> return $ Left $ SerializationError $
+                                              "Failed to deserialize build result: " <> err
+                            Right buildResult -> return $ Right buildResult
+                    StoreReadResponse Nothing ->
+                        return $ Left $ StoreError $ "Build result not found: " <> storePathToText path
+                    ErrorMessage msg ->
+                        return $ Left $ StoreError msg
+                    _ -> return $ Left $ ProtocolError "Unexpected response from daemon"
+
+            _ -> return $ Left $ PrivilegeError
+                             "Cannot read build result in builder context without daemon connection"
+
+-- | Send a request to the daemon and get a response (Builder context)
+requestFromDaemon :: DaemonConnection -> DaemonMessage -> TenM p 'Builder DaemonMessage
+requestFromDaemon conn msg = do
+    reqId <- liftIO $ atomically $ do
+        rid <- readTVar (connNextReqId conn)
+        writeTVar (connNextReqId conn) (rid + 1)
+        return rid
+
+    -- Create a response MVar
+    respVar <- liftIO $ newEmptyMVar
+
+    -- Register the request
+    liftIO $ atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
+
+    -- Serialize the message
+    let msgJson = Aeson.encode msg
+    let msgLen = LBS.length msgJson
+    let lenBytes = Aeson.encode msgLen
+
+    -- Send the message with length prefix
+    liftIO $ LBS.hPut (connHandle conn) lenBytes
+    liftIO $ LBS.hPut (connHandle conn) msgJson
+    liftIO $ hFlush (connHandle conn)
+
+    -- Handle binary content if present
+    case msg of
+        StoreWriteRequest _ content -> do
+            -- Send binary content separately
+            liftIO $ BS.hPut (connHandle conn) content
+            liftIO $ hFlush (connHandle conn)
+        _ -> return ()
+
+    -- Wait for response with timeout (5 minutes for build)
+    let timeout = case msg of
+            BuildRequest _ -> 5 * 60 * 1000000  -- 5 min for builds
+            _ -> 30 * 1000000  -- 30 sec for everything else
+
+    mResp <- liftIO $ withTimeout timeout $ takeMVar respVar
+
+    -- Clean up the request mapping
+    liftIO $ atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
+
+    case mResp of
+        Nothing -> throwError $ DaemonError "Timeout waiting for daemon response"
+        Just resp -> do
+            -- Handle binary content in response
+            case resp of
+                StoreReadResponse (Just _) -> do
+                    -- Read binary content based on length specified in headers
+                    -- This is simplified - in a real impl you'd extract the length
+                    content <- liftIO $ BS.hGet (connHandle conn) 4096
+                    return $ StoreReadResponse (Just content)
+                _ -> return resp
+
+-- | Helper for timeouts
+withTimeout :: Int -> IO a -> IO (Maybe a)
+withTimeout micros action = do
+    result <- newEmptyMVar
+    tid <- forkIO $ do
+        r <- action
+        putMVar result r
+
+    -- Wait for result or timeout
+    threadDelay micros
+    gotResult <- isJust <$> tryTakeMVar result
+
+    unless gotResult $ killThread tid
+
+    if gotResult
+        then Just <$> readMVar result
+        else return Nothing
+
+-- | Spawn a builder process with dropped privileges (Daemon context)
+spawnBuilder :: BuildId -> StorePath -> TenM 'Build 'Daemon (Either BuildError BuildResult)
+spawnBuilder buildId derivPath = do
+    env <- ask
+
+    -- Create pipes for communication
+    (readFd, writeFd) <- liftIO $ createPipe
+    readHandle <- liftIO $ fdToHandle readFd
+    writeHandle <- liftIO $ fdToHandle writeFd
+
+    -- Get builder script location
+    let builderScript = storeLocation env </> "libexec/ten-builder"
+
+    -- Create a unique work directory
+    let workDir' = workDir env </> "builders" </> show buildId
+    liftIO $ createDirectoryIfMissing True workDir'
+
+    -- Determine user/group to run as
+    targetUser <- case userName env of
+        Just name -> return $ T.unpack name
+        Nothing -> return "nobody"  -- Default to nobody
+
+    -- Prepare environment variables for the builder
+    baseEnv <- liftIO getEnvironment
+    let builderEnv = [
+            ("TEN_STORE", storeLocation env),
+            ("TEN_WORK_DIR", workDir'),
+            ("TEN_BUILD_ID", show buildId),
+            ("TEN_DERIVATION_PATH", storePathToFilePath derivPath env)
+            ] ++ baseEnv
+
+    -- Fork a child process
+    pid <- liftIO $ forkProcess $ do
+        -- In child process
+
+        -- Close read end of pipe
+        liftIO $ closeFd readFd
+
+        -- Drop privileges if running as root
+        uid <- liftIO User.getRealUserID
+        when (uid == 0) $ do
+            targetUid <- safeGetUserUID targetUser
+            targetGid <- safeGetGroupGID "nogroup"  -- Default to nogroup
+
+            -- Set groups first, then user
+            liftIO $ User.setGroupID targetGid
+            liftIO $ User.setUserID targetUid
+
+        -- Execute the builder with the derivation path
+        liftIO $ executeFile builderScript True [
+            "--derivation", storePathToFilePath derivPath env,
+            "--build-id", show buildId,
+            "--store", storeLocation env
+            ] (Just builderEnv)
+
+        -- Should never get here
+        liftIO $ exitWith $ ExitFailure 1
+
+    -- Close write end of pipe in parent
+    liftIO $ closeFd writeFd
+
+    -- Wait for child to complete and collect output
+    result <- liftIO $ waitForChildProcess pid readHandle
+
+    liftIO $ hClose readHandle
+
+    -- Process the result
+    case result of
+        Left err -> return $ Left $ BuildFailed $ "Builder process failed: " <> err
+        Right output -> do
+            -- Parse the output as a BuildResult
+            case deserializeBuildResult output of
+                Left err -> return $ Left $ SerializationError $
+                              "Failed to parse builder output: " <> err
+                Right buildResult -> return $ Right buildResult
+
+-- | Wait for a child process and collect output
+waitForChildProcess :: ProcessID -> Handle -> IO (Either Text BS.ByteString)
+waitForChildProcess pid handle = do
+    -- Read output from the handle
+    output <- BS.hGetContents handle
+
+    -- Wait for process to exit
+    status <- getProcessStatus True True pid
+
+    case status of
+        Just (Exited ExitSuccess) -> return $ Right output
+        Just (Exited (ExitFailure code)) -> return $ Left $ "Process exited with status " <> T.pack (show code)
+        Just (Terminated signum _) -> return $ Left $ "Process terminated by signal " <> T.pack (show signum)
+        Just (Stopped signum) -> return $ Left $ "Process stopped by signal " <> T.pack (show signum)
+        Nothing -> return $ Left "Failed to get process status"
+
+-- | Run a function as an unprivileged builder (replaces withPrivilegeTransition)
+runAsBuilder :: String -> DaemonConfig -> StorePath -> IO (Either BuildError BuildResult)
+runAsBuilder userName config derivPath = do
+    -- Generate a build ID
+    buildId <- randomBuildId
+
+    -- Create a work directory
+    let workDir' = "/tmp/ten-builder-" ++ show buildId
+    createDirectoryIfMissing True workDir'
+
+    -- Prepare environment variables
+    env <- getEnvironment
+    let builderEnv = [
+            ("TEN_STORE", daemonStorePath config),
+            ("TEN_WORK_DIR", workDir'),
+            ("TEN_BUILD_ID", show buildId),
+            ("TEN_DERIVATION_PATH", daemonStorePath config </> T.unpack (storeHashText derivPath) ++ "-" ++ T.unpack (storeName derivPath))
+            ] ++ env
+
+    -- Get builder script location
+    let builderScript = daemonStorePath config </> "libexec/ten-builder"
+
+    -- Create pipes for IPC
+    (readFd, writeFd) <- createPipe
+    readHandle <- fdToHandle readFd
+    writeHandle <- fdToHandle writeFd
+
+    -- Fork a child process
+    pid <- forkProcess $ do
+        -- In child process
+
+        -- Close read end of pipe
+        closeFd readFd
+
+        -- Drop privileges if running as root
+        uid <- User.getRealUserID
+        when (uid == 0) $ do
+            targetUid <- safeGetUserUID userName
+            targetGid <- safeGetGroupGID "nogroup"  -- Default to nogroup
+
+            -- Set groups first, then user
+            User.setGroupID targetGid
+            User.setUserID targetUid
+
+        -- Execute the builder with the derivation path
+        executeFile builderScript True [
+            "--derivation", daemonStorePath config </> T.unpack (storeHashText derivPath) ++ "-" ++ T.unpack (storeName derivPath),
+            "--build-id", show buildId,
+            "--store", daemonStorePath config
+            ] (Just builderEnv)
+
+        -- Should never get here
+        exitWith $ ExitFailure 1
+
+    -- Close write end of pipe in parent
+    closeFd writeFd
+
+    -- Wait for child to complete and collect output
+    result <- waitForChildProcess pid readHandle
+
+    hClose readHandle
+
+    -- Clean up work directory
+    removePathForcibly workDir' `catch` (\(_ :: SomeException) -> return ())
+
+    -- Return the result
+    case result of
+        Left err -> return $ Left $ BuildFailed $ "Builder process failed: " <> err
+        Right output ->
+            case deserializeBuildResult output of
+                Left err -> return $ Left $ SerializationError $
+                              "Failed to parse builder output: " <> err
+                Right buildResult -> return $ Right buildResult
+  where
+    storeHashText :: StorePath -> Text
+    storeHashText = storeHash
+
+    randomBuildId :: IO BuildId
+    randomBuildId = BuildIdFromInt <$> randomRIO (1000, 9999999)
+
+-- | Safely get a user's UID with fallback options
+safeGetUserUID :: String -> IO UserID
+safeGetUserUID username = do
+    result <- try $ User.getUserEntryForName username
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nobody
+            hPutStrLn stderr $ "Warning: User " ++ username ++ " not found, falling back to nobody"
+            nobodyResult <- try $ User.getUserEntryForName "nobody"
+            case nobodyResult of
+                Left (_ :: SomeException) -> do
+                    -- Ultimate fallback to current user if even nobody doesn't exist
+                    User.getRealUserID
+                Right entry ->
+                    return $ User.userID entry
+        Right entry ->
+            return $ User.userID entry
+
+-- | Safely get a group's GID with fallback options
+safeGetGroupGID :: String -> IO GroupID
+safeGetGroupGID groupname = do
+    result <- try $ User.getGroupEntryForName groupname
+    case result of
+        Left (_ :: SomeException) -> do
+            -- Fallback to nogroup
+            hPutStrLn stderr $ "Warning: Group " ++ groupname ++ " not found, falling back to nogroup"
+            nogroupResult <- try $ User.getGroupEntryForName "nogroup"
+            case nogroupResult of
+                Left (_ :: SomeException) -> do
+                    -- Try nobody as group
+                    nobodyResult <- try $ User.getGroupEntryForName "nobody"
+                    case nobodyResult of
+                        Left (_ :: SomeException) -> do
+                            -- Ultimate fallback to current group
+                            uid <- User.getRealUserID
+                            entry <- User.getUserEntryForID uid
+                            return $ User.userGroupID entry
+                        Right entry ->
+                            return $ User.groupID entry
+                Right entry ->
+                    return $ User.groupID entry
+        Right entry ->
+            return $ User.groupID entry
 
 -- | Generate a new unique build ID
 newBuildId :: TenM p t BuildId
