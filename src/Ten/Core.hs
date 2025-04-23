@@ -1013,7 +1013,6 @@ storeDerivation deriv = do
     hashByteString :: BS.ByteString -> Int
     hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
--- | Read a derivation from the store
 -- This is a daemon-only operation for direct store access
 -- | Read a derivation from the store (daemon-only operation)
 readDerivationDaemon :: StorePath -> TenM p 'Daemon (Either BuildError Derivation)
@@ -1070,29 +1069,58 @@ readDerivation path = do
     if not (validateStorePath path)
         then return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
         else do
-            -- Check the privilege tier and use appropriate method
+            -- Get the current environment to check privilege and mode
             env <- ask
             case currentPrivilegeTier env of
-                -- Daemon with direct store access
-                Daemon ->
-                    withSPrivilegeTier sDaemon $ \st' ->
-                        TenM $ \sp _ -> do
-                            -- Run the daemon-specific implementation
-                            let TenM m = readDerivationDaemon path
-                            m sp st'
+                -- Daemon context - direct store access
+                Daemon -> do
+                    -- Direct access to store files
+                    let fullPath = storePathToFilePath path env
+                    exists <- liftIO $ doesFileExist fullPath
+                    if not exists
+                        then return $ Left $ StoreError $ "Derivation not found: " <> storePathToText path
+                        else do
+                            -- Read and deserialize
+                            content <- liftIO $ BS.readFile fullPath
+                            case deserializeDerivation content of
+                                Left err -> return $ Left $ SerializationError $
+                                    "Failed to deserialize derivation: " <> err
+                                Right deriv -> return $ Right deriv
 
-                -- Builder using protocol
+                -- Builder context - must use protocol
                 Builder ->
                     case runMode env of
-                        ClientMode conn ->
-                            withSPrivilegeTier sBuilder $ \st' ->
-                                TenM $ \sp _ -> do
-                                    -- Run the builder-specific implementation
-                                    let TenM m = requestDerivationBuilder path conn
-                                    m sp st'
-                        _ ->
-                            return $ Left $ PrivilegeError
-                                "Cannot read derivation in builder context without daemon connection"
+                        ClientMode conn -> do
+                            -- Create request for derivation content
+                            let request = Request {
+                                    reqId = 0,  -- Will be set by sendRequest
+                                    reqType = "store-read",
+                                    reqParams = Map.singleton "path" (storePathToText path),
+                                    reqPayload = Nothing
+                                }
+
+                            -- Send request and wait for response with proper lifting
+                            response <- liftIO $ sendRequestSync conn request 30000000
+
+                            case response of
+                                Left err ->
+                                    return $ Left err
+                                Right resp ->
+                                    if respStatus resp == "ok"
+                                        then case respPayload resp of
+                                            Just content ->
+                                                case deserializeDerivation content of
+                                                    Left err -> return $ Left $ SerializationError $
+                                                        "Failed to deserialize derivation: " <> err
+                                                    Right deriv -> return $ Right deriv
+                                            Nothing ->
+                                                return $ Left $ StoreError "Received empty response"
+                                        else
+                                            return $ Left $ StoreError $ respMessage resp
+
+                        -- No connection to daemon
+                        _ -> return $ Left $ PrivilegeError
+                              "Cannot read derivation in builder context without daemon connection"
 
 -- | Store a build result (Daemon privilege)
 storeBuildResult :: BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
@@ -1160,8 +1188,8 @@ requestBuildResultBuilder path conn = do
             reqPayload = Nothing
         }
 
-    -- Send request and wait for response
-    response <- sendRequestSync conn request 30000000 -- 30 second timeout
+    -- Send request and wait for response with proper lifting
+    response <- liftIO $ sendRequestSync conn request 30000000 -- 30 second timeout
 
     case response of
         Left err ->
@@ -1183,26 +1211,35 @@ requestBuildResultBuilder path conn = do
 readBuildResult :: StorePath -> TenM p t (Either BuildError BuildResult)
 readBuildResult path = do
     -- Validate the path before attempting to retrieve
-    unless (validateStorePath path) $
-        return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
+    if not (validateStorePath path)
+        then return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
+        else do
+            -- Get environment to check privilege tier
+            env <- ask
+            case currentPrivilegeTier env of
+                -- Daemon context - direct store access
+                Daemon -> do
+                    let fullPath = storePathToFilePath path env
+                    exists <- liftIO $ doesFileExist fullPath
+                    if not exists
+                        then return $ Left $ StoreError $ "Build result not found: " <> storePathToText path
+                        else do
+                            -- Read and deserialize
+                            content <- liftIO $ BS.readFile fullPath
+                            case deserializeBuildResult content of
+                                Left err -> return $ Left $ SerializationError $
+                                    "Failed to deserialize build result: " <> err
+                                Right result -> return $ Right result
 
-    -- Check the privilege tier and use appropriate method
-    env <- ask
-    case currentPrivilegeTier env of
-        -- Daemon with direct store access
-        Daemon ->
-            withSPrivilegeTier sDaemon $ \_ ->
-                readBuildResultDaemon path
+                -- Builder context - use protocol
+                Builder ->
+                    case runMode env of
+                        ClientMode conn ->
+                            requestBuildResultBuilder path conn
 
-        -- Builder using protocol
-        Builder ->
-            case runMode env of
-                ClientMode conn ->
-                    withSPrivilegeTier sBuilder $ \_ ->
-                        requestBuildResultBuilder path conn
-                _ ->
-                    return $ Left $ PrivilegeError
-                        "Cannot read build result in builder context without daemon connection"
+                        -- No connection to daemon
+                        _ -> return $ Left $ PrivilegeError
+                              "Cannot read build result in builder context without daemon connection"
 
 -- | Implementation to serialize a derivation to JSON
 serializeDerivation :: Derivation -> BS.ByteString
@@ -1284,28 +1321,29 @@ decodeResponse bs =
                 hasPayload <- extractBool obj "payload"
 
                 -- If payload is present, extract it
-                payload <- if hasPayload
-                    then
-                        if BS.length bs <= headerEnd + 4
-                            then Left "Response truncated, missing payload length"
-                            else
-                                let payloadLen =
-                                        fromIntegral (BS.index bs (headerEnd)) `shiftL` 24 .|.
-                                        fromIntegral (BS.index bs (headerEnd + 1)) `shiftL` 16 .|.
-                                        fromIntegral (BS.index bs (headerEnd + 2)) `shiftL` 8 .|.
-                                        fromIntegral (BS.index bs (headerEnd + 3))
-                                    payloadStart = headerEnd + 4
-                                    payloadEnd = payloadStart + payloadLen
-                                in
-                                    if BS.length bs < payloadEnd
-                                        then Left "Response truncated, incomplete payload"
-                                        else Right $ Just $ BS.take payloadLen (BS.drop payloadStart bs)
-                    else Right Nothing
+                let payloadResult =
+                      if hasPayload
+                          then
+                              if BS.length bs <= headerEnd + 4
+                                  then Left "Response truncated, missing payload length"
+                                  else
+                                      let payloadLen =
+                                              fromIntegral (BS.index bs (headerEnd)) `shiftL` 24 .|.
+                                              fromIntegral (BS.index bs (headerEnd + 1)) `shiftL` 16 .|.
+                                              fromIntegral (BS.index bs (headerEnd + 2)) `shiftL` 8 .|.
+                                              fromIntegral (BS.index bs (headerEnd + 3))
+                                          payloadStart = headerEnd + 4
+                                          payloadEnd = payloadStart + payloadLen
+                                      in
+                                          if BS.length bs < payloadEnd
+                                              then Left "Response truncated, incomplete payload"
+                                              else Right $ Just $ BS.take payloadLen (BS.drop payloadStart bs)
+                          else Right Nothing
 
-                -- Construct the response object
-                case payload of
+                -- Construct the response object based on payload result
+                case payloadResult of
                     Left err -> Left err
-                    Right p -> Right $ Response rid status message respData p
+                    Right payloadMaybe -> Right $ Response rid status message respData payloadMaybe
   where
     extractInt :: Aeson.Object -> Text -> Either Text Int
     extractInt obj key = case KeyMap.lookup (Key.fromText key) obj of
@@ -1324,18 +1362,26 @@ decodeResponse bs =
 
     extractMap :: Aeson.Object -> Text -> Either Text (Map Text Text)
     extractMap obj key = case KeyMap.lookup (Key.fromText key) obj of
-        Just (Aeson.Object o) -> Right $ Map.mapMaybe extractTextValue (KeyMap.toList o)
+        Just (Aeson.Object o) ->
+            -- Convert KeyMap to Map Text Text
+            Right $ Map.fromList $ mapMaybe extractTextPair $ KeyMap.toList o
         _ -> Left $ "Missing or invalid " <> key <> " field in response"
 
-    extractTextValue :: (Aeson.Key, Aeson.Value) -> Maybe Text
-    extractTextValue (k, Aeson.String t) = Just t
-    extractTextValue _ = Nothing
+    extractTextPair :: (Key.Key, Aeson.Value) -> Maybe (Text, Text)
+    extractTextPair (k, Aeson.String t) = Just (Key.toText k, t)
+    extractTextPair _ = Nothing
 
     shiftL :: Int -> Int -> Int
     shiftL x n = x * (2 ^ n)
 
     (.|.) :: Int -> Int -> Int
     a .|. b = a + b
+
+    mapMaybe :: (a -> Maybe b) -> [a] -> [b]
+    mapMaybe _ [] = []
+    mapMaybe f (x:xs) = case f x of
+        Nothing -> mapMaybe f xs
+        Just y  -> y : mapMaybe f xs
 
 -- | Read a response with timeout
 readResponseWithTimeout :: Handle -> Int -> IO Response
