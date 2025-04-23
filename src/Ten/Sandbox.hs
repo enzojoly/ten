@@ -55,7 +55,8 @@ module Ten.Sandbox (
 
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
-import Control.Monad.State (get, gets, put, modify, State)
+import Control.Monad.State (get, gets, put, modify)
+import qualified Control.Monad.State as State
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Data.List (isPrefixOf, isInfixOf, sort)
@@ -68,15 +69,14 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Bits ((.|.), (.&.))
 import Data.Maybe (isJust, fromMaybe, listToMaybe, catMaybes)
-import Data.Binary (Binary(..), encode, decode)
-import Data.Binary.Get (Get)
-import Data.Binary.Put (Put)
 import qualified Data.Binary as Binary
+import Data.Binary.Get (runGet)
+import Data.Binary.Put (runPut)
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString as BS
 import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMissing, getHomeDirectory,
                         removeFile, getPermissions, setPermissions, removePathForcibly,
-                        listDirectory, copyFile, Permissions)
+                        listDirectory, copyFile, Permissions, pathIsSymbolicLink)
 import qualified System.Directory as Directory
 import System.FilePath ((</>), takeDirectory, takeFileName, makeRelative)
 import qualified System.FilePath as FilePath
@@ -102,6 +102,7 @@ import System.IO (hPutStrLn, stderr, hClose, Handle, hFlush)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (Socket)
 import qualified Network.Socket as Network
+import qualified Network.Socket.ByteString as NetworkBS
 import System.Random (randomRIO)
 import Data.UUID (UUID)
 import qualified Data.UUID as UUID
@@ -118,6 +119,7 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Text.Encoding as TE
 
 import Ten.Core
+import Ten.Daemon.Protocol (DaemonConnection(..))
 
 -- | Sandbox connection type for proper process separation
 data SandboxConnection = SandboxConnection {
@@ -233,7 +235,7 @@ defaultSandboxConfig = SandboxConfig {
 }
 
 -- | Binary instance for SandboxRequest for serialization
-instance Binary SandboxRequest where
+instance Binary.Binary SandboxRequest where
     put (SandboxCreateRequest buildId inputs config) = do
         Binary.put (0 :: Word8)  -- Tag for CreateRequest
         Binary.put (show buildId)
@@ -253,7 +255,7 @@ instance Binary SandboxRequest where
         Binary.put sandboxId
 
     get = do
-        tag <- Binary.get :: Get Word8
+        tag <- Binary.get :: Binary.Get Word8
         case tag of
             0 -> do  -- CreateRequest
                 buildIdStr <- Binary.get
@@ -266,7 +268,7 @@ instance Binary SandboxRequest where
             _ -> fail $ "Unknown SandboxRequest tag: " ++ show tag
 
 -- | Binary instance for SandboxResponse for serialization
-instance Binary SandboxResponse where
+instance Binary.Binary SandboxResponse where
     put (SandboxCreatedResponse sid path) = do
         Binary.put (0 :: Word8)  -- Tag for CreatedResponse
         Binary.put sid
@@ -288,7 +290,7 @@ instance Binary SandboxResponse where
         Binary.put err
 
     get = do
-        tag <- Binary.get :: Get Word8
+        tag <- Binary.get :: Binary.Get Word8
         case tag of
             0 -> SandboxCreatedResponse <$> Binary.get <*> Binary.get
             1 -> SandboxReleasedResponse <$> Binary.get
@@ -307,10 +309,10 @@ instance Binary SandboxResponse where
 
 -- Helper functions to encode/decode sandbox config
 encodeConfig :: SandboxConfig -> BS.ByteString
-encodeConfig = LBS.toStrict . encode . configToList
+encodeConfig = LBS.toStrict . Binary.encode . configToList
 
 decodeConfig :: BS.ByteString -> SandboxConfig
-decodeConfig = listToConfig . decode . LBS.fromStrict
+decodeConfig = listToConfig . Binary.decode . LBS.fromStrict
 
 -- Convert config to/from a list of key-value pairs for serialization
 configToList :: SandboxConfig -> [(String, String)]
@@ -487,7 +489,7 @@ instance Storable RLimit where
 withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
 withSandbox inputs config action = do
     env <- ask
-    state <- get
+    state <- State.get
 
     -- Verify we are in Build phase
     unless (currentPhase state == Build) $
@@ -616,9 +618,9 @@ getSandboxConnection conn = do
 
     -- Create the sandbox connection
     return SandboxConnection {
-        sandboxConnSocket = conn.connSocket,
-        sandboxConnAuthToken = conn.connAuthToken,
-        sandboxConnUserId = conn.connUserId,
+        sandboxConnSocket = connSocket conn,
+        sandboxConnAuthToken = connAuthToken conn,
+        sandboxConnUserId = connUserId conn,
         sandboxConnRequestCounter = requestCounter,
         sandboxConnResponses = responses
     }
@@ -1423,16 +1425,16 @@ requestSandbox conn buildId inputs config = do
             Map.insert reqId responseMVar
 
     -- Serialize the request
-    let requestData = encode request
+    let requestData = Binary.encode request
 
     -- Send the request to the daemon
     liftIO $ do
         -- Create a header with the request ID and size
-        let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
+        let header = LBS.toStrict $ Binary.encode (reqId, LBS.length requestData)
 
         -- Send header followed by request data through the socket
-        Network.sendAll (sandboxConnSocket conn) header
-        Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+        NetworkBS.sendAll (sandboxConnSocket conn) header
+        NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
         -- Wait for response with a reasonable timeout (30 seconds)
         response <- timeout 30000000 $ takeMVar responseMVar
@@ -1468,15 +1470,15 @@ releaseSandbox conn sandboxId = do
             Map.insert reqId responseMVar
 
     -- Serialize the request
-    let requestData = encode request
+    let requestData = Binary.encode request
 
     -- Send the request to the daemon
     -- Create a header with the request ID and size
-    let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
+    let header = LBS.toStrict $ Binary.encode (reqId, LBS.length requestData)
 
     -- Send header followed by request data through the socket
-    Network.sendAll (sandboxConnSocket conn) header
-    Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+    NetworkBS.sendAll (sandboxConnSocket conn) header
+    NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (10 seconds)
     _ <- timeout 10000000 $ takeMVar responseMVar
@@ -1510,15 +1512,15 @@ notifySandboxError conn sandboxId err = do
             Map.insert reqId responseMVar
 
     -- Serialize the request
-    let requestData = encode request
+    let requestData = Binary.encode request
 
     -- Send the request to the daemon
     -- Create a header with the request ID and size
-    let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
+    let header = LBS.toStrict $ Binary.encode (reqId, LBS.length requestData)
 
     -- Send header followed by request data through the socket
-    Network.sendAll (sandboxConnSocket conn) header
-    Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+    NetworkBS.sendAll (sandboxConnSocket conn) header
+    NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (5 seconds)
     _ <- timeout 5000000 $ takeMVar responseMVar

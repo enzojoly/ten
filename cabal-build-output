@@ -1,0 +1,103 @@
+Build profile: -w ghc-9.8.2 -O1
+In order, the following will be built (use -v for more details):
+ - ten-0.1.0.0 (lib) (first run)
+ - ten-0.1.0.0 (exe:ten-daemon) (first run)
+ - ten-0.1.0.0 (exe:ten) (first run)
+Preprocessing library for ten-0.1.0.0...
+Building library for ten-0.1.0.0...
+[ 8 of 21] Compiling Ten.Sandbox      ( src/Ten/Sandbox.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Sandbox.dyn_o )
+
+src/Ten/Sandbox.hs:490:5: error: [GHC-87543]
+    Ambiguous occurrence ‘get’.
+    It could refer to
+       either ‘Control.Monad.State.get’,
+              imported from ‘Control.Monad.State’ at src/Ten/Sandbox.hs:58:29-31
+              (and originally defined in ‘Control.Monad.State.Class’),
+           or ‘Data.Binary.get’,
+              imported from ‘Data.Binary’ at src/Ten/Sandbox.hs:71:21-30
+              (and originally defined in ‘binary-0.8.9.3:Data.Binary.Class’).
+    |
+490 |     state <- get
+    |     ^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:611:25: error: [GHC-76037]
+    Not in scope: type constructor or class ‘DaemonConnection’
+    |
+611 | getSandboxConnection :: DaemonConnection -> IO SandboxConnection
+    |                         ^^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:1434:9: error: [GHC-76037]
+    Not in scope: ‘Network.sendAll’
+    NB: the module ‘Network.Socket’ does not export ‘sendAll’.
+    Suggested fix:
+      Perhaps use one of these:
+        ‘Network.sendFd’ (imported from Network.Socket),
+        ‘Network.sendBuf’ (imported from Network.Socket)
+     |
+1434 |         Network.sendAll (sandboxConnSocket conn) header
+     |         ^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:1435:9: error: [GHC-76037]
+    Not in scope: ‘Network.sendAll’
+    NB: the module ‘Network.Socket’ does not export ‘sendAll’.
+    Suggested fix:
+      Perhaps use one of these:
+        ‘Network.sendFd’ (imported from Network.Socket),
+        ‘Network.sendBuf’ (imported from Network.Socket)
+     |
+1435 |         Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+     |         ^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:1478:5: error: [GHC-76037]
+    Not in scope: ‘Network.sendAll’
+    NB: the module ‘Network.Socket’ does not export ‘sendAll’.
+    Suggested fix:
+      Perhaps use one of these:
+        ‘Network.sendFd’ (imported from Network.Socket),
+        ‘Network.sendBuf’ (imported from Network.Socket)
+     |
+1478 |     Network.sendAll (sandboxConnSocket conn) header
+     |     ^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:1479:5: error: [GHC-76037]
+    Not in scope: ‘Network.sendAll’
+    NB: the module ‘Network.Socket’ does not export ‘sendAll’.
+    Suggested fix:
+      Perhaps use one of these:
+        ‘Network.sendFd’ (imported from Network.Socket),
+        ‘Network.sendBuf’ (imported from Network.Socket)
+     |
+1479 |     Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+     |     ^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:1520:5: error: [GHC-76037]
+    Not in scope: ‘Network.sendAll’
+    NB: the module ‘Network.Socket’ does not export ‘sendAll’.
+    Suggested fix:
+      Perhaps use one of these:
+        ‘Network.sendFd’ (imported from Network.Socket),
+        ‘Network.sendBuf’ (imported from Network.Socket)
+     |
+1520 |     Network.sendAll (sandboxConnSocket conn) header
+     |     ^^^^^^^^^^^^^^^
+
+src/Ten/Sandbox.hs:1521:5: error: [GHC-76037]
+    Not in scope: ‘Network.sendAll’
+    NB: the module ‘Network.Socket’ does not export ‘sendAll’.
+    Suggested fix:
+      Perhaps use one of these:
+        ‘Network.sendFd’ (imported from Network.Socket),
+        ‘Network.sendBuf’ (imported from Network.Socket)
+     |
+1521 |     Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+     |     ^^^^^^^^^^^^^^^
+[ 9 of 21] Compiling Ten.Store        ( src/Ten/Store.hs, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Store.o, /home/enzo/ten/dist-newstyle/build/x86_64-linux/ghc-9.8.2/ten-0.1.0.0/build/Ten/Store.dyn_o )
+
+src/Ten/Store.hs:106:27: error: [GHC-61689]
+    Module ‘System.Posix.Files’ does not export ‘symbolicLinkExistant’.
+    |
+106 |                           symbolicLinkExistant, readSymbolicLink)
+    |                           ^^^^^^^^^^^^^^^^^^^^
+Error: [Cabal-7125]
+Failed to build ten-0.1.0.0 (which is required by exe:ten-daemon from ten-0.1.0.0 and exe:ten from ten-0.1.0.0).
+
