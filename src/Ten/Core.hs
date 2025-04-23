@@ -196,6 +196,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Unique (Unique, newUnique, hashUnique)
 import Data.Map.Strict (Map)
+import Data.Maybe (isJust)
+import Data.Bits (shiftL, shiftR, (.&.))
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -1031,7 +1033,6 @@ readDerivationDaemon path = do
                                    "Failed to deserialize derivation: " <> err
                 Right deriv -> return $ Right deriv
 
--- | Request a derivation via the daemon protocol (builder-only operation)
 -- | Request a derivation via the daemon protocol (builder-only operation)
 requestDerivationBuilder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError Derivation)
 requestDerivationBuilder path conn = do
