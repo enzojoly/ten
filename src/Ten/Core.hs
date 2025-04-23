@@ -127,18 +127,18 @@ module Ten.Core (
     initBuildEnv,
     initClientEnv,
     initDaemonEnv,
-    initBuildState_Eval,
-    initBuildState_Build,
+    initBuildStateEval,
+    initBuildStateBuild,
 
     -- Monad operations
     runTen,
     evalTen,
     buildTen,
     runTenDaemon,
-    runTenDaemon_Eval,
-    runTenDaemon_Build,
-    runTenBuilder_Eval,
-    runTenBuilder_Build,
+    runTenDaemonEval,
+    runTenDaemonBuild,
+    runTenBuilderEval,
+    runTenBuilderBuild,
     runTenIO,
     liftTenIO,
     liftDaemonIO,
@@ -867,8 +867,8 @@ initDaemonEnv wd sp user = (initBuildEnv wd sp)
     }
 
 -- | Initialize build state for Eval phase with a BuildId
-initBuildState_Eval :: BuildId -> BuildState 'Eval
-initBuildState_Eval bid = BuildState
+initBuildStateEval :: BuildId -> BuildState 'Eval
+initBuildStateEval bid = BuildState
     { buildProofs = []
     , buildInputs = Set.empty
     , buildOutputs = Set.empty
@@ -879,8 +879,8 @@ initBuildState_Eval bid = BuildState
     }
 
 -- | Initialize build state for Build phase with a BuildId
-initBuildState_Build :: BuildId -> BuildState 'Build
-initBuildState_Build bid = BuildState
+initBuildStateBuild :: BuildId -> BuildState 'Build
+initBuildStateBuild bid = BuildState
     { buildProofs = []
     , buildInputs = Set.empty
     , buildOutputs = Set.empty
@@ -904,7 +904,7 @@ evalTen m env = do
     -- Ensure environment is daemon tier
     let env' = env { currentPrivilegeTier = Daemon }
     bid <- BuildId <$> newUnique
-    runTen sEval sDaemon m env' (initBuildState_Eval bid)
+    runTen sEval sDaemon m env' (initBuildStateEval bid)
 
 -- | Execute a build-phase computation in builder mode
 buildTen :: TenM 'Build 'Builder a -> BuildEnv -> IO (Either BuildError (a, BuildState 'Build))
@@ -912,7 +912,7 @@ buildTen m env = do
     -- Ensure environment is builder tier
     let env' = env { currentPrivilegeTier = Builder }
     bid <- BuildId <$> newUnique
-    runTen sBuild sBuilder m env' (initBuildState_Build bid)
+    runTen sBuild sBuilder m env' (initBuildStateBuild bid)
 
 -- | Execute a daemon operation with appropriate phase (general version)
 runTenDaemon :: forall p a. (SingI p) => TenM p 'Daemon a -> BuildEnv -> BuildState p -> IO (Either BuildError (a, BuildState p))
@@ -926,23 +926,23 @@ runTenDaemon m env state = do
         _ -> return $ Left $ PrivilegeError "Cannot run daemon operation in non-daemon mode"
 
 -- | Execute a daemon operation in Eval phase (privileged)
-runTenDaemon_Eval :: TenM 'Eval 'Daemon a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
-runTenDaemon_Eval = runTenDaemon
+runTenDaemonEval :: TenM 'Eval 'Daemon a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
+runTenDaemonEval = runTenDaemon
 
 -- | Execute a daemon operation in Build phase (privileged)
-runTenDaemon_Build :: TenM 'Build 'Daemon a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
-runTenDaemon_Build = runTenDaemon
+runTenDaemonBuild :: TenM 'Build 'Daemon a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
+runTenDaemonBuild = runTenDaemon
 
 -- | Execute a builder operation in Eval phase (unprivileged)
-runTenBuilder_Eval :: TenM 'Eval 'Builder a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
-runTenBuilder_Eval m env state = do
+runTenBuilderEval :: TenM 'Eval 'Builder a -> BuildEnv -> BuildState 'Eval -> IO (Either BuildError (a, BuildState 'Eval))
+runTenBuilderEval m env state = do
     -- Set builder privilege tier
     let env' = env { currentPrivilegeTier = Builder }
     runTen sEval sBuilder m env' state
 
 -- | Execute a builder operation in Build phase (unprivileged)
-runTenBuilder_Build :: TenM 'Build 'Builder a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
-runTenBuilder_Build m env state = do
+runTenBuilderBuild :: TenM 'Build 'Builder a -> BuildEnv -> BuildState 'Build -> IO (Either BuildError (a, BuildState 'Build))
+runTenBuilderBuild m env state = do
     -- Set builder privilege tier
     let env' = env { currentPrivilegeTier = Builder }
     runTen sBuild sBuilder m env' state
@@ -1013,8 +1013,9 @@ storeDerivation deriv = do
 
 -- | Read a derivation from the store
 -- This is a daemon-only operation for direct store access
-readDerivation_Daemon :: StorePath -> TenM p 'Daemon (Either BuildError Derivation)
-readDerivation_Daemon path = do
+-- | Read a derivation from the store (daemon-only operation)
+readDerivationDaemon :: StorePath -> TenM p 'Daemon (Either BuildError Derivation)
+readDerivationDaemon path = do
     env <- ask
     let fullPath = storePathToFilePath path env
 
@@ -1031,8 +1032,9 @@ readDerivation_Daemon path = do
                 Right deriv -> return $ Right deriv
 
 -- | Request a derivation via the daemon protocol (builder-only operation)
-requestDerivation_Builder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError Derivation)
-requestDerivation_Builder path conn = do
+-- | Request a derivation via the daemon protocol (builder-only operation)
+requestDerivationBuilder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError Derivation)
+requestDerivationBuilder path conn = do
     -- Create request for derivation content
     let request = Request {
             reqId = 0,  -- Will be set by sendRequest
@@ -1041,8 +1043,8 @@ requestDerivation_Builder path conn = do
             reqPayload = Nothing
         }
 
-    -- Send request and wait for response
-    response <- sendRequestSync conn request 30000000 -- 30 second timeout
+    -- Send request and wait for response - add liftIO here
+    response <- liftIO $ sendRequestSync conn request 30000000 -- 30 second timeout
 
     case response of
         Left err ->
@@ -1064,26 +1066,32 @@ requestDerivation_Builder path conn = do
 readDerivation :: StorePath -> TenM p t (Either BuildError Derivation)
 readDerivation path = do
     -- Validate the path before attempting to retrieve
-    unless (validateStorePath path) $
-        return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
+    if not (validateStorePath path)
+        then return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
+        else do
+            -- Check the privilege tier and use appropriate method
+            env <- ask
+            case currentPrivilegeTier env of
+                -- Daemon with direct store access
+                Daemon ->
+                    withSPrivilegeTier sDaemon $ \st' ->
+                        TenM $ \sp _ -> do
+                            -- Run the daemon-specific implementation
+                            let TenM m = readDerivationDaemon path
+                            m sp st'
 
-    -- Check the privilege tier and use appropriate method
-    env <- ask
-    case currentPrivilegeTier env of
-        -- Daemon with direct store access
-        Daemon ->
-            withSPrivilegeTier sDaemon $ \_ ->
-                readDerivation_Daemon path
-
-        -- Builder using protocol
-        Builder ->
-            case runMode env of
-                ClientMode conn ->
-                    withSPrivilegeTier sBuilder $ \_ ->
-                        requestDerivation_Builder path conn
-                _ ->
-                    return $ Left $ PrivilegeError
-                        "Cannot read derivation in builder context without daemon connection"
+                -- Builder using protocol
+                Builder ->
+                    case runMode env of
+                        ClientMode conn ->
+                            withSPrivilegeTier sBuilder $ \st' ->
+                                TenM $ \sp _ -> do
+                                    -- Run the builder-specific implementation
+                                    let TenM m = requestDerivationBuilder path conn
+                                    m sp st'
+                        _ ->
+                            return $ Left $ PrivilegeError
+                                "Cannot read derivation in builder context without daemon connection"
 
 -- | Store a build result (Daemon privilege)
 storeBuildResult :: BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
@@ -1123,8 +1131,8 @@ storeBuildResult buildId result = do
     hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
 -- | Read a build result from the store (daemon-only operation)
-readBuildResult_Daemon :: StorePath -> TenM p 'Daemon (Either BuildError BuildResult)
-readBuildResult_Daemon path = do
+readBuildResultDaemon :: StorePath -> TenM p 'Daemon (Either BuildError BuildResult)
+readBuildResultDaemon path = do
     env <- ask
     let fullPath = storePathToFilePath path env
 
@@ -1141,8 +1149,8 @@ readBuildResult_Daemon path = do
                 Right result -> return $ Right result
 
 -- | Request a build result via the daemon protocol (builder-only operation)
-requestBuildResult_Builder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError BuildResult)
-requestBuildResult_Builder path conn = do
+requestBuildResultBuilder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError BuildResult)
+requestBuildResultBuilder path conn = do
     -- Create request for build result content
     let request = Request {
             reqId = 0,  -- Will be set by sendRequest
@@ -1183,14 +1191,14 @@ readBuildResult path = do
         -- Daemon with direct store access
         Daemon ->
             withSPrivilegeTier sDaemon $ \_ ->
-                readBuildResult_Daemon path
+                readBuildResultDaemon path
 
         -- Builder using protocol
         Builder ->
             case runMode env of
                 ClientMode conn ->
                     withSPrivilegeTier sBuilder $ \_ ->
-                        requestBuildResult_Builder path conn
+                        requestBuildResultBuilder path conn
                 _ ->
                     return $ Left $ PrivilegeError
                         "Cannot read build result in builder context without daemon connection"
