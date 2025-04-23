@@ -111,7 +111,11 @@ import Data.Word (Word8)
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Control.Concurrent.STM
 import Control.Concurrent.MVar
-import Data.Unique (Unique, newUnique, hashUnique, hashInt)
+import Data.Unique (Unique, newUnique, hashUnique)
+import Crypto.Hash (hash, SHA256(..), Digest)
+import qualified Crypto.Hash as Crypto
+import qualified Data.ByteString.Char8 as BS8
+import qualified Data.Text.Encoding as TE
 
 import Ten.Core
 
@@ -367,6 +371,29 @@ listToConfig items =
 showBuildId :: BuildId -> String
 showBuildId (BuildId u) = "build-" ++ show (hashUnique u)
 showBuildId (BuildIdFromInt n) = "build-" ++ show n
+
+-- | Hash an integer in a cryptographically secure way
+-- Replacement for the non-existent hashInt function
+hashInt :: Int -> Int
+hashInt n =
+    let
+        -- Convert int to ByteString using text encoding
+        bs = BS8.pack (show n)
+        -- Hash using SHA256
+        digest = Crypto.hash bs :: Digest SHA256
+        -- Convert to hex string and take first 8 chars
+        hexStr = take 8 $ show digest
+        -- Convert hex to int
+        hexVal = foldl (\acc c -> acc * 16 + hexDigitToInt c) 0 hexStr
+    in
+        abs hexVal  -- Ensure positive value
+  where
+    hexDigitToInt :: Char -> Int
+    hexDigitToInt c
+        | c >= '0' && c <= '9' = fromEnum c - fromEnum '0'
+        | c >= 'a' && c <= 'f' = 10 + fromEnum c - fromEnum 'a'
+        | c >= 'A' && c <= 'F' = 10 + fromEnum c - fromEnum 'A'
+        | otherwise = 0
 
 -- Linux-specific constants for mount operations
 mS_RDONLY, mS_BIND, mS_NOSUID, mS_NODEV, mS_NOEXEC, mS_REMOUNT, mS_REC, mS_PRIVATE :: CInt
