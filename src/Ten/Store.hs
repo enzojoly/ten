@@ -88,6 +88,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as LBS
 import Data.Char (isHexDigit)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, listToMaybe, catMaybes)
 import Data.List (isPrefixOf, isInfixOf, sort)
 import Data.Set (Set)
@@ -100,10 +102,10 @@ import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMis
                          listDirectory, removeFile, getPermissions, Permissions,
                          readable, executable, renameFile)
 import System.FilePath ((</>), takeDirectory, takeFileName, normalise)
-import System.IO (withFile, IOMode(..), hPutStr, stderr, hPutStrLn)
+import System.IO (withFile, IOMode(..), hPutStr, stderr, hPutStrLn, Handle, hFlush)
 import System.Posix.Files (fileExist, getFileStatus, isRegularFile, setFileMode,
                           setOwnerAndGroup, fileSize, FileStatus,
-                          symbolicLinkExistant, readSymbolicLink)
+                          isSymbolicLink, readSymbolicLink)
 import System.Posix.User (getUserEntryForName, getGroupEntryForName, userID, groupID)
 import System.Process (readCreateProcessWithExitCode, proc, CreateProcess(..))
 import System.Exit (ExitCode(..))
@@ -544,7 +546,7 @@ isGCRoot _ path = do
                     else do
                         -- Check if this root points to our path
                         let rootPath = rootsDir </> root
-                        isLink <- liftIO $ symbolicLinkExistant rootPath
+                        isLink <- isSymbolicLink <$> getFileStatus rootPath `catch` \(_ :: SomeException) -> return False
                         if isLink
                             then do
                                 target <- liftIO $ readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
@@ -678,7 +680,7 @@ findGCRoots _ = do
             fsRoots <- liftIO $ foldM (\acc file -> do
                 let path = rootsDir </> file
                 -- Check if it's a symlink
-                isLink <- symbolicLinkExistant path
+                isLink <- isSymbolicLink <$> getFileStatus path `catch` \(_ :: SomeException) -> return False
                 if isLink
                     then do
                         -- Read the target
@@ -1067,8 +1069,8 @@ requestReferrersToPath :: StorePath -> TenM p 'Builder (Set StorePath)
 requestReferrersToPath path = do
     conn <- getDaemonConnection
 
-    -- There's no direct endpoint for referrers, synthesize a request
-    let customRequest = StoreRequest {
+    -- There's no direct endpoint for referrers, create a custom protocol message
+    let customRequest = StoreRequestMessage {
         reqId = 0,  -- Will be set by protocol
         reqType = "store-referrers",
         reqParams = Map.singleton "path" (storePathToText path),
@@ -1141,8 +1143,8 @@ data DaemonConnection = DaemonConnection {
     connPendingRequests :: TVar (Map Integer (TMVar DaemonResponse))
 }
 
--- | Request structure for daemon protocol
-data StoreRequest = StoreRequest {
+-- | Protocol message structure for daemon communication
+data StoreRequestMessage = StoreRequestMessage {
     reqId :: Integer,
     reqType :: Text,
     reqParams :: Map Text Text,
@@ -1157,35 +1159,39 @@ getDaemonConnection = do
         ClientMode conn -> return conn
         _ -> throwError $ ConfigError "Not in client mode - no daemon connection available"
 
+-- | Convert domain StoreRequest to protocol StoreRequestMessage
+domainToProtocol :: StoreRequest -> StoreRequestMessage
+domainToProtocol req = StoreRequestMessage {
+    reqId = 0,  -- Will be filled later
+    reqType = "store-" <> case req of
+                  StoreAddRequest {} -> "add"
+                  StoreReadRequest {} -> "read"
+                  StoreVerifyRequest {} -> "verify"
+                  StoreListRequest {} -> "list"
+                  StoreDerivationRequest {} -> "derivation"
+                  StoreReferenceRequest {} -> "reference"
+                  StoreGCRequest {} -> "gc",
+    reqParams = case req of
+                  StoreAddRequest name _ -> Map.singleton "name" name
+                  StoreReadRequest path -> Map.singleton "path" (storePathToText path)
+                  StoreVerifyRequest path -> Map.singleton "path" (storePathToText path)
+                  StoreListRequest -> Map.empty
+                  StoreDerivationRequest _ -> Map.empty
+                  StoreReferenceRequest path -> Map.singleton "path" (storePathToText path)
+                  StoreGCRequest force -> Map.singleton "force" (T.pack $ show force),
+    reqPayload = case req of
+                  StoreAddRequest _ content -> Just content
+                  StoreDerivationRequest content -> Just content
+                  _ -> Nothing
+}
+
 -- | Send a store request to the daemon
 sendStoreRequest :: DaemonConnection -> StoreRequest -> TenM p 'Builder StoreResponse
 sendStoreRequest conn req = do
-    -- Create a store request message
-    let storeRequestMsg = StoreRequest {
-        reqId = 0,  -- Will be filled by sendToDaemon
-        reqType = "store-" <> case req of
-                      StoreAddRequest {} -> "add"
-                      StoreReadRequest {} -> "read"
-                      StoreVerifyRequest {} -> "verify"
-                      StoreListRequest {} -> "list"
-                      StoreDerivationRequest {} -> "derivation"
-                      StoreReferenceRequest {} -> "reference"
-                      StoreGCRequest {} -> "gc",
-        reqParams = case req of
-                      StoreAddRequest name _ -> Map.singleton "name" name
-                      StoreReadRequest path -> Map.singleton "path" (storePathToText path)
-                      StoreVerifyRequest path -> Map.singleton "path" (storePathToText path)
-                      StoreListRequest -> Map.empty
-                      StoreDerivationRequest _ -> Map.empty
-                      StoreReferenceRequest path -> Map.singleton "path" (storePathToText path)
-                      StoreGCRequest force -> Map.singleton "force" (T.pack $ show force),
-        reqPayload = case req of
-                      StoreAddRequest _ content -> Just content
-                      StoreDerivationRequest content -> Just content
-                      _ -> Nothing
-    }
+    -- Convert domain request to protocol message
+    let storeRequestMsg = domainToProtocol req
 
-    -- Send the request
+    -- Send the protocol message to the daemon
     response <- sendToDaemon conn storeRequestMsg
 
     -- Parse the response
@@ -1265,7 +1271,7 @@ data DaemonResponse = DaemonResponse {
 }
 
 -- | Send a request to the daemon and wait for response
-sendToDaemon :: DaemonConnection -> StoreRequest -> TenM p 'Builder (Either Text DaemonResponse)
+sendToDaemon :: DaemonConnection -> StoreRequestMessage -> TenM p 'Builder (Either Text DaemonResponse)
 sendToDaemon conn req = do
     -- Get next request ID
     reqId <- liftIO $ atomically $ do
@@ -1303,8 +1309,8 @@ sendToDaemon conn req = do
         Right response ->
             return response
 
--- | Serialize a request to binary format
-serializeRequest :: StoreRequest -> BS.ByteString
+-- | Serialize a protocol message to binary format
+serializeRequest :: StoreRequestMessage -> BS.ByteString
 serializeRequest req = do
     -- In a real implementation, this would properly serialize to binary
     -- For this implementation, we'll use a simple format:
@@ -1333,7 +1339,3 @@ readMaybe :: Read a => String -> Maybe a
 readMaybe s = case reads s of
     [(x, "")] -> Just x
     _ -> Nothing
-
--- | Check if a path is a symbolic link
-isSymbolicLink :: FileStatus -> Bool
-isSymbolicLink status = not (isRegularFile status)
