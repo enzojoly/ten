@@ -36,6 +36,22 @@ module Ten.Core (
     UserId(..),
     AuthToken(..),
 
+    -- Connection and protocol types
+    DaemonConnection(..),
+    Response(..),
+    Request(..),
+    encodeRequest,
+    decodeResponse,
+    createDaemonConnection,
+    closeDaemonConnection,
+    withDaemonConnection,
+    sendRequest,
+    receiveResponse,
+    sendRequestSync,
+    responseReaderThread,
+    readResponseWithTimeout,
+    getCurrentMillis,
+
     -- Singletons and witnesses
     SingI(..),
     sing,
@@ -194,12 +210,11 @@ import System.Exit
 import Data.Unique (Unique, newUnique)
 import Data.Proxy (Proxy(..))
 import Network.Socket (Socket)
-import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr)
-import Data.Maybe (isJust, isNothing, fromMaybe, catMaybes)
-import Data.List (isPrefixOf, isInfixOf, nub)
+import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdin,
+                 openFile, hGetLine, BufferMode(..), hSetBuffering)
+import System.IO.Error (isDoesNotExistError, isPermissionError)
 import qualified System.Posix.User as User
-import System.Posix.Files (setFileMode)
-import System.Posix.Types (ProcessID, UserID, GroupID)
+import System.Posix.Files (fileExist, getFileStatus, isRegularFile, setFileMode)
 import qualified System.Posix.IO as PosixIO
 import System.IO.Error (isDoesNotExistError)
 import Control.Exception (bracket, try, catch, throwIO, finally, mask, Exception, ErrorCall(..), SomeException)
@@ -208,7 +223,7 @@ import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessS
 import qualified System.Posix.IO as PosixIO
 import Text.Read (readPrec)
 import qualified Text.Read as Read
-import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay)
+import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, myThreadId)
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Char (isHexDigit)
@@ -222,6 +237,7 @@ import qualified Data.Aeson.Encoding as Aeson
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
 import System.Random (randomRIO)
+import Network.Socket.ByteString (sendAll, recv)
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -530,8 +546,9 @@ newtype UserId = UserId Text
 newtype AuthToken = AuthToken Text
     deriving (Show, Eq)
 
--- | Daemon connection type for protocol communication
-data DaemonConnection = DaemonConnection {
+-- | Daemon connection type - core implementation for client-server communication
+-- Parameterized by privilege tier for type-level enforcement
+data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
     connSocket :: Socket,                     -- ^ Socket connected to daemon
     connHandle :: Handle,                     -- ^ Handle for socket I/O
     connUserId :: UserId,                     -- ^ Authenticated user ID
@@ -539,8 +556,55 @@ data DaemonConnection = DaemonConnection {
     connRequestMap :: TVar (Map Int (MVar Response)), -- ^ Map of pending requests
     connNextReqId :: TVar Int,                -- ^ Next request ID
     connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
-    connShutdown :: TVar Bool                 -- ^ Flag to indicate connection shutdown
+    connShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
+    connPrivEvidence :: SPrivilegeTier t      -- ^ Runtime evidence of privilege tier
 }
+
+-- | Create a new daemon connection with privilege tier singleton evidence
+createDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t -> IO (DaemonConnection t)
+createDaemonConnection sock handle userId authToken priEvidence = do
+    requestMap <- newTVarIO Map.empty
+    nextReqId <- newTVarIO 1
+    shutdownFlag <- newTVarIO False
+
+    -- Start background thread to read responses
+    readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
+
+    return DaemonConnection {
+        connSocket = sock,
+        connHandle = handle,
+        connUserId = userId,
+        connAuthToken = authToken,
+        connRequestMap = requestMap,
+        connNextReqId = nextReqId,
+        connReaderThread = readerThread,
+        connShutdown = shutdownFlag,
+        connPrivEvidence = priEvidence
+    }
+
+-- | Close a daemon connection, cleaning up resources
+closeDaemonConnection :: DaemonConnection t -> IO ()
+closeDaemonConnection conn = do
+    -- Signal reader thread to shut down
+    atomically $ writeTVar (connShutdown conn) True
+
+    -- Close socket handle
+    hClose (connHandle conn)
+
+    -- Close socket
+    Network.Socket.close (connSocket conn)
+
+    -- Kill reader thread if it doesn't exit on its own
+    killThread (connReaderThread conn)
+
+-- | Execute an action with a daemon connection
+withDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t
+                     -> (DaemonConnection t -> IO a) -> IO a
+withDaemonConnection sock handle userId authToken priEvidence action =
+    bracket
+        (createDaemonConnection sock handle userId authToken priEvidence)
+        closeDaemonConnection
+        action
 
 -- | Request type (for communication with daemon)
 data Request = Request {
@@ -559,10 +623,88 @@ data Response = Response {
     respPayload :: Maybe ByteString       -- ^ Optional binary payload
 } deriving (Show, Eq)
 
+-- | Send a request to the daemon
+sendRequest :: DaemonConnection t -> Request -> IO Int
+sendRequest conn request = do
+    -- Generate request ID
+    reqId <- atomically $ do
+        rid <- readTVar (connNextReqId conn)
+        writeTVar (connNextReqId conn) (rid + 1)
+        return rid
+
+    -- Create response variable
+    respVar <- newEmptyMVar
+
+    -- Register the pending request
+    atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
+
+    -- Update the request with the ID
+    let request' = request { reqId = reqId }
+
+    -- Serialize and send the request
+    let encoded = encodeRequest request'
+    BS.hPut (connHandle conn) encoded
+    hFlush (connHandle conn)
+
+    -- Return the request ID for tracking
+    return reqId
+
+-- | Receive a response for a specific request
+receiveResponse :: DaemonConnection t -> Int -> Int -> IO (Either BuildError Response)
+receiveResponse conn reqId timeoutMicros = do
+    -- Get response MVar
+    reqMap <- atomically $ readTVar (connRequestMap conn)
+    case Map.lookup reqId reqMap of
+        Nothing ->
+            -- No such request ID
+            return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
+
+        Just respVar -> do
+            -- Wait for response with timeout
+            result <- timeout timeoutMicros $ takeMVar respVar
+
+            -- Clean up request map
+            atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
+
+            -- Return response or error
+            case result of
+                Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
+                Just resp -> return $ Right resp
+
+-- | Send a request and wait for response (synchronous)
+sendRequestSync :: DaemonConnection t -> Request -> Int -> IO (Either BuildError Response)
+sendRequestSync conn request timeoutMicros = do
+    -- Send the request
+    reqId <- sendRequest conn request
+
+    -- Wait for response
+    receiveResponse conn reqId timeoutMicros
+
+-- | Background thread to read and dispatch responses
+responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> IO ()
+responseReaderThread handle requestMap shutdownFlag = forever $ do
+    -- Check if we should shut down
+    shutdown <- atomically $ readTVar shutdownFlag
+    when shutdown $ return ()
+
+    -- Try to read a response
+    response <- try $ readResponseWithTimeout handle 30000000 -- 30 second timeout
+    case response of
+        Left (e :: SomeException) -> do
+            -- Connection error, exit thread
+            return ()
+
+        Right resp -> do
+            -- Look up request and deliver response
+            reqMap <- atomically $ readTVar requestMap
+            case Map.lookup (respId resp) reqMap of
+                Nothing -> return () -- Unknown request ID, ignore
+                Just respVar -> putMVar respVar resp
+
 -- | Running mode for Ten
 data RunMode
     = StandaloneMode                     -- Direct execution without daemon
-    | ClientMode DaemonConnection        -- Connect to existing daemon
+    | ClientMode (DaemonConnection 'Builder)  -- Connect to existing daemon
     | DaemonMode                         -- Running as daemon process
 
 -- Custom instances for RunMode to avoid needing instances for DaemonConnection
@@ -600,7 +742,11 @@ data DaemonConfig = DaemonConfig
     , daemonLogLevel :: Int              -- Log verbosity level
     , daemonGcInterval :: Maybe Int      -- Garbage collection interval in seconds
     , daemonUser :: Maybe Text           -- User to run as
+    , daemonGroup :: Maybe Text          -- Group to run as
     , daemonAllowedUsers :: Set Text     -- Users allowed to connect
+    , daemonMaxJobs :: Int               -- Maximum concurrent jobs
+    , daemonForeground :: Bool           -- Run in foreground instead of daemonizing
+    , daemonTmpDir :: FilePath           -- Directory for temporary files
     } deriving (Show, Eq)
 
 -- | Environment for build operations
@@ -703,7 +849,7 @@ initBuildEnv wd sp = BuildEnv
     }
 
 -- | Initialize client build environment
-initClientEnv :: FilePath -> FilePath -> DaemonConnection -> BuildEnv
+initClientEnv :: FilePath -> FilePath -> DaemonConnection 'Builder -> BuildEnv
 initClientEnv wd sp conn = (initBuildEnv wd sp)
     { runMode = ClientMode conn
     , currentPrivilegeTier = Builder  -- Clients are always Builder privilege tier
@@ -882,38 +1028,59 @@ readDerivation_Daemon path = do
                 Right deriv -> return $ Right deriv
 
 -- | Request a derivation via the daemon protocol (builder-only operation)
-requestDerivation_Builder :: StorePath -> DaemonConnection -> TenM p 'Builder (Either BuildError Derivation)
+requestDerivation_Builder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError Derivation)
 requestDerivation_Builder path conn = do
-    -- Request derivation content from daemon
-    response <- requestFromDaemon conn (storeRequestForPath path)
+    -- Create request for derivation content
+    let request = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "store-read",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request 30000000 -- 30 second timeout
+
     case response of
-        Right content ->
-            case deserializeDerivation content of
-                Left err -> return $ Left $ SerializationError $
-                                 "Failed to deserialize derivation: " <> err
-                Right deriv -> return $ Right deriv
         Left err ->
-            return $ Left $ StoreError $ "Failed to read derivation: " <> err
+            return $ Left err
+        Right resp ->
+            if respStatus resp == "ok"
+                then case respPayload resp of
+                    Just content ->
+                        case deserializeDerivation content of
+                            Left err -> return $ Left $ SerializationError $
+                                             "Failed to deserialize derivation: " <> err
+                            Right deriv -> return $ Right deriv
+                    Nothing ->
+                        return $ Left $ StoreError "Received empty response"
+                else
+                    return $ Left $ StoreError $ respMessage resp
 
 -- | Read a derivation from the store using the appropriate privilege mechanism
 readDerivation :: StorePath -> TenM p t (Either BuildError Derivation)
 readDerivation path = do
-    env <- ask
+    -- Validate the path before attempting to retrieve
+    unless (validateStorePath path) $
+        return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
 
-    case (currentPrivilegeTier env, runMode env) of
+    -- Check the privilege tier and use appropriate method
+    env <- ask
+    case currentPrivilegeTier env of
         -- Daemon with direct store access
-        (Daemon, _) -> TenM $ \sp _ ->
-            let (TenM m) = readDerivation_Daemon path
-            in m sp sDaemon
+        Daemon ->
+            withSPrivilegeTier sDaemon $ \_ ->
+                readDerivation_Daemon path
 
         -- Builder using protocol
-        (Builder, ClientMode conn) -> TenM $ \sp _ ->
-            let (TenM m) = requestDerivation_Builder path conn
-            in m sp sBuilder
-
-        -- Builder without daemon connection - error
-        (Builder, _) -> return $ Left $ PrivilegeError
-                          "Cannot read derivation in builder context without daemon connection"
+        Builder ->
+            case runMode env of
+                ClientMode conn ->
+                    withSPrivilegeTier sBuilder $ \_ ->
+                        requestDerivation_Builder path conn
+                _ ->
+                    return $ Left $ PrivilegeError
+                        "Cannot read derivation in builder context without daemon connection"
 
 -- | Store a build result (Daemon privilege)
 storeBuildResult :: BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
@@ -971,141 +1138,63 @@ readBuildResult_Daemon path = do
                 Right result -> return $ Right result
 
 -- | Request a build result via the daemon protocol (builder-only operation)
-requestBuildResult_Builder :: StorePath -> DaemonConnection -> TenM p 'Builder (Either BuildError BuildResult)
+requestBuildResult_Builder :: StorePath -> DaemonConnection 'Builder -> TenM p 'Builder (Either BuildError BuildResult)
 requestBuildResult_Builder path conn = do
-    -- Request build result content from daemon
-    response <- requestFromDaemon conn (storeRequestForPath path)
+    -- Create request for build result content
+    let request = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "store-read",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn request 30000000 -- 30 second timeout
+
     case response of
-        Right content ->
-            case deserializeBuildResult content of
-                Left err -> return $ Left $ SerializationError $
-                                 "Failed to deserialize build result: " <> err
-                Right buildResult -> return $ Right buildResult
         Left err ->
-            return $ Left $ StoreError $ "Failed to read build result: " <> err
+            return $ Left err
+        Right resp ->
+            if respStatus resp == "ok"
+                then case respPayload resp of
+                    Just content ->
+                        case deserializeBuildResult content of
+                            Left err -> return $ Left $ SerializationError $
+                                             "Failed to deserialize build result: " <> err
+                            Right result -> return $ Right result
+                    Nothing ->
+                        return $ Left $ StoreError "Received empty response"
+                else
+                    return $ Left $ StoreError $ respMessage resp
 
 -- | Read a build result from the store using the appropriate privilege mechanism
 readBuildResult :: StorePath -> TenM p t (Either BuildError BuildResult)
 readBuildResult path = do
-    env <- ask
+    -- Validate the path before attempting to retrieve
+    unless (validateStorePath path) $
+        return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
 
-    case (currentPrivilegeTier env, runMode env) of
+    -- Check the privilege tier and use appropriate method
+    env <- ask
+    case currentPrivilegeTier env of
         -- Daemon with direct store access
-        (Daemon, _) -> TenM $ \sp _ ->
-            let (TenM m) = readBuildResult_Daemon path
-            in m sp sDaemon
+        Daemon ->
+            withSPrivilegeTier sDaemon $ \_ ->
+                readBuildResult_Daemon path
 
         -- Builder using protocol
-        (Builder, ClientMode conn) -> TenM $ \sp _ ->
-            let (TenM m) = requestBuildResult_Builder path conn
-            in m sp sBuilder
-
-        -- Builder without daemon connection - error
-        (Builder, _) -> return $ Left $ PrivilegeError
-                          "Cannot read build result in builder context without daemon connection"
-
--- | Create a store request for reading a path
-storeRequestForPath :: StorePath -> Request
-storeRequestForPath path = Request {
-    reqId = 0,  -- Will be set by protocol layer
-    reqType = "store-read",
-    reqParams = Map.singleton "path" (storePathToText path),
-    reqPayload = Nothing
-}
-
--- | Generic function to send a request to the daemon and get a response
-requestFromDaemon :: DaemonConnection -> Request -> TenM p 'Builder (Either Text ByteString)
-requestFromDaemon conn req = do
-    -- Generate a request ID for tracking the response
-    reqId <- liftIO $ atomically $ do
-        rid <- readTVar (connNextReqId conn)
-        writeTVar (connNextReqId conn) (rid + 1)
-        return rid
-
-    -- Create response variable
-    respVar <- liftIO $ newEmptyMVar
-
-    -- Register the pending request
-    liftIO $ atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
-
-    -- Inject the request ID
-    let req' = req { reqId = reqId }
-
-    -- Serialize request to binary
-    let encoded = encodeRequest req'
-
-    -- Send the request
-    liftIO $ hPutStrLn (connHandle conn) (show encoded) >> hFlush (connHandle conn)
-
-    -- Wait for response with timeout
-    mResp <- liftIO $ timeout 30000000 $ takeMVar respVar  -- 30 second timeout
-
-    -- Clean up the request mapping
-    liftIO $ atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
-
-    case mResp of
-        Nothing -> return $ Left "Timeout waiting for daemon response"
-        Just resp ->
-            if respStatus resp == "ok"
-                then return $ Right $ fromMaybe BS.empty (respPayload resp)
-                else return $ Left $ respMessage resp
-
--- | Helper for timeouts
-timeout :: Int -> IO a -> IO (Maybe a)
-timeout micros action = do
-    result <- newEmptyMVar
-    tid <- forkIO $ do
-        r <- try action
-        case r of
-            Left (e :: SomeException) -> return ()
-            Right v -> putMVar result v
-
-    -- Wait for result or timeout
-    threadDelay micros
-    filled <- isJust <$> tryTakeMVar result
-
-    unless filled $ killThread tid
-
-    if filled
-        then Just <$> readMVar result
-        else return Nothing
+        Builder ->
+            case runMode env of
+                ClientMode conn ->
+                    withSPrivilegeTier sBuilder $ \_ ->
+                        requestBuildResult_Builder path conn
+                _ ->
+                    return $ Left $ PrivilegeError
+                        "Cannot read build result in builder context without daemon connection"
 
 -- | Implementation to serialize a derivation to JSON
 serializeDerivation :: Derivation -> BS.ByteString
 serializeDerivation = LBS.toStrict . Aeson.encode
-
--- | ToJSON instance for Derivation
-instance Aeson.ToJSON Derivation where
-    toJSON deriv = Aeson.object [
-        "name" .= derivName deriv,
-        "hash" .= derivHash deriv,
-        "builder" .= storePathToText (derivBuilder deriv),
-        "args" .= derivArgs deriv,
-        "inputs" .= derivInputs deriv,
-        "outputs" .= derivOutputs deriv,
-        "env" .= derivEnv deriv,
-        "system" .= derivSystem deriv,
-        "strategy" .= (if derivStrategy deriv == ApplicativeStrategy then "applicative" else "monadic" :: Text),
-        "meta" .= derivMeta deriv
-        ]
-
--- | ToJSON instance for DerivationInput
-instance Aeson.ToJSON DerivationInput where
-    toJSON (DerivationInput path name) = Aeson.object [
-        "path" .= storePathToText path,
-        "name" .= name
-        ]
-
--- | ToJSON instance for DerivationOutput
-instance Aeson.ToJSON DerivationOutput where
-    toJSON (DerivationOutput name path) = Aeson.object [
-        "name" .= name,
-        "path" .= storePathToText path
-        ]
-
--- | ToJSON instance for StorePath
-instance Aeson.ToJSON StorePath where
-    toJSON = Aeson.String . storePathToText
 
 -- | Implementation to deserialize a derivation from JSON
 deserializeDerivation :: BS.ByteString -> Either Text Derivation
@@ -1114,58 +1203,6 @@ deserializeDerivation bs = case Aeson.eitherDecodeStrict bs of
     Right val -> case Aeson.fromJSON val of
         Aeson.Error err -> Left $ T.pack err
         Aeson.Success deriv -> Right deriv
-
--- | FromJSON instance for Derivation
-instance Aeson.FromJSON Derivation where
-    parseJSON = Aeson.withObject "Derivation" $ \obj -> do
-        name <- obj .: "name"
-        hash <- obj .: "hash"
-        builderText <- obj .: "builder"
-        builder <- case textToStorePath builderText of
-            Just p -> return p
-            Nothing -> fail "Invalid builder path"
-        args <- obj .: "args"
-        inputObjs <- obj .: "inputs"
-        inputs <- Set.fromList <$> mapM Aeson.parseJSON inputObjs
-        outputObjs <- obj .: "outputs"
-        outputs <- Set.fromList <$> mapM Aeson.parseJSON outputObjs
-        env <- obj .: "env"
-        system <- obj .: "system"
-        strategyText <- obj .: "strategy" :: Aeson.Parser Text
-        let strategy = if strategyText == "applicative" then ApplicativeStrategy else MonadicStrategy
-        meta <- obj .: "meta"
-        return Derivation {
-            derivName = name,
-            derivHash = hash,
-            derivBuilder = builder,
-            derivArgs = args,
-            derivInputs = inputs,
-            derivOutputs = outputs,
-            derivEnv = env,
-            derivSystem = system,
-            derivStrategy = strategy,
-            derivMeta = meta
-        }
-
--- | FromJSON instance for DerivationInput
-instance Aeson.FromJSON DerivationInput where
-    parseJSON = Aeson.withObject "DerivationInput" $ \obj -> do
-        pathText <- obj .: "path"
-        path <- case textToStorePath pathText of
-            Just p -> return p
-            Nothing -> fail "Invalid input path"
-        name <- obj .: "name"
-        return $ DerivationInput path name
-
--- | FromJSON instance for DerivationOutput
-instance Aeson.FromJSON DerivationOutput where
-    parseJSON = Aeson.withObject "DerivationOutput" $ \obj -> do
-        name <- obj .: "name"
-        pathText <- obj .: "path"
-        path <- case textToStorePath pathText of
-            Just p -> return p
-            Nothing -> fail "Invalid output path"
-        return $ DerivationOutput name path
 
 -- | Implementation to serialize a build result
 serializeBuildResult :: BuildResult -> BS.ByteString
@@ -1179,61 +1216,148 @@ deserializeBuildResult bs = case Aeson.eitherDecodeStrict bs of
         Aeson.Error err -> Left $ T.pack err
         Aeson.Success result -> Right result
 
--- | FromJSON instance for BuildResult
-instance Aeson.FromJSON BuildResult where
-    parseJSON = Aeson.withObject "BuildResult" $ \obj -> do
-        outputPathsTexts <- obj .: "outputPaths"
-        outputPaths <- Set.fromList <$> mapM parseStorePath outputPathsTexts
-        exitCodeObj <- obj .: "exitCode"
-        exitCode <- parseExitCode exitCodeObj
-        buildLog <- obj .: "log"
-        referencesTexts <- obj .: "references"
-        references <- Set.fromList <$> mapM parseStorePath referencesTexts
-        return BuildResult {
-            brOutputPaths = outputPaths,
-            brExitCode = exitCode,
-            brLog = buildLog,
-            brReferences = references
-        }
-      where
-        parseStorePath :: Text -> Aeson.Parser StorePath
-        parseStorePath txt = case textToStorePath txt of
-            Just path -> return path
-            Nothing -> fail $ "Invalid store path: " <> T.unpack txt
-
-        parseExitCode :: Aeson.Value -> Aeson.Parser ExitCode
-        parseExitCode = Aeson.withObject "ExitCode" $ \obj -> do
-            success <- obj .: "success"
-            if success
-                then return ExitSuccess
-                else ExitFailure <$> obj .: "code"
-
--- | Encode a request
-encodeRequest :: Request -> ByteString
-encodeRequest = LBS.toStrict . Aeson.encode
-
--- | ToJSON instance for Request
-instance Aeson.ToJSON Request where
-    toJSON req = Aeson.object [
-        "id" .= reqId req,
-        "type" .= reqType req,
-        "params" .= reqParams req,
-        "payload" .= fmap (const Aeson.Null) (reqPayload req)  -- Binary data represented as null in JSON
+-- | Encode a request for transmission
+encodeRequest :: Request -> BS.ByteString
+encodeRequest req =
+    let reqJson = Aeson.object [
+            "id" .= reqId req,
+            "type" .= reqType req,
+            "params" .= reqParams req,
+            "payload" .= isJust (reqPayload req)
         ]
+        header = LBS.toStrict $ Aeson.encode reqJson
+        headerLen = BS.length header
+        lenBytes = BS.pack [
+            fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
+            fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
+            fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
+            fromIntegral headerLen .&. 0xFF
+        ]
+    in
+        case reqPayload req of
+            Nothing ->
+                BS.concat [lenBytes, header]
+            Just payload ->
+                let payloadLen = BS.length payload
+                    payloadLenBytes = BS.pack [
+                        fromIntegral (payloadLen `shiftR` 24) .&. 0xFF,
+                        fromIntegral (payloadLen `shiftR` 16) .&. 0xFF,
+                        fromIntegral (payloadLen `shiftR` 8) .&. 0xFF,
+                        fromIntegral payloadLen .&. 0xFF
+                    ]
+                in BS.concat [lenBytes, header, payloadLenBytes, payload]
 
--- | FromJSON instance for Request
-instance Aeson.FromJSON Request where
-    parseJSON = Aeson.withObject "Request" $ \obj -> do
-        id' <- obj .: "id"
-        type' <- obj .: "type"
-        params <- obj .: "params"
-        -- Payload is handled separately since binary data can't be in JSON directly
-        return Request {
-            reqId = id',
-            reqType = type',
-            reqParams = params,
-            reqPayload = Nothing  -- Payload needs to be handled separately
-        }
+-- | Decode a response from bytes
+decodeResponse :: BS.ByteString -> Either Text Response
+decodeResponse bs =
+    -- Skip length prefix and decode JSON header
+    let (headerLen, headerStart) = (
+            fromIntegral (BS.index bs 0) `shiftL` 24 .|.
+            fromIntegral (BS.index bs 1) `shiftL` 16 .|.
+            fromIntegral (BS.index bs 2) `shiftL` 8 .|.
+            fromIntegral (BS.index bs 3),
+            4
+            )
+        headerEnd = headerStart + headerLen
+        header = BS.take headerLen (BS.drop headerStart bs)
+    in
+        case Aeson.eitherDecodeStrict header of
+            Left err -> Left $ "Failed to decode response header: " <> T.pack err
+            Right obj -> do
+                -- Extract response fields from JSON
+                rid <- extractInt obj "id"
+                status <- extractText obj "status"
+                message <- extractText obj "message"
+                respData <- extractMap obj "data"
+                hasPayload <- extractBool obj "payload"
+
+                -- If payload is present, extract it
+                payload <- if hasPayload
+                    then
+                        if BS.length bs <= headerEnd + 4
+                            then Left "Response truncated, missing payload length"
+                            else
+                                let payloadLen =
+                                        fromIntegral (BS.index bs (headerEnd)) `shiftL` 24 .|.
+                                        fromIntegral (BS.index bs (headerEnd + 1)) `shiftL` 16 .|.
+                                        fromIntegral (BS.index bs (headerEnd + 2)) `shiftL` 8 .|.
+                                        fromIntegral (BS.index bs (headerEnd + 3))
+                                    payloadStart = headerEnd + 4
+                                    payloadEnd = payloadStart + payloadLen
+                                in
+                                    if BS.length bs < payloadEnd
+                                        then Left "Response truncated, incomplete payload"
+                                        else Right $ Just $ BS.take payloadLen (BS.drop payloadStart bs)
+                    else Right Nothing
+
+                -- Construct the response object
+                case payload of
+                    Left err -> Left err
+                    Right p -> Right $ Response rid status message respData p
+  where
+    extractInt :: Aeson.Object -> Text -> Either Text Int
+    extractInt obj key = case Aeson.lookup key obj of
+        Just (Aeson.Number n) -> Right $ round n
+        _ -> Left $ "Missing or invalid " <> key <> " field in response"
+
+    extractText :: Aeson.Object -> Text -> Either Text Text
+    extractText obj key = case Aeson.lookup key obj of
+        Just (Aeson.String t) -> Right t
+        _ -> Left $ "Missing or invalid " <> key <> " field in response"
+
+    extractBool :: Aeson.Object -> Text -> Either Text Bool
+    extractBool obj key = case Aeson.lookup key obj of
+        Just (Aeson.Bool b) -> Right b
+        _ -> Left $ "Missing or invalid " <> key <> " field in response"
+
+    extractMap :: Aeson.Object -> Text -> Either Text (Map Text Text)
+    extractMap obj key = case Aeson.lookup key obj of
+        Just (Aeson.Object o) -> Right $ Map.mapMaybe extractTextValue (Aeson.toList o)
+        _ -> Left $ "Missing or invalid " <> key <> " field in response"
+
+    extractTextValue :: (Aeson.Key, Aeson.Value) -> Maybe Text
+    extractTextValue (k, Aeson.String t) = Just t
+    extractTextValue _ = Nothing
+
+    shiftL :: Int -> Int -> Int
+    shiftL x n = x * (2 ^ n)
+
+    (.|.) :: Int -> Int -> Int
+    a .|. b = a + b
+
+-- | Read a response with timeout
+readResponseWithTimeout :: Handle -> Int -> IO Response
+readResponseWithTimeout handle timeoutMicros = do
+    -- Read length prefix (4 bytes)
+    lenBytes <- BS.hGet handle 4
+    when (BS.length lenBytes /= 4) $
+        throwIO $ DaemonError "Disconnected from daemon while reading message length"
+
+    -- Decode message length
+    let len = fromIntegral (BS.index lenBytes 0) `shiftL` 24 .|.
+              fromIntegral (BS.index lenBytes 1) `shiftL` 16 .|.
+              fromIntegral (BS.index lenBytes 2) `shiftL` 8 .|.
+              fromIntegral (BS.index lenBytes 3)
+
+    -- Sanity check on message length
+    when (len > 100 * 1024 * 1024) $ -- 100 MB limit
+        throwIO $ DaemonError $ "Message too large: " <> T.pack (show len) <> " bytes"
+
+    -- Read message body
+    msgBytes <- BS.hGet handle len
+    when (BS.length msgBytes /= len) $
+        throwIO $ DaemonError "Disconnected from daemon while reading message body"
+
+    -- Decode the response
+    case decodeResponse (BS.append lenBytes msgBytes) of
+        Left err -> throwIO $ DaemonError $ "Failed to decode response: " <> err
+        Right resp -> return resp
+  where
+    shiftL :: Int -> Int -> Int
+    shiftL x n = x * (2 ^ n)
+
+    (.|.) :: Int -> Int -> Int
+    a .|. b = a + b
 
 -- | Spawn a builder process with proper process isolation
 spawnBuilderProcess :: FilePath -> [String] -> Map Text Text -> TenM 'Build 'Daemon ProcessID
@@ -1337,7 +1461,6 @@ isInDerivationChain drv = do
     chain <- gets buildChain
     return $ any (derivationEquals drv) chain
 
-
 -- | Logging function
 logMsg :: Int -> Text -> TenM p t ()
 logMsg level msg = do
@@ -1358,7 +1481,7 @@ atomicallyTen :: STM a -> TenM p t a
 atomicallyTen = liftIO . atomically
 
 -- | Execute a build operation using the daemon (if in client mode)
-withDaemon :: (DaemonConnection -> IO (Either BuildError a)) -> TenM p t a
+withDaemon :: (DaemonConnection 'Builder -> IO (Either BuildError a)) -> TenM p 'Builder a
 withDaemon f = do
     mode <- asks runMode
     case mode of
@@ -1426,3 +1549,30 @@ derivationPathsEqual p1 p2 = storeHash p1 == storeHash p2 && storeName p1 == sto
 -- | Helper for privilege errors
 privilegeError :: Text -> BuildError
 privilegeError = PrivilegeError
+
+-- | Get current time in milliseconds
+getCurrentMillis :: IO Int
+getCurrentMillis = do
+    now <- getCurrentTime
+    let nowSeconds = diffUTCTime now (posixSecondsToUTCTime 0)
+    return $ floor $ realToFrac nowSeconds * 1000
+
+-- | Timeout helper
+timeout :: Int -> IO a -> IO (Maybe a)
+timeout micros action = do
+    result <- newEmptyMVar
+    tid <- forkIO $ do
+        value <- try action
+        case value of
+            Left (e :: SomeException) -> return ()
+            Right v -> putMVar result v
+
+    -- Wait for result or timeout
+    threadDelay micros
+    filled <- isJust <$> tryTakeMVar result
+
+    unless filled $ killThread tid
+
+    if filled
+        then Just <$> readMVar result
+        else return Nothing
