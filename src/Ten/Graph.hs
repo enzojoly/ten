@@ -601,11 +601,11 @@ deserializeGraph json =
                 path <- parsePath pathObj
                 hash <- maybe (Left "Missing derivation hash in output node") parseText $
                        KeyMap.lookup "derivation" obj
-                -- Fix the issue with the ambiguous string literal by properly handling the 'maybe'
-                nameVal <- KeyMap.lookup "name" obj
-                name <- case nameVal of
+
+                -- Handle optional name field consistently with proper Either monad treatment
+                name <- case KeyMap.lookup "name" obj of
                     Just nameValue -> parseText nameValue
-                    Nothing -> pure "unknown"
+                    Nothing -> Right "unknown"  -- Default value wrapped in Right
 
                 -- Construct minimal derivation for graph purposes
                 let drv = Derivation {

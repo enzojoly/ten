@@ -43,6 +43,11 @@ module Ten.Sandbox (
     releaseSandbox,
     sandboxProtocolHandler,
 
+    -- Sandbox connection types
+    SandboxConnection(..),
+    createSandboxConnection,
+    closeSandboxConnection,
+
     -- Sandbox status
     SandboxStatus(..),
     SandboxResponse(..)
@@ -106,8 +111,36 @@ import Data.Word (Word8)
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Control.Concurrent.STM
 import Control.Concurrent.MVar
+import Data.Unique (Unique, newUnique, hashUnique, hashInt)
 
 import Ten.Core
+
+-- | Sandbox connection type for proper process separation
+data SandboxConnection = SandboxConnection {
+    sandboxConnSocket :: Socket,         -- Socket for communicating with daemon
+    sandboxConnAuthToken :: AuthToken,   -- Authentication token
+    sandboxConnUserId :: UserId,         -- User ID
+    sandboxConnRequestCounter :: TVar Int, -- Request counter
+    sandboxConnResponses :: TVar (Map Int (MVar SandboxResponse)) -- Response tracking
+}
+
+-- | Create a sandbox connection from socket information
+createSandboxConnection :: Socket -> AuthToken -> UserId -> IO SandboxConnection
+createSandboxConnection sock authToken userId = do
+    requestCounter <- newTVarIO 0
+    responses <- newTVarIO Map.empty
+    return SandboxConnection {
+        sandboxConnSocket = sock,
+        sandboxConnAuthToken = authToken,
+        sandboxConnUserId = userId,
+        sandboxConnRequestCounter = requestCounter,
+        sandboxConnResponses = responses
+    }
+
+-- | Close a sandbox connection
+closeSandboxConnection :: SandboxConnection -> IO ()
+closeSandboxConnection conn = do
+    Network.close (sandboxConnSocket conn)
 
 -- | Sandbox request message format for daemon-builder communication
 data SandboxRequest
@@ -267,15 +300,6 @@ instance Binary SandboxResponse where
                     (read timeStr)
             3 -> SandboxErrorResponse <$> Binary.get
             _ -> fail $ "Unknown SandboxResponse tag: " ++ show tag
-
--- | Daemon connection for IPC
-data DaemonConnection = DaemonConnection {
-    daemonConnSocket :: Socket,                     -- Socket for communicating with daemon
-    daemonConnAuthToken :: AuthToken,               -- Authentication token
-    daemonConnUserId :: UserId,                     -- User ID
-    daemonConnRequestCounter :: TVar Int,           -- Request counter for tracking requests
-    daemonConnPendingResponses :: TVar (Map Int (MVar SandboxResponse)) -- Pending responses
-}
 
 -- Helper functions to encode/decode sandbox config
 encodeConfig :: SandboxConfig -> BS.ByteString
@@ -526,23 +550,26 @@ withSandboxViaProtocol inputs config action = do
     env <- ask
     bid <- gets currentBuildId
 
-    -- Get daemon connection from run mode
+    -- Get sandbox connection from run mode
     case runMode env of
         ClientMode conn -> do
+            -- Create a sandbox connection from daemon connection
+            sandboxConn <- liftIO $ getSandboxConnection conn
+
             -- Request a sandbox from the daemon via protocol
-            sandboxResp <- requestSandbox conn bid inputs config
+            sandboxResp <- requestSandbox sandboxConn bid inputs config
 
             case sandboxResp of
                 SandboxCreatedResponse sandboxId sandboxPath -> do
                     -- Run the action in the sandbox
                     result <- action sandboxPath `catchError` \e -> do
                         -- Notify daemon of error
-                        liftIO $ notifySandboxError conn sandboxId e
+                        liftIO $ notifySandboxError sandboxConn sandboxId e
                         -- Re-throw the error
                         throwError e
 
                     -- Release the sandbox when done
-                    liftIO $ releaseSandbox conn sandboxId
+                    liftIO $ releaseSandbox sandboxConn sandboxId
 
                     return result
 
@@ -552,6 +579,22 @@ withSandboxViaProtocol inputs config action = do
                 _ -> throwError $ SandboxError "Unexpected response from daemon"
 
         _ -> throwError $ SandboxError "Builder cannot create sandboxes without daemon connection"
+
+-- | Get a sandbox connection from a daemon connection
+getSandboxConnection :: DaemonConnection -> IO SandboxConnection
+getSandboxConnection conn = do
+    -- Create request counter and response map
+    requestCounter <- newTVarIO 0
+    responses <- newTVarIO Map.empty
+
+    -- Create the sandbox connection
+    return SandboxConnection {
+        sandboxConnSocket = conn.connSocket,
+        sandboxConnAuthToken = conn.connAuthToken,
+        sandboxConnUserId = conn.connUserId,
+        sandboxConnRequestCounter = requestCounter,
+        sandboxConnResponses = responses
+    }
 
 -- | Set up a sandbox with proper namespaces and isolation
 setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build 'Daemon ()
@@ -1331,7 +1374,7 @@ sandboxOutputPath :: FilePath -> FilePath -> FilePath
 sandboxOutputPath sandboxDir outputName = sandboxDir </> "out" </> outputName
 
 -- | Request a sandbox from the daemon via protocol
-requestSandbox :: DaemonConnection -> BuildId -> Set StorePath -> SandboxConfig ->
+requestSandbox :: SandboxConnection -> BuildId -> Set StorePath -> SandboxConfig ->
                 TenM 'Build 'Builder SandboxResponse
 requestSandbox conn buildId inputs config = do
     -- Create the request
@@ -1339,9 +1382,9 @@ requestSandbox conn buildId inputs config = do
 
     -- Create a new request ID
     reqId <- liftIO $ atomically $ do
-        currentId <- readTVar (daemonConnRequestCounter conn)
+        currentId <- readTVar (sandboxConnRequestCounter conn)
         let newId = currentId + 1
-        writeTVar (daemonConnRequestCounter conn) newId
+        writeTVar (sandboxConnRequestCounter conn) newId
         return newId
 
     -- Create a place to store the response
@@ -1349,7 +1392,7 @@ requestSandbox conn buildId inputs config = do
 
     -- Register the request
     liftIO $ atomically $ do
-        modifyTVar' (daemonConnPendingResponses conn) $
+        modifyTVar' (sandboxConnResponses conn) $
             Map.insert reqId responseMVar
 
     -- Serialize the request
@@ -1361,14 +1404,14 @@ requestSandbox conn buildId inputs config = do
         let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
 
         -- Send header followed by request data through the socket
-        Network.sendAll (daemonConnSocket conn) header
-        Network.sendAll (daemonConnSocket conn) (LBS.toStrict requestData)
+        Network.sendAll (sandboxConnSocket conn) header
+        Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
         -- Wait for response with a reasonable timeout (30 seconds)
         response <- timeout 30000000 $ takeMVar responseMVar
 
         -- Clean up the request entry
-        atomically $ modifyTVar' (daemonConnPendingResponses conn) $
+        atomically $ modifyTVar' (sandboxConnResponses conn) $
             Map.delete reqId
 
         -- Return the response or error
@@ -1377,16 +1420,16 @@ requestSandbox conn buildId inputs config = do
             Nothing -> return $ SandboxErrorResponse "Timeout waiting for daemon response"
 
 -- | Release a sandbox back to the daemon
-releaseSandbox :: DaemonConnection -> Text -> IO ()
+releaseSandbox :: SandboxConnection -> Text -> IO ()
 releaseSandbox conn sandboxId = do
     -- Create the release request
     let request = SandboxReleaseRequest sandboxId
 
     -- Create a new request ID
     reqId <- atomically $ do
-        currentId <- readTVar (daemonConnRequestCounter conn)
+        currentId <- readTVar (sandboxConnRequestCounter conn)
         let newId = currentId + 1
-        writeTVar (daemonConnRequestCounter conn) newId
+        writeTVar (sandboxConnRequestCounter conn) newId
         return newId
 
     -- Create a place to store the response
@@ -1394,7 +1437,7 @@ releaseSandbox conn sandboxId = do
 
     -- Register the request
     atomically $ do
-        modifyTVar' (daemonConnPendingResponses conn) $
+        modifyTVar' (sandboxConnResponses conn) $
             Map.insert reqId responseMVar
 
     -- Serialize the request
@@ -1405,30 +1448,30 @@ releaseSandbox conn sandboxId = do
     let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
 
     -- Send header followed by request data through the socket
-    Network.sendAll (daemonConnSocket conn) header
-    Network.sendAll (daemonConnSocket conn) (LBS.toStrict requestData)
+    Network.sendAll (sandboxConnSocket conn) header
+    Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (10 seconds)
     _ <- timeout 10000000 $ takeMVar responseMVar
 
     -- Clean up the request entry
-    atomically $ modifyTVar' (daemonConnPendingResponses conn) $
+    atomically $ modifyTVar' (sandboxConnResponses conn) $
         Map.delete reqId
 
     -- We don't care about the response for release operations
     return ()
 
 -- | Notify daemon of sandbox error
-notifySandboxError :: DaemonConnection -> Text -> BuildError -> IO ()
+notifySandboxError :: SandboxConnection -> Text -> BuildError -> IO ()
 notifySandboxError conn sandboxId err = do
     -- Create the error request
     let request = SandboxAbortRequest sandboxId
 
     -- Create a new request ID
     reqId <- atomically $ do
-        currentId <- readTVar (daemonConnRequestCounter conn)
+        currentId <- readTVar (sandboxConnRequestCounter conn)
         let newId = currentId + 1
-        writeTVar (daemonConnRequestCounter conn) newId
+        writeTVar (sandboxConnRequestCounter conn) newId
         return newId
 
     -- Create a place to store the response
@@ -1436,7 +1479,7 @@ notifySandboxError conn sandboxId err = do
 
     -- Register the request
     atomically $ do
-        modifyTVar' (daemonConnPendingResponses conn) $
+        modifyTVar' (sandboxConnResponses conn) $
             Map.insert reqId responseMVar
 
     -- Serialize the request
@@ -1447,14 +1490,14 @@ notifySandboxError conn sandboxId err = do
     let header = LBS.toStrict $ encode (reqId, LBS.length requestData)
 
     -- Send header followed by request data through the socket
-    Network.sendAll (daemonConnSocket conn) header
-    Network.sendAll (daemonConnSocket conn) (LBS.toStrict requestData)
+    Network.sendAll (sandboxConnSocket conn) header
+    Network.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (5 seconds)
     _ <- timeout 5000000 $ takeMVar responseMVar
 
     -- Clean up the request entry
-    atomically $ modifyTVar' (daemonConnPendingResponses conn) $
+    atomically $ modifyTVar' (sandboxConnResponses conn) $
         Map.delete reqId
 
     -- We don't care about the response for error notifications

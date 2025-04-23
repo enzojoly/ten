@@ -133,9 +133,7 @@ module Ten.Core (
     -- Build chain handling
     newBuildId,
     setCurrentBuildId,
-    addToDerivationChain,
     isInDerivationChain,
-    detectRecursionCycle,
 
     -- STM operations
     atomicallyTen,
@@ -1333,25 +1331,12 @@ newBuildId = liftIO $ BuildId <$> newUnique
 setCurrentBuildId :: BuildId -> TenM p t ()
 setCurrentBuildId bid = modify $ \s -> s { currentBuildId = bid }
 
--- | Add a derivation to the build chain
-addToDerivationChain :: Derivation -> TenM p t ()
-addToDerivationChain drv = do
-    depth <- gets recursionDepth
-    maxDepth <- asks maxRecursionDepth
-    when (depth >= maxDepth) $
-        throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show maxDepth)
-    modify $ \s -> s { buildChain = drv : buildChain s, recursionDepth = depth + 1 }
-
 -- | Check if a derivation is in the build chain (cycle detection)
 isInDerivationChain :: Derivation -> TenM p t Bool
 isInDerivationChain drv = do
     chain <- gets buildChain
     return $ any (derivationEquals drv) chain
 
--- | Detect cycles in a chain of derivations
-detectRecursionCycle :: [Derivation] -> Bool
-detectRecursionCycle [] = False
-detectRecursionCycle (drv:rest) = any (derivationEquals drv) rest || detectRecursionCycle rest
 
 -- | Logging function
 logMsg :: Int -> Text -> TenM p t ()
