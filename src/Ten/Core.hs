@@ -209,7 +209,7 @@ import qualified System.Process as Process
 import System.Exit
 import Data.Unique (Unique, newUnique)
 import Data.Proxy (Proxy(..))
-import Network.Socket (Socket)
+import Network.Socket (Socket, SockAddr(..), socketToHandle, close)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdin,
                  openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError)
@@ -221,6 +221,7 @@ import Control.Exception (bracket, try, catch, throwIO, finally, mask, Exception
 import System.Environment (lookupEnv, getEnvironment)
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
 import qualified System.Posix.IO as PosixIO
+import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
 import Text.Read (readPrec)
 import qualified Text.Read as Read
 import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, myThreadId)
@@ -233,6 +234,8 @@ import Data.Kind (Type)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
+import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.Encoding as Aeson
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
@@ -592,7 +595,7 @@ closeDaemonConnection conn = do
     hClose (connHandle conn)
 
     -- Close socket
-    Network.Socket.close (connSocket conn)
+    close (connSocket conn)
 
     -- Kill reader thread if it doesn't exit on its own
     killThread (connReaderThread conn)
@@ -1224,7 +1227,7 @@ encodeRequest req =
             "type" .= reqType req,
             "params" .= reqParams req,
             "payload" .= isJust (reqPayload req)
-        ]
+            ]
         header = LBS.toStrict $ Aeson.encode reqJson
         headerLen = BS.length header
         lenBytes = BS.pack [
@@ -1232,7 +1235,7 @@ encodeRequest req =
             fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
             fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
             fromIntegral headerLen .&. 0xFF
-        ]
+            ]
     in
         case reqPayload req of
             Nothing ->
@@ -1244,7 +1247,7 @@ encodeRequest req =
                         fromIntegral (payloadLen `shiftR` 16) .&. 0xFF,
                         fromIntegral (payloadLen `shiftR` 8) .&. 0xFF,
                         fromIntegral payloadLen .&. 0xFF
-                    ]
+                        ]
                 in BS.concat [lenBytes, header, payloadLenBytes, payload]
 
 -- | Decode a response from bytes
@@ -1296,23 +1299,23 @@ decodeResponse bs =
                     Right p -> Right $ Response rid status message respData p
   where
     extractInt :: Aeson.Object -> Text -> Either Text Int
-    extractInt obj key = case Aeson.lookup key obj of
+    extractInt obj key = case KeyMap.lookup (Key.fromText key) obj of
         Just (Aeson.Number n) -> Right $ round n
         _ -> Left $ "Missing or invalid " <> key <> " field in response"
 
     extractText :: Aeson.Object -> Text -> Either Text Text
-    extractText obj key = case Aeson.lookup key obj of
+    extractText obj key = case KeyMap.lookup (Key.fromText key) obj of
         Just (Aeson.String t) -> Right t
         _ -> Left $ "Missing or invalid " <> key <> " field in response"
 
     extractBool :: Aeson.Object -> Text -> Either Text Bool
-    extractBool obj key = case Aeson.lookup key obj of
+    extractBool obj key = case KeyMap.lookup (Key.fromText key) obj of
         Just (Aeson.Bool b) -> Right b
         _ -> Left $ "Missing or invalid " <> key <> " field in response"
 
     extractMap :: Aeson.Object -> Text -> Either Text (Map Text Text)
-    extractMap obj key = case Aeson.lookup key obj of
-        Just (Aeson.Object o) -> Right $ Map.mapMaybe extractTextValue (Aeson.toList o)
+    extractMap obj key = case KeyMap.lookup (Key.fromText key) obj of
+        Just (Aeson.Object o) -> Right $ Map.mapMaybe extractTextValue (KeyMap.toList o)
         _ -> Left $ "Missing or invalid " <> key <> " field in response"
 
     extractTextValue :: (Aeson.Key, Aeson.Value) -> Maybe Text

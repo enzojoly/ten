@@ -919,7 +919,7 @@ getReferencesToPath path = do
             -- Query for referrers
             rows <- liftIO $ SQL.query conn
                 "SELECT referrer FROM References WHERE reference = ?"
-                (Only (storePathToText path)) :: TenM p 'Daemon (Set StorePath)
+                (Only (storePathToText path)) :: TenM p 'Daemon [Only Text]
 
             -- Close connection
             liftIO $ SQL.close conn
@@ -992,17 +992,35 @@ getPathHash = storeHash
 -- For use in builder tier
 requestAddToStore :: Text -> ByteString -> TenM p 'Builder StorePath
 requestAddToStore nameHint content = do
-    -- Get daemon connection
+    -- Get daemon connection from environment
     conn <- getDaemonConnection
 
-    -- Send request to daemon
-    response <- sendStoreRequest conn (StoreAddRequest nameHint content)
+    -- Create the request object
+    let req = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "store-add",
+            reqParams = Map.singleton "name" nameHint,
+            reqPayload = Just content
+        }
+
+    -- Send the request and wait for response
+    response <- sendRequestSync conn req 60000000 -- 60 second timeout
 
     -- Handle response
     case response of
-        StoreAddResponse path -> return path
-        StoreErrorResponse err -> throwError $ StoreError err
-        _ -> throwError $ ProtocolError "Unexpected response from daemon"
+        Left err ->
+            throwError $ StoreError $ "Failed to add to store: " <> case err of
+                DaemonError m -> m
+                _ -> T.pack (show err)
+        Right resp ->
+            if respStatus resp == "ok"
+                then case Map.lookup "path" (respData resp) of
+                    Just pathText ->
+                        case parseStorePath pathText of
+                            Just path -> return path
+                            Nothing -> throwError $ StoreError $ "Invalid path in response: " <> pathText
+                    Nothing -> throwError $ StoreError "Missing path in response"
+                else throwError $ StoreError $ respMessage resp
 
 -- | Request to read from the store via daemon protocol
 -- For use in builder tier when direct read is not possible
@@ -1021,20 +1039,40 @@ requestReadFromStore path = do
                 Right content -> return content
                 Left (_ :: IOException) -> do
                     -- If direct read fails, go through the daemon
-                    conn <- getDaemonConnection
-                    response <- sendStoreRequest conn (StoreReadRequest path)
-                    case response of
-                        StoreReadResponse content -> return content
-                        StoreErrorResponse err -> throwError $ StoreError err
-                        _ -> throwError $ ProtocolError "Unexpected response from daemon"
+                    requestReadViaProtocol path
         else do
             -- File doesn't exist or can't be accessed, request from daemon
-            conn <- getDaemonConnection
-            response <- sendStoreRequest conn (StoreReadRequest path)
-            case response of
-                StoreReadResponse content -> return content
-                StoreErrorResponse err -> throwError $ StoreError err
-                _ -> throwError $ ProtocolError "Unexpected response from daemon"
+            requestReadViaProtocol path
+
+-- | Request store content via protocol
+requestReadViaProtocol :: StorePath -> TenM p 'Builder ByteString
+requestReadViaProtocol path = do
+    -- Get daemon connection
+    conn <- getDaemonConnection
+
+    -- Create the request
+    let req = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "store-read",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn req 30000000 -- 30 second timeout
+
+    -- Handle response
+    case response of
+        Left err ->
+            throwError $ StoreError $ "Failed to read from store: " <> case err of
+                DaemonError m -> m
+                _ -> T.pack (show err)
+        Right resp ->
+            if respStatus resp == "ok"
+                then case respPayload resp of
+                    Just content -> return content
+                    Nothing -> throwError $ StoreError "Missing content in response"
+                else throwError $ StoreError $ respMessage resp
 
 -- | Request to verify a path via daemon protocol
 -- For use in builder tier
@@ -1050,38 +1088,88 @@ requestVerifyPath path = do
         else do
             -- If not accessible, ask daemon
             conn <- getDaemonConnection
-            response <- sendStoreRequest conn (StoreVerifyRequest path)
+
+            -- Create the request
+            let req = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "store-verify",
+                    reqParams = Map.singleton "path" (storePathToText path),
+                    reqPayload = Nothing
+                }
+
+            -- Send request and wait for response
+            response <- sendRequestSync conn req 10000000 -- 10 second timeout
+
+            -- Handle response
             case response of
-                StoreVerifyResponse result -> return result
-                _ -> return False  -- Any other response means verification failed
+                Left _ ->
+                    return False  -- Any error means verification failed
+                Right resp ->
+                    if respStatus resp == "ok"
+                        then case Map.lookup "exists" (respData resp) of
+                            Just "true" -> return True
+                            _ -> return False
+                        else return False
 
 -- | Request references from a path via protocol
 requestReferencesFromPath :: StorePath -> TenM p 'Builder (Set StorePath)
 requestReferencesFromPath path = do
     conn <- getDaemonConnection
-    response <- sendStoreRequest conn (StoreReferenceRequest path)
+
+    -- Create the request
+    let req = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "store-references",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
+
+    -- Send request and wait for response
+    response <- sendRequestSync conn req 30000000 -- 30 second timeout
+
+    -- Handle response
     case response of
-        StoreReferenceResponse refs -> return refs
-        _ -> return Set.empty  -- Return empty set on error
+        Left _ ->
+            return Set.empty  -- Return empty set on error
+        Right resp ->
+            if respStatus resp == "ok"
+                then case Map.lookup "refs" (respData resp) of
+                    Just refsText -> do
+                        let refsList = T.splitOn "," refsText
+                        let paths = catMaybes $ map parseStorePath refsList
+                        return $ Set.fromList paths
+                    Nothing -> return Set.empty
+                else return Set.empty
 
 -- | Request referrers to a path via protocol
 requestReferrersToPath :: StorePath -> TenM p 'Builder (Set StorePath)
 requestReferrersToPath path = do
     conn <- getDaemonConnection
 
-    -- There's no direct endpoint for referrers, create a custom protocol message
-    let customRequest = StoreRequestMessage {
-        reqId = 0,  -- Will be set by protocol
-        reqType = "store-referrers",
-        reqParams = Map.singleton "path" (storePathToText path),
-        reqPayload = Nothing
-    }
+    -- Create the request
+    let req = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "store-referrers",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
 
-    response <- sendToDaemon conn customRequest
+    -- Send request and wait for response
+    response <- sendRequestSync conn req 30000000 -- 30 second timeout
 
+    -- Handle response
     case response of
-        Right (StoreReferenceResponse paths) -> return paths
-        _ -> return Set.empty  -- Return empty set on error
+        Left _ ->
+            return Set.empty  -- Return empty set on error
+        Right resp ->
+            if respStatus resp == "ok"
+                then case Map.lookup "refs" (respData resp) of
+                    Just refsText -> do
+                        let refsList = T.splitOn "," refsText
+                        let paths = catMaybes $ map parseStorePath refsList
+                        return $ Set.fromList paths
+                    Nothing -> return Set.empty
+                else return Set.empty
 
 -- | Scan a file for references to store paths
 -- Available in both daemon and builder tiers
@@ -1133,206 +1221,13 @@ sanitizeName name =
                    (c >= 'A' && c <= 'Z') ||
                    (c >= '0' && c <= '9')
 
--- | Data structure representing a daemon connection
-data DaemonConnection = DaemonConnection {
-    connSocket :: Socket,
-    connHandle :: Handle,
-    connUserId :: UserId,
-    connAuthToken :: AuthToken,
-    connRequestId :: TVar Integer,
-    connPendingRequests :: TVar (Map Integer (TMVar DaemonResponse))
-}
-
--- | Protocol message structure for daemon communication
-data StoreRequestMessage = StoreRequestMessage {
-    reqId :: Integer,
-    reqType :: Text,
-    reqParams :: Map Text Text,
-    reqPayload :: Maybe ByteString
-}
-
 -- | Get daemon connection from environment
-getDaemonConnection :: TenM p 'Builder DaemonConnection
+getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
 getDaemonConnection = do
     env <- ask
     case runMode env of
         ClientMode conn -> return conn
         _ -> throwError $ ConfigError "Not in client mode - no daemon connection available"
-
--- | Convert domain StoreRequest to protocol StoreRequestMessage
-domainToProtocol :: StoreRequest -> StoreRequestMessage
-domainToProtocol req = StoreRequestMessage {
-    reqId = 0,  -- Will be filled later
-    reqType = "store-" <> case req of
-                  StoreAddRequest {} -> "add"
-                  StoreReadRequest {} -> "read"
-                  StoreVerifyRequest {} -> "verify"
-                  StoreListRequest {} -> "list"
-                  StoreDerivationRequest {} -> "derivation"
-                  StoreReferenceRequest {} -> "reference"
-                  StoreGCRequest {} -> "gc",
-    reqParams = case req of
-                  StoreAddRequest name _ -> Map.singleton "name" name
-                  StoreReadRequest path -> Map.singleton "path" (storePathToText path)
-                  StoreVerifyRequest path -> Map.singleton "path" (storePathToText path)
-                  StoreListRequest -> Map.empty
-                  StoreDerivationRequest _ -> Map.empty
-                  StoreReferenceRequest path -> Map.singleton "path" (storePathToText path)
-                  StoreGCRequest force -> Map.singleton "force" (T.pack $ show force),
-    reqPayload = case req of
-                  StoreAddRequest _ content -> Just content
-                  StoreDerivationRequest content -> Just content
-                  _ -> Nothing
-}
-
--- | Send a store request to the daemon
-sendStoreRequest :: DaemonConnection -> StoreRequest -> TenM p 'Builder StoreResponse
-sendStoreRequest conn req = do
-    -- Convert domain request to protocol message
-    let storeRequestMsg = domainToProtocol req
-
-    -- Send the protocol message to the daemon
-    response <- sendToDaemon conn storeRequestMsg
-
-    -- Parse the response
-    case response of
-        Right resp ->
-            case respType resp of
-                "store-add-response" ->
-                    case Map.lookup "path" (respParams resp) of
-                        Just pathText ->
-                            case parseStorePath pathText of
-                                Just path -> return $ StoreAddResponse path
-                                Nothing -> return $ StoreErrorResponse "Invalid path in response"
-                        Nothing -> return $ StoreErrorResponse "Missing path in response"
-
-                "store-read-response" ->
-                    case respPayload resp of
-                        Just content -> return $ StoreReadResponse content
-                        Nothing -> return $ StoreErrorResponse "Missing content in response"
-
-                "store-verify-response" ->
-                    case Map.lookup "exists" (respParams resp) of
-                        Just existsText -> return $ StoreVerifyResponse (existsText == "true")
-                        Nothing -> return $ StoreErrorResponse "Missing verification result"
-
-                "store-list-response" ->
-                    case Map.lookup "paths" (respParams resp) of
-                        Just pathsText -> do
-                            let pathsList = T.splitOn "," pathsText
-                            let paths = catMaybes $ map parseStorePath pathsList
-                            return $ StoreListResponse paths
-                        Nothing -> return $ StoreErrorResponse "Missing paths in response"
-
-                "store-derivation-response" ->
-                    case Map.lookup "path" (respParams resp) of
-                        Just pathText ->
-                            case parseStorePath pathText of
-                                Just path -> return $ StoreDerivationResponse path
-                                Nothing -> return $ StoreErrorResponse "Invalid path in response"
-                        Nothing -> return $ StoreErrorResponse "Missing path in response"
-
-                "store-reference-response" ->
-                    case Map.lookup "refs" (respParams resp) of
-                        Just refsText -> do
-                            let refsList = T.splitOn "," refsText
-                            let paths = Set.fromList $ catMaybes $ map parseStorePath refsList
-                            return $ StoreReferenceResponse paths
-                        Nothing -> return $ StoreErrorResponse "Missing references in response"
-
-                "store-gc-response" ->
-                    case (Map.lookup "collected" (respParams resp),
-                          Map.lookup "remaining" (respParams resp),
-                          Map.lookup "bytes" (respParams resp)) of
-                        (Just collText, Just remText, Just bytesText) ->
-                            case (readMaybe (T.unpack collText),
-                                  readMaybe (T.unpack remText),
-                                  readMaybe (T.unpack bytesText)) of
-                                (Just coll, Just rem, Just bytes) ->
-                                    return $ StoreGCResponse coll rem bytes
-                                _ -> return $ StoreErrorResponse "Invalid numbers in GC response"
-                        _ -> return $ StoreErrorResponse "Missing data in GC response"
-
-                "store-error" ->
-                    case Map.lookup "error" (respParams resp) of
-                        Just err -> return $ StoreErrorResponse err
-                        Nothing -> return $ StoreErrorResponse "Unknown error"
-
-                _ -> return $ StoreErrorResponse $ "Unknown response type: " <> respType resp
-
-        Left err -> return $ StoreErrorResponse err
-
--- | Response structure from daemon
-data DaemonResponse = DaemonResponse {
-    respId :: Integer,
-    respType :: Text,
-    respParams :: Map Text Text,
-    respPayload :: Maybe ByteString
-}
-
--- | Send a request to the daemon and wait for response
-sendToDaemon :: DaemonConnection -> StoreRequestMessage -> TenM p 'Builder (Either Text DaemonResponse)
-sendToDaemon conn req = do
-    -- Get next request ID
-    reqId <- liftIO $ atomically $ do
-        currentId <- readTVar (connRequestId conn)
-        writeTVar (connRequestId conn) (currentId + 1)
-        return currentId
-
-    -- Create response TMVar
-    respVar <- liftIO $ atomically $ newEmptyTMVar
-
-    -- Register with pending requests
-    liftIO $ atomically $ modifyTVar' (connPendingRequests conn) $
-        Map.insert reqId respVar
-
-    -- Prepare the message with ID
-    let req' = req { reqId = reqId }
-
-    -- Serialize the request
-    let serialized = serializeRequest req'
-
-    -- Send the request
-    result <- liftIO $ try $ do
-        BS.hPutStr (connHandle conn) serialized
-        hFlush (connHandle conn)
-
-        -- Wait for response with timeout (30 seconds)
-        atomically $ do
-            response <- takeTMVar respVar
-            modifyTVar' (connPendingRequests conn) $ Map.delete reqId
-            return $ Right response
-
-    case result of
-        Left (e :: SomeException) ->
-            return $ Left $ "Error communicating with daemon: " <> T.pack (show e)
-        Right response ->
-            return response
-
--- | Serialize a protocol message to binary format
-serializeRequest :: StoreRequestMessage -> BS.ByteString
-serializeRequest req = do
-    -- In a real implementation, this would properly serialize to binary
-    -- For this implementation, we'll use a simple format:
-    let headerLines = [
-            T.pack $ show (reqId req),
-            reqType req,
-            T.pack $ show (Map.size (reqParams req))
-            ]
-
-    let paramLines = concat $ map (\(k, v) -> [k, v]) $ Map.toList (reqParams req)
-
-    let payloadLine = case reqPayload req of
-            Nothing -> ["0"]
-            Just payload -> [T.pack $ show $ BS.length payload]
-
-    let allLines = headerLines ++ paramLines ++ payloadLine
-    let textContent = T.unlines allLines
-
-    -- Combine text header with binary payload if any
-    case reqPayload req of
-        Nothing -> TE.encodeUtf8 textContent
-        Just payload -> BS.append (TE.encodeUtf8 textContent) payload
 
 -- | Helper function for reading Maybe values
 readMaybe :: Read a => String -> Maybe a

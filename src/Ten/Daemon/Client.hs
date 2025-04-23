@@ -89,7 +89,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime, diffUTCTime)
 import Data.Word (Word32)
-import Network.Socket (Socket, Family(..), SocketType(..), SockAddr(..), socket, connect, close, socketToFd, socketToHandle)
+import Network.Socket (Socket, Family(..), SocketType(..), SockAddr(..), socket, connect, close, socketToHandle)
 import Network.Socket.ByteString (sendAll, recv)
 import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirectory, getXdgDirectory, XdgDirectory(..), findExecutable)
 import System.Environment (lookupEnv)
@@ -105,33 +105,8 @@ import Ten.Daemon.Auth (UserCredentials(..))
 import Ten.Daemon.Config (getDefaultSocketPath)
 import Ten.Derivation (Derivation, serializeDerivation, deserializeDerivation)
 
--- | Connection state for daemon communication
-data ConnectionState = ConnectionState {
-    csSocket :: Socket,                     -- ^ Socket connected to daemon
-    csHandle :: Handle,                     -- ^ Handle for socket I/O
-    csUserId :: UserId,                     -- ^ Authenticated user ID
-    csToken :: AuthToken,                   -- ^ Authentication token
-    csRequestMap :: TVar (Map Int (MVar Response)), -- ^ Map of pending requests
-    csNextReqId :: TVar Int,                -- ^ Next request ID
-    csReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
-    csShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
-    csLastError :: TVar (Maybe BuildError), -- ^ Last error encountered
-    csCapabilities :: Set DaemonCapability, -- ^ Granted capabilities from auth
-    csPrivilegeTier :: PrivilegeTier        -- ^ Always 'Builder for client
-}
-
--- | Daemon connection type with privilege context
-data DaemonConnection = DaemonConnection {
-    connSocket :: Socket,
-    connUserId :: UserId,
-    connAuthToken :: AuthToken,
-    connState :: ConnectionState,
-    -- Builder privilege singleton for runtime evidence
-    connPrivEvidence :: SPrivilegeTier 'Builder
-}
-
 -- | Connect to the Ten daemon - always in Builder context
-connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError DaemonConnection)
+connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError (DaemonConnection 'Builder))
 connectToDaemon socketPath credentials = try $ do
     -- Check if daemon is running
     running <- isDaemonRunning socketPath
@@ -148,11 +123,8 @@ connectToDaemon socketPath credentials = try $ do
     -- Create socket and connect
     (sock, handle) <- createSocketAndConnect socketPath
 
-    -- Initialize request tracking
-    requestMap <- newTVarIO Map.empty
-    nextReqId <- newTVarIO 1
-    shutdownFlag <- newTVarIO False
-    lastError <- newTVarIO Nothing
+    -- Set up proper handle buffering
+    hSetBuffering handle (BlockBuffering Nothing)
 
     -- Authenticate with the daemon
     let authReq = AuthRequest {
@@ -178,51 +150,19 @@ connectToDaemon socketPath credentials = try $ do
             throwIO $ AuthError $ "Authentication failed: " <> err
 
         Right (AuthResponseMsg (AuthAccepted userId authToken capabilities)) -> do
-            -- Set up proper handle buffering
-            hSetBuffering handle (BlockBuffering Nothing)
+            -- Create daemon connection with proper privilege tier evidence
+            conn <- createDaemonConnection sock handle userId authToken sBuilder
 
-            -- Start background thread to read responses
-            readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag lastError
-
-            -- Create connection state
-            let connState = ConnectionState {
-                    csSocket = sock,
-                    csHandle = handle,
-                    csUserId = userId,
-                    csToken = authToken,
-                    csRequestMap = requestMap,
-                    csNextReqId = nextReqId,
-                    csReaderThread = readerThread,
-                    csShutdown = shutdownFlag,
-                    csLastError = lastError,
-                    csCapabilities = capabilities,
-                    csPrivilegeTier = Builder -- Always 'Builder for client
-                }
-
-            -- Get singleton evidence for Builder context
-            let privilegeEvidence = SBuilder
-
-            -- Return connection object with privilege evidence
-            return $ DaemonConnection sock userId authToken connState privilegeEvidence
+            return conn
 
         Right (AuthResponseMsg (AuthRejected reason)) ->
             throwIO $ AuthError $ "Authentication rejected: " <> reason
 
 -- | Disconnect from the Ten daemon
-disconnectFromDaemon :: DaemonConnection -> IO ()
+disconnectFromDaemon :: DaemonConnection 'Builder -> IO ()
 disconnectFromDaemon conn = do
-    -- Extract connection state
-    let state = connState conn
-
-    -- Signal reader thread to shut down
-    atomically $ writeTVar (csShutdown state) True
-
-    -- Close socket handle and socket
-    catch (hClose $ csHandle state) (\(_ :: IOException) -> return ())
-    catch (close $ csSocket state) (\(_ :: IOException) -> return ())
-
-    -- Kill reader thread if still running
-    catch (killThread $ csReaderThread state) (\(_ :: IOException) -> return ())
+    -- Use the closeDaemonConnection function from Ten.Core
+    closeDaemonConnection conn
 
 -- | Check if the daemon is running
 isDaemonRunning :: FilePath -> IO Bool
@@ -247,7 +187,7 @@ isDaemonRunning socketPath = do
                     return True
 
 -- | Execute an action with a daemon connection
-withDaemonConnection :: FilePath -> UserCredentials -> (DaemonConnection -> IO a) -> IO (Either BuildError a)
+withDaemonConnection :: FilePath -> UserCredentials -> (DaemonConnection 'Builder -> IO a) -> IO (Either BuildError a)
 withDaemonConnection socketPath credentials action = try $
     bracket
         (do
@@ -281,182 +221,436 @@ createSocketAndConnect socketPath = do
             return (s, handle))
 
 -- | Send a request to the daemon with privilege checking
-sendRequest :: SPrivilegeTier 'Builder -> DaemonConnection -> DaemonRequest -> IO (Either PrivilegeError Int)
-sendRequest st conn request = do
-    -- Get request capabilities and privilege requirement
-    let capabilities = requestCapabilities request
-        privReq = requestPrivilegeRequirement request
+sendRequest :: DaemonConnection 'Builder -> DaemonRequest -> IO (Either BuildError Int)
+sendRequest conn request = do
+    -- Convert domain request to core Request
+    let req = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = requestTypeToString request,
+            reqParams = requestToParams request,
+            reqPayload = requestToPayload request
+        }
 
-    -- Verify capabilities against Builder tier
-    case verifyCapabilities st capabilities of
-        Left err -> return $ Left err
-        Right () ->
-            -- Check privilege requirement (Builder vs Daemon)
-            case checkPrivilegeRequirement st privReq of
-                Left err -> return $ Left err
-                Right () -> do
-                    -- Extract connection state
-                    let state = connState conn
-
-                    -- Generate request ID
-                    reqId <- atomically $ do
-                        rid <- readTVar (csNextReqId state)
-                        writeTVar (csNextReqId state) (rid + 1)
-                        return rid
-
-                    -- Create response MVar
-                    respVar <- newEmptyMVar
-
-                    -- Register request
-                    atomically $ modifyTVar' (csRequestMap state) $ Map.insert reqId respVar
-
-                    -- Create protocol message with privilege evidence
-                    let reqMsg = RequestMessage {
-                            reqId = reqId,
-                            reqTag = requestTypeToTag request,
-                            reqPayload = Aeson.toJSON request,
-                            reqCapabilities = capabilities,
-                            reqPrivilege = privReq,
-                            reqAuth = Just (connAuthToken conn)
-                        }
-
-                    -- Serialize message
-                    let serialized = serializeMessage (RequestMsg reqMsg)
-
-                    -- Send message
-                    BS.hPut (csHandle state) serialized
-                    hFlush (csHandle state)
-
-                    -- Return request ID for tracking
-                    return $ Right reqId
+    -- Send request to daemon using Core implementation
+    reqId <- Ten.Core.sendRequest conn req
+    return $ Right reqId
 
 -- | Receive a response for a specific request
-receiveResponse :: DaemonConnection -> Int -> Int -> IO (Either BuildError Response)
+receiveResponse :: DaemonConnection 'Builder -> Int -> Int -> IO (Either BuildError DaemonResponse)
 receiveResponse conn reqId timeoutMicros = do
-    -- Extract connection state
-    let state = connState conn
+    -- Use the core receiveResponse function
+    result <- Ten.Core.receiveResponse conn reqId timeoutMicros
 
-    -- Get response MVar
-    reqMap <- atomically $ readTVar (csRequestMap state)
-    case Map.lookup reqId reqMap of
-        Nothing ->
-            -- No such request ID
-            return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
+    -- Convert from core Response to domain DaemonResponse
+    case result of
+        Left err -> return $ Left err
+        Right resp -> return $ parseResponse resp
 
-        Just respVar -> do
-            -- Wait for response with timeout
-            result <- timeout timeoutMicros $ takeMVar respVar
-
-            -- Clean up request map
-            atomically $ modifyTVar' (csRequestMap state) $ Map.delete reqId
-
-            -- Check for error
-            lastErr <- atomically $ readTVar (csLastError state)
-
-            -- Return response or error
-            case (result, lastErr) of
-                (Nothing, _) ->
-                    return $ Left $ DaemonError "Timeout waiting for daemon response"
-                (_, Just err) -> do
-                    -- Clear the error
-                    atomically $ writeTVar (csLastError state) Nothing
-                    return $ Left err
-                (Just resp, _) ->
-                    return $ Right resp
-
--- | Send a request and wait for response (synchronous) with privilege checking
-sendRequestSync :: DaemonConnection -> DaemonRequest -> Int -> IO (Either BuildError DaemonResponse)
+-- | Send a request and wait for response (synchronous)
+sendRequestSync :: DaemonConnection 'Builder -> DaemonRequest -> Int -> IO (Either BuildError DaemonResponse)
 sendRequestSync conn request timeoutMicros = do
-    -- Send request with privilege evidence
-    reqIdResult <- sendRequest (connPrivEvidence conn) conn request
+    -- Send request
+    reqIdResult <- sendRequest conn request
 
     -- Process result
     case reqIdResult of
         Left err ->
-            -- Return privilege error
-            return $ Left $ PrivilegeError $ T.pack $ show err
+            return $ Left err
+        Right reqId ->
+            receiveResponse conn reqId timeoutMicros
 
-        Right reqId -> do
-            -- Wait for response
-            respResult <- receiveResponse conn reqId timeoutMicros
+-- | Convert request type to string
+requestTypeToString :: DaemonRequest -> Text
+requestTypeToString = \case
+    AuthRequest {} -> "auth"
+    BuildRequest {} -> "build"
+    EvalRequest {} -> "eval"
+    BuildDerivationRequest {} -> "build-derivation"
+    BuildStatusRequest {} -> "build-status"
+    CancelBuildRequest {} -> "cancel-build"
+    QueryBuildOutputRequest {} -> "build-output"
+    ListBuildsRequest {} -> "list-builds"
+    StoreAddRequest {} -> "store-add"
+    StoreVerifyRequest {} -> "store-verify"
+    StorePathRequest {} -> "store-path"
+    StoreListRequest -> "store-list"
+    StoreDerivationRequest {} -> "store-derivation"
+    RetrieveDerivationRequest {} -> "retrieve-derivation"
+    QueryDerivationRequest {} -> "query-derivation"
+    GetDerivationForOutputRequest {} -> "get-derivation-for-output"
+    ListDerivationsRequest {} -> "list-derivations"
+    GCRequest {} -> "gc"
+    GCStatusRequest {} -> "gc-status"
+    AddGCRootRequest {} -> "add-gc-root"
+    RemoveGCRootRequest {} -> "remove-gc-root"
+    ListGCRootsRequest -> "list-gc-roots"
+    PingRequest -> "ping"
+    ShutdownRequest -> "shutdown"
+    StatusRequest -> "status"
+    ConfigRequest -> "config"
 
-            -- Process the response
-            case respResult of
-                Left err ->
-                    return $ Left err
+-- | Convert request to parameters map
+requestToParams :: DaemonRequest -> Map Text Text
+requestToParams = \case
+    AuthRequest version creds -> Map.fromList [
+        ("version", T.pack $ show version),
+        ("username", username creds),
+        ("token", token creds),
+        ("requestedTier", "Builder")
+        ]
+    BuildRequest path _ options -> Map.fromList [
+        ("path", path),
+        ("hasContent", if isJust _ then "true" else "false"),
+        ("timeout", maybe "" (T.pack . show) (buildTimeout options)),
+        ("flags", T.intercalate "," (buildFlags options))
+        ]
+    EvalRequest path _ options -> Map.fromList [
+        ("path", path),
+        ("hasContent", if isJust _ then "true" else "false"),
+        ("timeout", maybe "" (T.pack . show) (buildTimeout options)),
+        ("flags", T.intercalate "," (buildFlags options))
+        ]
+    BuildDerivationRequest _ options -> Map.fromList [
+        ("hasDerivation", "true"),
+        ("timeout", maybe "" (T.pack . show) (buildTimeout options)),
+        ("flags", T.intercalate "," (buildFlags options))
+        ]
+    BuildStatusRequest buildId -> Map.fromList [
+        ("buildId", T.pack $ show buildId)
+        ]
+    CancelBuildRequest buildId -> Map.fromList [
+        ("buildId", T.pack $ show buildId)
+        ]
+    QueryBuildOutputRequest buildId -> Map.fromList [
+        ("buildId", T.pack $ show buildId)
+        ]
+    ListBuildsRequest limit -> Map.fromList [
+        ("limit", maybe "" (T.pack . show) limit)
+        ]
+    StoreAddRequest path _ -> Map.fromList [
+        ("path", path),
+        ("hasContent", "true")
+        ]
+    StoreVerifyRequest path -> Map.fromList [
+        ("path", path)
+        ]
+    StorePathRequest path _ -> Map.fromList [
+        ("path", path),
+        ("hasContent", "true")
+        ]
+    StoreListRequest -> Map.empty
+    StoreDerivationRequest {} -> Map.singleton "hasDerivation" "true"
+    RetrieveDerivationRequest path -> Map.singleton "path" (storePathToText path)
+    QueryDerivationRequest qType qValue qLimit -> Map.fromList [
+        ("queryType", qType),
+        ("queryValue", qValue),
+        ("limit", maybe "" (T.pack . show) qLimit)
+        ]
+    GetDerivationForOutputRequest path -> Map.singleton "path" path
+    ListDerivationsRequest limit -> Map.singleton "limit" (maybe "" (T.pack . show) limit)
+    GCRequest force -> Map.singleton "force" (if force then "true" else "false")
+    GCStatusRequest forceCheck -> Map.singleton "forceCheck" (if forceCheck then "true" else "false")
+    AddGCRootRequest path name permanent -> Map.fromList [
+        ("path", storePathToText path),
+        ("name", name),
+        ("permanent", if permanent then "true" else "false")
+        ]
+    RemoveGCRootRequest name -> Map.singleton "name" name
+    ListGCRootsRequest -> Map.empty
+    PingRequest -> Map.empty
+    ShutdownRequest -> Map.empty
+    StatusRequest -> Map.empty
+    ConfigRequest -> Map.empty
 
-                Right resp ->
-                    -- Convert to Response type
-                    case responseToResponseData resp of
-                        Left err ->
-                            return $ Left $ DaemonError $ "Failed to decode response: " <> err
-                        Right respData ->
-                            return $ Right respData
+-- | Convert request to payload
+requestToPayload :: DaemonRequest -> Maybe BS.ByteString
+requestToPayload = \case
+    BuildRequest _ (Just content) _ -> Just content
+    EvalRequest _ (Just content) _ -> Just content
+    BuildDerivationRequest drv _ -> Just (serializeDerivation drv)
+    StoreAddRequest _ content -> Just content
+    StorePathRequest _ content -> Just content
+    StoreDerivationRequest content -> Just content
+    _ -> Nothing
 
--- | Background thread to read and dispatch responses
-responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> TVar (Maybe BuildError) -> IO ()
-responseReaderThread handle requestMap shutdownFlag lastError = do
-    let loop = do
-            -- Check if we should shut down
-            shutdown <- atomically $ readTVar shutdownFlag
-            unless shutdown $ do
-                -- Try to read a message with error handling
-                result <- try $ readMessage handle
-                case result of
-                    Left (e :: SomeException) -> do
-                        -- Socket error, write to lastError and exit thread
-                        atomically $ writeTVar lastError $ Just $ DaemonError $ "Connection error: " <> T.pack (show e)
-                        return ()
+-- | Parse a response from core Response to domain DaemonResponse
+parseResponse :: Response -> Either BuildError DaemonResponse
+parseResponse resp
+    | respStatus resp == "error" =
+        Left $ BuildError $ parseErrorType (Map.findWithDefault "unknown" "type" (respData resp)) (respMessage resp)
+    | otherwise = parseSuccessResponse resp
 
-                    Right msgBS -> do
-                        -- Process message if valid
-                        case deserializeMessage msgBS of
-                            Left err -> do
-                                -- Parsing error, write to lastError and continue
-                                atomically $ writeTVar lastError $ Just $ DaemonError $ "Protocol error: " <> err
-                                loop
+-- | Parse error type from response
+parseErrorType :: Text -> Text -> BuildError
+parseErrorType "eval" = EvalError
+parseErrorType "build" = BuildFailed
+parseErrorType "store" = StoreError
+parseErrorType "sandbox" = SandboxError
+parseErrorType "input" = \msg -> InputNotFound (T.unpack msg)
+parseErrorType "hash" = HashError
+parseErrorType "graph" = GraphError
+parseErrorType "resource" = ResourceError
+parseErrorType "daemon" = DaemonError
+parseErrorType "auth" = AuthError
+parseErrorType "cycle" = CyclicDependency
+parseErrorType "serialization" = SerializationError
+parseErrorType "recursion" = RecursionLimit
+parseErrorType "network" = NetworkError
+parseErrorType "parse" = ParseError
+parseErrorType "db" = DBError
+parseErrorType "gc" = GCError
+parseErrorType "phase" = PhaseError
+parseErrorType "privilege" = PrivilegeError
+parseErrorType "protocol" = ProtocolError
+parseErrorType _ = InternalError
 
-                            Right (ResponseMsg respId resp) -> do
-                                -- Look up request
-                                reqMap <- atomically $ readTVar requestMap
-                                case Map.lookup respId reqMap of
-                                    Nothing ->
-                                        -- Unknown request ID, ignore and continue
-                                        loop
+-- | Parse successful response based on type
+parseSuccessResponse :: Response -> Either BuildError DaemonResponse
+parseSuccessResponse resp =
+    case respType resp of
+        "auth" -> Right $ AuthResponse $ parseAuthResult (respData resp) (respPayload resp)
+        "build-started" -> Right $ BuildStartedResponse $ parseBuildId (Map.findWithDefault "" "buildId" (respData resp))
+        "build-result" -> Right $ BuildResponse $ parseBuildResult (respData resp) (respPayload resp)
+        "build-status" -> Right $ BuildStatusResponse $ parseBuildStatus (respData resp)
+        "build-output" -> Right $ BuildOutputResponse $ Map.findWithDefault "" "output" (respData resp)
+        "build-list" -> Right $ BuildListResponse $ parseBuildList (respData resp)
+        "build-cancelled" -> Right $ CancelBuildResponse $ Map.findWithDefault "false" "success" (respData resp) == "true"
+        "store-add" -> Right $ StoreAddResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
+        "store-verify" -> Right $ StoreVerifyResponse $ Map.findWithDefault "false" "valid" (respData resp) == "true"
+        "store-path" -> Right $ StorePathResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
+        "store-list" -> Right $ StoreListResponse $ parseStorePaths (Map.findWithDefault "" "paths" (respData resp))
+        "derivation" ->
+            case respPayload resp of
+                Just content ->
+                    case deserializeDerivation content of
+                        Left err -> Left $ SerializationError err
+                        Right drv -> Right $ DerivationResponse drv
+                Nothing -> Left $ SerializationError "Missing derivation content"
+        "derivation-stored" -> Right $ DerivationStoredResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
+        "derivation-retrieved" ->
+            case respPayload resp of
+                Just content ->
+                    case deserializeDerivation content of
+                        Left err -> Left $ SerializationError err
+                        Right drv -> Right $ DerivationRetrievedResponse (Just drv)
+                Nothing -> Right $ DerivationRetrievedResponse Nothing
+        "derivation-query" ->
+            case respPayload resp of
+                Just content -> parseDerivationList content
+                Nothing -> Right $ DerivationQueryResponse []
+        "derivation-outputs" -> Right $ DerivationOutputResponse $ parseStorePathSet (Map.findWithDefault "" "outputs" (respData resp))
+        "derivation-list" -> Right $ DerivationListResponse $ parseStorePaths (Map.findWithDefault "" "paths" (respData resp))
+        "gc-result" -> Right $ GCResponse $ parseGCStats (respData resp)
+        "gc-started" -> Right GCStartedResponse
+        "gc-status" -> Right $ GCStatusResponse $ parseGCStatus (respData resp)
+        "gc-root-added" -> Right $ GCRootAddedResponse $ Map.findWithDefault "" "name" (respData resp)
+        "gc-root-removed" -> Right $ GCRootRemovedResponse $ Map.findWithDefault "" "name" (respData resp)
+        "gc-roots-list" -> Right $ GCRootsListResponse $ parseGCRoots (respData resp)
+        "pong" -> Right PongResponse
+        "shutdown" -> Right ShutdownResponse
+        "status" -> Right $ StatusResponse $ parseDaemonStatus (respData resp)
+        "config" -> Right $ ConfigResponse $ parseDaemonConfig (respData resp)
+        "eval" ->
+            case respPayload resp of
+                Just content ->
+                    case deserializeDerivation content of
+                        Left err -> Left $ SerializationError err
+                        Right drv -> Right $ EvalResponse drv
+                Nothing -> Left $ SerializationError "Missing derivation content"
+        _ -> Left $ ProtocolError $ "Unknown response type: " <> respType resp
 
-                                    Just respVar -> do
-                                        -- Check privilege requirements for response
-                                        let privRequirement = responsePrivilegeRequirement resp
+-- | Parse auth result from response data
+parseAuthResult :: Map Text Text -> Maybe BS.ByteString -> AuthResult
+parseAuthResult data_ _ =
+    let status = Map.findWithDefault "rejected" "status" data_
+    in case status of
+        "accepted" ->
+            let userId = UserId $ Map.findWithDefault "" "userId" data_
+                token = AuthToken $ Map.findWithDefault "" "token" data_
+                capStrs = T.splitOn "," $ Map.findWithDefault "" "capabilities" data_
+                caps = Set.fromList $ map parseCapability capStrs
+            in AuthAccepted userId token caps
+        "success" ->
+            let userId = UserId $ Map.findWithDefault "" "userId" data_
+                token = AuthToken $ Map.findWithDefault "" "token" data_
+            in AuthSuccess userId token
+        _ -> AuthRejected $ Map.findWithDefault "Authentication rejected" "reason" data_
 
-                                        -- Builder context can only receive unprivileged responses
-                                        case privRequirement of
-                                            PrivilegedResponse -> do
-                                                -- Cannot receive privileged response in builder context
-                                                atomically $ writeTVar lastError $ Just $ PrivilegeError
-                                                    "Received privileged response in builder context"
-                                                -- Still deliver to unblock waiting thread
-                                                putMVar respVar resp
-                                                loop
+-- | Parse a capability from text
+parseCapability :: Text -> DaemonCapability
+parseCapability "StoreAccess" = StoreAccess
+parseCapability "SandboxCreation" = SandboxCreation
+parseCapability "GarbageCollection" = GarbageCollection
+parseCapability "DerivationRegistration" = DerivationRegistration
+parseCapability "DerivationBuild" = DerivationBuild
+parseCapability "StoreQuery" = StoreQuery
+parseCapability "BuildQuery" = BuildQuery
+parseCapability _ = BuildQuery  -- Default to safe capability
 
-                                            UnprivilegedResponse -> do
-                                                -- Deliver response
-                                                putMVar respVar resp
-                                                loop
+-- | Parse a BuildId from text
+parseBuildId :: Text -> BuildId
+parseBuildId str =
+    case reads (T.unpack str) of
+        [(n, "")] -> BuildIdFromInt n
+        _ -> BuildIdFromInt 0  -- Default to zero if parsing fails
 
-                            Right _ ->
-                                -- Other message type, ignore and continue
-                                loop
+-- | Parse a BuildResult from response data and payload
+parseBuildResult :: Map Text Text -> Maybe BS.ByteString -> BuildResult
+parseBuildResult data_ _ =
+    BuildResult {
+        brOutputPaths = parseStorePathSet $ Map.findWithDefault "" "outputs" data_,
+        brExitCode = if Map.findWithDefault "false" "success" data_ == "true"
+                     then ExitSuccess
+                     else ExitFailure $ read $ T.unpack $ Map.findWithDefault "1" "exitCode" data_,
+        brLog = Map.findWithDefault "" "log" data_,
+        brReferences = parseStorePathSet $ Map.findWithDefault "" "references" data_
+    }
 
-    -- Start the loop and handle exceptions
-    loop `catch` (\(e :: SomeException) -> do
-        -- Store the error
-        atomically $ writeTVar lastError $ Just $ DaemonError $ "Connection error: " <> T.pack (show e)
-        -- Continue loop if the socket is still open
-        unlessM (atomically $ readTVar shutdownFlag) loop)
+-- | Parse a BuildStatus from response data
+parseBuildStatus :: Map Text Text -> BuildStatusUpdate
+parseBuildStatus data_ =
+    BuildStatusUpdate {
+        buildId = parseBuildId $ Map.findWithDefault "build-0" "buildId" data_,
+        buildStatus = parseStatus $ Map.findWithDefault "pending" "status" data_,
+        buildTimeElapsed = read $ T.unpack $ Map.findWithDefault "0" "timeElapsed" data_,
+        buildTimeRemaining = if Map.member "timeRemaining" data_
+                             then Just $ read $ T.unpack $ Map.findWithDefault "0" "timeRemaining" data_
+                             else Nothing,
+        buildLogUpdate = if Map.member "logUpdate" data_
+                         then Just $ Map.findWithDefault "" "logUpdate" data_
+                         else Nothing,
+        buildResourceUsage = Map.empty  -- Not parsed for simplicity
+    }
+  where
+    parseStatus :: Text -> BuildStatus
+    parseStatus "pending" = BuildPending
+    parseStatus "running" = BuildRunning $ read $ T.unpack $ Map.findWithDefault "0" "progress" data_
+    parseStatus "recursing" = BuildRecursing $ parseBuildId $ Map.findWithDefault "build-0" "innerBuildId" data_
+    parseStatus "completed" = BuildCompleted
+    parseStatus "failed" = BuildFailed'
+    parseStatus _ = BuildPending
+
+-- | Parse a list of builds from response data
+parseBuildList :: Map Text Text -> [(BuildId, BuildStatus, Float)]
+parseBuildList data_ =
+    let buildCount = read $ T.unpack $ Map.findWithDefault "0" "count" data_
+        builds = [0..buildCount-1]
+    in map (\i -> parseBuild i data_) builds
+  where
+    parseBuild :: Int -> Map Text Text -> (BuildId, BuildStatus, Float)
+    parseBuild i data_ =
+        let prefix = "build." <> T.pack (show i) <> "."
+            idStr = Map.findWithDefault ("build-" <> T.pack (show i)) (prefix <> "id") data_
+            statusStr = Map.findWithDefault "pending" (prefix <> "status") data_
+            progressStr = Map.findWithDefault "0" (prefix <> "progress") data_
+        in (parseBuildId idStr, parseStatus statusStr progressStr, read $ T.unpack progressStr)
+
+    parseStatus :: Text -> Text -> BuildStatus
+    parseStatus "pending" _ = BuildPending
+    parseStatus "running" progress = BuildRunning $ read $ T.unpack progress
+    parseStatus "recursing" innerBuildId = BuildRecursing $ parseBuildId innerBuildId
+    parseStatus "completed" _ = BuildCompleted
+    parseStatus "failed" _ = BuildFailed'
+    parseStatus _ _ = BuildPending
+
+-- | Parse a StorePath from text
+parseStorePath :: Text -> StorePath
+parseStorePath text =
+    case Ten.Core.parseStorePath text of
+        Just path -> path
+        Nothing -> StorePath "invalid" "invalid"  -- Fallback for invalid paths
+
+-- | Parse a list of StorePaths from comma-separated text
+parseStorePaths :: Text -> [StorePath]
+parseStorePaths text =
+    let pathStrs = T.splitOn "," text
+        paths = map parseStorePath $ filter (not . T.null) pathStrs
+    in paths
+
+-- | Parse a set of StorePaths from comma-separated text
+parseStorePathSet :: Text -> Set StorePath
+parseStorePathSet text = Set.fromList $ parseStorePaths text
+
+-- | Parse a list of derivations from binary content
+parseDerivationList :: BS.ByteString -> Either BuildError (DaemonResponse)
+parseDerivationList content =
+    -- For simplicity, assume we're parsing a single derivation for now
+    case deserializeDerivation content of
+        Left err -> Left $ SerializationError err
+        Right drv -> Right $ DerivationQueryResponse [drv]
+
+-- | Parse GC stats from response data
+parseGCStats :: Map Text Text -> GCStats
+parseGCStats data_ =
+    GCStats {
+        gcTotal = read $ T.unpack $ Map.findWithDefault "0" "total" data_,
+        gcLive = read $ T.unpack $ Map.findWithDefault "0" "live" data_,
+        gcCollected = read $ T.unpack $ Map.findWithDefault "0" "collected" data_,
+        gcBytes = read $ T.unpack $ Map.findWithDefault "0" "bytes" data_,
+        gcElapsedTime = read $ T.unpack $ Map.findWithDefault "0" "elapsedTime" data_
+    }
+
+-- | Parse GC status from response data
+parseGCStatus :: Map Text Text -> GCStatusResponse
+parseGCStatus data_ =
+    GCStatusResponse {
+        gcRunning = Map.findWithDefault "false" "running" data_ == "true",
+        gcOwner = if Map.member "owner" data_ then Just $ Map.findWithDefault "" "owner" data_ else Nothing,
+        gcLockTime = Nothing  -- Not parsed for simplicity
+    }
+
+-- | Parse GC roots from response data
+parseGCRoots :: Map Text Text -> [(StorePath, Text, Bool)]
+parseGCRoots data_ =
+    let rootCount = read $ T.unpack $ Map.findWithDefault "0" "count" data_
+        roots = [0..rootCount-1]
+    in map (\i -> parseRoot i data_) roots
+  where
+    parseRoot :: Int -> Map Text Text -> (StorePath, Text, Bool)
+    parseRoot i data_ =
+        let prefix = "root." <> T.pack (show i) <> "."
+            pathStr = Map.findWithDefault "" (prefix <> "path") data_
+            name = Map.findWithDefault "" (prefix <> "name") data_
+            permanent = Map.findWithDefault "false" (prefix <> "permanent") data_ == "true"
+        in (parseStorePath pathStr, name, permanent)
+
+-- | Parse daemon status from response data
+parseDaemonStatus :: Map Text Text -> DaemonStatus
+parseDaemonStatus data_ =
+    DaemonStatus {
+        daemonStatus = Map.findWithDefault "unknown" "status" data_,
+        daemonUptime = read $ T.unpack $ Map.findWithDefault "0" "uptime" data_,
+        daemonActiveBuilds = read $ T.unpack $ Map.findWithDefault "0" "activeBuilds" data_,
+        daemonCompletedBuilds = read $ T.unpack $ Map.findWithDefault "0" "completedBuilds" data_,
+        daemonFailedBuilds = read $ T.unpack $ Map.findWithDefault "0" "failedBuilds" data_,
+        daemonGcRoots = read $ T.unpack $ Map.findWithDefault "0" "gcRoots" data_,
+        daemonStoreSize = read $ T.unpack $ Map.findWithDefault "0" "storeSize" data_,
+        daemonStorePaths = read $ T.unpack $ Map.findWithDefault "0" "storePaths" data_
+    }
+
+-- | Parse daemon config from response data
+parseDaemonConfig :: Map Text Text -> DaemonConfig
+parseDaemonConfig data_ =
+    DaemonConfig {
+        daemonSocketPath = T.unpack $ Map.findWithDefault "/var/run/ten/daemon.sock" "socketPath" data_,
+        daemonStorePath = T.unpack $ Map.findWithDefault "/var/lib/ten/store" "storePath" data_,
+        daemonStateFile = T.unpack $ Map.findWithDefault "/var/lib/ten/state.json" "stateFile" data_,
+        daemonLogLevel = read $ T.unpack $ Map.findWithDefault "1" "logLevel" data_,
+        daemonGcInterval = if Map.member "gcInterval" data_
+                           then Just $ read $ T.unpack $ Map.findWithDefault "0" "gcInterval" data_
+                           else Nothing,
+        daemonUser = if Map.member "user" data_ then Just $ Map.findWithDefault "" "user" data_ else Nothing,
+        daemonGroup = if Map.member "group" data_ then Just $ Map.findWithDefault "" "group" data_ else Nothing,
+        daemonAllowedUsers = Set.fromList $ T.splitOn "," $ Map.findWithDefault "" "allowedUsers" data_,
+        daemonMaxJobs = read $ T.unpack $ Map.findWithDefault "4" "maxJobs" data_,
+        daemonForeground = Map.findWithDefault "false" "foreground" data_ == "true",
+        daemonTmpDir = T.unpack $ Map.findWithDefault "/tmp/ten" "tmpDir" data_
+    }
 
 -- | Read a message with timeout
 readMessageWithTimeout :: Handle -> Int -> IO BS.ByteString
 readMessageWithTimeout handle timeoutMicros = do
+    -- Use the socket directly for more control
     result <- timeout timeoutMicros $ readMessage handle
     case result of
         Nothing -> throwIO $ DaemonError "Timeout waiting for daemon response"
@@ -465,16 +659,17 @@ readMessageWithTimeout handle timeoutMicros = do
 -- | Read a message from a handle
 readMessage :: Handle -> IO BS.ByteString
 readMessage handle = do
-    -- Read length header (4 bytes)
+    -- Read length prefix (4 bytes)
     lenBytes <- BS.hGet handle 4
     when (BS.length lenBytes /= 4) $
         throwIO $ DaemonError "Disconnected from daemon while reading message length"
 
     -- Decode message length
-    let len = fromIntegral (BS.index lenBytes 0) `shiftL` 24 .|.
-              fromIntegral (BS.index lenBytes 1) `shiftL` 16 .|.
-              fromIntegral (BS.index lenBytes 2) `shiftL` 8 .|.
-              fromIntegral (BS.index lenBytes 3)
+    let len = fromIntegral $
+              (fromIntegral (BS.index lenBytes 0) `shiftL` 24) .|.
+              (fromIntegral (BS.index lenBytes 1) `shiftL` 16) .|.
+              (fromIntegral (BS.index lenBytes 2) `shiftL` 8) .|.
+              (fromIntegral (BS.index lenBytes 3))
 
     -- Sanity check on message length
     when (len > 100 * 1024 * 1024) $ -- 100 MB limit
@@ -485,29 +680,33 @@ readMessage handle = do
     when (BS.length msgBytes /= len) $
         throwIO $ DaemonError "Disconnected from daemon while reading message body"
 
-    return msgBytes
+    -- Return the complete message
+    return $ BS.append lenBytes msgBytes
 
 -- | Encode a request for transmission
 encodeRequest :: DaemonRequest -> BS.ByteString
 encodeRequest req =
-    -- Convert to Protocol.Request
-    let protocolReq = Request (requestTypeToTag req) (Aeson.toJSON req)
-        -- Convert to bytes (without message framing)
-        bytes = LBS.toStrict $ Aeson.encode protocolReq
-        -- Add length prefix
-        len = fromIntegral $ BS.length bytes
-        lenBytes = LBS.toStrict $ toLazyByteString $ word32BE len
-    in
-        -- Combine length and payload
-        lenBytes <> bytes
+    -- Convert to core Request and use its serialization
+    let coreReq = Request {
+            reqId = 0,  -- Will be set later
+            reqType = requestTypeToString req,
+            reqParams = requestToParams req,
+            reqPayload = requestToPayload req
+        }
+        encoded = Ten.Core.encodeRequest coreReq
+    in encoded
 
 -- | Decode a response from bytes
 decodeResponse :: BS.ByteString -> Either Text DaemonResponse
-decodeResponse bs = do
-    -- First parse as Protocol.Response
-    case Aeson.eitherDecodeStrict bs of
-        Left err -> Left $ "JSON parse error: " <> T.pack err
-        Right resp -> responseToResponseData resp
+decodeResponse bs =
+    -- First decode to core Response
+    case Ten.Core.decodeResponse bs of
+        Left err -> Left err
+        Right coreResp ->
+            -- Then convert to domain response
+            case parseResponse coreResp of
+                Left err -> Left $ T.pack $ show err
+                Right resp -> Right resp
 
 -- | Start the daemon if it's not running
 startDaemonIfNeeded :: FilePath -> IO (Either BuildError ())
@@ -580,7 +779,7 @@ getProcessExitCode ph = do
         Right exitCode -> return $ Just exitCode
 
 -- | Build a file using the daemon
-buildFile :: DaemonConnection -> FilePath -> IO (Either BuildError BuildResult)
+buildFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError BuildResult)
 buildFile conn filePath = do
     -- Check file existence
     fileExists <- doesFileExist filePath
@@ -613,7 +812,7 @@ buildFile conn filePath = do
                 "Invalid response type for build request: " <> T.pack (show resp)
 
 -- | Evaluate a file using the daemon
-evalFile :: DaemonConnection -> FilePath -> IO (Either BuildError Derivation)
+evalFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError Derivation)
 evalFile conn filePath = do
     -- Check file existence
     fileExists <- doesFileExist filePath
@@ -641,12 +840,15 @@ evalFile conn filePath = do
         Right (DerivationResponse derivation) ->
             return $ Right derivation
 
+        Right (EvalResponse derivation) ->
+            return $ Right derivation
+
         Right resp ->
             return $ Left $ DaemonError $
                 "Invalid response type for eval request: " <> T.pack (show resp)
 
 -- | Build a derivation using the daemon
-buildDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError BuildResult)
+buildDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError BuildResult)
 buildDerivation conn derivation = do
     -- Create build derivation request
     let request = BuildDerivationRequest
@@ -670,7 +872,7 @@ buildDerivation conn derivation = do
                 "Invalid response type for build derivation request: " <> T.pack (show resp)
 
 -- | Cancel a build
-cancelBuild :: DaemonConnection -> BuildId -> IO (Either BuildError ())
+cancelBuild :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError ())
 cancelBuild conn buildId = do
     -- Create cancel build request
     let request = CancelBuildRequest
@@ -685,7 +887,7 @@ cancelBuild conn buildId = do
         Left err ->
             return $ Left err
 
-        Right CancelBuildResponse ->
+        Right CancelBuildResponse {} ->
             return $ Right ()
 
         Right resp ->
@@ -693,7 +895,7 @@ cancelBuild conn buildId = do
                 "Invalid response type for cancel build request: " <> T.pack (show resp)
 
 -- | Get status of a build
-getBuildStatus :: DaemonConnection -> BuildId -> IO (Either BuildError BuildStatusUpdate)
+getBuildStatus :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError BuildStatusUpdate)
 getBuildStatus conn buildId = do
     -- Create build status request
     let request = BuildStatusRequest
@@ -716,7 +918,7 @@ getBuildStatus conn buildId = do
                 "Invalid response type for build status request: " <> T.pack (show resp)
 
 -- | Get output of a build
-getBuildOutput :: DaemonConnection -> BuildId -> IO (Either BuildError Text)
+getBuildOutput :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError Text)
 getBuildOutput conn buildId = do
     -- Create build output request
     let request = QueryBuildOutputRequest
@@ -739,7 +941,7 @@ getBuildOutput conn buildId = do
                 "Invalid response type for build output request: " <> T.pack (show resp)
 
 -- | List all builds
-listBuilds :: DaemonConnection -> Maybe Int -> IO (Either BuildError [(BuildId, BuildStatus, Float)])
+listBuilds :: DaemonConnection 'Builder -> Maybe Int -> IO (Either BuildError [(BuildId, BuildStatus, Float)])
 listBuilds conn limit = do
     -- Create list builds request
     let request = ListBuildsRequest
@@ -762,7 +964,7 @@ listBuilds conn limit = do
                 "Invalid response type for list builds request: " <> T.pack (show resp)
 
 -- | Add a file to the store (requires daemon privileges via protocol)
-addFileToStore :: DaemonConnection -> FilePath -> IO (Either BuildError StorePath)
+addFileToStore :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
 addFileToStore conn filePath = do
     -- Check file existence
     fileExists <- doesFileExist filePath
@@ -794,7 +996,7 @@ addFileToStore conn filePath = do
                 "Invalid response type for store add request: " <> T.pack (show resp)
 
 -- | Verify a store path
-verifyStorePath :: DaemonConnection -> StorePath -> IO (Either BuildError Bool)
+verifyStorePath :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
 verifyStorePath conn path = do
     -- Create verify request
     let request = StoreVerifyRequest
@@ -817,7 +1019,7 @@ verifyStorePath conn path = do
                 "Invalid response type for store verify request: " <> T.pack (show resp)
 
 -- | Get store path for a file
-getStorePathForFile :: DaemonConnection -> FilePath -> IO (Either BuildError StorePath)
+getStorePathForFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
 getStorePathForFile conn filePath = do
     -- Check file existence
     fileExists <- doesFileExist filePath
@@ -849,7 +1051,7 @@ getStorePathForFile conn filePath = do
                 "Invalid response type for store path request: " <> T.pack (show resp)
 
 -- | List store contents
-listStore :: DaemonConnection -> IO (Either BuildError [StorePath])
+listStore :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
 listStore conn = do
     -- Create list request
     let request = StoreListRequest
@@ -870,7 +1072,7 @@ listStore conn = do
                 "Invalid response type for store list request: " <> T.pack (show resp)
 
 -- | Store a derivation in the daemon store (requires daemon privileges via protocol)
-storeDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError StorePath)
+storeDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError StorePath)
 storeDerivation conn derivation = do
     -- Serialize the derivation
     let serialized = serializeDerivation derivation
@@ -878,7 +1080,6 @@ storeDerivation conn derivation = do
     -- Create store derivation request
     let request = StoreDerivationRequest
             { derivationContent = serialized
-            , registerOutputs = True
             }
 
     -- Send request and wait for response
@@ -897,7 +1098,7 @@ storeDerivation conn derivation = do
                 "Invalid response type for store derivation request: " <> T.pack (show resp)
 
 -- | Retrieve a derivation from the store
-retrieveDerivation :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
+retrieveDerivation :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
 retrieveDerivation conn path = do
     -- Create retrieve derivation request
     let request = RetrieveDerivationRequest
@@ -920,7 +1121,7 @@ retrieveDerivation conn path = do
                 "Invalid response type for retrieve derivation request: " <> T.pack (show resp)
 
 -- | Query which derivation produced a particular output
-queryDerivationForOutput :: DaemonConnection -> StorePath -> IO (Either BuildError (Maybe Derivation))
+queryDerivationForOutput :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
 queryDerivationForOutput conn outputPath = do
     -- Create get derivation for output request
     let request = GetDerivationForOutputRequest
@@ -946,7 +1147,7 @@ queryDerivationForOutput conn outputPath = do
                 "Invalid response type for query derivation for output request: " <> T.pack (show resp)
 
 -- | Query all outputs produced by a derivation
-queryOutputsForDerivation :: DaemonConnection -> Derivation -> IO (Either BuildError (Set StorePath))
+queryOutputsForDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError (Set StorePath))
 queryOutputsForDerivation conn derivation = do
     -- Create query derivation outputs request
     let request = QueryDerivationRequest
@@ -971,7 +1172,7 @@ queryOutputsForDerivation conn derivation = do
                 "Invalid response type for query outputs for derivation request: " <> T.pack (show resp)
 
 -- | List all derivations in the store
-listDerivations :: DaemonConnection -> IO (Either BuildError [StorePath])
+listDerivations :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
 listDerivations conn = do
     -- Create list derivations request
     let request = ListDerivationsRequest
@@ -994,7 +1195,7 @@ listDerivations conn = do
                 "Invalid response type for list derivations request: " <> T.pack (show resp)
 
 -- | Get detailed information about a derivation
-getDerivationInfo :: DaemonConnection -> StorePath -> IO (Either BuildError DerivationInfo)
+getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError DerivationInfo)
 getDerivationInfo conn path = do
     -- Create query derivation info request
     let request = QueryDerivationRequest
@@ -1019,7 +1220,7 @@ getDerivationInfo conn path = do
                 "Invalid response type for get derivation info request: " <> T.pack (show resp)
 
 -- | Run garbage collection (requires daemon privileges via protocol)
-collectGarbage :: DaemonConnection -> Bool -> IO (Either BuildError GCStats)
+collectGarbage :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
 collectGarbage conn force = do
     -- Create GC request
     let request = GCRequest
@@ -1042,7 +1243,7 @@ collectGarbage conn force = do
                 "Invalid response type for GC request: " <> T.pack (show resp)
 
 -- | Get GC status
-getGCStatus :: DaemonConnection -> Bool -> IO (Either BuildError GCStatusResponse)
+getGCStatus :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStatusResponse)
 getGCStatus conn forceCheck = do
     -- Create GC status request
     let request = GCStatusRequest
@@ -1065,7 +1266,7 @@ getGCStatus conn forceCheck = do
                 "Invalid response type for GC status request: " <> T.pack (show resp)
 
 -- | Add a GC root (requires daemon privileges via protocol)
-addGCRoot :: DaemonConnection -> StorePath -> Text -> Bool -> IO (Either BuildError Text)
+addGCRoot :: DaemonConnection 'Builder -> StorePath -> Text -> Bool -> IO (Either BuildError Text)
 addGCRoot conn path name permanent = do
     -- Create add GC root request
     let request = AddGCRootRequest
@@ -1090,7 +1291,7 @@ addGCRoot conn path name permanent = do
                 "Invalid response type for add GC root request: " <> T.pack (show resp)
 
 -- | Remove a GC root (requires daemon privileges via protocol)
-removeGCRoot :: DaemonConnection -> Text -> IO (Either BuildError Text)
+removeGCRoot :: DaemonConnection 'Builder -> Text -> IO (Either BuildError Text)
 removeGCRoot conn name = do
     -- Create remove GC root request
     let request = RemoveGCRootRequest
@@ -1113,7 +1314,7 @@ removeGCRoot conn name = do
                 "Invalid response type for remove GC root request: " <> T.pack (show resp)
 
 -- | List all GC roots
-listGCRoots :: DaemonConnection -> IO (Either BuildError [(StorePath, Text, Bool)])
+listGCRoots :: DaemonConnection 'Builder -> IO (Either BuildError [(StorePath, Text, Bool)])
 listGCRoots conn = do
     -- Create list GC roots request
     let request = ListGCRootsRequest
@@ -1134,7 +1335,7 @@ listGCRoots conn = do
                 "Invalid response type for list GC roots request: " <> T.pack (show resp)
 
 -- | Shutdown the daemon (requires daemon privileges via protocol)
-shutdownDaemon :: DaemonConnection -> IO (Either BuildError ())
+shutdownDaemon :: DaemonConnection 'Builder -> IO (Either BuildError ())
 shutdownDaemon conn = do
     -- Create shutdown request
     let request = ShutdownRequest
@@ -1155,7 +1356,7 @@ shutdownDaemon conn = do
                 "Invalid response type for shutdown request: " <> T.pack (show resp)
 
 -- | Get daemon status
-getDaemonStatus :: DaemonConnection -> IO (Either BuildError DaemonStatus)
+getDaemonStatus :: DaemonConnection 'Builder -> IO (Either BuildError DaemonStatus)
 getDaemonStatus conn = do
     -- Create status request
     let request = StatusRequest
@@ -1176,7 +1377,7 @@ getDaemonStatus conn = do
                 "Invalid response type for status request: " <> T.pack (show resp)
 
 -- | Get daemon configuration
-getDaemonConfig :: DaemonConnection -> IO (Either BuildError DaemonConfig)
+getDaemonConfig :: DaemonConnection 'Builder -> IO (Either BuildError DaemonConfig)
 getDaemonConfig conn = do
     -- Create config request
     let request = ConfigRequest
@@ -1195,12 +1396,6 @@ getDaemonConfig conn = do
         Right resp ->
             return $ Left $ DaemonError $
                 "Invalid response type for config request: " <> T.pack (show resp)
-
--- | Helper function for control flow - unlessM
-unlessM :: Monad m => m Bool -> m () -> m ()
-unlessM cond action = do
-    result <- cond
-    unless result action
 
 -- | Bitwise operations for message length encoding/decoding
 shiftL :: Int -> Int -> Int
