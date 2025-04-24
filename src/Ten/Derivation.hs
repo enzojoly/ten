@@ -80,10 +80,15 @@ import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode, S
 import System.Exit
 import Control.Exception (try, SomeException)
 import Data.Kind (Type)
+import Crypto.Hash (Digest, SHA256(..), hash)
+import qualified Crypto.Hash as Crypto
+import Network.Socket (Socket)
+import qualified Network.Socket as Network
+import Network.Socket.ByteString (sendAll, recv)
+import System.IO (Handle, hPutStrLn, stderr)
 
 import Ten.Core
 import Ten.Store
-import Ten.Hash
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -116,7 +121,7 @@ mkDerivation name builder args inputs outputNames env system = do
             , system
             ]
 
-    let derivHash' = hashByteString (TE.encodeUtf8 hashBase)
+    let derivHash' = hashBlob (TE.encodeUtf8 hashBase)
 
     -- Create output specifications with predicted paths
     let outputs = Set.map (\outName -> DerivationOutput
@@ -147,6 +152,12 @@ mkDerivation name builder args inputs outputNames env system = do
         , derivStrategy = strategy
         , derivMeta = meta
         }
+
+-- | Hash a ByteString blob and return as Text
+hashBlob :: BS.ByteString -> Text
+hashBlob bs =
+    let digest = hash bs :: Digest SHA256
+    in T.pack $ show digest
 
 -- | Analyze a derivation to determine optimal build strategy
 analyzeDerivationStrategy :: Text -> [Text] -> Map Text Text -> BuildStrategy
@@ -296,12 +307,22 @@ instantiateDerivation deriv = do
         throwError $ CyclicDependency $ "Cyclic derivation detected: " <> derivName deriv
 
     -- Add to build chain
-    addToDerivationChain deriv
+    modify $ \s -> s { buildChain = deriv : buildChain s }
 
     -- Add input proof
     addProof InputProof
 
     logMsg 1 $ "Instantiated derivation: " <> derivName deriv
+
+-- | Add a derivation to the chain
+addToDerivationChain :: Derivation -> DerivationChain -> DerivationChain
+addToDerivationChain drv (DerivationChain hashes) =
+    DerivationChain (derivHash drv : hashes)
+
+-- | Check if a derivation is in the build chain
+isInDerivationChain :: Derivation -> DerivationChain -> Bool
+isInDerivationChain drv (DerivationChain hashes) =
+    derivHash drv `elem` hashes
 
 -- | The monadic join operation for Return-Continuation - context-aware implementation
 joinDerivation :: Derivation -> TenM 'Build t Derivation
@@ -570,35 +591,103 @@ validateDerivation drv = do
   where
     isHexDigit c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
--- | Check if a derivation is in the build chain
-isInDerivationChain :: Derivation -> DerivationChain -> Bool
-isInDerivationChain drv (DerivationChain hashes) =
-    derivHash drv `elem` hashes
+-- | Send a request to the daemon through the store layer
+sendStoreDaemonRequest :: StoreRequest -> TenM p 'Builder StoreResponse
+sendStoreDaemonRequest request = withDaemon $ \conn -> do
+    -- Create proper protocol request from the Store request type
+    let (requestType, params, payload) = storeRequestToProtocol request
 
--- | Add a derivation to the chain
-addToDerivationChain :: Derivation -> DerivationChain -> DerivationChain
-addToDerivationChain drv (DerivationChain hashes) =
-    DerivationChain (derivHash drv : hashes)
+    -- Create a proper protocol Request object
+    let protocolRequest = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = requestType,
+        reqParams = params,
+        reqPayload = payload
+    }
 
--- | Type for sandbox configuration (imported from Ten.Sandbox)
-data SandboxConfig = SandboxConfig {
-    sandboxReturnSupport :: Bool,
-    sandboxPrivileged :: Bool,
-    -- Other fields would be here in the real implementation
-    -- We're only referencing the fields we use
-    sandboxAllowNetwork :: Bool
-}
+    -- Send request and wait for response
+    response <- sendRequestSync conn protocolRequest 30000000  -- 30 second timeout
 
--- | Default sandbox configuration (simplified version)
-defaultSandboxConfig :: SandboxConfig
-defaultSandboxConfig = SandboxConfig {
-    sandboxReturnSupport = False,
-    sandboxPrivileged = False,
-    sandboxAllowNetwork = False
-}
+    case response of
+        Left err -> return $ Left $ storeErrorFromProtocol err
+        Right resp -> return $ Right $ protocolToStoreResponse resp
+  where
+    -- Convert store request to protocol parameters
+    storeRequestToProtocol :: StoreRequest -> (Text, Map Text Text, Maybe BS.ByteString)
+    storeRequestToProtocol (StoreDerivationRequest content) =
+        ("store-derivation", Map.empty, Just content)
+    storeRequestToProtocol (StoreReadRequest path) =
+        ("store-read", Map.singleton "path" (storePathToText path), Nothing)
+    storeRequestToProtocol (StoreVerifyRequest path) =
+        ("store-verify", Map.singleton "path" (storePathToText path), Nothing)
+    storeRequestToProtocol (StoreAddRequest name content) =
+        ("store-add", Map.singleton "name" name, Just content)
+    storeRequestToProtocol (StoreListRequest) =
+        ("store-list", Map.empty, Nothing)
+    storeRequestToProtocol (StoreReferenceRequest path) =
+        ("store-reference", Map.singleton "path" (storePathToText path), Nothing)
+    storeRequestToProtocol (StoreGCRequest force) =
+        ("store-gc", Map.singleton "force" (if force then "true" else "false"), Nothing)
+
+    -- Convert protocol error to store error
+    storeErrorFromProtocol :: BuildError -> StoreResponse
+    storeErrorFromProtocol (StoreError msg) = StoreErrorResponse msg
+    storeErrorFromProtocol (DaemonError msg) = StoreErrorResponse $ "Daemon error: " <> msg
+    storeErrorFromProtocol (AuthError msg) = StoreErrorResponse $ "Authentication error: " <> msg
+    storeErrorFromProtocol err = StoreErrorResponse $ T.pack $ show err
+
+    -- Convert protocol response to store response
+    protocolToStoreResponse :: Response -> StoreResponse
+    protocolToStoreResponse resp =
+        if respStatus resp == "ok"
+            then
+                case respType resp of
+                    "store-derivation" -> case Map.lookup "path" (respData resp) of
+                        Just pathText -> case parseStorePath pathText of
+                            Just path -> StoreDerivationResponse path
+                            Nothing -> StoreErrorResponse $ "Invalid store path: " <> pathText
+                        Nothing -> StoreErrorResponse "Missing path in response"
+
+                    "store-read" -> case respPayload resp of
+                        Just content -> StoreReadResponse content
+                        Nothing -> StoreErrorResponse "Missing content in response"
+
+                    "store-verify" -> case Map.lookup "exists" (respData resp) of
+                        Just "true" -> StoreVerifyResponse True
+                        _ -> StoreVerifyResponse False
+
+                    "store-add" -> case Map.lookup "path" (respData resp) of
+                        Just pathText -> case parseStorePath pathText of
+                            Just path -> StoreAddResponse path
+                            Nothing -> StoreErrorResponse $ "Invalid store path: " <> pathText
+                        Nothing -> StoreErrorResponse "Missing path in response"
+
+                    "store-list" -> case Map.lookup "paths" (respData resp) of
+                        Just pathsText ->
+                            let pathsList = T.splitOn "," pathsText
+                                paths = catMaybes $ map parseStorePath pathsList
+                            in StoreListResponse paths
+                        Nothing -> StoreListResponse []
+
+                    "store-reference" -> case Map.lookup "refs" (respData resp) of
+                        Just refsText ->
+                            let refsList = T.splitOn "," refsText
+                                paths = catMaybes $ map parseStorePath refsList
+                            in StoreReferenceResponse (Set.fromList paths)
+                        Nothing -> StoreReferenceResponse Set.empty
+
+                    "store-gc" ->
+                        let collected = maybe 0 (read . T.unpack) $ Map.lookup "collected" (respData resp)
+                            remaining = maybe 0 (read . T.unpack) $ Map.lookup "remaining" (respData resp)
+                            bytes = maybe 0 (read . T.unpack) $ Map.lookup "bytes" (respData resp)
+                        in StoreGCResponse collected remaining bytes
+
+                    _ -> StoreErrorResponse $ "Unknown response type: " <> respType resp
+            else
+                StoreErrorResponse $ respMessage resp
 
 -- | Create sandbox environment for builder
-prepareSandboxEnvironment :: BuildEnv -> BuildState -> FilePath -> Map Text Text -> Map Text Text
+prepareSandboxEnvironment :: BuildEnv -> BuildState p -> FilePath -> Map Text Text -> Map Text Text
 prepareSandboxEnvironment env state sandboxDir userEnv =
     let
         -- Basic environment variables
@@ -622,49 +711,146 @@ prepareSandboxEnvironment env state sandboxDir userEnv =
 returnDerivationPath :: FilePath -> FilePath
 returnDerivationPath sandboxDir = sandboxDir </> "result.drv"
 
--- | Mock implementation for sendStoreDaemonRequest (would be provided by Ten.Store)
-sendStoreDaemonRequest :: StoreRequest -> TenM p 'Builder StoreResponse
-sendStoreDaemonRequest request =
-    withDaemon $ \conn -> do
-        -- In a real implementation, this would communicate with the daemon
-        -- For now, return a simplified response
-        case request of
-            StoreDerivationRequest content ->
-                let hash = hashByteString content
-                    name = "derivation.drv"
-                in return $ Right $ StoreDerivationResponse $ StorePath hash name
-            StoreReadRequest path ->
-                -- Simplified mock response
-                return $ Right $ StoreReadResponse $ BS.pack [0, 1, 2, 3]
-            _ ->
-                return $ Right $ StoreErrorResponse "Operation not implemented"
+-- | Type for sandbox configuration
+data SandboxConfig = SandboxConfig {
+    sandboxReturnSupport :: Bool,
+    sandboxPrivileged :: Bool,
+    sandboxAllowNetwork :: Bool,
+    sandboxReadOnlyStore :: Bool,
+    sandboxUseChroot :: Bool,
+    sandboxEnableSyslog :: Bool,
+    sandboxKeepBuildOutput :: Bool,
+    sandboxUseCgroups :: Bool,
+    sandboxMountProc :: Bool,
+    sandboxEnvWhitelist :: [Text],
+    sandboxResourceLimits :: Map Text Int
+}
 
--- | Mock for StoreRequest (would be defined in Ten.Store)
-data StoreRequest =
-    StoreDerivationRequest BS.ByteString |
-    StoreReadRequest StorePath |
-    OtherRequest
-    deriving (Show, Eq)
+-- | Default sandbox configuration
+defaultSandboxConfig :: SandboxConfig
+defaultSandboxConfig = SandboxConfig {
+    sandboxReturnSupport = False,
+    sandboxPrivileged = False,
+    sandboxAllowNetwork = False,
+    sandboxReadOnlyStore = True,
+    sandboxUseChroot = True,
+    sandboxEnableSyslog = False,
+    sandboxKeepBuildOutput = False,
+    sandboxUseCgroups = True,
+    sandboxMountProc = False,
+    sandboxEnvWhitelist = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ"],
+    sandboxResourceLimits = Map.fromList [
+        ("memory", 2 * 1024 * 1024),  -- 2 GB in KB
+        ("cpu-time", 3600),           -- 1 hour in seconds
+        ("stack-size", 8 * 1024),     -- 8 MB in KB
+        ("processes", 20)             -- Max child processes
+    ]
+}
 
--- | Mock for StoreResponse (would be defined in Ten.Store)
-data StoreResponse =
-    StoreDerivationResponse StorePath |
-    StoreReadResponse BS.ByteString |
-    StoreErrorResponse Text |
-    OtherResponse
-    deriving (Show, Eq)
-
--- | Mock sandbox implementation (would be provided by Ten.Sandbox)
+-- | Create a sandbox for building
 withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
 withSandbox inputs config action = do
     env <- ask
 
     -- Create a temporary directory for the sandbox
-    let sandboxDir = workDir env </> "sandbox" </> "temp"
+    let sandboxDir = workDir env </> "sandbox" </> "temp-" ++ show (currentBuildId env)
     liftIO $ createDirectoryIfMissing True sandboxDir
 
-    -- Run the action in the sandbox
-    result <- action sandboxDir
+    -- Set up the sandbox with appropriate privilege and isolation
+    case currentPrivilegeTier env of
+        Daemon ->
+            -- For daemon, we can set up a full sandbox with proper isolation
+            setupDaemonSandbox env inputs config sandboxDir
 
-    -- Return the result
-    return result
+        Builder ->
+            -- For builder, we use a simplified sandbox since we can't drop privileges
+            setupBuilderSandbox env inputs config sandboxDir
+
+    -- Run the action and ensure cleanup happens even if it fails
+    finally (action sandboxDir) $ do
+        -- Clean up sandbox unless we're keeping the output
+        unless (sandboxKeepBuildOutput config) $
+            liftIO $ removeDirectoryRecursive sandboxDir
+  where
+    -- Full privileged sandbox setup for daemon tier
+    setupDaemonSandbox env inputs config dir = do
+        -- Make store inputs available in the sandbox
+        forM_ (Set.toList inputs) $ \path -> do
+            -- Create symlinks to store paths
+            let storePath = storePathToFilePath path env
+            let targetPath = dir </> "store" </> T.unpack (storeHash path ++ "-" ++ storeName path)
+            liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
+            liftIO $ createSymbolicLink storePath targetPath
+
+        -- Set up isolation if using chroot
+        when (sandboxUseChroot config) $ do
+            -- Setup basic directory structure
+            liftIO $ createDirectoryIfMissing True (dir </> "etc")
+            liftIO $ createDirectoryIfMissing True (dir </> "bin")
+            liftIO $ createDirectoryIfMissing True (dir </> "tmp")
+            liftIO $ createDirectoryIfMissing True (dir </> "dev")
+
+            -- Create minimal /etc files needed for builds
+            liftIO $ writeFile (dir </> "etc/passwd") "root:x:0:0::/:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n"
+            liftIO $ writeFile (dir </> "etc/group") "root:x:0:\nnobody:x:65534:\n"
+
+            -- Create /dev nodes if privileged
+            when (sandboxPrivileged config) $ do
+                -- Use mknod to create basic device nodes
+                void $ liftIO $ system $ "mknod " ++ dir </> "dev/null" ++ " c 1 3"
+                void $ liftIO $ system $ "mknod " ++ dir </> "dev/zero" ++ " c 1 5"
+                void $ liftIO $ system $ "mknod " ++ dir </> "dev/urandom" ++ " c 1 9"
+
+                -- Mount /proc if configured
+                when (sandboxMountProc config) $
+                    void $ liftIO $ system $ "mount -t proc proc " ++ dir </> "proc"
+
+            -- Setup resources limits with cgroups if enabled
+            when (sandboxUseCgroups config) $
+                setupCgroups dir (sandboxResourceLimits config)
+
+    -- Simplified sandbox for builder tier (can't use most isolation features)
+    setupBuilderSandbox env inputs config dir = do
+        -- Make store inputs available in the sandbox via symlinks
+        forM_ (Set.toList inputs) $ \path -> do
+            let storePath = storePathToFilePath path env
+            let targetPath = dir </> "inputs" </> T.unpack (storeName path)
+            liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
+            liftIO $ createSymbolicLink storePath targetPath
+
+        -- Create workspace directories
+        liftIO $ createDirectoryIfMissing True (dir </> "work")
+        liftIO $ createDirectoryIfMissing True (dir </> "outputs")
+
+    -- Set up cgroups for resource limiting (simplified implementation)
+    setupCgroups dir limits = do
+        -- Create a cgroup for this build
+        let cgroupName = "ten-build-" ++ takeFileName dir
+        void $ liftIO $ system $ "cgcreate -g cpu,memory,pids:" ++ cgroupName
+
+        -- Set resource limits
+        forM_ (Map.toList limits) $ \(resource, value) ->
+            case resource of
+                "memory" ->
+                    void $ liftIO $ system $ "cgset -r memory.limit_in_bytes=" ++ show (value * 1024) ++ " " ++ cgroupName
+                "cpu-time" ->
+                    void $ liftIO $ system $ "cgset -r cpu.cfs_quota_us=" ++ show (value * 1000) ++ " " ++ cgroupName
+                "processes" ->
+                    void $ liftIO $ system $ "cgset -r pids.max=" ++ show value ++ " " ++ cgroupName
+                _ -> return ()
+
+    -- Run a system command (simplified)
+    system cmd = do
+        (exitCode, _, _) <- readCreateProcessWithExitCode (proc "sh" ["-c", cmd]) ""
+        return $ exitCode == ExitSuccess
+
+    -- Run an action and perform cleanup afterwards
+    finally action cleanup = do
+        result <- catchError action (\e -> cleanup >> throwError e)
+        cleanup
+        return result
+
+    -- Recursive directory removal
+    removeDirectoryRecursive path = do
+        -- Use rm -rf for simplicity in this implementation
+        void $ system $ "rm -rf " ++ path

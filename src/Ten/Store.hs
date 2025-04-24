@@ -155,8 +155,8 @@ initializeStore _ storeDir = do
     liftIO $ createDirectoryIfMissing True (storeDir </> "var/ten")
 
     -- Create lock directory for GC
-    env <- ask
-    liftIO $ createDirectoryIfMissing True (takeDirectory $ gcLockPath env)
+    storeEnv <- ask  -- Get BuildEnv, not FilePath
+    liftIO $ createDirectoryIfMissing True (takeDirectory $ getGCLockPath storeEnv)
 
     -- Set appropriate permissions
     -- Store root: read-execute for all, write for owner only
@@ -465,7 +465,7 @@ removeFromStore _ path = do
         throwError $ StoreError $ "Path does not exist: " <> storePathToText path
 
     -- Check if path has any referrers
-    refs <- getReferencesToPath path
+    refs <- getReferencesToPath path  -- Changed from getReferencesToPathDaemon
     unless (Set.null refs) $
         throwError $ StoreError $ "Cannot remove path with referrers: " <> storePathToText path
 
@@ -546,10 +546,13 @@ isGCRoot _ path = do
                     else do
                         -- Check if this root points to our path
                         let rootPath = rootsDir </> root
-                        isLink <- isSymbolicLink <$> getFileStatus rootPath `catch` \(_ :: SomeException) -> return False
+                        linkStatus <- try $ getFileStatus rootPath
+                        let isLink = case linkStatus of
+                                      Right stat -> isSymbolicLink stat
+                                      Left (_ :: SomeException) -> False
                         if isLink
                             then do
-                                target <- liftIO $ readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
+                                target <- readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
                                 let targetPath = storePathToFilePath path env
                                 return $ targetPath == target
                             else return False
@@ -610,7 +613,7 @@ collectGarbageCandidate st path = do
         then return False
         else do
             -- Check if path has any referrers
-            refs <- getReferencesToPath path
+            refs <- getReferencesToPath path  -- Changed from getReferencesToPathDaemon
             return $ Set.null refs
 
 -- | Garbage collection
@@ -680,7 +683,10 @@ findGCRoots _ = do
             fsRoots <- liftIO $ foldM (\acc file -> do
                 let path = rootsDir </> file
                 -- Check if it's a symlink
-                isLink <- isSymbolicLink <$> getFileStatus path `catch` \(_ :: SomeException) -> return False
+                linkStatus <- try $ getFileStatus path
+                let isLink = case linkStatus of
+                              Right stat -> isSymbolicLink stat
+                              Left (_ :: SomeException) -> False
                 if isLink
                     then do
                         -- Read the target
@@ -903,49 +909,42 @@ unregisterValidPath path = do
     -- Close connection
     liftIO $ SQL.close conn
 
--- | Get references to a path (what refers to this path)
--- Available in both daemon and builder tiers with different implementations
-getReferencesToPath :: StorePath -> TenM p t (Set StorePath)
+-- | Get references to a path (what refers to this path) - Daemon implementation
+-- This is a privileged operation requiring access to the store database
+getReferencesToPath :: StorePath -> TenM p 'Daemon (Set StorePath)
 getReferencesToPath path = do
     env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> do
-            -- In daemon context, query the database directly
-            let dbPath = defaultDBPath (storeLocation env)
+    let dbPath = defaultDBPath (storeLocation env)
 
-            -- Open database connection
-            conn <- liftIO $ SQL.open dbPath
+    -- Open database connection
+    conn <- liftIO $ SQL.open dbPath
 
-            -- Query for referrers
-            rows <- liftIO $ SQL.query conn
-                "SELECT referrer FROM References WHERE reference = ?"
-                (Only (storePathToText path)) :: TenM p 'Daemon [Only Text]
+    -- Query for referrers
+    rows <- liftIO $ query conn
+        "SELECT referrer FROM References WHERE reference = ?"
+        (Only (storePathToText path))
 
-            -- Close connection
-            liftIO $ SQL.close conn
+    -- Close connection
+    liftIO $ SQL.close conn
 
-            -- Convert to StorePath objects
-            let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
-            return $ Set.fromList paths
+    -- Convert to StorePath objects
+    let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
+    return $ Set.fromList paths
 
-        Builder -> do
-            -- In builder context, request via daemon protocol
-            requestReferrersToPath path
+-- | Get references to a path - Builder implementation
+-- This is an unprivileged operation that goes through the daemon protocol
+getReferencesToPathBuilder :: StorePath -> TenM p 'Builder (Set StorePath)
+getReferencesToPathBuilder = requestReferrersToPath
 
--- | Get references from a path (what this path refers to)
--- Available in both daemon and builder tiers with different implementations
-getReferencesFromPath :: StorePath -> TenM p t (Set StorePath)
-getReferencesFromPath path = do
-    env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> do
-            -- In daemon context, query the database directly
-            let st = sDaemon  -- Use singleton for Daemon privilege tier
-            findPathReferences st path
+-- | Get references from a path (what this path refers to) - Daemon implementation
+-- This is a privileged operation requiring access to store content
+getReferencesFromPath :: StorePath -> TenM p 'Daemon (Set StorePath)
+getReferencesFromPath path = findPathReferences sDaemon path
 
-        Builder -> do
-            -- In builder context, request via daemon protocol
-            requestReferencesFromPath path
+-- | Get references from a path - Builder implementation
+-- This is an unprivileged operation that goes through the daemon protocol
+getReferencesFromPathBuilder :: StorePath -> TenM p 'Builder (Set StorePath)
+getReferencesFromPathBuilder = requestReferencesFromPath
 
 -- | Find store paths with a specific prefix
 -- This is a daemon-only operation
@@ -1004,7 +1003,7 @@ requestAddToStore nameHint content = do
         }
 
     -- Send the request and wait for response
-    response <- sendRequestSync conn req 60000000 -- 60 second timeout
+    response <- liftIO $ sendRequestSync conn req 60000000 -- 60 second timeout
 
     -- Handle response
     case response of
@@ -1059,7 +1058,7 @@ requestReadViaProtocol path = do
         }
 
     -- Send request and wait for response
-    response <- sendRequestSync conn req 30000000 -- 30 second timeout
+    response <- liftIO $ sendRequestSync conn req 30000000 -- 30 second timeout
 
     -- Handle response
     case response of
@@ -1098,7 +1097,7 @@ requestVerifyPath path = do
                 }
 
             -- Send request and wait for response
-            response <- sendRequestSync conn req 10000000 -- 10 second timeout
+            response <- liftIO $ sendRequestSync conn req 10000000 -- 10 second timeout
 
             -- Handle response
             case response of
@@ -1125,7 +1124,7 @@ requestReferencesFromPath path = do
         }
 
     -- Send request and wait for response
-    response <- sendRequestSync conn req 30000000 -- 30 second timeout
+    response <- liftIO $ sendRequestSync conn req 30000000 -- 30 second timeout
 
     -- Handle response
     case response of
@@ -1155,7 +1154,7 @@ requestReferrersToPath path = do
         }
 
     -- Send request and wait for response
-    response <- sendRequestSync conn req 30000000 -- 30 second timeout
+    response <- liftIO $ sendRequestSync conn req 30000000 -- 30 second timeout
 
     -- Handle response
     case response of
@@ -1177,28 +1176,28 @@ scanFileForStoreReferences :: FilePath -> TenM p t (Set StorePath)
 scanFileForStoreReferences filePath = do
     -- Check if file exists
     exists <- liftIO $ doesFileExist filePath
-    unless exists $
-        return Set.empty
+    if not exists
+        then return Set.empty
+        else do
+            -- Get store location
+            env <- ask
+            let storeDir = storeLocation env
 
-    -- Get store location
-    env <- ask
-    let storeDir = storeLocation env
+            -- Read file content
+            contentResult <- liftIO $ try $ BS.readFile filePath
+            content <- case contentResult of
+                Right c -> return c
+                Left (_ :: IOException) -> return BS.empty
 
-    -- Read file content
-    contentResult <- liftIO $ try $ BS.readFile filePath
-    content <- case contentResult of
-        Right c -> return c
-        Left (_ :: IOException) -> return BS.empty
+            -- Extract store paths from binary content
+            let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
+            let paths = findStorePaths contentText storeDir
 
-    -- Extract store paths from binary content
-    let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
-    let paths = findStorePaths contentText storeDir
+            -- Filter for valid paths
+            validPaths <- filterM storePathExists paths
 
-    -- Filter for valid paths
-    validPaths <- filterM storePathExists paths
-
-    -- Return the set of found paths
-    return $ Set.fromList validPaths
+            -- Return the set of found paths
+            return $ Set.fromList validPaths
 
 -- | Calculate hash of ByteString content
 hashByteString :: ByteString -> Digest SHA256

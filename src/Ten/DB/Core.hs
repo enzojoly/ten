@@ -63,7 +63,7 @@ import System.IO (withFile, IOMode(..), hPutStrLn, stderr)
 import Ten.Core (
     TenM, BuildEnv(..), BuildError(..), privilegeError, StorePath, Phase(..),
     PrivilegeTier(..), SPrivilegeTier(..), sDaemon, defaultDBPath, BuildState(..),
-    currentBuildId, initBuildState_Build, runTen, sBuild, verbosity, logMsg)
+    currentBuildId, initBuildState, runTen, sBuild, verbosity, logMsg)
 
 -- | Database error types
 data DBError
@@ -167,7 +167,7 @@ withDatabase st dbPath busyTimeout action = do
         (\db -> do
             -- Run the action with privilege verification inside IO
             let env' = env { currentPrivilegeTier = Daemon }
-            let state = initBuildState_Build bid  -- Use the bid we extracted before
+            let state = initBuildState Build bid
             result <- runTen sBuild st (action db) env' state
             case result of
                 Left err -> throwIO err
