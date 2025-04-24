@@ -8,6 +8,10 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Ten.Derivation (
     -- Core types reexported from Ten.Core
@@ -48,6 +52,12 @@ module Ten.Derivation (
     newDerivationChain,
     addToDerivationChain,
     derivationChainLength,
+
+    -- Type classes for operations based on privilege tier
+    CanStoreDerivation,
+    CanStoreBuildDerivation,
+    CanRetrieveDerivation,
+    CanCreateSandbox
 ) where
 
 import Control.Monad
@@ -83,9 +93,240 @@ import Data.Kind (Type)
 import Crypto.Hash (Digest, SHA256(..), hash)
 import qualified Crypto.Hash as Crypto
 import Data.ByteArray.Encoding (convertToBase, Base(Base16))
+import Data.Char (isHexDigit)
 
 import qualified Ten.Core as Core
 import qualified Ten.Store as Store
+
+-- | Type class for operations that can store derivations in the Eval phase
+class CanStoreDerivation (t :: Core.PrivilegeTier) where
+    storeDerivationEval :: Core.Derivation -> Core.TenM 'Core.Eval t Core.StorePath
+
+-- | Daemon instance for storing derivations
+instance CanStoreDerivation 'Core.Daemon where
+    storeDerivationEval drv = do
+        validateDerivation drv
+        Core.storeDerivationDaemon drv
+
+-- | Builder instance for storing derivations
+instance CanStoreDerivation 'Core.Builder where
+    storeDerivationEval drv = do
+        validateDerivation drv
+        Core.storeDerivationBuilder drv
+
+-- | Type class for operations that can store derivations in the Build phase
+class CanStoreBuildDerivation (t :: Core.PrivilegeTier) where
+    storeDerivationBuild :: Core.Derivation -> Core.TenM 'Core.Build t Core.StorePath
+
+-- | Daemon instance for storing build derivations
+instance CanStoreBuildDerivation 'Core.Daemon where
+    storeDerivationBuild drv = do
+        validateDerivation drv
+        -- For build phase, we need to serialize and store directly
+        let serialized = serializeDerivation drv
+        let fileName = Core.derivName drv <> ".drv"
+
+        -- Store in content-addressed store
+        env <- ask
+        let storeDir = Core.storeLocation env
+        let hash = hashBlob serialized
+        let storePath = Core.StorePath hash fileName
+
+        -- Write to store path
+        let fullPath = Core.storePathToFilePath storePath env
+        liftIO $ createDirectoryIfMissing True (takeDirectory fullPath)
+        liftIO $ BS.writeFile fullPath serialized
+        liftIO $ Posix.setFileMode fullPath 0o444  -- Read-only for all
+
+        return storePath
+
+-- | Builder instance for storing build derivations
+instance CanStoreBuildDerivation 'Core.Builder where
+    storeDerivationBuild drv = do
+        validateDerivation drv
+        -- For builder, we need to send to daemon
+        env <- ask
+        case Core.runMode env of
+            Core.ClientMode conn -> do
+                -- Serialize and prepare request
+                let serialized = serializeDerivation drv
+                let request = Core.Request {
+                    Core.reqId = 0,
+                    Core.reqType = "store-derivation-build",
+                    Core.reqParams = Map.singleton "name" (Core.derivName drv <> ".drv"),
+                    Core.reqPayload = Just serialized
+                }
+
+                -- Send request to daemon
+                response <- liftIO $ Core.sendRequestSync conn request 30000000  -- 30 second timeout
+
+                case response of
+                    Left err -> throwError err
+                    Right resp ->
+                        if Core.respStatus resp == "ok"
+                            then case Map.lookup "path" (Core.respData resp) of
+                                Just pathText ->
+                                    case Core.parseStorePath pathText of
+                                        Just path -> return path
+                                        Nothing -> throwError $ Core.StoreError "Invalid path in response"
+                                Nothing -> throwError $ Core.StoreError "Missing path in response"
+                            else throwError $ Core.StoreError $ Core.respMessage resp
+
+            _ -> throwError $ Core.PrivilegeError "Cannot store derivation in build phase without daemon connection"
+
+-- | Type class for operations that can retrieve derivations
+class CanRetrieveDerivation p (t :: Core.PrivilegeTier) where
+    retrieveDerivation :: Core.StorePath -> Core.TenM p t (Maybe Core.Derivation)
+
+-- | Daemon instance for retrieving derivations
+instance CanRetrieveDerivation p 'Core.Daemon where
+    retrieveDerivation path = do
+        -- Validate the path before attempting to retrieve
+        unless (Core.validateStorePath path) $
+            throwError $ Core.StoreError $ "Invalid store path format: " <> Core.storePathToText path
+
+        -- Check if the path exists in the store
+        exists <- Store.storePathExists path
+        if not exists
+            then return Nothing
+            else do
+                -- Direct function call instead of using withSPhase
+                env <- ask
+
+                -- Read from store path directly
+                let filePath = Core.storePathToFilePath path env
+                fileExists <- liftIO $ doesFileExist filePath
+
+                if fileExists
+                    then do
+                        content <- liftIO $ BS.readFile filePath
+                        case deserializeDerivation content of
+                            Left _ -> return Nothing
+                            Right drv -> return $ Just drv
+                    else return Nothing
+
+-- | Builder instance for retrieving derivations
+instance CanRetrieveDerivation p 'Core.Builder where
+    retrieveDerivation path = do
+        -- Validate the path before attempting to retrieve
+        unless (Core.validateStorePath path) $
+            throwError $ Core.StoreError $ "Invalid store path format: " <> Core.storePathToText path
+
+        -- Check if the path exists in the store
+        exists <- Store.storePathExists path
+        if not exists
+            then return Nothing
+            else do
+                env <- ask
+                -- First try direct read if file is accessible
+                let filePath = Core.storePathToFilePath path env
+                fileExists <- liftIO $ doesFileExist filePath
+
+                if fileExists
+                    then do
+                        contentEither <- liftIO $ try $ BS.readFile filePath
+                        case contentEither of
+                            Right content ->
+                                case deserializeDerivation content of
+                                    Left _ -> return Nothing
+                                    Right drv -> return $ Just drv
+                            Left (_ :: SomeException) ->
+                                -- If direct read fails, use protocol
+                                retrieveViaProtocol path
+                    else retrieveViaProtocol path
+      where
+        retrieveViaProtocol :: Core.StorePath -> Core.TenM p 'Core.Builder (Maybe Core.Derivation)
+        retrieveViaProtocol p = do
+            env <- ask
+            case Core.runMode env of
+                Core.ClientMode conn -> do
+                    -- Create request
+                    let request = Core.Request {
+                        Core.reqId = 0,
+                        Core.reqType = "get-derivation",
+                        Core.reqParams = Map.singleton "path" (Core.storePathToText p),
+                        Core.reqPayload = Nothing
+                    }
+
+                    -- Send request and get response
+                    response <- liftIO $ Core.sendRequestSync conn request 30000000
+
+                    case response of
+                        Left _ -> return Nothing
+                        Right resp ->
+                            if Core.respStatus resp == "ok"
+                                then case Core.respPayload resp of
+                                    Just content ->
+                                        case deserializeDerivation content of
+                                            Left _ -> return Nothing
+                                            Right drv -> return $ Just drv
+                                    Nothing -> return Nothing
+                                else return Nothing
+
+                _ -> return Nothing  -- Not in client mode
+
+-- | Convenience functions for phase-specific derivation retrieval
+retrieveDerivationEval :: (CanRetrieveDerivation 'Core.Eval t) => Core.StorePath -> Core.TenM 'Core.Eval t (Maybe Core.Derivation)
+retrieveDerivationEval = retrieveDerivation
+
+retrieveDerivationBuild :: (CanRetrieveDerivation 'Core.Build t) => Core.StorePath -> Core.TenM 'Core.Build t (Maybe Core.Derivation)
+retrieveDerivationBuild = retrieveDerivation
+
+-- | Type class for operations that can create sandboxes
+class CanCreateSandbox (t :: Core.PrivilegeTier) where
+    setupSandbox :: Core.BuildEnv -> Set Core.StorePath -> SandboxConfig -> FilePath -> Core.TenM 'Core.Build t ()
+
+-- | Daemon instance for creating sandboxes
+instance CanCreateSandbox 'Core.Daemon where
+    setupSandbox e i c dir = do
+        -- Make store inputs available in the sandbox
+        forM_ (Set.toList i) $ \path -> do
+            -- Create symlinks to store paths
+            let storePath = Core.storePathToFilePath path e
+            let targetPath = dir </> "store" </> T.unpack (T.concat [Core.storeHash path, T.pack "-", Core.storeName path])
+            liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
+            liftIO $ Posix.createSymbolicLink storePath targetPath
+
+        -- Set up isolation if using chroot
+        when (sandboxUseChroot c) $ do
+            -- Setup basic directory structure
+            liftIO $ createDirectoryIfMissing True (dir </> "etc")
+            liftIO $ createDirectoryIfMissing True (dir </> "bin")
+            liftIO $ createDirectoryIfMissing True (dir </> "tmp")
+            liftIO $ createDirectoryIfMissing True (dir </> "dev")
+
+            -- Create minimal /etc files needed for builds
+            liftIO $ writeFile (dir </> "etc/passwd") "root:x:0:0::/:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n"
+            liftIO $ writeFile (dir </> "etc/group") "root:x:0:\nnobody:x:65534:\n"
+
+            -- Create /dev nodes if privileged
+            when (sandboxPrivileged c) $ do
+                -- Use system calls to create basic device nodes
+                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/null" ++ " c 1 3"
+                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/zero" ++ " c 1 5"
+                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/urandom" ++ " c 1 9"
+
+                -- Mount /proc if configured
+                when (sandboxMountProc c) $
+                    void $ liftIO $ runSystemCommand $ "mount -t proc proc " ++ dir </> "proc"
+
+            -- Setup resources limits with cgroups if enabled
+            when (sandboxUseCgroups c) $
+                setupCgroups dir (sandboxResourceLimits c)
+
+-- | Builder instance for creating sandboxes
+instance CanCreateSandbox 'Core.Builder where
+    setupSandbox e i c dir = do
+        -- Make store inputs available in the sandbox via symlinks
+        forM_ (Set.toList i) $ \path -> do
+            let storePath = Core.storePathToFilePath path e
+            let targetPath = dir </> "inputs" </> T.unpack (Core.storeName path)
+            liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
+            liftIO $ Posix.createSymbolicLink storePath targetPath
+
+        -- Create workspace directories
+        liftIO $ createDirectoryIfMissing True (dir </> "work")
+        liftIO $ createDirectoryIfMissing True (dir </> "outputs")
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -193,108 +434,36 @@ isReturnContinuationDerivation name args env =
         "--return" `T.isPrefixOf` arg ||
         "--output-derivation" `T.isPrefixOf` arg
 
--- | Store a derivation in the Eval phase
--- This function is specific to the Eval phase to enforce phase separation
-storeDerivationEval :: Core.Derivation -> Core.TenM 'Core.Eval t Core.StorePath
-storeDerivationEval drv = do
-    -- Validate the derivation before storing
-    validateDerivation drv
-
-    -- Serialize the derivation to a ByteString
-    let serialized = serializeDerivation drv
-    let fileName = Core.derivName drv <> ".drv"
-
-    -- Check the privilege tier and use appropriate method
-    env <- ask
-    case Core.currentPrivilegeTier env of
-        Core.Daemon ->
-            -- Use direct store access for daemon privilege
-            Core.storeDerivationDaemon drv
-        Core.Builder ->
-            -- Use protocol to request storage in builder context
-            Core.storeDerivationBuilder drv
-
--- | Store a derivation in the Build phase
--- This function is specific to the Build phase to enforce phase separation
-storeDerivationBuild :: Core.Derivation -> Core.TenM 'Core.Build t Core.StorePath
-storeDerivationBuild drv = do
-    -- Validate the derivation before storing
-    validateDerivation drv
-
-    -- Serialize the derivation to a ByteString
-    let serialized = serializeDerivation drv
-    let fileName = Core.derivName drv <> ".drv"
-
-    -- Check the privilege tier and use appropriate method
-    env <- ask
-    case Core.currentPrivilegeTier env of
-        Core.Daemon ->
-            -- Use direct store access for daemon privilege
-            Core.storeDerivationDaemon drv
-        Core.Builder ->
-            -- Use protocol to request storage in builder context
-            Core.storeDerivationBuilder drv
-
--- | Retrieve a derivation in the Eval phase
-retrieveDerivationEval :: Core.StorePath -> Core.TenM 'Core.Eval t (Maybe Core.Derivation)
-retrieveDerivationEval path = retrieveDerivation path
-
--- | Retrieve a derivation in the Build phase
-retrieveDerivationBuild :: Core.StorePath -> Core.TenM 'Core.Build t (Maybe Core.Derivation)
-retrieveDerivationBuild path = retrieveDerivation path
-
--- | Retrieve a derivation from the store - common implementation for both phases
-retrieveDerivation :: Core.StorePath -> Core.TenM p t (Maybe Core.Derivation)
-retrieveDerivation path = do
-    -- Validate the path before attempting to retrieve
-    unless (Core.validateStorePath path) $
-        throwError $ Core.StoreError $ "Invalid store path format: " <> Core.storePathToText path
-
-    -- Check if the path exists in the store
-    exists <- Store.storePathExists path
-    if not exists
-        then return Nothing
-        else do
-            -- Get content based on privilege tier
-            env <- ask
-            content <- case Core.currentPrivilegeTier env of
-                Core.Daemon -> do
-                    -- Direct read in daemon context using proper type-safe API
-                    result <- Core.readDerivationDaemon path
-                    case result of
-                        Left err -> throwError err
-                        Right drv -> return $ serializeDerivation drv
-
-                Core.Builder -> do
-                    -- First try direct read (works if file is accessible)
-                    -- If that fails, use protocol request
-                    let filePath = Core.storePathToFilePath path env
-                    fileExists <- liftIO $ doesFileExist filePath
-                    if fileExists
-                        then do
-                            contentEither <- liftIO $ try $ BS.readFile filePath
-                            case contentEither of
-                                Right content -> return content
-                                Left (_ :: SomeException) -> readViaProtocolBuilder path
-                        else readViaProtocolBuilder path
-
-            -- Deserialize the content
-            case deserializeDerivation content of
-                Left err -> do
-                    Core.logMsg 1 $ "Error deserializing derivation: " <> T.pack (show err)
-                    return Nothing
-                Right drv -> return $ Just drv
-
 -- | Helper to read via daemon protocol - Builder specific version
 readViaProtocolBuilder :: Core.StorePath -> Core.TenM p 'Core.Builder ByteString
 readViaProtocolBuilder path = do
-    result <- Core.readDerivationBuilder path
-    case result of
-        Left err -> throwError err
-        Right drv -> return $ serializeDerivation drv
+    env <- ask
+    case Core.runMode env of
+        Core.ClientMode conn -> do
+            -- Create request for derivation content
+            let request = Core.Request {
+                Core.reqId = 0,
+                Core.reqType = "store-read",
+                Core.reqParams = Map.singleton "path" (Core.storePathToText path),
+                Core.reqPayload = Nothing
+            }
+
+            -- Send request and wait for response
+            response <- liftIO $ Core.sendRequestSync conn request 30000000  -- 30 second timeout
+
+            case response of
+                Left err -> throwError err
+                Right resp ->
+                    if Core.respStatus resp == "ok"
+                        then case Core.respPayload resp of
+                            Just content -> return content
+                            Nothing -> throwError $ Core.StoreError "Missing content in response"
+                        else throwError $ Core.StoreError $ Core.respMessage resp
+
+        _ -> throwError $ Core.PrivilegeError "Cannot read via protocol without daemon connection"
 
 -- | Instantiate a derivation for building - context-aware implementation
-instantiateDerivation :: Core.Derivation -> Core.TenM 'Core.Build t ()
+instantiateDerivation :: (CanStoreBuildDerivation t) => Core.Derivation -> Core.TenM 'Core.Build t ()
 instantiateDerivation deriv = do
     -- Store the derivation using the phase-specific implementation
     derivPath <- storeDerivationBuild deriv
@@ -339,7 +508,7 @@ addToDerivationChain drv (DerivationChain hashes) =
     DerivationChain (Core.derivHash drv : hashes)
 
 -- | The monadic join operation for Return-Continuation - context-aware implementation
-joinDerivation :: Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
+joinDerivation :: (CanStoreBuildDerivation t) => Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
 joinDerivation outerDrv = do
     -- Build the outer derivation just enough to get inner derivation
     innerDrv <- buildToGetInnerDerivation outerDrv
@@ -351,7 +520,7 @@ joinDerivation outerDrv = do
     return innerDrv
 
 -- | Build a derivation to the point where it returns an inner derivation
-buildToGetInnerDerivation :: Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
+buildToGetInnerDerivation :: (CanStoreBuildDerivation t, CanCreateSandbox t) => Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
 buildToGetInnerDerivation drv = do
     env <- ask
     state <- get
@@ -434,19 +603,19 @@ serializeDerivation = LBS.toStrict . Aeson.encode . derivationToJSON
 
 -- | Convert derivation to JSON
 derivationToJSON :: Core.Derivation -> Aeson.Value
-derivationToJSON Core.Derivation{..} = Aeson.object
-    [ "name" .= Core.derivName
-    , "hash" .= Core.derivHash
-    , "builder" .= storePathToJSON Core.derivBuilder
-    , "args" .= Core.derivArgs
-    , "inputs" .= Aeson.Array (Vector.fromList $ map Aeson.toJSON $ Set.toList Core.derivInputs)
-    , "outputs" .= Aeson.Array (Vector.fromList $ map Aeson.toJSON $ Set.toList Core.derivOutputs)
-    , "env" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList Core.derivEnv)
-    , "system" .= Core.derivSystem
-    , "strategy" .= (case Core.derivStrategy of
+derivationToJSON drv = Aeson.object
+    [ "name" .= Core.derivName drv
+    , "hash" .= Core.derivHash drv
+    , "builder" .= storePathToJSON (Core.derivBuilder drv)
+    , "args" .= Core.derivArgs drv
+    , "inputs" .= Aeson.Array (Vector.fromList $ map Aeson.toJSON $ Set.toList $ Core.derivInputs drv)
+    , "outputs" .= Aeson.Array (Vector.fromList $ map Aeson.toJSON $ Set.toList $ Core.derivOutputs drv)
+    , "env" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList $ Core.derivEnv drv)
+    , "system" .= Core.derivSystem drv
+    , "strategy" .= (case Core.derivStrategy drv of
                         Core.ApplicativeStrategy -> "applicative" :: Text
                         Core.MonadicStrategy -> "monadic")
-    , "meta" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList Core.derivMeta)
+    , "meta" .= Aeson.object (map (\(k, v) -> Aeson.fromText k .= v) $ Map.toList $ Core.derivMeta drv)
     ]
 
 -- Helper to convert StorePath to JSON
@@ -642,7 +811,7 @@ defaultSandboxConfig = SandboxConfig {
 }
 
 -- | Create a sandbox for building
-withSandbox :: Set Core.StorePath -> SandboxConfig -> (FilePath -> Core.TenM 'Core.Build t a) -> Core.TenM 'Core.Build t a
+withSandbox :: (CanCreateSandbox t) => Set Core.StorePath -> SandboxConfig -> (FilePath -> Core.TenM 'Core.Build t a) -> Core.TenM 'Core.Build t a
 withSandbox inputs config action = do
     env <- ask
 
@@ -653,15 +822,8 @@ withSandbox inputs config action = do
     let sandboxDir = Core.workDir env </> "sandbox" </> "temp-" ++ show buildId
     liftIO $ createDirectoryIfMissing True sandboxDir
 
-    -- Set up the sandbox with appropriate privilege and isolation
-    case Core.currentPrivilegeTier env of
-        Core.Daemon ->
-            -- For daemon, we can set up a full sandbox with proper isolation
-            setupDaemonSandbox env inputs config sandboxDir
-
-        Core.Builder ->
-            -- For builder, we use a simplified sandbox since we can't drop privileges
-            setupBuilderSandbox env inputs config sandboxDir
+    -- Set up the sandbox with appropriate privilege tier using the type class
+    setupSandbox env inputs config sandboxDir
 
     -- Run the action and ensure cleanup happens even if it fails
     result <- catchError (action sandboxDir) $ \e -> do
@@ -675,73 +837,24 @@ withSandbox inputs config action = do
         liftIO $ cleanupSandbox sandboxDir
 
     return result
-  where
-    -- Full privileged sandbox setup for daemon tier
-    setupDaemonSandbox env inputs config dir = do
-        -- Make store inputs available in the sandbox
-        forM_ (Set.toList inputs) $ \path -> do
-            -- Create symlinks to store paths
-            let storePath = Core.storePathToFilePath path env
-            let targetPath = dir </> "store" </> T.unpack (T.concat [Core.storeHash path, T.pack "-", Core.storeName path])
-            liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
-            liftIO $ Posix.createSymbolicLink storePath targetPath
 
-        -- Set up isolation if using chroot
-        when (sandboxUseChroot config) $ do
-            -- Setup basic directory structure
-            liftIO $ createDirectoryIfMissing True (dir </> "etc")
-            liftIO $ createDirectoryIfMissing True (dir </> "bin")
-            liftIO $ createDirectoryIfMissing True (dir </> "tmp")
-            liftIO $ createDirectoryIfMissing True (dir </> "dev")
+-- | Set up cgroups for resource limiting
+setupCgroups :: FilePath -> Map Text Int -> Core.TenM 'Core.Build 'Core.Daemon ()
+setupCgroups dir limits = do
+    -- Create a cgroup for this build
+    let cgroupName = "ten-build-" ++ takeFileName dir
+    void $ liftIO $ runSystemCommand $ "cgcreate -g cpu,memory,pids:" ++ cgroupName
 
-            -- Create minimal /etc files needed for builds
-            liftIO $ writeFile (dir </> "etc/passwd") "root:x:0:0::/:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n"
-            liftIO $ writeFile (dir </> "etc/group") "root:x:0:\nnobody:x:65534:\n"
-
-            -- Create /dev nodes if privileged
-            when (sandboxPrivileged config) $ do
-                -- Use system calls to create basic device nodes
-                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/null" ++ " c 1 3"
-                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/zero" ++ " c 1 5"
-                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/urandom" ++ " c 1 9"
-
-                -- Mount /proc if configured
-                when (sandboxMountProc config) $
-                    void $ liftIO $ runSystemCommand $ "mount -t proc proc " ++ dir </> "proc"
-
-            -- Setup resources limits with cgroups if enabled
-            when (sandboxUseCgroups config) $
-                setupCgroups dir (sandboxResourceLimits config)
-
-    -- Simplified sandbox for builder tier (can't use most isolation features)
-    setupBuilderSandbox env inputs config dir = do
-        -- Make store inputs available in the sandbox via symlinks
-        forM_ (Set.toList inputs) $ \path -> do
-            let storePath = Core.storePathToFilePath path env
-            let targetPath = dir </> "inputs" </> T.unpack (Core.storeName path)
-            liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
-            liftIO $ Posix.createSymbolicLink storePath targetPath
-
-        -- Create workspace directories
-        liftIO $ createDirectoryIfMissing True (dir </> "work")
-        liftIO $ createDirectoryIfMissing True (dir </> "outputs")
-
-    -- Set up cgroups for resource limiting
-    setupCgroups dir limits = do
-        -- Create a cgroup for this build
-        let cgroupName = "ten-build-" ++ takeFileName dir
-        void $ liftIO $ runSystemCommand $ "cgcreate -g cpu,memory,pids:" ++ cgroupName
-
-        -- Set resource limits
-        forM_ (Map.toList limits) $ \(resource, value) ->
-            case resource of
-                "memory" ->
-                    void $ liftIO $ runSystemCommand $ "cgset -r memory.limit_in_bytes=" ++ show (value * 1024) ++ " " ++ cgroupName
-                "cpu-time" ->
-                    void $ liftIO $ runSystemCommand $ "cgset -r cpu.cfs_quota_us=" ++ show (value * 1000) ++ " " ++ cgroupName
-                "processes" ->
-                    void $ liftIO $ runSystemCommand $ "cgset -r pids.max=" ++ show value ++ " " ++ cgroupName
-                _ -> return ()
+    -- Set resource limits
+    forM_ (Map.toList limits) $ \(resource, value) ->
+        case resource of
+            "memory" ->
+                void $ liftIO $ runSystemCommand $ "cgset -r memory.limit_in_bytes=" ++ show (value * 1024) ++ " " ++ cgroupName
+            "cpu-time" ->
+                void $ liftIO $ runSystemCommand $ "cgset -r cpu.cfs_quota_us=" ++ show (value * 1000) ++ " " ++ cgroupName
+            "processes" ->
+                void $ liftIO $ runSystemCommand $ "cgset -r pids.max=" ++ show value ++ " " ++ cgroupName
+            _ -> return ()
 
 -- | Run a system command and return success/failure
 runSystemCommand :: String -> IO Bool
