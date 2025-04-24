@@ -177,7 +177,7 @@ import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                  Phase(..), PrivilegeTier(..), SPhase(..), SPrivilegeTier(..),
                  CanAccessStore, CanAccessDatabase, CanCreateSandbox, CanDropPrivileges,
                  CanModifyStore)
-import Ten.Derivation (Derivation)
+import Ten.Core (Derivation)
 
 -- | Protocol version
 data ProtocolVersion = ProtocolVersion {
@@ -1380,7 +1380,7 @@ serializeMessageContent (DaemonMessage msgType content) =
             "messageType" .= show msgType,
             "content" .= Aeson.toJSON content,
             "privileged" .= True
-        ]
+            ]
     in LBS.toStrict $ Aeson.encode jsonObj
 
 serializeMessageContent (BuilderMessage msgType content) =
@@ -1390,7 +1390,7 @@ serializeMessageContent (BuilderMessage msgType content) =
             "messageType" .= show msgType,
             "content" .= Aeson.toJSON content,
             "privileged" .= False
-        ]
+            ]
     in LBS.toStrict $ Aeson.encode jsonObj
 
 serializeMessageContent (AuthMessage content) =
@@ -1398,7 +1398,7 @@ serializeMessageContent (AuthMessage content) =
     let jsonObj = Aeson.object [
             "type" .= ("auth" :: Text),
             "content" .= Aeson.toJSON content
-        ]
+            ]
     in LBS.toStrict $ Aeson.encode jsonObj
 
 serializeMessageContent (ErrorMessage err) =
@@ -1406,7 +1406,7 @@ serializeMessageContent (ErrorMessage err) =
     let jsonObj = Aeson.object [
             "type" .= ("error" :: Text),
             "error" .= errorToJSON err
-        ]
+            ]
     in LBS.toStrict $ Aeson.encode jsonObj
   where
     errorToJSON :: BuildError -> Aeson.Value
@@ -1619,7 +1619,7 @@ createResponsePrivileged resp =
             "type" .= ("response" :: Text),
             "privileged" .= True,
             "content" .= Aeson.toJSON resp
-        ]
+            ]
     in createResponseFrame $ LBS.toStrict $ Aeson.encode content
 
 -- | Create an unprivileged response frame
@@ -1629,7 +1629,7 @@ createResponseUnprivileged resp =
             "type" .= ("response" :: Text),
             "privileged" .= False,
             "content" .= Aeson.toJSON resp
-        ]
+            ]
     in createResponseFrame $ LBS.toStrict $ Aeson.encode content
 
 -- | Create an error response
@@ -1641,7 +1641,7 @@ createErrorResponse err =
                 "errorType" .= errorTypeString err,
                 "message" .= errorMessage err
             ]
-        ]
+            ]
     in createResponseFrame $ LBS.toStrict $ Aeson.encode content
   where
     errorTypeString :: BuildError -> Text
@@ -1743,7 +1743,7 @@ createDaemonRequest msgType content =
             "messageType" .= show msgType,
             "content" .= Aeson.toJSON content,
             "privileged" .= True
-        ]
+            ]
     in createRequestFrame $ LBS.toStrict $ Aeson.encode jsonContent
 
 -- | Create a builder (unprivileged) request
@@ -1754,7 +1754,7 @@ createBuilderRequest msgType content =
             "messageType" .= show msgType,
             "content" .= Aeson.toJSON content,
             "privileged" .= False
-        ]
+            ]
     in createRequestFrame $ LBS.toStrict $ Aeson.encode jsonContent
 
 -- | Create an error request
@@ -1766,7 +1766,7 @@ createErrorRequest err =
                 "errorType" .= errorTypeString err,
                 "message" .= errorMessage err
             ]
-        ]
+            ]
     in createRequestFrame $ LBS.toStrict $ Aeson.encode jsonContent
   where
     errorTypeString :: BuildError -> Text

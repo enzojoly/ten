@@ -508,7 +508,7 @@ addToDerivationChain drv (DerivationChain hashes) =
     DerivationChain (Core.derivHash drv : hashes)
 
 -- | The monadic join operation for Return-Continuation - context-aware implementation
-joinDerivation :: (CanStoreBuildDerivation t) => Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
+joinDerivation :: (CanStoreBuildDerivation t, CanCreateSandbox t) => Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
 joinDerivation outerDrv = do
     -- Build the outer derivation just enough to get inner derivation
     innerDrv <- buildToGetInnerDerivation outerDrv
