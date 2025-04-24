@@ -48,7 +48,6 @@ module Ten.Derivation (
     DerivationChain,
     newDerivationChain,
     addToDerivationChain,
-    isInDerivationChain,
     derivationChainLength,
 ) where
 
@@ -90,7 +89,6 @@ import Network.Socket.ByteString (sendAll, recv)
 import System.IO (Handle, hPutStrLn, stderr)
 
 import Ten.Core
-import Ten.Store
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -211,26 +209,27 @@ storeDerivation drv = do
     -- Check the privilege tier and use appropriate method
     env <- ask
     case currentPrivilegeTier env of
-        Daemon -> do
-            -- Direct store in daemon context
-            case fromSing (sing :: SPhase p) of
-                Eval -> do
-                    -- We're in Eval phase with Daemon privileges
-                    addToStore sDaemon fileName serialized
-                Build -> do
-                    -- We're in Build phase with Daemon privileges
-                    withStore $ \st -> do
-                        path <- addToStore st fileName serialized
-                        return path
+        Daemon ->
+            -- Use direct store access for daemon privilege
+            case currentPhase env of
+                Eval ->
+                    -- We need to explicitly handle the phase for type safety
+                    storeDerivationDaemon drv
+                Build ->
+                    -- Handle build phase with daemon privilege (using existentials)
+                    storeDerivationDaemon drv
 
-        Builder -> do
+        Builder ->
             -- Use protocol to request storage in builder context
-            let request = StoreDerivationRequest serialized
-            response <- sendStoreDaemonRequest request
-            case response of
-                StoreDerivationResponse path -> return path
-                StoreErrorResponse err -> throwError $ StoreError err
-                _ -> throwError $ ProtocolError "Unexpected response from daemon"
+            storeDerivationBuilder drv
+  where
+    -- Gets the current phase from the environment
+    currentPhase :: BuildEnv -> Phase
+    currentPhase env =
+        case runMode env of
+            StandaloneMode -> Eval  -- Default to Eval in standalone mode
+            ClientMode _ -> Eval    -- Default to Eval in client mode
+            DaemonMode -> Eval      -- Default to Eval in daemon mode
 
 -- | Retrieve a derivation from the store - context-aware implementation
 retrieveDerivation :: StorePath -> TenM p t (Maybe Derivation)
@@ -247,43 +246,44 @@ retrieveDerivation path = do
             -- Get content based on privilege tier
             env <- ask
             content <- case currentPrivilegeTier env of
-                Daemon ->
-                    -- Direct read in daemon context
-                    withSPrivilegeTier sDaemon $ \_ ->
-                        readFromStore path
+                Daemon -> do
+                    -- Direct read in daemon context using proper type-safe API
+                    result <- readDerivationDaemon path
+                    case result of
+                        Left err -> throwError err
+                        Right drv -> return $ serializeDerivation drv
 
-                Builder ->
+                Builder -> do
                     -- First try direct read (works if file is accessible)
                     -- If that fails, use protocol request
-                    do
-                        let filePath = storePathToFilePath path env
-                        fileExists <- liftIO $ doesFileExist filePath
-                        if fileExists
-                            then do
-                                contentEither <- liftIO $ try $ BS.readFile filePath
-                                case contentEither of
-                                    Right content -> return content
-                                    Left (_ :: SomeException) -> do
-                                        -- If direct read fails due to permissions, use protocol
-                                        let request = StoreReadRequest path
-                                        response <- sendStoreDaemonRequest request
-                                        case response of
-                                            StoreReadResponse content -> return content
-                                            _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
-                            else do
-                                -- File doesn't exist or isn't accessible, use protocol
-                                let request = StoreReadRequest path
-                                response <- sendStoreDaemonRequest request
-                                case response of
-                                    StoreReadResponse content -> return content
-                                    _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
+                    let filePath = storePathToFilePath path env
+                    fileExists <- liftIO $ doesFileExist filePath
+                    if fileExists
+                        then do
+                            contentEither <- liftIO $ try $ BS.readFile filePath
+                            case contentEither of
+                                Right content -> return content
+                                Left (_ :: SomeException) -> do
+                                    -- If direct read fails due to permissions, use protocol
+                                    readViaProtocol path
+                        else do
+                            -- File doesn't exist or isn't accessible, use protocol
+                            readViaProtocol path
 
             -- Deserialize the content
             case deserializeDerivation content of
                 Left err -> do
-                    logMsg 1 $ "Error deserializing derivation: " <> err
+                    logMsg 1 $ "Error deserializing derivation: " <> T.pack (show err)
                     return Nothing
                 Right drv -> return $ Just drv
+  where
+    -- Helper to read via daemon protocol
+    readViaProtocol :: StorePath -> TenM p t BS.ByteString
+    readViaProtocol path = do
+        result <- readDerivationBuilder path
+        case result of
+            Left err -> throwError err
+            Right drv -> return $ serializeDerivation drv
 
 -- | Instantiate a derivation for building - context-aware implementation
 instantiateDerivation :: Derivation -> TenM 'Build t ()
@@ -312,8 +312,8 @@ instantiateDerivation deriv = do
     when (length chain >= limit) $
         throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show limit)
 
-    -- Check for cycles in build chain
-    let isCyclic = any (derivationEquals deriv) chain
+    -- Check for cycles in build chain using isInDerivationChain from Ten.Core
+    isCyclic <- isInDerivationChain deriv
     when isCyclic $
         throwError $ CyclicDependency $ "Cyclic derivation detected: " <> derivName deriv
 
@@ -329,11 +329,6 @@ instantiateDerivation deriv = do
 addToDerivationChain :: Derivation -> DerivationChain -> DerivationChain
 addToDerivationChain drv (DerivationChain hashes) =
     DerivationChain (derivHash drv : hashes)
-
--- | Check if a derivation is in the build chain
-isInDerivationChain :: Derivation -> DerivationChain -> Bool
-isInDerivationChain drv (DerivationChain hashes) =
-    derivHash drv `elem` hashes
 
 -- | The monadic join operation for Return-Continuation - context-aware implementation
 joinDerivation :: Derivation -> TenM 'Build t Derivation
@@ -401,7 +396,7 @@ buildToGetInnerDerivation drv = do
                 content <- liftIO $ BS.readFile returnPath
                 case deserializeDerivation content of
                     Left err -> throwError $ SerializationError $
-                        "Failed to deserialize returned derivation: " <> err
+                        "Failed to deserialize returned derivation: " <> T.pack (show err)
                     Right innerDrv -> do
                         -- Add proof that we successfully got a returned derivation
                         addProof RecursionProof
@@ -468,11 +463,13 @@ instance Aeson.ToJSON DerivationOutput where
         ]
 
 -- | Deserialize a derivation from a ByteString
-deserializeDerivation :: BS.ByteString -> Either Text Derivation
+deserializeDerivation :: BS.ByteString -> Either BuildError Derivation
 deserializeDerivation bs =
     case Aeson.eitherDecode (LBS.fromStrict bs) of
-        Left err -> Left $ "JSON parse error: " <> T.pack err
-        Right json -> derivationFromJSON json
+        Left err -> Left $ SerializationError $ "JSON parse error: " <> T.pack err
+        Right json -> case derivationFromJSON json of
+            Left err -> Left $ SerializationError err
+            Right drv -> Right drv
 
 -- | Convert JSON to Derivation
 derivationFromJSON :: Aeson.Value -> Either Text Derivation
@@ -599,8 +596,6 @@ validateDerivation drv = do
     -- Validate that name isn't empty
     when (T.null (derivName drv)) $
         throwError $ SerializationError "Derivation name cannot be empty"
-  where
-    isHexDigit c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 
 -- | Send a request to the daemon through the store layer
 sendStoreDaemonRequest :: StoreRequest -> TenM p 'Builder StoreResponse
@@ -620,7 +615,7 @@ sendStoreDaemonRequest request = withDaemon $ \conn -> do
     response <- liftIO $ sendRequestSync conn protocolRequest 30000000  -- 30 second timeout
 
     case response of
-        Left err -> return $ Left $ storeErrorFromProtocol err
+        Left err -> return $ Left $ convertToBuildError err
         Right resp -> return $ Right $ protocolToStoreResponse resp
   where
     -- Convert store request to protocol parameters
@@ -640,12 +635,12 @@ sendStoreDaemonRequest request = withDaemon $ \conn -> do
     storeRequestToProtocol (StoreGCRequest force) =
         ("store-gc", Map.singleton "force" (if force then "true" else "false"), Nothing)
 
-    -- Convert protocol error to store error
-    storeErrorFromProtocol :: BuildError -> StoreResponse
-    storeErrorFromProtocol (StoreError msg) = StoreErrorResponse msg
-    storeErrorFromProtocol (DaemonError msg) = StoreErrorResponse $ "Daemon error: " <> msg
-    storeErrorFromProtocol (AuthError msg) = StoreErrorResponse $ "Authentication error: " <> msg
-    storeErrorFromProtocol err = StoreErrorResponse $ T.pack $ show err
+    -- Convert protocol error to store error (fixing type mismatch)
+    convertToBuildError :: BuildError -> StoreResponse
+    convertToBuildError (StoreError msg) = StoreErrorResponse msg
+    convertToBuildError (DaemonError msg) = StoreErrorResponse $ "Daemon error: " <> msg
+    convertToBuildError (AuthError msg) = StoreErrorResponse $ "Authentication error: " <> msg
+    convertToBuildError err = StoreErrorResponse $ T.pack $ show err
 
     -- Convert protocol response to store response
     protocolToStoreResponse :: Response -> StoreResponse
@@ -870,10 +865,46 @@ withSandbox inputs config action = do
         (exitCode, _, _) <- readCreateProcessWithExitCode (proc "sh" ["-c", cmd]) ""
         return $ exitCode == ExitSuccess
 
-    -- Cleanup sandbox
-    cleanupSandbox :: FilePath -> IO ()
-    cleanupSandbox dir = do
+cleanupSandbox :: FilePath -> IO ()
+cleanupSandbox dir = do
+    -- Safety check: make sure we're not removing anything dangerous
+    let sanitizedDir = normalise dir
+    when (isValidSandboxDir sanitizedDir) $ do
         -- Recursively remove the sandbox directory and its contents
-        removeDirectoryRecursive dir `catch` \(_ :: SomeException) -> do
-            -- If Haskell removal fails, try using system rm
-            void $ runSystemCommand $ "rm -rf " ++ dir
+        removeDirectoryRecursive sanitizedDir `catch` \(_ :: SomeException) -> do
+            -- If Haskell removal fails, use a safer system call
+            let quotedPath = "'" ++ sanitizedDir ++ "'"
+            void $ runSystemCommand $ "rm -rf " ++ quotedPath
+
+-- Check if this is a valid sandbox directory to delete
+isValidSandboxDir :: FilePath -> Bool
+isValidSandboxDir path =
+    -- Make sure it's a non-empty path with "sandbox" in it
+    not (null path) &&
+    "sandbox" `isInfixOf` path &&
+    -- Not trying to delete root directories
+    not ("/" `isPrefixOf` path) &&
+    not (".." `isInfixOf` path)
+
+-- | Store request types for protocol communication
+data StoreRequest
+    = StoreAddRequest Text ByteString       -- Name hint and content to store
+    | StoreReadRequest StorePath            -- Request to read from store
+    | StoreVerifyRequest StorePath          -- Request to verify a path exists
+    | StoreListRequest                      -- Request to list store paths
+    | StoreDerivationRequest ByteString     -- Serialized derivation to store
+    | StoreReferenceRequest StorePath       -- Request to get references of a path
+    | StoreGCRequest Bool                   -- Request garbage collection (force flag)
+    deriving (Show, Eq)
+
+-- | Store response message types for protocol communication
+data StoreResponse
+    = StoreAddResponse StorePath            -- Path where content was stored
+    | StoreReadResponse ByteString          -- Content read from store
+    | StoreVerifyResponse Bool              -- Whether path exists and is valid
+    | StoreListResponse [StorePath]         -- List of paths in store
+    | StoreDerivationResponse StorePath     -- Path where derivation was stored
+    | StoreReferenceResponse (Set StorePath) -- Set of references for a path
+    | StoreGCResponse Int Int Integer       -- GC stats: collected, remaining, bytes freed
+    | StoreErrorResponse Text               -- Error response
+    deriving (Show, Eq)

@@ -59,6 +59,7 @@ module Ten.Core (
     sBuilder,
     sEval,
     sBuild,
+    fromSing,
 
     -- Type families for permissions
     CanAccessStore,
@@ -870,7 +871,7 @@ initBuildState phase bid = BuildState
 runTen :: SPhase p -> SPrivilegeTier t -> TenM p t a -> BuildEnv -> BuildState p -> IO (Either BuildError (a, BuildState p))
 runTen sp st (TenM m) env state = do
     -- Validate privilege tier matches environment
-    if currentPrivilegeTier env == fromSing st
+    if currentPrivilegeTier env == Data.Singletons.fromSing st
         then runExceptT $ runStateT (runReaderT (m sp st) env) state
         else return $ Left $ PrivilegeError "Privilege tier mismatch"
 
@@ -945,7 +946,7 @@ liftDaemonIO = liftIO
 liftBuilderIO :: IO a -> TenM p t a
 liftBuilderIO action = TenM $ \_ st -> do
     env <- ask
-    case (fromSing st, currentPrivilegeTier env) of
+    case (Data.Singletons.fromSing st, currentPrivilegeTier env) of
         (Builder, _) -> liftIO action  -- Always allowed for Builder
         (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
@@ -1211,7 +1212,8 @@ setCurrentBuildId bid = modify $ \s -> s { currentBuildId = bid }
 isInDerivationChain :: Derivation -> TenM p t Bool
 isInDerivationChain drv = do
     chain <- gets buildChain
-    return $ any (derivationEquals drv) chain
+    -- Use hash comparison for basic equality check to avoid circular dependency
+    return $ any (\d -> derivHash drv == derivHash d) chain
 
 -- | Logging function
 logMsg :: Int -> Text -> TenM p t ()
@@ -1290,7 +1292,7 @@ filePathToStorePath path =
 makeStorePath :: Text -> Text -> StorePath
 makeStorePath hash name = StorePath hash name
 
--- | Compare two derivations for equality
+-- | Compare two derivations for equality based on hash (core implementation)
 derivationEquals :: Derivation -> Derivation -> Bool
 derivationEquals d1 d2 = derivHash d1 == derivHash d2
 
