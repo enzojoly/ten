@@ -235,6 +235,7 @@ import Data.Singletons.TH
 import Data.Kind (Type)
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
+import qualified Data.Aeson.Types as Aeson (parseEither)
 import qualified Data.Aeson.KeyMap as AKeyMap
 import qualified Data.Aeson.Key as Key
 import Network.Socket.ByteString (sendAll, recv)
