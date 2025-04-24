@@ -226,11 +226,6 @@ sDaemon = SDaemon
 sBuilder :: SPrivilegeTier 'Builder
 sBuilder = SBuilder
 
--- | Convert from singleton to the value
-fromSing :: SPrivilegeTier t -> PrivilegeTier
-fromSing SDaemon = Daemon
-fromSing SBuilder = Builder
-
 -- | Existential wrapper for privilege tier singletons
 data SomePrivilegeTier where
     SomePrivilegeTier :: SPrivilegeTier t -> SomePrivilegeTier
