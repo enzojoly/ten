@@ -233,6 +233,7 @@ import Data.Char (isHexDigit)
 import Data.Singletons
 import Data.Singletons.TH
 import Data.Kind (Type)
+import qualified Data.Aeson as Aeson
 import Network.Socket.ByteString (sendAll, recv)
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
@@ -980,7 +981,7 @@ storeDerivationDaemon deriv = do
     hashByteString :: BS.ByteString -> Int
     hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
--- | Request daemon to store a derivation (Builder context)
+-- | Store a derivation in builder context
 storeDerivationBuilder :: Derivation -> TenM 'Eval 'Builder StorePath
 storeDerivationBuilder deriv = do
     -- Get daemon connection
@@ -988,9 +989,7 @@ storeDerivationBuilder deriv = do
     case runMode env of
         ClientMode conn -> do
             -- Create store request with derivation payload
-            -- Serialization would be provided by Ten.Derivation
-            let serialized = BS.pack []  -- Placeholder
-
+            let serialized = serializeDerivation deriv
             let request = Request {
                 reqId = 0,  -- Will be set by sendRequest
                 reqType = "store-derivation",
@@ -999,7 +998,7 @@ storeDerivationBuilder deriv = do
             }
 
             -- Send request and wait for response
-            response <- sendRequestSync conn request 30000000  -- 30 second timeout
+            response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
 
             case response of
                 Left err -> throwError err
@@ -1014,6 +1013,7 @@ storeDerivationBuilder deriv = do
                         else throwError $ StoreError $ respMessage resp
 
         _ -> throwError $ PrivilegeError "Cannot store derivation in builder context without daemon connection"
+
 
 -- | Read a derivation from the store (Daemon context with direct store access)
 readDerivationDaemon :: (CanAccessStore 'Daemon ~ 'True) => StorePath -> TenM p 'Daemon (Either BuildError Derivation)
@@ -1047,8 +1047,8 @@ readDerivationBuilder path = do
                 reqPayload = Nothing
             }
 
-            -- Send request and wait for response
-            response <- sendRequestSync conn request 30000000  -- 30 second timeout
+            -- Send request and wait for response with proper lifting
+            response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
 
             case response of
                 Left err -> return $ Left err
@@ -1056,8 +1056,8 @@ readDerivationBuilder path = do
                     if respStatus resp == "ok"
                         then case respPayload resp of
                             Just content ->
-                                -- Placeholder: deserialization would be imported from Ten.Derivation
-                                return $ Left $ SerializationError "Derivation deserialization not implemented"
+                                -- Deserialize using proper format
+                                return $ deserializeDerivation content
                             Nothing -> return $ Left $ StoreError "Received empty response"
                         else return $ Left $ StoreError $ respMessage resp
 
@@ -1114,7 +1114,7 @@ readBuildResultDaemon path = do
             -- Placeholder: deserialization would be imported from appropriate module
             return $ Left $ SerializationError "BuildResult deserialization not implemented"
 
--- | Request a build result via the daemon protocol (Builder context)
+-- | Read build result via daemon protocol (Builder context)
 readBuildResultBuilder :: StorePath -> TenM p 'Builder (Either BuildError BuildResult)
 readBuildResultBuilder path = do
     -- Get daemon connection
@@ -1129,8 +1129,8 @@ readBuildResultBuilder path = do
                 reqPayload = Nothing
             }
 
-            -- Send request and wait for response
-            response <- sendRequestSync conn request 30000000  -- 30 second timeout
+            -- Send request and wait for response with proper lifting
+            response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
 
             case response of
                 Left err -> return $ Left err
@@ -1138,8 +1138,8 @@ readBuildResultBuilder path = do
                     if respStatus resp == "ok"
                         then case respPayload resp of
                             Just content ->
-                                -- Placeholder: deserialization would be imported from appropriate module
-                                return $ Left $ SerializationError "BuildResult deserialization not implemented"
+                                -- Deserialize with proper format
+                                return $ deserializeBuildResult content
                             Nothing -> return $ Left $ StoreError "Received empty response"
                         else return $ Left $ StoreError $ respMessage resp
 
@@ -1312,7 +1312,8 @@ spawnBuilderProcess programPath args env = do
         -- 6. Execute the builder program
 
         -- For now, just execute the program
-        executeFile programPath True args (Just $ Map.toList $ Map.map T.unpack env)
+    --ENVIRONMENT VARIABLE CONVERSION
+        executeFile programPath True args (Just $ map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList env)
 
     return pid
 
@@ -1377,3 +1378,49 @@ timeout micros action = do
     if filled
         then Just <$> readMVar result
         else return Nothing
+
+-- | Serialize a derivation to a ByteString for cross-boundary transmission
+serializeDerivation :: Derivation -> ByteString
+serializeDerivation drv =
+    -- Convert to JSON and then to ByteString with proper formatting
+    LBS.toStrict $ Aeson.encode $ Aeson.object
+        [ "name" Aeson..= derivName drv
+        , "hash" Aeson..= derivHash drv
+        , "builder" Aeson..= encodeStorePath (derivBuilder drv)
+        , "args" Aeson..= derivArgs drv
+        , "inputs" Aeson..= map encodeDerivationInput (Set.toList $ derivInputs drv)
+        , "outputs" Aeson..= map encodeDerivationOutput (Set.toList $ derivOutputs drv)
+        , "env" Aeson..= Map.mapKeys T.unpack (derivEnv drv)
+        , "system" Aeson..= derivSystem drv
+        , "strategy" Aeson..= (case derivStrategy drv of
+                           ApplicativeStrategy -> "applicative" :: Text
+                           MonadicStrategy -> "monadic" :: Text)
+        , "meta" Aeson..= derivMeta drv
+        ]
+  where
+    encodeStorePath :: StorePath -> Aeson.Value
+    encodeStorePath (StorePath hash name) = Aeson.object
+        [ "hash" Aeson..= hash
+        , "name" Aeson..= name
+        ]
+
+    encodeDerivationInput :: DerivationInput -> Aeson.Value
+    encodeDerivationInput (DerivationInput path name) = Aeson.object
+        [ "path" Aeson..= encodeStorePath path
+        , "name" Aeson..= name
+        ]
+
+    encodeDerivationOutput :: DerivationOutput -> Aeson.Value
+    encodeDerivationOutput (DerivationOutput name path) = Aeson.object
+        [ "name" Aeson..= name
+        , "path" Aeson..= encodeStorePath path
+        ]
+
+
+-- | Helper to deserialize a BuildResult properly
+deserializeBuildResult :: ByteString -> Either BuildError BuildResult
+deserializeBuildResult content =
+    -- Use proper deserialization based on the content format
+    case Aeson.eitherDecodeStrict content of
+        Left err -> Left $ SerializationError $ "Failed to parse BuildResult: " <> T.pack err
+        Right result -> Right result
