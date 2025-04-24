@@ -27,9 +27,11 @@ module Ten.Derivation (
     buildToGetInnerDerivation,
     isReturnContinuationDerivation,
 
-    -- Context-aware derivation storage
-    storeDerivation,
-    retrieveDerivation,
+    -- Phase-specific derivation storage
+    storeDerivationEval,
+    storeDerivationBuild,
+    retrieveDerivationEval,
+    retrieveDerivationBuild,
 
     -- Serialization
     serializeDerivation,
@@ -88,8 +90,10 @@ import Network.Socket (Socket)
 import qualified Network.Socket as Network
 import Network.Socket.ByteString (sendAll, recv)
 import System.IO (Handle, hPutStrLn, stderr)
+import Data.Char (isHexDigit)
 
-import Ten.Core
+import qualified Ten.Core as Core
+import Ten.Store (storePathExists, readFromStore)
 
 -- | Represents a chain of recursive derivations
 data DerivationChain = DerivationChain [Text] -- Chain of derivation hashes
@@ -107,7 +111,7 @@ derivationChainLength (DerivationChain hashes) = length hashes
 hashDerivation :: Derivation -> Text
 hashDerivation drv = hashBlob (serializeDerivation drv)
 
--- | Create a new derivation - works in any phase/tier
+-- | Create a new derivation - works in Eval phase only
 mkDerivation :: Text -> StorePath -> [Text] -> Set DerivationInput
              -> Set Text -> Map Text Text -> Text -> TenM 'Eval t Derivation
 mkDerivation name builder args inputs outputNames env system = do
@@ -134,12 +138,12 @@ mkDerivation name builder args inputs outputNames env system = do
     let strategy = analyzeDerivationStrategy name args env
 
     -- Add metadata if it's a return-continuation derivation
-    let meta = if strategy == MonadicStrategy && isReturnContinuationDerivation name args env
+    let meta = if strategy == Core.MonadicStrategy && isReturnContinuationDerivation name args env
                   then Map.singleton "returnContinuation" "true"
                   else Map.empty
 
     -- Record proof that this is a valid derivation
-    addProof TypeProof
+    Core.addProof Core.TypeProof
 
     return Derivation
         { derivName = name
@@ -162,16 +166,16 @@ hashBlob bs =
     in TE.decodeUtf8 hexBytes
 
 -- | Analyze a derivation to determine optimal build strategy
-analyzeDerivationStrategy :: Text -> [Text] -> Map Text Text -> BuildStrategy
+analyzeDerivationStrategy :: Text -> [Text] -> Map Text Text -> Core.BuildStrategy
 analyzeDerivationStrategy name args env =
     -- Check various indicators that this derivation uses return-continuation
     if isReturnContinuationDerivation name args env
-        then MonadicStrategy
+        then Core.MonadicStrategy
         else
             -- Check for other indicators that require dynamic dependency resolution
             if any isDynamicDependencyArg args || Map.member "TEN_DYNAMIC_DEPS" env
-                then MonadicStrategy
-                else ApplicativeStrategy
+                then Core.MonadicStrategy
+                else Core.ApplicativeStrategy
   where
     -- Check if an argument suggests dynamic dependencies
     isDynamicDependencyArg arg =
@@ -197,9 +201,10 @@ isReturnContinuationDerivation name args env =
         "--return" `T.isPrefixOf` arg ||
         "--output-derivation" `T.isPrefixOf` arg
 
--- | Store a derivation in the store - context-aware implementation
-storeDerivation :: Derivation -> TenM p t StorePath
-storeDerivation drv = do
+-- | Store a derivation in the Eval phase
+-- This function is specific to the Eval phase to enforce phase separation
+storeDerivationEval :: Derivation -> TenM 'Eval t StorePath
+storeDerivationEval drv = do
     -- Validate the derivation before storing
     validateDerivation drv
 
@@ -209,35 +214,49 @@ storeDerivation drv = do
 
     -- Check the privilege tier and use appropriate method
     env <- ask
-    case currentPrivilegeTier env of
-        Daemon ->
+    case Core.currentPrivilegeTier env of
+        Core.Daemon ->
             -- Use direct store access for daemon privilege
-            case currentPhase env of
-                Eval ->
-                    -- We need to explicitly handle the phase for type safety
-                    storeDerivationDaemon drv
-                Build ->
-                    -- Handle build phase with daemon privilege (using existentials)
-                    storeDerivationDaemon drv
-
-        Builder ->
+            Core.storeDerivationDaemon drv
+        Core.Builder ->
             -- Use protocol to request storage in builder context
-            storeDerivationBuilder drv
-  where
-    -- Gets the current phase from the environment
-    currentPhase :: BuildEnv -> Phase
-    currentPhase env =
-        case runMode env of
-            StandaloneMode -> Eval  -- Default to Eval in standalone mode
-            ClientMode _ -> Eval    -- Default to Eval in client mode
-            DaemonMode -> Eval      -- Default to Eval in daemon mode
+            Core.storeDerivationBuilder drv
 
--- | Retrieve a derivation from the store - context-aware implementation
+-- | Store a derivation in the Build phase
+-- This function is specific to the Build phase to enforce phase separation
+storeDerivationBuild :: Derivation -> TenM 'Build t StorePath
+storeDerivationBuild drv = do
+    -- Validate the derivation before storing
+    validateDerivation drv
+
+    -- Serialize the derivation to a ByteString
+    let serialized = serializeDerivation drv
+    let fileName = derivName drv <> ".drv"
+
+    -- Check the privilege tier and use appropriate method
+    env <- ask
+    case Core.currentPrivilegeTier env of
+        Core.Daemon ->
+            -- Use direct store access for daemon privilege
+            Core.storeDerivationDaemon drv
+        Core.Builder ->
+            -- Use protocol to request storage in builder context
+            Core.storeDerivationBuilder drv
+
+-- | Retrieve a derivation in the Eval phase
+retrieveDerivationEval :: StorePath -> TenM 'Eval t (Maybe Derivation)
+retrieveDerivationEval path = retrieveDerivation path
+
+-- | Retrieve a derivation in the Build phase
+retrieveDerivationBuild :: StorePath -> TenM 'Build t (Maybe Derivation)
+retrieveDerivationBuild path = retrieveDerivation path
+
+-- | Retrieve a derivation from the store - common implementation for both phases
 retrieveDerivation :: StorePath -> TenM p t (Maybe Derivation)
 retrieveDerivation path = do
     -- Validate the path before attempting to retrieve
     unless (validateStorePath path) $
-        throwError $ StoreError $ "Invalid store path format: " <> storePathToText path
+        throwError $ Core.StoreError $ "Invalid store path format: " <> storePathToText path
 
     -- Check if the path exists in the store
     exists <- storePathExists path
@@ -246,85 +265,81 @@ retrieveDerivation path = do
         else do
             -- Get content based on privilege tier
             env <- ask
-            content <- case currentPrivilegeTier env of
-                Daemon -> do
+            content <- case Core.currentPrivilegeTier env of
+                Core.Daemon -> do
                     -- Direct read in daemon context using proper type-safe API
-                    result <- readDerivationDaemon path
+                    result <- Core.readDerivationDaemon path
                     case result of
                         Left err -> throwError err
                         Right drv -> return $ serializeDerivation drv
 
-                Builder -> do
+                Core.Builder -> do
                     -- First try direct read (works if file is accessible)
                     -- If that fails, use protocol request
-                    let filePath = storePathToFilePath path env
+                    let filePath = Core.storePathToFilePath path env
                     fileExists <- liftIO $ doesFileExist filePath
                     if fileExists
                         then do
                             contentEither <- liftIO $ try $ BS.readFile filePath
                             case contentEither of
                                 Right content -> return content
-                                Left (_ :: SomeException) -> do
-                                    -- If direct read fails due to permissions, use protocol
-                                    readViaProtocol path
-                        else do
-                            -- File doesn't exist or isn't accessible, use protocol
-                            readViaProtocol path
+                                Left (_ :: SomeException) -> readViaProtocolBuilder path
+                        else readViaProtocolBuilder path
 
             -- Deserialize the content
             case deserializeDerivation content of
                 Left err -> do
-                    logMsg 1 $ "Error deserializing derivation: " <> T.pack (show err)
+                    Core.logMsg 1 $ "Error deserializing derivation: " <> T.pack (show err)
                     return Nothing
                 Right drv -> return $ Just drv
-  where
-    -- Helper to read via daemon protocol
-    readViaProtocol :: StorePath -> TenM p t BS.ByteString
-    readViaProtocol path = do
-        result <- readDerivationBuilder path
-        case result of
-            Left err -> throwError err
-            Right drv -> return $ serializeDerivation drv
+
+-- | Helper to read via daemon protocol - Builder specific version
+readViaProtocolBuilder :: StorePath -> TenM p 'Builder ByteString
+readViaProtocolBuilder path = do
+    result <- Core.readDerivationBuilder path
+    case result of
+        Left err -> throwError err
+        Right drv -> return $ serializeDerivation drv
 
 -- | Instantiate a derivation for building - context-aware implementation
 instantiateDerivation :: Derivation -> TenM 'Build t ()
 instantiateDerivation deriv = do
-    -- Store the derivation using the context-aware implementation
-    derivPath <- storeDerivation deriv
+    -- Store the derivation using the phase-specific implementation
+    derivPath <- storeDerivationBuild deriv
 
     -- Verify inputs exist
     forM_ (derivInputs deriv) $ \input -> do
         exists <- storePathExists (inputPath input)
         unless exists $ throwError $
-            BuildFailed $ "Input does not exist: " <> T.pack (show $ inputPath input)
+            Core.BuildFailed $ "Input does not exist: " <> T.pack (show $ inputPath input)
 
     -- Record inputs in build state
     let inputPaths = Set.map inputPath (derivInputs deriv)
-    modify $ \s -> s { buildInputs = Set.union inputPaths (buildInputs s) }
+    modify $ \s -> s { Core.buildInputs = Set.union inputPaths (Core.buildInputs s) }
 
     -- Verify builder exists
     builderExists <- storePathExists (derivBuilder deriv)
     unless builderExists $ throwError $
-        BuildFailed $ "Builder does not exist: " <> T.pack (show $ derivBuilder deriv)
+        Core.BuildFailed $ "Builder does not exist: " <> T.pack (show $ derivBuilder deriv)
 
     -- Track this derivation in the build chain for recursion detection
-    chain <- gets buildChain
-    limit <- asks maxRecursionDepth
+    chain <- gets Core.buildChain
+    limit <- asks Core.maxRecursionDepth
     when (length chain >= limit) $
-        throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show limit)
+        throwError $ Core.RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show limit)
 
     -- Check for cycles in build chain using isInDerivationChain from Ten.Core
-    isCyclic <- isInDerivationChain deriv
+    isCyclic <- Core.isInDerivationChain deriv
     when isCyclic $
-        throwError $ CyclicDependency $ "Cyclic derivation detected: " <> derivName deriv
+        throwError $ Core.CyclicDependency $ "Cyclic derivation detected: " <> derivName deriv
 
     -- Add to build chain
-    modify $ \s -> s { buildChain = deriv : buildChain s }
+    modify $ \s -> s { Core.buildChain = deriv : Core.buildChain s }
 
     -- Add input proof
-    addProof InputProof
+    Core.addProof Core.InputProof
 
-    logMsg 1 $ "Instantiated derivation: " <> derivName deriv
+    Core.logMsg 1 $ "Instantiated derivation: " <> derivName deriv
 
 -- | Add a derivation to the chain
 addToDerivationChain :: Derivation -> DerivationChain -> DerivationChain
@@ -338,7 +353,7 @@ joinDerivation outerDrv = do
     innerDrv <- buildToGetInnerDerivation outerDrv
 
     -- Record that we performed a join operation
-    addProof ReturnProof
+    Core.addProof Core.ReturnProof
 
     -- Return the inner derivation to be built
     return innerDrv
@@ -352,7 +367,7 @@ buildToGetInnerDerivation drv = do
     -- Create a sandbox configuration with return-continuation support
     let sandboxConfig = defaultSandboxConfig {
             sandboxReturnSupport = True,
-            sandboxPrivileged = currentPrivilegeTier env == Daemon
+            sandboxPrivileged = Core.currentPrivilegeTier env == Core.Daemon
         }
 
     -- Use withSandbox which handles both contexts correctly
@@ -369,9 +384,9 @@ buildToGetInnerDerivation drv = do
         let buildEnv = prepareSandboxEnvironment env state sandboxDir (derivEnv drv)
 
         -- Add context-specific environment variables
-        let contextEnv = case currentPrivilegeTier env of
-                            Daemon -> Map.singleton "TEN_DAEMON" "1"
-                            Builder -> Map.singleton "TEN_BUILDER" "1"
+        let contextEnv = case Core.currentPrivilegeTier env of
+                            Core.Daemon -> Map.singleton "TEN_DAEMON" "1"
+                            Core.Builder -> Map.singleton "TEN_BUILDER" "1"
 
         let fullEnv = Map.union buildEnv contextEnv
 
@@ -396,18 +411,18 @@ buildToGetInnerDerivation drv = do
                 -- Read the returned derivation
                 content <- liftIO $ BS.readFile returnPath
                 case deserializeDerivation content of
-                    Left err -> throwError $ SerializationError $
+                    Left err -> throwError $ Core.SerializationError $
                         "Failed to deserialize returned derivation: " <> T.pack (show err)
                     Right innerDrv -> do
                         -- Add proof that we successfully got a returned derivation
-                        addProof RecursionProof
+                        Core.addProof Core.RecursionProof
 
                         -- Store the inner derivation - context-aware implementation
-                        void $ storeDerivation innerDrv
+                        void $ storeDerivationBuild innerDrv
 
                         return innerDrv
             else
-                throwError $ BuildFailed $
+                throwError $ Core.BuildFailed $
                     "Builder did not return a derivation at: " <> T.pack returnPath <>
                     "\nExit code: " <> T.pack (show exitCode) <>
                     "\nStdout: " <> T.pack stdout <>
@@ -464,12 +479,12 @@ instance Aeson.ToJSON DerivationOutput where
         ]
 
 -- | Deserialize a derivation from a ByteString
-deserializeDerivation :: BS.ByteString -> Either BuildError Derivation
+deserializeDerivation :: BS.ByteString -> Either Core.BuildError Derivation
 deserializeDerivation bs =
     case Aeson.eitherDecode (LBS.fromStrict bs) of
-        Left err -> Left $ SerializationError $ "JSON parse error: " <> T.pack err
+        Left err -> Left $ Core.SerializationError $ "JSON parse error: " <> T.pack err
         Right json -> case derivationFromJSON json of
-            Left err -> Left $ SerializationError err
+            Left err -> Left $ Core.SerializationError err
             Right drv -> Right drv
 
 -- | Convert JSON to Derivation
@@ -578,45 +593,45 @@ validateDerivation :: Derivation -> TenM p t ()
 validateDerivation drv = do
     -- Validate the hash
     unless (T.length (derivHash drv) >= 8 && T.all isHexDigit (derivHash drv)) $
-        throwError $ SerializationError $ "Invalid derivation hash: " <> derivHash drv
+        throwError $ Core.SerializationError $ "Invalid derivation hash: " <> derivHash drv
 
     -- Validate the builder path
-    unless (validateStorePath (derivBuilder drv)) $
-        throwError $ SerializationError $ "Invalid builder path: " <> T.pack (show (derivBuilder drv))
+    unless (Core.validateStorePath (derivBuilder drv)) $
+        throwError $ Core.SerializationError $ "Invalid builder path: " <> T.pack (show (derivBuilder drv))
 
     -- Validate all input paths
     forM_ (derivInputs drv) $ \input ->
-        unless (validateStorePath (inputPath input)) $
-            throwError $ SerializationError $ "Invalid input path: " <> T.pack (show (inputPath input))
+        unless (Core.validateStorePath (inputPath input)) $
+            throwError $ Core.SerializationError $ "Invalid input path: " <> T.pack (show (inputPath input))
 
     -- Validate all output paths
     forM_ (derivOutputs drv) $ \output ->
-        unless (validateStorePath (outputPath output)) $
-            throwError $ SerializationError $ "Invalid output path: " <> T.pack (show (outputPath output))
+        unless (Core.validateStorePath (outputPath output)) $
+            throwError $ Core.SerializationError $ "Invalid output path: " <> T.pack (show (outputPath output))
 
     -- Validate that name isn't empty
     when (T.null (derivName drv)) $
-        throwError $ SerializationError "Derivation name cannot be empty"
+        throwError $ Core.SerializationError "Derivation name cannot be empty"
 
--- | Send a request to the daemon through the store layer
-sendStoreDaemonRequest :: StoreRequest -> TenM p 'Builder StoreResponse
-sendStoreDaemonRequest request = withDaemon $ \conn -> do
+-- | Send a request to the daemon through the store layer - Builder-specific
+sendStoreDaemonRequest :: StoreRequest -> TenM p 'Builder (Either Core.BuildError StoreResponse)
+sendStoreDaemonRequest request = Core.withDaemon $ \conn -> do
     -- Create proper protocol request from the Store request type
     let (requestType, params, payload) = storeRequestToProtocol request
 
     -- Create a proper protocol Request object
-    let protocolRequest = Request {
-        reqId = 0,  -- Will be set by sendRequest
-        reqType = requestType,
-        reqParams = params,
-        reqPayload = payload
+    let protocolRequest = Core.Request {
+        Core.reqId = 0,  -- Will be set by sendRequest
+        Core.reqType = requestType,
+        Core.reqParams = params,
+        Core.reqPayload = payload
     }
 
     -- Send request and wait for response
-    response <- liftIO $ sendRequestSync conn protocolRequest 30000000  -- 30 second timeout
+    response <- liftIO $ Core.sendRequestSync conn protocolRequest 30000000  -- 30 second timeout
 
     case response of
-        Left err -> return $ Left $ convertToBuildError err
+        Left err -> return $ Left err  -- Already a BuildError
         Right resp -> return $ Right $ protocolToStoreResponse resp
   where
     -- Convert store request to protocol parameters
@@ -636,82 +651,87 @@ sendStoreDaemonRequest request = withDaemon $ \conn -> do
     storeRequestToProtocol (StoreGCRequest force) =
         ("store-gc", Map.singleton "force" (if force then "true" else "false"), Nothing)
 
-    -- Convert protocol error to store error (fixing type mismatch)
-    convertToBuildError :: BuildError -> StoreResponse
-    convertToBuildError (StoreError msg) = StoreErrorResponse msg
-    convertToBuildError (DaemonError msg) = StoreErrorResponse $ "Daemon error: " <> msg
-    convertToBuildError (AuthError msg) = StoreErrorResponse $ "Authentication error: " <> msg
-    convertToBuildError err = StoreErrorResponse $ T.pack $ show err
-
     -- Convert protocol response to store response
-    protocolToStoreResponse :: Response -> StoreResponse
+    protocolToStoreResponse :: Core.Response -> StoreResponse
     protocolToStoreResponse resp =
-        if respStatus resp == "ok"
+        if Core.respStatus resp == "ok"
             then
                 case getResponseType resp of
-                    "store-derivation" -> case Map.lookup "path" (respData resp) of
-                        Just pathText -> case parseStorePath pathText of
+                    "store-derivation" -> case Map.lookup "path" (Core.respData resp) of
+                        Just pathText -> case Core.parseStorePath pathText of
                             Just path -> StoreDerivationResponse path
                             Nothing -> StoreErrorResponse $ "Invalid store path: " <> pathText
                         Nothing -> StoreErrorResponse "Missing path in response"
 
-                    "store-read" -> case respPayload resp of
+                    "store-read" -> case Core.respPayload resp of
                         Just content -> StoreReadResponse content
                         Nothing -> StoreErrorResponse "Missing content in response"
 
-                    "store-verify" -> case Map.lookup "exists" (respData resp) of
+                    "store-verify" -> case Map.lookup "exists" (Core.respData resp) of
                         Just "true" -> StoreVerifyResponse True
                         _ -> StoreVerifyResponse False
 
-                    "store-add" -> case Map.lookup "path" (respData resp) of
-                        Just pathText -> case parseStorePath pathText of
+                    "store-add" -> case Map.lookup "path" (Core.respData resp) of
+                        Just pathText -> case Core.parseStorePath pathText of
                             Just path -> StoreAddResponse path
                             Nothing -> StoreErrorResponse $ "Invalid store path: " <> pathText
                         Nothing -> StoreErrorResponse "Missing path in response"
 
-                    "store-list" -> case Map.lookup "paths" (respData resp) of
+                    "store-list" -> case Map.lookup "paths" (Core.respData resp) of
                         Just pathsText ->
                             let pathsList = T.splitOn "," pathsText
-                                paths = catMaybes $ map parseStorePath pathsList
+                                paths = catMaybes $ map Core.parseStorePath pathsList
                             in StoreListResponse paths
                         Nothing -> StoreListResponse []
 
-                    "store-reference" -> case Map.lookup "refs" (respData resp) of
+                    "store-reference" -> case Map.lookup "refs" (Core.respData resp) of
                         Just refsText ->
                             let refsList = T.splitOn "," refsText
-                                paths = catMaybes $ map parseStorePath refsList
+                                paths = catMaybes $ map Core.parseStorePath refsList
                             in StoreReferenceResponse (Set.fromList paths)
                         Nothing -> StoreReferenceResponse Set.empty
 
                     "store-gc" ->
-                        let collected = maybe 0 (read . T.unpack) $ Map.lookup "collected" (respData resp)
-                            remaining = maybe 0 (read . T.unpack) $ Map.lookup "remaining" (respData resp)
-                            bytes = maybe 0 (read . T.unpack) $ Map.lookup "bytes" (respData resp)
+                        let collected = maybe 0 (read . T.unpack) $ Map.lookup "collected" (Core.respData resp)
+                            remaining = maybe 0 (read . T.unpack) $ Map.lookup "remaining" (Core.respData resp)
+                            bytes = maybe 0 (read . T.unpack) $ Map.lookup "bytes" (Core.respData resp)
                         in StoreGCResponse collected remaining bytes
 
                     _ -> StoreErrorResponse $ "Unknown response type: " <> getResponseType resp
             else
-                StoreErrorResponse $ respMessage resp
+                StoreErrorResponse $ Core.respMessage resp
 
     -- Extract response type from a response
-    getResponseType :: Response -> Text
-    getResponseType resp = fromMaybe "unknown" $ Map.lookup "type" (respData resp)
+    getResponseType :: Core.Response -> Text
+    getResponseType resp = fromMaybe "unknown" $ Map.lookup "type" (Core.respData resp)
+
+-- | These functions are now imported from Ten.Core instead of being reimplemented here.
+-- This follows proper architectural separation of concerns where:
+-- - Core provides the primitive operations
+-- - Derivation module focuses on derivation-specific logic
+--
+-- For reference, the signatures are:
+--
+-- storeDerivationDaemon :: Derivation -> TenM p 'Daemon StorePath
+-- storeDerivationBuilder :: Derivation -> TenM p 'Builder StorePath
+-- readDerivationDaemon :: StorePath -> TenM p 'Daemon (Either BuildError Derivation)
+-- readDerivationBuilder :: StorePath -> TenM p 'Builder (Either BuildError Derivation)
 
 -- | Create sandbox environment for builder
-prepareSandboxEnvironment :: BuildEnv -> BuildState p -> FilePath -> Map Text Text -> Map Text Text
+prepareSandboxEnvironment :: Core.BuildEnv -> Core.BuildState p -> FilePath -> Map Text Text -> Map Text Text
 prepareSandboxEnvironment env state sandboxDir userEnv =
     let
         -- Basic environment variables
         baseEnv = Map.fromList [
             ("TEN_SANDBOX", T.pack sandboxDir),
-            ("TEN_BUILD_ID", T.pack $ show $ currentBuildId state),
-            ("TEN_STORE", T.pack $ storeLocation env)
+            ("TEN_BUILD_ID", T.pack $ show $ Core.currentBuildId state),
+            ("TEN_STORE", T.pack $ Core.storeLocation env)
             ]
 
         -- Add strategy information
-        strategyEnv = case buildStrategy env of
-            MonadicStrategy -> Map.singleton "TEN_STRATEGY" "monadic"
-            ApplicativeStrategy -> Map.singleton "TEN_STRATEGY" "applicative"
+        strategyEnv = case Core.buildStrategy env of
+            Core.MonadicStrategy -> Map.singleton "TEN_STRATEGY" "monadic"
+            Core.ApplicativeStrategy -> Map.singleton "TEN_STRATEGY" "applicative"
 
         -- Merge all environments, with user env taking precedence
         finalEnv = Map.unions [userEnv, strategyEnv, baseEnv]
@@ -764,19 +784,19 @@ withSandbox inputs config action = do
     env <- ask
 
     -- Determine the current build ID
-    buildId <- gets currentBuildId
+    buildId <- gets Core.currentBuildId
 
     -- Create a temporary directory for the sandbox
-    let sandboxDir = workDir env </> "sandbox" </> "temp-" ++ show buildId
+    let sandboxDir = Core.workDir env </> "sandbox" </> "temp-" ++ show buildId
     liftIO $ createDirectoryIfMissing True sandboxDir
 
     -- Set up the sandbox with appropriate privilege and isolation
-    case currentPrivilegeTier env of
-        Daemon ->
+    case Core.currentPrivilegeTier env of
+        Core.Daemon ->
             -- For daemon, we can set up a full sandbox with proper isolation
             setupDaemonSandbox env inputs config sandboxDir
 
-        Builder ->
+        Core.Builder ->
             -- For builder, we use a simplified sandbox since we can't drop privileges
             setupBuilderSandbox env inputs config sandboxDir
 
@@ -798,8 +818,8 @@ withSandbox inputs config action = do
         -- Make store inputs available in the sandbox
         forM_ (Set.toList inputs) $ \path -> do
             -- Create symlinks to store paths
-            let storePath = storePathToFilePath path env
-            let targetPath = dir </> "store" </> T.unpack (T.concat [storeHash path, T.pack "-", storeName path])
+            let storePath = Core.storePathToFilePath path env
+            let targetPath = dir </> "store" </> T.unpack (T.concat [Core.storeHash path, T.pack "-", Core.storeName path])
             liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
             liftIO $ Posix.createSymbolicLink storePath targetPath
 
@@ -817,7 +837,7 @@ withSandbox inputs config action = do
 
             -- Create /dev nodes if privileged
             when (sandboxPrivileged config) $ do
-                -- Use mknod to create basic device nodes
+                -- Use system calls to create basic device nodes
                 void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/null" ++ " c 1 3"
                 void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/zero" ++ " c 1 5"
                 void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/urandom" ++ " c 1 9"
@@ -834,8 +854,8 @@ withSandbox inputs config action = do
     setupBuilderSandbox env inputs config dir = do
         -- Make store inputs available in the sandbox via symlinks
         forM_ (Set.toList inputs) $ \path -> do
-            let storePath = storePathToFilePath path env
-            let targetPath = dir </> "inputs" </> T.unpack (storeName path)
+            let storePath = Core.storePathToFilePath path env
+            let targetPath = dir </> "inputs" </> T.unpack (Core.storeName path)
             liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
             liftIO $ Posix.createSymbolicLink storePath targetPath
 
@@ -860,12 +880,13 @@ withSandbox inputs config action = do
                     void $ liftIO $ runSystemCommand $ "cgset -r pids.max=" ++ show value ++ " " ++ cgroupName
                 _ -> return ()
 
-    -- Run a system command
-    runSystemCommand :: String -> IO Bool
-    runSystemCommand cmd = do
-        (exitCode, _, _) <- readCreateProcessWithExitCode (proc "sh" ["-c", cmd]) ""
-        return $ exitCode == ExitSuccess
+-- | Run a system command and return success/failure
+runSystemCommand :: String -> IO Bool
+runSystemCommand cmd = do
+    (exitCode, _, _) <- readCreateProcessWithExitCode (proc "sh" ["-c", cmd]) ""
+    return $ exitCode == ExitSuccess
 
+-- | Clean up a sandbox directory safely
 cleanupSandbox :: FilePath -> IO ()
 cleanupSandbox dir = do
     -- Safety check: make sure we're not removing anything dangerous
@@ -877,15 +898,15 @@ cleanupSandbox dir = do
             let quotedPath = "'" ++ sanitizedDir ++ "'"
             void $ runSystemCommand $ "rm -rf " ++ quotedPath
 
--- Check if this is a valid sandbox directory to delete
+-- | Check if this is a valid sandbox directory to delete
 isValidSandboxDir :: FilePath -> Bool
 isValidSandboxDir path =
     -- Make sure it's a non-empty path with "sandbox" in it
     not (null path) &&
-    "sandbox" `isInfixOf` path &&
+    "sandbox" `List.isInfixOf` path &&
     -- Not trying to delete root directories
-    not ("/" `isPrefixOf` path) &&
-    not (".." `isInfixOf` path)
+    not ("/" `List.isPrefixOf` path) &&
+    not (".." `List.isInfixOf` path)
 
 -- | Store request types for protocol communication
 data StoreRequest
