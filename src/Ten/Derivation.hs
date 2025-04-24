@@ -67,6 +67,7 @@ import qualified Data.List as List
 import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
@@ -74,14 +75,15 @@ import qualified Data.Aeson.Key as Aeson
 import qualified Data.Aeson.KeyMap as Aeson.KeyMap
 import qualified Data.Vector as Vector
 import System.FilePath
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, createDirectoryIfMissing, removeDirectoryRecursive)
 import qualified System.Posix.Files as Posix
 import System.Process (CreateProcess(..), proc, readCreateProcessWithExitCode, StdStream(NoStream, CreatePipe))
 import System.Exit
-import Control.Exception (try, SomeException)
+import Control.Exception (try, catch, finally, SomeException)
 import Data.Kind (Type)
 import Crypto.Hash (Digest, SHA256(..), hash)
 import qualified Crypto.Hash as Crypto
+import Data.ByteArray.Encoding (convertToBase, Base(Base16))
 import Network.Socket (Socket)
 import qualified Network.Socket as Network
 import Network.Socket.ByteString (sendAll, recv)
@@ -104,7 +106,7 @@ derivationChainLength (DerivationChain hashes) = length hashes
 
 -- | Hash a derivation to get its textual representation
 hashDerivation :: Derivation -> Text
-hashDerivation drv = hashByteString (serializeDerivation drv)
+hashDerivation drv = hashBlob (serializeDerivation drv)
 
 -- | Create a new derivation - works in any phase/tier
 mkDerivation :: Text -> StorePath -> [Text] -> Set DerivationInput
@@ -157,7 +159,8 @@ mkDerivation name builder args inputs outputNames env system = do
 hashBlob :: BS.ByteString -> Text
 hashBlob bs =
     let digest = hash bs :: Digest SHA256
-    in T.pack $ show digest
+        hexBytes = convertToBase Base16 digest
+    in TE.decodeUtf8 hexBytes
 
 -- | Analyze a derivation to determine optimal build strategy
 analyzeDerivationStrategy :: Text -> [Text] -> Map Text Text -> BuildStrategy
@@ -208,16 +211,22 @@ storeDerivation drv = do
     -- Check the privilege tier and use appropriate method
     env <- ask
     case currentPrivilegeTier env of
-        Daemon ->
+        Daemon -> do
             -- Direct store in daemon context
-            withSPrivilegeTier sDaemon $ \_ ->
-                addToStore fileName serialized
+            case fromSing (sing :: SPhase p) of
+                Eval -> do
+                    -- We're in Eval phase with Daemon privileges
+                    addToStore sDaemon fileName serialized
+                Build -> do
+                    -- We're in Build phase with Daemon privileges
+                    withStore $ \st -> do
+                        path <- addToStore st fileName serialized
+                        return path
 
         Builder -> do
             -- Use protocol to request storage in builder context
             let request = StoreDerivationRequest serialized
-            response <- withSPrivilegeTier sBuilder $ \_ ->
-                sendStoreDaemonRequest request
+            response <- sendStoreDaemonRequest request
             case response of
                 StoreDerivationResponse path -> return path
                 StoreErrorResponse err -> throwError $ StoreError err
@@ -250,22 +259,24 @@ retrieveDerivation path = do
                         let filePath = storePathToFilePath path env
                         fileExists <- liftIO $ doesFileExist filePath
                         if fileExists
-                            then liftIO $ BS.readFile filePath `catch` \(_ :: SomeException) -> do
-                                -- If direct read fails due to permissions, use protocol
-                                withSPrivilegeTier sBuilder $ \_ -> do
-                                    let request = StoreReadRequest path
-                                    response <- sendStoreDaemonRequest request
-                                    case response of
-                                        StoreReadResponse content -> return content
-                                        _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
+                            then do
+                                contentEither <- liftIO $ try $ BS.readFile filePath
+                                case contentEither of
+                                    Right content -> return content
+                                    Left (_ :: SomeException) -> do
+                                        -- If direct read fails due to permissions, use protocol
+                                        let request = StoreReadRequest path
+                                        response <- sendStoreDaemonRequest request
+                                        case response of
+                                            StoreReadResponse content -> return content
+                                            _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
                             else do
                                 -- File doesn't exist or isn't accessible, use protocol
-                                withSPrivilegeTier sBuilder $ \_ -> do
-                                    let request = StoreReadRequest path
-                                    response <- sendStoreDaemonRequest request
-                                    case response of
-                                        StoreReadResponse content -> return content
-                                        _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
+                                let request = StoreReadRequest path
+                                response <- sendStoreDaemonRequest request
+                                case response of
+                                    StoreReadResponse content -> return content
+                                    _ -> throwError $ StoreError $ "Failed to read via protocol: " <> storePathToText path
 
             -- Deserialize the content
             case deserializeDerivation content of
@@ -606,7 +617,7 @@ sendStoreDaemonRequest request = withDaemon $ \conn -> do
     }
 
     -- Send request and wait for response
-    response <- sendRequestSync conn protocolRequest 30000000  -- 30 second timeout
+    response <- liftIO $ sendRequestSync conn protocolRequest 30000000  -- 30 second timeout
 
     case response of
         Left err -> return $ Left $ storeErrorFromProtocol err
@@ -641,7 +652,7 @@ sendStoreDaemonRequest request = withDaemon $ \conn -> do
     protocolToStoreResponse resp =
         if respStatus resp == "ok"
             then
-                case respType resp of
+                case getResponseType resp of
                     "store-derivation" -> case Map.lookup "path" (respData resp) of
                         Just pathText -> case parseStorePath pathText of
                             Just path -> StoreDerivationResponse path
@@ -682,9 +693,13 @@ sendStoreDaemonRequest request = withDaemon $ \conn -> do
                             bytes = maybe 0 (read . T.unpack) $ Map.lookup "bytes" (respData resp)
                         in StoreGCResponse collected remaining bytes
 
-                    _ -> StoreErrorResponse $ "Unknown response type: " <> respType resp
+                    _ -> StoreErrorResponse $ "Unknown response type: " <> getResponseType resp
             else
                 StoreErrorResponse $ respMessage resp
+
+    -- Extract response type from a response
+    getResponseType :: Response -> Text
+    getResponseType resp = fromMaybe "unknown" $ Map.lookup "type" (respData resp)
 
 -- | Create sandbox environment for builder
 prepareSandboxEnvironment :: BuildEnv -> BuildState p -> FilePath -> Map Text Text -> Map Text Text
@@ -752,8 +767,11 @@ withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -
 withSandbox inputs config action = do
     env <- ask
 
+    -- Determine the current build ID
+    buildId <- gets currentBuildId
+
     -- Create a temporary directory for the sandbox
-    let sandboxDir = workDir env </> "sandbox" </> "temp-" ++ show (currentBuildId env)
+    let sandboxDir = workDir env </> "sandbox" </> "temp-" ++ show buildId
     liftIO $ createDirectoryIfMissing True sandboxDir
 
     -- Set up the sandbox with appropriate privilege and isolation
@@ -767,10 +785,17 @@ withSandbox inputs config action = do
             setupBuilderSandbox env inputs config sandboxDir
 
     -- Run the action and ensure cleanup happens even if it fails
-    finally (action sandboxDir) $ do
-        -- Clean up sandbox unless we're keeping the output
+    result <- catchError (action sandboxDir) $ \e -> do
+        -- Clean up sandbox on error unless we're keeping the output
         unless (sandboxKeepBuildOutput config) $
-            liftIO $ removeDirectoryRecursive sandboxDir
+            liftIO $ cleanupSandbox sandboxDir
+        throwError e
+
+    -- Clean up sandbox unless we're keeping the output
+    unless (sandboxKeepBuildOutput config) $
+        liftIO $ cleanupSandbox sandboxDir
+
+    return result
   where
     -- Full privileged sandbox setup for daemon tier
     setupDaemonSandbox env inputs config dir = do
@@ -778,9 +803,9 @@ withSandbox inputs config action = do
         forM_ (Set.toList inputs) $ \path -> do
             -- Create symlinks to store paths
             let storePath = storePathToFilePath path env
-            let targetPath = dir </> "store" </> T.unpack (storeHash path ++ "-" ++ storeName path)
+            let targetPath = dir </> "store" </> T.unpack (T.concat [storeHash path, T.pack "-", storeName path])
             liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
-            liftIO $ createSymbolicLink storePath targetPath
+            liftIO $ Posix.createSymbolicLink storePath targetPath
 
         -- Set up isolation if using chroot
         when (sandboxUseChroot config) $ do
@@ -797,13 +822,13 @@ withSandbox inputs config action = do
             -- Create /dev nodes if privileged
             when (sandboxPrivileged config) $ do
                 -- Use mknod to create basic device nodes
-                void $ liftIO $ system $ "mknod " ++ dir </> "dev/null" ++ " c 1 3"
-                void $ liftIO $ system $ "mknod " ++ dir </> "dev/zero" ++ " c 1 5"
-                void $ liftIO $ system $ "mknod " ++ dir </> "dev/urandom" ++ " c 1 9"
+                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/null" ++ " c 1 3"
+                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/zero" ++ " c 1 5"
+                void $ liftIO $ runSystemCommand $ "mknod " ++ dir </> "dev/urandom" ++ " c 1 9"
 
                 -- Mount /proc if configured
                 when (sandboxMountProc config) $
-                    void $ liftIO $ system $ "mount -t proc proc " ++ dir </> "proc"
+                    void $ liftIO $ runSystemCommand $ "mount -t proc proc " ++ dir </> "proc"
 
             -- Setup resources limits with cgroups if enabled
             when (sandboxUseCgroups config) $
@@ -816,41 +841,39 @@ withSandbox inputs config action = do
             let storePath = storePathToFilePath path env
             let targetPath = dir </> "inputs" </> T.unpack (storeName path)
             liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
-            liftIO $ createSymbolicLink storePath targetPath
+            liftIO $ Posix.createSymbolicLink storePath targetPath
 
         -- Create workspace directories
         liftIO $ createDirectoryIfMissing True (dir </> "work")
         liftIO $ createDirectoryIfMissing True (dir </> "outputs")
 
-    -- Set up cgroups for resource limiting (simplified implementation)
+    -- Set up cgroups for resource limiting
     setupCgroups dir limits = do
         -- Create a cgroup for this build
         let cgroupName = "ten-build-" ++ takeFileName dir
-        void $ liftIO $ system $ "cgcreate -g cpu,memory,pids:" ++ cgroupName
+        void $ liftIO $ runSystemCommand $ "cgcreate -g cpu,memory,pids:" ++ cgroupName
 
         -- Set resource limits
         forM_ (Map.toList limits) $ \(resource, value) ->
             case resource of
                 "memory" ->
-                    void $ liftIO $ system $ "cgset -r memory.limit_in_bytes=" ++ show (value * 1024) ++ " " ++ cgroupName
+                    void $ liftIO $ runSystemCommand $ "cgset -r memory.limit_in_bytes=" ++ show (value * 1024) ++ " " ++ cgroupName
                 "cpu-time" ->
-                    void $ liftIO $ system $ "cgset -r cpu.cfs_quota_us=" ++ show (value * 1000) ++ " " ++ cgroupName
+                    void $ liftIO $ runSystemCommand $ "cgset -r cpu.cfs_quota_us=" ++ show (value * 1000) ++ " " ++ cgroupName
                 "processes" ->
-                    void $ liftIO $ system $ "cgset -r pids.max=" ++ show value ++ " " ++ cgroupName
+                    void $ liftIO $ runSystemCommand $ "cgset -r pids.max=" ++ show value ++ " " ++ cgroupName
                 _ -> return ()
 
-    -- Run a system command (simplified)
-    system cmd = do
+    -- Run a system command
+    runSystemCommand :: String -> IO Bool
+    runSystemCommand cmd = do
         (exitCode, _, _) <- readCreateProcessWithExitCode (proc "sh" ["-c", cmd]) ""
         return $ exitCode == ExitSuccess
 
-    -- Run an action and perform cleanup afterwards
-    finally action cleanup = do
-        result <- catchError action (\e -> cleanup >> throwError e)
-        cleanup
-        return result
-
-    -- Recursive directory removal
-    removeDirectoryRecursive path = do
-        -- Use rm -rf for simplicity in this implementation
-        void $ system $ "rm -rf " ++ path
+    -- Cleanup sandbox
+    cleanupSandbox :: FilePath -> IO ()
+    cleanupSandbox dir = do
+        -- Recursively remove the sandbox directory and its contents
+        removeDirectoryRecursive dir `catch` \(_ :: SomeException) -> do
+            -- If Haskell removal fails, try using system rm
+            void $ runSystemCommand $ "rm -rf " ++ dir
