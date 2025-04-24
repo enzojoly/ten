@@ -137,9 +137,10 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (Exception, throwIO, bracket, try, SomeException)
 import Control.Monad (unless, when, foldM)
-import Data.Aeson ((.:), (.=))
+import Data.Aeson ((.:), (.=), (.:?))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
+import qualified Data.HashMap.Strict as HM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Builder as Builder
@@ -225,9 +226,9 @@ sBuilder :: SPrivilegeTier 'Builder
 sBuilder = SBuilder
 
 -- | Convert from singleton to the value
-fromSing :: SPrivilegeTier t -> PrivilegeTier
-fromSing SDaemon = Daemon
-fromSing SBuilder = Builder
+fromSingPrivTier :: SPrivilegeTier t -> PrivilegeTier
+fromSingPrivTier SDaemon = Daemon
+fromSingPrivTier SBuilder = Builder
 
 -- | Existential wrapper for privilege tier singletons
 data SomePrivilegeTier where
@@ -978,7 +979,7 @@ data ProtocolHandle = ProtocolHandle {
 -- | Check if a request has the necessary capabilities
 verifyCapabilities :: SPrivilegeTier t -> Set DaemonCapability -> Either PrivilegeError ()
 verifyCapabilities st capabilities =
-    case fromSing st of
+    case fromSingPrivTier st of
         -- Daemon context can perform any operation
         Daemon -> Right ()
 
@@ -1002,7 +1003,7 @@ verifyCapabilities st capabilities =
 -- | Check if a request can be performed with given privilege tier
 checkPrivilegeRequirement :: SPrivilegeTier t -> RequestPrivilege -> Either PrivilegeError ()
 checkPrivilegeRequirement st reqPriv =
-    case (fromSing st, reqPriv) of
+    case (fromSingPrivTier st, reqPriv) of
         (Daemon, _) ->
             -- Daemon can perform any operation
             Right ()
@@ -1467,28 +1468,27 @@ deserializeMessage bs st =
 -- | Deserialize message content (internal)
 deserializeMessageContent :: Aeson.Value -> SPrivilegeTier t -> Either Text (Message t)
 deserializeMessageContent val st =
-    case Aeson.fromJSON val of
-        Aeson.Error err -> Left $ "JSON parsing error: " <> T.pack err
-        Aeson.Success obj -> do
-            msgType <- case Aeson.lookup "type" obj of
+    case val of
+        Aeson.Object obj -> do
+            msgType <- case HM.lookup "type" obj of
                 Just (Aeson.String typ) -> Right typ
                 _ -> Left "Missing or invalid message type"
 
             case msgType of
                 "daemon" -> do
                     -- Parse daemon message with privilege checking
-                    msgTypeStr <- case Aeson.lookup "messageType" obj of
+                    msgTypeStr <- case HM.lookup "messageType" obj of
                         Just (Aeson.String t) -> Right t
                         _ -> Left "Missing or invalid messageType"
 
-                    content <- case Aeson.lookup "content" obj of
+                    content <- case HM.lookup "content" obj of
                         Just c -> case Aeson.fromJSON c of
                             Aeson.Success content -> Right content
                             Aeson.Error err -> Left $ "Invalid content: " <> T.pack err
                         _ -> Left "Missing message content"
 
                     -- Verify privilege tier
-                    case fromSing st of
+                    case fromSingPrivTier st of
                         Daemon -> do
                             let messageType = read (T.unpack msgTypeStr) :: MessageType
                             Right (DaemonMessage messageType content)
@@ -1498,11 +1498,11 @@ deserializeMessageContent val st =
 
                 "builder" -> do
                     -- Parse builder message (can be processed by both tiers)
-                    msgTypeStr <- case Aeson.lookup "messageType" obj of
+                    msgTypeStr <- case HM.lookup "messageType" obj of
                         Just (Aeson.String t) -> Right t
                         _ -> Left "Missing or invalid messageType"
 
-                    content <- case Aeson.lookup "content" obj of
+                    content <- case HM.lookup "content" obj of
                         Just c -> case Aeson.fromJSON c of
                             Aeson.Success content -> Right content
                             Aeson.Error err -> Left $ "Invalid content: " <> T.pack err
@@ -1513,7 +1513,7 @@ deserializeMessageContent val st =
 
                 "auth" -> do
                     -- Parse auth message
-                    content <- case Aeson.lookup "content" obj of
+                    content <- case HM.lookup "content" obj of
                         Just c -> case Aeson.fromJSON c of
                             Aeson.Success content -> Right content
                             Aeson.Error err -> Left $ "Invalid auth content: " <> T.pack err
@@ -1523,7 +1523,7 @@ deserializeMessageContent val st =
 
                 "error" -> do
                     -- Parse error message
-                    errObj <- case Aeson.lookup "error" obj of
+                    errObj <- case HM.lookup "error" obj of
                         Just e -> Right e
                         _ -> Left "Missing error content"
 
@@ -1531,6 +1531,7 @@ deserializeMessageContent val st =
                     Right (ErrorMessage err)
 
                 _ -> Left $ "Unknown message type: " <> msgType
+        _ -> Left "Expected JSON object"
   where
     parseError :: Aeson.Value -> Either Text BuildError
     parseError = Aeson.withObject "Error" $ \e -> do
@@ -1828,48 +1829,40 @@ receiveResponse handle = do
                     Left err ->
                         return $ Left $ ProtocolParseError $ T.pack err
 
-                    Right val -> do
-                        -- Check response type
-                        msgType <- case Aeson.lookup "type" val of
-                            Just (Aeson.String typ) -> return typ
-                            _ -> return $ Left $ ProtocolParseError "Missing or invalid response type"
+                    Right val -> case val of
+                        Aeson.Object obj -> do
+                            -- Check response type
+                            case HM.lookup "type" obj of
+                                Just (Aeson.String typ) -> do
+                                    case typ of
+                                        "response" -> do
+                                            -- Check privilege requirement
+                                            privileged <- case HM.lookup "privileged" obj of
+                                                Just (Aeson.Bool p) -> return p
+                                                _ -> return False
 
-                        case msgType of
-                            "response" -> do
-                                -- Check privilege requirement
-                                privileged <- case Aeson.lookup "privileged" val of
-                                    Just (Aeson.Bool p) -> return p
-                                    _ -> return False
+                                            -- If response is privileged, check our privilege tier
+                                            if privileged && protocolPrivilegeTier handle /= Daemon
+                                                then return $ Left $ PrivilegeViolation "Insufficient privileges to receive this response"
+                                                else do
+                                                    -- Parse content
+                                                    case HM.lookup "content" obj of
+                                                        Just c -> case Aeson.fromJSON c of
+                                                            Aeson.Success resp -> return $ Right resp
+                                                            Aeson.Error err -> return $ Left $ ProtocolParseError $ "Invalid content: " <> T.pack err
+                                                        _ -> return $ Left $ ProtocolParseError "Missing response content"
 
-                                -- If response is privileged, check our privilege tier
-                                if privileged && protocolPrivilegeTier handle /= Daemon
-                                    then return $ Left $ PrivilegeViolation "Insufficient privileges to receive this response"
-                                    else do
-                                        -- Parse content
-                                        content <- case Aeson.lookup "content" val of
-                                            Just c -> case Aeson.fromJSON c of
-                                                Aeson.Success resp -> return $ Right resp
-                                                Aeson.Error err -> return $ Left $ ProtocolParseError $ "Invalid content: " <> T.pack err
-                                            _ -> return $ Left $ ProtocolParseError "Missing response content"
+                                        "error" -> do
+                                            -- Parse error
+                                            case HM.lookup "error" obj of
+                                                Just e -> case parseError e of
+                                                    Left err -> return $ Left $ ProtocolParseError err
+                                                    Right buildErr -> return $ Right $ ErrorResponseContent buildErr
+                                                _ -> return $ Left $ ProtocolParseError "Missing error content"
 
-                                        case content of
-                                            Left err -> return $ Left err
-                                            Right resp -> return $ Right resp
-
-                            "error" -> do
-                                -- Parse error
-                                errObj <- case Aeson.lookup "error" val of
-                                    Just e -> return e
-                                    _ -> return $ Left $ ProtocolParseError "Missing error content"
-
-                                -- Convert to error response
-                                case errObj of
-                                    Left err -> return $ Left err
-                                    Right e -> case parseError e of
-                                        Left err -> return $ Left $ ProtocolParseError err
-                                        Right buildErr -> return $ Right $ ErrorResponseContent buildErr
-
-                            _ -> return $ Left $ ProtocolParseError $ "Unknown response type: " <> msgType
+                                        _ -> return $ Left $ ProtocolParseError $ "Unknown response type: " <> typ
+                                _ -> return $ Left $ ProtocolParseError "Missing or invalid response type"
+                        _ -> return $ Left $ ProtocolParseError "Expected JSON object"
   where
     parseError :: Aeson.Value -> Either Text BuildError
     parseError = Aeson.withObject "Error" $ \e -> do
