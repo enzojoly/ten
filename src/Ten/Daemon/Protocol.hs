@@ -23,7 +23,6 @@ module Ten.Daemon.Protocol (
     currentProtocolVersion,
     compatibleVersions,
 
-    -- Phase and Privilege types and singletons
     PrivilegeTier(..),
     SPrivilegeTier(..),
     SDaemon,
@@ -137,10 +136,12 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (Exception, throwIO, bracket, try, SomeException)
 import Control.Monad (unless, when, foldM)
-import Data.Aeson ((.:), (.=), (.:?))
+import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
-import qualified Data.HashMap.Strict as HM
+import Data.Aeson.Types ((.!=), (.:?))
+import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Aeson.Key as Key
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Builder as Builder
@@ -170,10 +171,10 @@ import Data.Proxy (Proxy(..))
 import Data.Binary (Binary(..), Get, put, get, encode, decode)
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
-import Data.Bits (shiftL, shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 
 -- Import Ten modules
-import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
+import Ten.Core (fromSing, BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                  UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
                  Phase(..), PrivilegeTier(..), SPhase(..), SPrivilegeTier(..),
                  CanAccessStore, CanAccessDatabase, CanCreateSandbox, CanDropPrivileges,
@@ -226,9 +227,9 @@ sBuilder :: SPrivilegeTier 'Builder
 sBuilder = SBuilder
 
 -- | Convert from singleton to the value
-fromSingPrivTier :: SPrivilegeTier t -> PrivilegeTier
-fromSingPrivTier SDaemon = Daemon
-fromSingPrivTier SBuilder = Builder
+fromSing :: SPrivilegeTier t -> PrivilegeTier
+fromSing SDaemon = Daemon
+fromSing SBuilder = Builder
 
 -- | Existential wrapper for privilege tier singletons
 data SomePrivilegeTier where
@@ -324,7 +325,7 @@ instance Aeson.FromJSON UserCredentials where
     parseJSON = Aeson.withObject "UserCredentials" $ \v -> do
         username <- v .: "username"
         token <- v .: "token"
-        tierStr <- v .: "requestedTier" :: Aeson.Parser String
+        tierStr <- v .:? "requestedTier" .!= "Builder" :: Aeson.Parser String
         let requestedTier = case tierStr of
                 "Daemon" -> Daemon
                 _ -> Builder  -- Default to less privileged
@@ -979,7 +980,7 @@ data ProtocolHandle = ProtocolHandle {
 -- | Check if a request has the necessary capabilities
 verifyCapabilities :: SPrivilegeTier t -> Set DaemonCapability -> Either PrivilegeError ()
 verifyCapabilities st capabilities =
-    case fromSingPrivTier st of
+    case fromSing st of
         -- Daemon context can perform any operation
         Daemon -> Right ()
 
@@ -1003,7 +1004,7 @@ verifyCapabilities st capabilities =
 -- | Check if a request can be performed with given privilege tier
 checkPrivilegeRequirement :: SPrivilegeTier t -> RequestPrivilege -> Either PrivilegeError ()
 checkPrivilegeRequirement st reqPriv =
-    case (fromSingPrivTier st, reqPriv) of
+    case (fromSing st, reqPriv) of
         (Daemon, _) ->
             -- Daemon can perform any operation
             Right ()
@@ -1470,25 +1471,25 @@ deserializeMessageContent :: Aeson.Value -> SPrivilegeTier t -> Either Text (Mes
 deserializeMessageContent val st =
     case val of
         Aeson.Object obj -> do
-            msgType <- case HM.lookup "type" obj of
+            msgType <- case KeyMap.lookup "type" obj of
                 Just (Aeson.String typ) -> Right typ
                 _ -> Left "Missing or invalid message type"
 
             case msgType of
                 "daemon" -> do
                     -- Parse daemon message with privilege checking
-                    msgTypeStr <- case HM.lookup "messageType" obj of
+                    msgTypeStr <- case KeyMap.lookup "messageType" obj of
                         Just (Aeson.String t) -> Right t
                         _ -> Left "Missing or invalid messageType"
 
-                    content <- case HM.lookup "content" obj of
+                    content <- case KeyMap.lookup "content" obj of
                         Just c -> case Aeson.fromJSON c of
                             Aeson.Success content -> Right content
                             Aeson.Error err -> Left $ "Invalid content: " <> T.pack err
                         _ -> Left "Missing message content"
 
                     -- Verify privilege tier
-                    case fromSingPrivTier st of
+                    case fromSing st of
                         Daemon -> do
                             let messageType = read (T.unpack msgTypeStr) :: MessageType
                             Right (DaemonMessage messageType content)
@@ -1498,11 +1499,11 @@ deserializeMessageContent val st =
 
                 "builder" -> do
                     -- Parse builder message (can be processed by both tiers)
-                    msgTypeStr <- case HM.lookup "messageType" obj of
+                    msgTypeStr <- case KeyMap.lookup "messageType" obj of
                         Just (Aeson.String t) -> Right t
                         _ -> Left "Missing or invalid messageType"
 
-                    content <- case HM.lookup "content" obj of
+                    content <- case KeyMap.lookup "content" obj of
                         Just c -> case Aeson.fromJSON c of
                             Aeson.Success content -> Right content
                             Aeson.Error err -> Left $ "Invalid content: " <> T.pack err
@@ -1513,7 +1514,7 @@ deserializeMessageContent val st =
 
                 "auth" -> do
                     -- Parse auth message
-                    content <- case HM.lookup "content" obj of
+                    content <- case KeyMap.lookup "content" obj of
                         Just c -> case Aeson.fromJSON c of
                             Aeson.Success content -> Right content
                             Aeson.Error err -> Left $ "Invalid auth content: " <> T.pack err
@@ -1523,7 +1524,7 @@ deserializeMessageContent val st =
 
                 "error" -> do
                     -- Parse error message
-                    errObj <- case HM.lookup "error" obj of
+                    errObj <- case KeyMap.lookup "error" obj of
                         Just e -> Right e
                         _ -> Left "Missing error content"
 
@@ -1534,7 +1535,12 @@ deserializeMessageContent val st =
         _ -> Left "Expected JSON object"
   where
     parseError :: Aeson.Value -> Either Text BuildError
-    parseError = Aeson.withObject "Error" $ \e -> do
+    parseError = \val -> case Aeson.parseEither parseErrorObj val of
+        Left err -> Left $ "Failed to parse error: " <> T.pack err
+        Right buildErr -> Right buildErr
+
+    parseErrorObj :: Aeson.Value -> Aeson.Parser BuildError
+    parseErrorObj = Aeson.withObject "Error" $ \e -> do
         errType <- e .: "errorType" :: Aeson.Parser Text
         msg <- e .: "message" :: Aeson.Parser Text
         case errType of
@@ -1832,12 +1838,12 @@ receiveResponse handle = do
                     Right val -> case val of
                         Aeson.Object obj -> do
                             -- Check response type
-                            case HM.lookup "type" obj of
+                            case KeyMap.lookup "type" obj of
                                 Just (Aeson.String typ) -> do
                                     case typ of
                                         "response" -> do
                                             -- Check privilege requirement
-                                            privileged <- case HM.lookup "privileged" obj of
+                                            privileged <- case KeyMap.lookup "privileged" obj of
                                                 Just (Aeson.Bool p) -> return p
                                                 _ -> return False
 
@@ -1846,7 +1852,7 @@ receiveResponse handle = do
                                                 then return $ Left $ PrivilegeViolation "Insufficient privileges to receive this response"
                                                 else do
                                                     -- Parse content
-                                                    case HM.lookup "content" obj of
+                                                    case KeyMap.lookup "content" obj of
                                                         Just c -> case Aeson.fromJSON c of
                                                             Aeson.Success resp -> return $ Right resp
                                                             Aeson.Error err -> return $ Left $ ProtocolParseError $ "Invalid content: " <> T.pack err
@@ -1854,7 +1860,7 @@ receiveResponse handle = do
 
                                         "error" -> do
                                             -- Parse error
-                                            case HM.lookup "error" obj of
+                                            case KeyMap.lookup "error" obj of
                                                 Just e -> case parseError e of
                                                     Left err -> return $ Left $ ProtocolParseError err
                                                     Right buildErr -> return $ Right $ ErrorResponseContent buildErr
@@ -1865,7 +1871,12 @@ receiveResponse handle = do
                         _ -> return $ Left $ ProtocolParseError "Expected JSON object"
   where
     parseError :: Aeson.Value -> Either Text BuildError
-    parseError = Aeson.withObject "Error" $ \e -> do
+    parseError val = case Aeson.parseEither parseErrorObj val of
+        Left err -> Left $ "Failed to parse error: " <> T.pack err
+        Right buildErr -> Right buildErr
+
+    parseErrorObj :: Aeson.Value -> Aeson.Parser BuildError
+    parseErrorObj = Aeson.withObject "Error" $ \e -> do
         errType <- e .: "errorType" :: Aeson.Parser Text
         msg <- e .: "message" :: Aeson.Parser Text
         case errType of
@@ -1932,17 +1943,6 @@ withProtocolHandle socket tier action =
         (createHandle socket tier)
         closeHandle
         action
-
--- | Serialize and deserialize derivations (placeholders - would be implemented in Ten.Derivation)
-serializeDerivation :: Derivation -> BS.ByteString
-serializeDerivation _ = BS.pack []  -- Would call into Ten.Derivation
-
-deserializeDerivation :: BS.ByteString -> Either Text Derivation
-deserializeDerivation _ = Left "Not implemented"  -- Would call into Ten.Derivation
-
--- | Helper for getting unique value hashes
-hashUnique :: a -> Int
-hashUnique _ = 0  -- Placeholder - would be implemented in Ten.Core
 
 -- | Int64 type for database IDs
 type Int64 = Int
