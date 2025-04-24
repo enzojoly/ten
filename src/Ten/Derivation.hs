@@ -64,6 +64,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.List as List
 import qualified Data.Text.Encoding as TE
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (catMaybes, fromMaybe)
