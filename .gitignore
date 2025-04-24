@@ -27,3 +27,4 @@ cabal.project.local~
 /tmp/ten-store/
 output
 **/hello.c
+cabal-build-output
