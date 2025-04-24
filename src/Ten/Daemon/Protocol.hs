@@ -70,9 +70,9 @@ module Ten.Daemon.Protocol (
     DaemonConfig(..),
 
     -- GC status
-    GCRequestContent(..),
-    GCStatusRequestContent(..),
-    GCStatusResponseContent(..),
+    GCRequestParams(..),
+    GCStatusRequestParams(..),
+    GCStatusResponse(..),
     GCStats(..),
 
     -- Type families for permissions
@@ -176,8 +176,7 @@ import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                  UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
                  Phase(..), PrivilegeTier(..), SPhase(..), SPrivilegeTier(..),
                  CanAccessStore, CanAccessDatabase, CanCreateSandbox, CanDropPrivileges,
-                 CanModifyStore)
-import Ten.Core (Derivation)
+                 CanModifyStore, Derivation)
 
 -- | Protocol version
 data ProtocolVersion = ProtocolVersion {
@@ -652,56 +651,56 @@ instance Aeson.FromJSON BuildStatusUpdate where
                 _ -> fail $ "Unknown status type: " ++ T.unpack statusType
             ) obj
 
--- | GC Request content
-data GCRequestContent = GCRequestContent {
+-- | GC Request parameters - renamed from GCRequestContent to avoid naming conflict
+data GCRequestParams = GCRequestParams {
     gcForce :: Bool  -- Force GC (run even if unsafe)
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCRequestContent where
-    toJSON GCRequestContent{..} = Aeson.object [
+instance Aeson.ToJSON GCRequestParams where
+    toJSON GCRequestParams{..} = Aeson.object [
             "force" .= gcForce
         ]
 
-instance Aeson.FromJSON GCRequestContent where
-    parseJSON = Aeson.withObject "GCRequestContent" $ \v -> do
+instance Aeson.FromJSON GCRequestParams where
+    parseJSON = Aeson.withObject "GCRequestParams" $ \v -> do
         gcForce <- v .: "force"
-        return GCRequestContent{..}
+        return GCRequestParams{..}
 
--- | GC Status Request content
-data GCStatusRequestContent = GCStatusRequestContent {
+-- | GC Status Request parameters - renamed from GCStatusRequestContent to avoid naming conflict
+data GCStatusRequestParams = GCStatusRequestParams {
     gcForceCheck :: Bool  -- Whether to force recheck the lock file
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusRequestContent where
-    toJSON GCStatusRequestContent{..} = Aeson.object [
+instance Aeson.ToJSON GCStatusRequestParams where
+    toJSON GCStatusRequestParams{..} = Aeson.object [
             "forceCheck" .= gcForceCheck
         ]
 
-instance Aeson.FromJSON GCStatusRequestContent where
-    parseJSON = Aeson.withObject "GCStatusRequestContent" $ \v -> do
+instance Aeson.FromJSON GCStatusRequestParams where
+    parseJSON = Aeson.withObject "GCStatusRequestParams" $ \v -> do
         gcForceCheck <- v .: "forceCheck"
-        return GCStatusRequestContent{..}
+        return GCStatusRequestParams{..}
 
 -- | GC Status Response content
-data GCStatusResponseContent = GCStatusResponseContent {
+data GCStatusResponse = GCStatusResponse {
     gcRunning :: Bool,           -- Whether GC is currently running
     gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
     gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusResponseContent where
-    toJSON GCStatusResponseContent{..} = Aeson.object [
+instance Aeson.ToJSON GCStatusResponse where
+    toJSON GCStatusResponse{..} = Aeson.object [
             "running" .= gcRunning,
             "owner" .= gcOwner,
             "lockTime" .= gcLockTime
         ]
 
-instance Aeson.FromJSON GCStatusResponseContent where
-    parseJSON = Aeson.withObject "GCStatusResponseContent" $ \v -> do
+instance Aeson.FromJSON GCStatusResponse where
+    parseJSON = Aeson.withObject "GCStatusResponse" $ \v -> do
         gcRunning <- v .: "running"
         gcOwner <- v .: "owner"
         gcLockTime <- v .: "lockTime"
-        return GCStatusResponseContent{..}
+        return GCStatusResponse{..}
 
 -- | Message type tags for routing
 data MessageType
@@ -750,6 +749,7 @@ data Message (t :: PrivilegeTier) where
     ErrorMessage :: BuildError -> Message t
 
 -- | Contents of requests - separated from privilege tracking
+-- Modified to use the standalone types instead of redefining fields
 data RequestContent
     = BuildRequestContent {
         buildFilePath :: Text,
@@ -806,12 +806,8 @@ data RequestContent
     | ListDerivationsRequestContent {
         listDerivLimit :: Maybe Int
     }
-    | GCRequestContent {
-        gcForce :: Bool
-    }
-    | GCStatusRequestContent {
-        gcForceCheck :: Bool
-    }
+    | GCRequestContent GCRequestParams  -- Reference to the standalone type instead of redefining
+    | GCStatusRequestContent GCStatusRequestParams  -- Reference to the standalone type
     | AddGCRootRequestContent {
         rootPath :: StorePath,
         rootName :: Text,
@@ -848,7 +844,7 @@ data ResponseContent
     | DerivationListResponseContent [StorePath]
     | GCResponseContent GCStats
     | GCStartedResponseContent
-    | GCStatusResponseContent GCStatusResponseContent
+    | GCStatusResponseContent GCStatusResponse
     | GCRootAddedResponseContent Text
     | GCRootRemovedResponseContent Text
     | GCRootsListResponseContent [(StorePath, Text, Bool)]
@@ -1208,11 +1204,11 @@ requestToText req = case req of
     ListDerivationsRequestContent{..} ->
         "List derivations" <> maybe "" (\n -> " (limit: " <> T.pack (show n) <> ")") listDerivLimit
 
-    GCRequestContent{..} ->
-        "Collect garbage" <> if gcForce then " (force)" else ""
+    GCRequestContent params ->
+        "Collect garbage" <> if gcForce params then " (force)" else ""
 
-    GCStatusRequestContent{..} ->
-        "Check GC status" <> if gcForceCheck then " (force check)" else ""
+    GCStatusRequestContent params ->
+        "Check GC status" <> if gcForceCheck params then " (force check)" else ""
 
     AddGCRootRequestContent{..} ->
         "Add GC root: " <> rootName <> " -> " <> T.pack (show rootPath)
