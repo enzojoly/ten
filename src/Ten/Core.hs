@@ -168,6 +168,7 @@ module Ten.Core (
 
     -- Error utilities
     privilegeError,
+    buildErrorToText,
 
     -- Builder process control
     spawnBuilderProcess,
@@ -210,7 +211,7 @@ import System.Directory
 import System.FilePath
 import qualified System.Process as Process
 import System.Exit
-import Data.Unique (Unique, newUnique)
+import Data.Unique (Unique, hashUnique)
 import Data.Proxy (Proxy(..))
 import Network.Socket (Socket, SockAddr(..), socketToHandle, close)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdin,
@@ -367,6 +368,32 @@ data BuildError
     deriving (Show, Eq)
 
 instance Exception BuildError
+
+-- | Convert BuildError to Text for easier handling across module boundaries
+buildErrorToText :: BuildError -> Text
+buildErrorToText = \case
+    EvalError msg -> msg
+    BuildFailed msg -> msg
+    StoreError msg -> msg
+    SandboxError msg -> msg
+    InputNotFound path -> T.pack path
+    HashError msg -> msg
+    GraphError msg -> msg
+    ResourceError msg -> msg
+    DaemonError msg -> msg
+    AuthError msg -> msg
+    CyclicDependency msg -> msg
+    SerializationError msg -> msg
+    RecursionLimit msg -> msg
+    NetworkError msg -> msg
+    ParseError msg -> msg
+    DBError msg -> msg
+    GCError msg -> msg
+    PhaseError msg -> msg
+    PrivilegeError msg -> msg
+    ProtocolError msg -> msg
+    InternalError msg -> msg
+    ConfigError msg -> msg
 
 -- | Store path representing a content-addressed location
 data StorePath = StorePath
@@ -592,11 +619,10 @@ closeDaemonConnection conn = do
 -- | Execute an action with a daemon connection
 withDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t
                      -> (DaemonConnection t -> IO a) -> IO a
-withDaemonConnection sock handle userId authToken priEvidence action =
+withDaemonConnection sock handle userId authToken priEvidence =
     bracket
         (createDaemonConnection sock handle userId authToken priEvidence)
         closeDaemonConnection
-        action
 
 -- | Request type (for communication with daemon)
 data Request = Request {
@@ -731,6 +757,7 @@ data DaemonConfig = DaemonConfig
     { daemonSocketPath :: FilePath       -- Path to daemon socket
     , daemonStorePath :: FilePath        -- Path to store
     , daemonStateFile :: FilePath        -- Path to state file
+    , daemonLogFile :: Maybe FilePath    -- Optional log file path
     , daemonLogLevel :: Int              -- Log verbosity level
     , daemonGcInterval :: Maybe Int      -- Garbage collection interval in seconds
     , daemonUser :: Maybe Text           -- User to run as
@@ -871,7 +898,7 @@ initBuildState phase bid = BuildState
 runTen :: SPhase p -> SPrivilegeTier t -> TenM p t a -> BuildEnv -> BuildState p -> IO (Either BuildError (a, BuildState p))
 runTen sp st (TenM m) env state = do
     -- Validate privilege tier matches environment
-    if currentPrivilegeTier env == Data.Singletons.fromSing st
+    if currentPrivilegeTier env == fromSing st
         then runExceptT $ runStateT (runReaderT (m sp st) env) state
         else return $ Left $ PrivilegeError "Privilege tier mismatch"
 
@@ -946,7 +973,7 @@ liftDaemonIO = liftIO
 liftBuilderIO :: IO a -> TenM p t a
 liftBuilderIO action = TenM $ \_ st -> do
     env <- ask
-    case (Data.Singletons.fromSing st, currentPrivilegeTier env) of
+    case (fromSing st, currentPrivilegeTier env) of
         (Builder, _) -> liftIO action  -- Always allowed for Builder
         (Daemon, Daemon) -> liftIO action  -- Allowed for Daemon when running as Daemon
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
