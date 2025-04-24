@@ -1429,7 +1429,7 @@ deserializeDerivation bs =
             Aeson.Error err -> Left $ SerializationError $ "JSON conversion error: " <> T.pack err
             Aeson.Success drv -> Right drv
   where
-    fromJSON :: Aeson.Value -> Aeson.Result Derivation
+fromJSON :: Aeson.Value -> Aeson.Result Derivation
 fromJSON val = case Aeson.parseEither parser val of
     Left err -> Aeson.Error err
     Right x -> Aeson.Success x
@@ -1484,8 +1484,47 @@ fromJSON val = case Aeson.parseEither parser val of
 
 -- | Helper to deserialize a BuildResult properly
 deserializeBuildResult :: ByteString -> Either BuildError BuildResult
-deserializeBuildResult content =
-    -- Use proper deserialization based on the content format
-    case Aeson.eitherDecodeStrict content of
-        Left err -> Left $ SerializationError $ "Failed to parse BuildResult: " <> T.pack err
-        Right result -> Right result
+deserializeBuildResult bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ SerializationError $ "JSON parse error: " <> T.pack err
+        Right val -> case fromJSON val of
+            Aeson.Error err -> Left $ SerializationError $ "JSON conversion error: " <> T.pack err
+            Aeson.Success result -> Right result
+  where
+    fromJSON :: Aeson.Value -> Aeson.Result BuildResult
+    fromJSON val = case Aeson.parseEither parseBuildResult val of
+        Left err -> Aeson.Error err
+        Right x -> Aeson.Success x
+
+    parseBuildResult :: Aeson.Value -> Parser BuildResult
+    parseBuildResult = Aeson.withObject "BuildResult" $ \o -> do
+        outputsArray <- o Aeson..: "outputs"
+        outputs <- mapM parseStorePath outputsArray
+        exitCodeVal <- o Aeson..: "exitCode"
+        exitCode <- parseExitCode exitCodeVal
+        buildLog <- o Aeson..: "log"
+        refsArray <- o Aeson..: "references"
+        refs <- mapM parseStorePath refsArray
+
+        return BuildResult
+            { brOutputPaths = Set.fromList outputs
+            , brExitCode = exitCode
+            , brLog = buildLog
+            , brReferences = Set.fromList refs
+            }
+
+
+    parseStorePath :: Aeson.Value -> Parser StorePath
+    parseStorePath = Aeson.withObject "StorePath" $ \o -> do
+        hash <- o Aeson..: "hash"
+        name <- o Aeson..: "name"
+        return $ StorePath hash name
+
+    parseExitCode :: Aeson.Value -> Parser ExitCode
+    parseExitCode = Aeson.withObject "ExitCode" $ \o -> do
+        codeType <- o Aeson..: "type" :: Parser Text
+        if codeType == "success"
+            then return ExitSuccess
+            else do
+                code <- o Aeson..: "code"
+                return $ ExitFailure code
