@@ -234,6 +234,9 @@ import Data.Singletons
 import Data.Singletons.TH
 import Data.Kind (Type)
 import qualified Data.Aeson as Aeson
+import Data.Aeson.Types (Parser)
+import qualified Data.Aeson.KeyMap as AKeyMap
+import qualified Data.Aeson.Key as Key
 import Network.Socket.ByteString (sendAll, recv)
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
@@ -1416,6 +1419,67 @@ serializeDerivation drv =
         , "path" Aeson..= encodeStorePath path
         ]
 
+-- | Deserialize a derivation from ByteString format
+deserializeDerivation :: ByteString -> Either BuildError Derivation
+deserializeDerivation bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ SerializationError $ "JSON parse error: " <> T.pack err
+        Right val -> case fromJSON val of
+            Aeson.Error err -> Left $ SerializationError $ "JSON conversion error: " <> T.pack err
+            Aeson.Success drv -> Right drv
+  where
+    fromJSON :: Aeson.Value -> Aeson.Result Derivation
+fromJSON val = case Aeson.parseEither parser val of
+    Left err -> Aeson.Error err
+    Right x -> Aeson.Success x
+  where
+    parser = Aeson.withObject "Derivation" $ \o -> do
+        name <- o Aeson..: "name"
+        hash <- o Aeson..: "hash"
+        builderObj <- o Aeson..: "builder"
+        builder <- parseStorePath builderObj
+        args <- o Aeson..: "args"
+        inputsArray <- o Aeson..: "inputs"
+        inputs <- mapM parseInput inputsArray
+        outputsArray <- o Aeson..: "outputs"
+        outputs <- mapM parseOutput outputsArray
+        envObj <- o Aeson..: "env"
+        env <- parseEnvMap envObj
+        system <- o Aeson..: "system"
+        strategyText <- o Aeson..: "strategy"
+        let strategy = if strategyText == ("monadic" :: Text)
+                       then MonadicStrategy
+                       else ApplicativeStrategy
+        metaObj <- o Aeson..: "meta"
+        meta <- parseEnvMap metaObj
+
+        return $ Derivation name hash builder args
+                           (Set.fromList inputs) (Set.fromList outputs)
+                           env system strategy meta
+
+    parseStorePath :: Aeson.Value -> Parser StorePath
+    parseStorePath = Aeson.withObject "StorePath" $ \o -> do
+        hash <- o Aeson..: "hash"
+        name <- o Aeson..: "name"
+        return $ StorePath hash name
+
+    parseInput :: Aeson.Value -> Parser DerivationInput
+    parseInput = Aeson.withObject "DerivationInput" $ \o -> do
+        pathObj <- o Aeson..: "path"
+        path <- parseStorePath pathObj
+        name <- o Aeson..: "name"
+        return $ DerivationInput path name
+
+    parseOutput :: Aeson.Value -> Parser DerivationOutput
+    parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
+        name <- o Aeson..: "name"
+        pathObj <- o Aeson..: "path"
+        path <- parseStorePath pathObj
+        return $ DerivationOutput name path
+
+    parseEnvMap :: Aeson.Value -> Parser (Map Text Text)
+    parseEnvMap = Aeson.withObject "Environment" $ \o ->
+        return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- AKeyMap.toList o]
 
 -- | Helper to deserialize a BuildResult properly
 deserializeBuildResult :: ByteString -> Either BuildError BuildResult
