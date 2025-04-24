@@ -640,7 +640,7 @@ sendRequest conn request = do
 receiveResponse :: DaemonConnection t -> Int -> Int -> IO (Either BuildError Response)
 receiveResponse conn reqId timeoutMicros = do
     -- Get response MVar
-    reqMap <- atomically $ readTVar (connRequestMap conn)
+    reqMap <- readTVarIO (connRequestMap conn)
     case Map.lookup reqId reqMap of
         Nothing ->
             -- No such request ID
@@ -671,7 +671,7 @@ sendRequestSync conn request timeoutMicros = do
 responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> IO ()
 responseReaderThread handle requestMap shutdownFlag = forever $ do
     -- Check if we should shut down
-    shutdown <- atomically $ readTVar shutdownFlag
+    shutdown <- readTVarIO shutdownFlag
     when shutdown $ return ()
 
     -- Try to read a response
@@ -683,7 +683,7 @@ responseReaderThread handle requestMap shutdownFlag = forever $ do
 
         Right resp -> do
             -- Look up request and deliver response
-            reqMap <- atomically $ readTVar requestMap
+            reqMap <- readTVarIO requestMap
             case Map.lookup (respId resp) reqMap of
                 Nothing -> return () -- Unknown request ID, ignore
                 Just respVar -> putMVar respVar resp
