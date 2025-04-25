@@ -60,6 +60,8 @@ module Ten.Core (
     sEval,
     sBuild,
     fromSing,
+    SPrivilegeTier(SDaemon, SBuilder),
+    SPhase(SEval, SBuild),
 
     -- Type families for permissions
     CanAccessStore,

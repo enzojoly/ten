@@ -128,7 +128,10 @@ module Ten.Daemon.Protocol (
     -- Utilities for working with paths
     parseBuildId,
     renderBuildId,
-    hashByteString
+    hashByteString,
+
+    -- Error handling utilities
+    errorToText
 ) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay, myThreadId)
@@ -179,7 +182,7 @@ import Ten.Core (fromSing, BuildId(..), BuildStatus(..), BuildError(..), StorePa
                  UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
                  Phase(..), PrivilegeTier(..), SPhase(..), SPrivilegeTier(..),
                  CanAccessStore, CanAccessDatabase, CanCreateSandbox, CanDropPrivileges,
-                 CanModifyStore, Derivation)
+                 CanModifyStore, Derivation, buildErrorToText)
 import qualified Ten.Derivation (serializeDerivation, deserializeDerivation)
 
 -- | Protocol version
@@ -470,7 +473,7 @@ instance Aeson.FromJSON DerivationInfoResponse where
     parseJSON = Aeson.withObject "DerivationInfoResponse" $ \v -> do
         derivText <- v .: "derivation" :: Aeson.Parser Text
         derivation <- case Ten.Derivation.deserializeDerivation (TE.encodeUtf8 derivText) of
-            Left err -> fail $ "Invalid derivation: " ++ T.unpack err
+            Left err -> fail $ "Invalid derivation: " ++ T.unpack (buildErrorToText err)
             Right d -> return d
 
         outputsJson <- v .: "outputs"
@@ -1042,11 +1045,11 @@ parseRequestFrame bs
     | BS.length bs < 4 = Left "Message too short to contain length"
     | otherwise = do
         let (lenBytes, rest) = BS.splitAt 4 bs
-        let len = fromIntegral $
-                  (fromIntegral (BS.index lenBytes 0) `shiftL` 24) .|.
-                  (fromIntegral (BS.index lenBytes 1) `shiftL` 16) .|.
-                  (fromIntegral (BS.index lenBytes 2) `shiftL` 8) .|.
-                  (fromIntegral (BS.index lenBytes 3))
+    let len = (fromIntegral :: Word32 -> Int) $
+          ((fromIntegral (BS.index lenBytes 0) :: Word8 -> Word32) `shiftL` 24) .|.
+          ((fromIntegral (BS.index lenBytes 1) :: Word8 -> Word32) `shiftL` 16) .|.
+          ((fromIntegral (BS.index lenBytes 2) :: Word8 -> Word32) `shiftL` 8) .|.
+          ((fromIntegral (BS.index lenBytes 3) :: Word8 -> Word32))
 
         if len > 100 * 1024 * 1024  -- 100 MB limit
             then Left $ T.pack $ "Message too large (" ++ show len ++ " bytes)"
@@ -1063,6 +1066,10 @@ createResponseFrame = createRequestFrame  -- Same format
 -- | Parse a framed response from the wire
 parseResponseFrame :: BS.ByteString -> Either Text (BS.ByteString, BS.ByteString)
 parseResponseFrame = parseRequestFrame  -- Same format
+
+-- | Convert BuildError to Text
+errorToText :: BuildError -> Text
+errorToText = buildErrorToText
 
 -- | Determine capabilities required for a request
 requestCapabilities :: MessageType -> RequestContent -> Set DaemonCapability
@@ -1340,29 +1347,6 @@ responseToText resp = case resp of
     showStatus BuildCompleted = "completed"
     showStatus BuildFailed' = "failed"
 
-    errorToText :: BuildError -> Text
-    errorToText (EvalError msg) = "Evaluation error: " <> msg
-    errorToText (BuildFailed msg) = "Build failed: " <> msg
-    errorToText (StoreError msg) = "Store error: " <> msg
-    errorToText (SandboxError msg) = "Sandbox error: " <> msg
-    errorToText (InputNotFound path) = "Input not found: " <> T.pack path
-    errorToText (HashError msg) = "Hash error: " <> msg
-    errorToText (GraphError msg) = "Graph error: " <> msg
-    errorToText (ResourceError msg) = "Resource error: " <> msg
-    errorToText (DaemonError msg) = "Daemon error: " <> msg
-    errorToText (AuthError msg) = "Authentication error: " <> msg
-    errorToText (CyclicDependency msg) = "Cyclic dependency: " <> msg
-    errorToText (SerializationError msg) = "Serialization error: " <> msg
-    errorToText (RecursionLimit msg) = "Recursion limit exceeded: " <> msg
-    errorToText (NetworkError msg) = "Network error: " <> msg
-    errorToText (ParseError msg) = "Parse error: " <> msg
-    errorToText (DBError msg) = "Database error: " <> msg
-    errorToText (GCError msg) = "GC error: " <> msg
-    errorToText (PhaseError msg) = "Phase error: " <> msg
-    errorToText (PrivilegeError msg) = "Privilege error: " <> msg
-    errorToText (ProtocolError msg) = "Protocol error: " <> msg
-    errorToText _ = "Unknown error"
-
 -- | Serialize a message with length prefix
 serializeMessage :: Message t -> BS.ByteString
 serializeMessage msg =
@@ -1437,27 +1421,7 @@ serializeMessageContent (ErrorMessage err) =
     errorTypeString _ = "unknown"
 
     errorMessage :: BuildError -> Text
-    errorMessage (EvalError msg) = msg
-    errorMessage (BuildFailed msg) = msg
-    errorMessage (StoreError msg) = msg
-    errorMessage (SandboxError msg) = msg
-    errorMessage (InputNotFound path) = T.pack path
-    errorMessage (HashError msg) = msg
-    errorMessage (GraphError msg) = msg
-    errorMessage (ResourceError msg) = msg
-    errorMessage (DaemonError msg) = msg
-    errorMessage (AuthError msg) = msg
-    errorMessage (CyclicDependency msg) = msg
-    errorMessage (SerializationError msg) = msg
-    errorMessage (RecursionLimit msg) = msg
-    errorMessage (NetworkError msg) = msg
-    errorMessage (ParseError msg) = msg
-    errorMessage (DBError msg) = msg
-    errorMessage (GCError msg) = msg
-    errorMessage (PhaseError msg) = msg
-    errorMessage (PrivilegeError msg) = msg
-    errorMessage (ProtocolError msg) = msg
-    errorMessage _ = "Unknown error"
+    errorMessage = errorToText
 
 -- | Deserialize a message with privilege checking
 deserializeMessage :: BS.ByteString -> Either Text (Message t)
@@ -1683,27 +1647,7 @@ createErrorResponse err =
     errorTypeString _ = "unknown"
 
     errorMessage :: BuildError -> Text
-    errorMessage (EvalError msg) = msg
-    errorMessage (BuildFailed msg) = msg
-    errorMessage (StoreError msg) = msg
-    errorMessage (SandboxError msg) = msg
-    errorMessage (InputNotFound path) = T.pack path
-    errorMessage (HashError msg) = msg
-    errorMessage (GraphError msg) = msg
-    errorMessage (ResourceError msg) = msg
-    errorMessage (DaemonError msg) = msg
-    errorMessage (AuthError msg) = msg
-    errorMessage (CyclicDependency msg) = msg
-    errorMessage (SerializationError msg) = msg
-    errorMessage (RecursionLimit msg) = msg
-    errorMessage (NetworkError msg) = msg
-    errorMessage (ParseError msg) = msg
-    errorMessage (DBError msg) = msg
-    errorMessage (GCError msg) = msg
-    errorMessage (PhaseError msg) = msg
-    errorMessage (PrivilegeError msg) = msg
-    errorMessage (ProtocolError msg) = msg
-    errorMessage _ = "Unknown error"
+    errorMessage = errorToText
 
 -- | Receive a request from a protocol handle with privilege checking
 receiveRequest :: ProtocolHandle -> IO (Either ProtocolError (Message t))
@@ -1808,27 +1752,7 @@ createErrorRequest err =
     errorTypeString _ = "unknown"
 
     errorMessage :: BuildError -> Text
-    errorMessage (EvalError msg) = msg
-    errorMessage (BuildFailed msg) = msg
-    errorMessage (StoreError msg) = msg
-    errorMessage (SandboxError msg) = msg
-    errorMessage (InputNotFound path) = T.pack path
-    errorMessage (HashError msg) = msg
-    errorMessage (GraphError msg) = msg
-    errorMessage (ResourceError msg) = msg
-    errorMessage (DaemonError msg) = msg
-    errorMessage (AuthError msg) = msg
-    errorMessage (CyclicDependency msg) = msg
-    errorMessage (SerializationError msg) = msg
-    errorMessage (RecursionLimit msg) = msg
-    errorMessage (NetworkError msg) = msg
-    errorMessage (ParseError msg) = msg
-    errorMessage (DBError msg) = msg
-    errorMessage (GCError msg) = msg
-    errorMessage (PhaseError msg) = msg
-    errorMessage (PrivilegeError msg) = msg
-    errorMessage (ProtocolError msg) = msg
-    errorMessage _ = "Unknown error"
+    errorMessage = errorToText
 
 -- | Receive a response
 receiveResponse :: ProtocolHandle -> IO (Either ProtocolError ResponseContent)
@@ -1950,11 +1874,10 @@ recvExactly sock n = go n []
 
 -- | Execute an action with a protocol handle and clean up after
 withProtocolHandle :: Socket -> PrivilegeTier -> (ProtocolHandle -> IO a) -> IO a
-withProtocolHandle socket tier action =
+withProtocolHandle socket tier =
     bracket
         (createHandle socket tier)
         closeHandle
-        action
 
 -- | Int64 type for database IDs
 type Int64 = Int
