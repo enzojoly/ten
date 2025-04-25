@@ -183,7 +183,7 @@ import Ten.Core (fromSing, BuildId(..), BuildStatus(..), BuildError(..), StorePa
                  Phase(..), PrivilegeTier(..), SPhase(..), SPrivilegeTier(..),
                  CanAccessStore, CanAccessDatabase, CanCreateSandbox, CanDropPrivileges,
                  CanModifyStore, Derivation, buildErrorToText)
-import qualified Ten.Derivation (serializeDerivation, deserializeDerivation)
+import qualified Ten.Derivation (serializeDerivation, deserializeDerivation, derivationToJSON)
 
 -- | Protocol version
 data ProtocolVersion = ProtocolVersion {
@@ -313,6 +313,35 @@ data UserCredentials = UserCredentials {
     token :: Text,
     requestedTier :: PrivilegeTier  -- Which tier is being requested
 } deriving (Show, Eq, Generic)
+
+encodeError :: BuildError -> Aeson.Value
+encodeError err = Aeson.object [
+        "errorType" .= errorTypeString err,
+        "message" .= errorToText err
+    ]
+  where
+    errorTypeString :: BuildError -> Text
+    errorTypeString (EvalError _) = "eval"
+    errorTypeString (BuildFailed _) = "build"
+    errorTypeString (StoreError _) = "store"
+    errorTypeString (SandboxError _) = "sandbox"
+    errorTypeString (InputNotFound _) = "input"
+    errorTypeString (HashError _) = "hash"
+    errorTypeString (GraphError _) = "graph"
+    errorTypeString (ResourceError _) = "resource"
+    errorTypeString (DaemonError _) = "daemon"
+    errorTypeString (AuthError _) = "auth"
+    errorTypeString (CyclicDependency _) = "cycle"
+    errorTypeString (SerializationError _) = "serialization"
+    errorTypeString (RecursionLimit _) = "recursion"
+    errorTypeString (NetworkError _) = "network"
+    errorTypeString (ParseError _) = "parse"
+    errorTypeString (DBError _) = "db"
+    errorTypeString (GCError _) = "gc"
+    errorTypeString (PhaseError _) = "phase"
+    errorTypeString (PrivilegeError _) = "privilege"
+    errorTypeString (ProtocolError _) = "protocol"
+    errorTypeString _ = "unknown"
 
 instance Aeson.ToJSON UserCredentials where
     toJSON UserCredentials{..} = Aeson.object [
@@ -1128,7 +1157,7 @@ instance Aeson.ToJSON ResponseContent where
                 "type" .= ("derivation-retrieved" :: Text),
                 "found" .= isJust mDrv,
                 "derivation" .= maybe Aeson.Null
-                    (\drv -> Aeson.toJSON $ derivationToJSON drv) mDrv
+                    (\drv -> Ten.Derivation.derivationToJSON drv) mDrv
             ]
         DerivationQueryResponseContent drvs -> Aeson.object [
                 "type" .= ("derivation-query" :: Text),
