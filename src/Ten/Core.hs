@@ -36,19 +36,30 @@ module Ten.Core (
     UserId(..),
     AuthToken(..),
 
-    -- Connection and protocol types
+    -- Protocol Connection types
     DaemonConnection(..),
-    Response(..),
     Request(..),
     RequestId(..),
+    Response(..),
+    Message(..),
+    MessageType(..),
+    AuthResult(..),
+    Capability(..),
+    ProtocolVersion(..),
+    currentProtocolVersion,
+
+    -- Protocol actions
     createDaemonConnection,
     closeDaemonConnection,
     withDaemonConnection,
     sendRequest,
+    receiveRequest,
     receiveResponse,
     sendRequestSync,
     encodeRequest,
     decodeResponse,
+    sendMessage,
+    receiveMessage,
 
     -- Singletons and witnesses
     SingI(..),
@@ -60,8 +71,6 @@ module Ten.Core (
     sEval,
     sBuild,
     fromSing,
-    SPrivilegeTier(SDaemon, SBuilder),
-    SPhase(SEval, SBuild),
 
     -- Type families for permissions
     CanAccessStore,
@@ -69,6 +78,7 @@ module Ten.Core (
     CanDropPrivileges,
     CanModifyStore,
     CanAccessDatabase,
+    CanRunGC,
 
     -- Type classes for privilege and phase constraints
     RequiresDaemon,
@@ -101,6 +111,7 @@ module Ten.Core (
     ReferenceType(..),
     StorePathReference(..),
     GCRoot(..),
+    GCStats(..),
     RootType(..),
 
     -- Database paths
@@ -112,6 +123,11 @@ module Ten.Core (
     DerivationOutput(..),
     derivationEquals,
     derivationPathsEqual,
+    serializeDerivation,
+    deserializeDerivation,
+
+    -- Build result types
+    BuildResult(..),
 
     -- Graph types
     BuildGraph(..),
@@ -201,12 +217,13 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Unique (Unique, newUnique, hashUnique)
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
-import Data.Bits (shiftL, shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Word (Word8, Word32)
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import System.Directory
@@ -239,7 +256,7 @@ import Data.Singletons.TH
 import Data.Kind (Type)
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
-import qualified Data.Aeson.Types as Aeson (parseEither)
+import qualified Data.Aeson.Types as Aeson (parseEither, parseMaybe)
 import qualified Data.Aeson.KeyMap as AKeyMap
 import qualified Data.Aeson.Key as Key
 import Network.Socket.ByteString (sendAll, recv)
@@ -288,6 +305,10 @@ type family CanAccessDatabase (t :: PrivilegeTier) :: Bool where
     CanAccessDatabase 'Daemon = 'True
     CanAccessDatabase 'Builder = 'False
 
+type family CanRunGC (t :: PrivilegeTier) :: Bool where
+    CanRunGC 'Daemon = 'True
+    CanRunGC 'Builder = 'False
+
 -- | Singleton values for convenient use
 sDaemon :: SPrivilegeTier 'Daemon
 sDaemon = SDaemon
@@ -309,6 +330,21 @@ type RequiresEval p = RequiresPhase p 'Eval
 type RequiresBuild p = RequiresPhase p 'Build
 type AnyPrivilegeTier t = ()
 type AnyPhase p = ()
+
+-- | Protocol version
+data ProtocolVersion = ProtocolVersion {
+    protocolMajor :: Int,
+    protocolMinor :: Int,
+    protocolPatch :: Int
+} deriving (Eq, Show)
+
+instance Ord ProtocolVersion where
+    compare a b = compare (protocolMajor a, protocolMinor a, protocolPatch a)
+                          (protocolMajor b, protocolMinor b, protocolPatch b)
+
+-- | Current protocol version
+currentProtocolVersion :: ProtocolVersion
+currentProtocolVersion = ProtocolVersion 1 0 0
 
 -- | Request ID type for tracking requests
 newtype RequestId = RequestId Int
@@ -431,6 +467,63 @@ validateStorePath :: StorePath -> Bool
 validateStorePath (StorePath hash name) =
     T.length hash >= 8 && T.all isHexDigit hash && not (T.null name)
 
+-- | Message types for protocol communication
+data MessageType
+    = AuthType
+    | BuildType
+    | EvalType
+    | BuildDerivationType
+    | BuildStatusType
+    | CancelBuildType
+    | QueryBuildOutputType
+    | ListBuildsType
+    | StoreAddType
+    | StoreVerifyType
+    | StorePathType
+    | StoreListType
+    | StoreDerivationType
+    | RetrieveDerivationType
+    | QueryDerivationType
+    | GetDerivationForOutputType
+    | ListDerivationsType
+    | GCType
+    | GCStatusType
+    | AddGCRootType
+    | RemoveGCRootType
+    | ListGCRootsType
+    | PingType
+    | ShutdownType
+    | StatusType
+    | ConfigType
+    | ErrorType
+    deriving (Show, Eq, Read)
+
+-- | Message data for protocol communication
+data Message
+    = AuthMessage ByteString
+    | RequestMessage Request
+    | ResponseMessage Response
+    | ErrorMessage BuildError
+    deriving (Show, Eq)
+
+-- | Daemon capabilities for permission checking
+data Capability
+    = StoreAccess             -- Ability to access the store (read/write)
+    | SandboxCreation         -- Ability to create sandboxes
+    | GarbageCollection       -- Ability to perform garbage collection
+    | DerivationRegistration  -- Ability to register derivations
+    | DerivationBuild         -- Ability to build derivations
+    | StoreQuery              -- Ability to query the store
+    | BuildQuery              -- Ability to query build status
+    deriving (Show, Eq, Ord, Bounded, Enum)
+
+-- | Authentication result
+data AuthResult
+    = AuthAccepted UserId AuthToken (Set Capability)  -- Successful auth with capabilities
+    | AuthRejected Text                               -- Failed auth with reason
+    | AuthSuccess UserId AuthToken                    -- Legacy success format
+    deriving (Show, Eq)
+
 -- | Reference between store paths
 data StoreReference = StoreReference
     { refSource :: !StorePath     -- Source of the reference
@@ -467,6 +560,15 @@ data RootType
     | RegistryRoot     -- Explicitly registered in database
     | PermanentRoot    -- Never to be collected (e.g., system components)
     deriving (Show, Eq, Ord)
+
+-- | GC Statistics
+data GCStats = GCStats {
+    gcTotal :: Int,            -- Total paths in store
+    gcLive :: Int,             -- Paths still reachable
+    gcCollected :: Int,        -- Paths collected
+    gcBytes :: Integer,        -- Bytes freed
+    gcElapsedTime :: Double    -- Time taken for GC in seconds
+} deriving (Show, Eq)
 
 -- | Input to a derivation
 data DerivationInput = DerivationInput
@@ -567,65 +669,6 @@ newtype UserId = UserId Text
 newtype AuthToken = AuthToken Text
     deriving (Show, Eq)
 
--- | Daemon connection type - core implementation for client-server communication
--- Parameterized by privilege tier for type-level enforcement
-data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
-    connSocket :: Socket,                     -- ^ Socket connected to daemon
-    connHandle :: Handle,                     -- ^ Handle for socket I/O
-    connUserId :: UserId,                     -- ^ Authenticated user ID
-    connAuthToken :: AuthToken,               -- ^ Authentication token
-    connRequestMap :: TVar (Map Int (MVar Response)), -- ^ Map of pending requests
-    connNextReqId :: TVar Int,                -- ^ Next request ID
-    connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
-    connShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
-    connPrivEvidence :: SPrivilegeTier t      -- ^ Runtime evidence of privilege tier
-}
-
--- | Create a new daemon connection with privilege tier singleton evidence
-createDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t -> IO (DaemonConnection t)
-createDaemonConnection sock handle userId authToken priEvidence = do
-    requestMap <- newTVarIO Map.empty
-    nextReqId <- newTVarIO 1
-    shutdownFlag <- newTVarIO False
-
-    -- Start background thread to read responses
-    readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
-
-    return DaemonConnection {
-        connSocket = sock,
-        connHandle = handle,
-        connUserId = userId,
-        connAuthToken = authToken,
-        connRequestMap = requestMap,
-        connNextReqId = nextReqId,
-        connReaderThread = readerThread,
-        connShutdown = shutdownFlag,
-        connPrivEvidence = priEvidence
-    }
-
--- | Close a daemon connection, cleaning up resources
-closeDaemonConnection :: DaemonConnection t -> IO ()
-closeDaemonConnection conn = do
-    -- Signal reader thread to shut down
-    atomically $ writeTVar (connShutdown conn) True
-
-    -- Close socket handle
-    hClose (connHandle conn)
-
-    -- Close socket
-    close (connSocket conn)
-
-    -- Kill reader thread if it doesn't exit on its own
-    killThread (connReaderThread conn)
-
--- | Execute an action with a daemon connection
-withDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t
-                     -> (DaemonConnection t -> IO a) -> IO a
-withDaemonConnection sock handle userId authToken priEvidence =
-    bracket
-        (createDaemonConnection sock handle userId authToken priEvidence)
-        closeDaemonConnection
-
 -- | Request type (for communication with daemon)
 data Request = Request {
     reqId :: Int,                         -- ^ Unique request ID
@@ -643,83 +686,19 @@ data Response = Response {
     respPayload :: Maybe ByteString       -- ^ Optional binary payload
 } deriving (Show, Eq)
 
--- | Send a request to the daemon
-sendRequest :: DaemonConnection t -> Request -> IO Int
-sendRequest conn request = do
-    -- Generate request ID
-    reqId <- atomically $ do
-        rid <- readTVar (connNextReqId conn)
-        writeTVar (connNextReqId conn) (rid + 1)
-        return rid
-
-    -- Create response variable
-    respVar <- newEmptyMVar
-
-    -- Register the pending request
-    atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
-
-    -- Update the request with the ID
-    let request' = request { reqId = reqId }
-
-    -- Serialize and send the request
-    let encoded = encodeRequest request'
-    BS.hPut (connHandle conn) encoded
-    hFlush (connHandle conn)
-
-    -- Return the request ID for tracking
-    return reqId
-
--- | Receive a response for a specific request
-receiveResponse :: DaemonConnection t -> Int -> Int -> IO (Either BuildError Response)
-receiveResponse conn reqId timeoutMicros = do
-    -- Get response MVar
-    reqMap <- readTVarIO (connRequestMap conn)
-    case Map.lookup reqId reqMap of
-        Nothing ->
-            -- No such request ID
-            return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
-
-        Just respVar -> do
-            -- Wait for response with timeout
-            result <- timeout timeoutMicros $ takeMVar respVar
-
-            -- Clean up request map
-            atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
-
-            -- Return response or error
-            case result of
-                Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
-                Just resp -> return $ Right resp
-
--- | Send a request and wait for response (synchronous)
-sendRequestSync :: DaemonConnection t -> Request -> Int -> IO (Either BuildError Response)
-sendRequestSync conn request timeoutMicros = do
-    -- Send the request
-    reqId <- sendRequest conn request
-
-    -- Wait for response
-    receiveResponse conn reqId timeoutMicros
-
--- | Background thread to read and dispatch responses
-responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> IO ()
-responseReaderThread handle requestMap shutdownFlag = forever $ do
-    -- Check if we should shut down
-    shutdown <- readTVarIO shutdownFlag
-    when shutdown $ return ()
-
-    -- Try to read a response
-    response <- try $ readResponseWithTimeout handle 30000000 -- 30 second timeout
-    case response of
-        Left (e :: SomeException) -> do
-            -- Connection error, exit thread
-            return ()
-
-        Right resp -> do
-            -- Look up request and deliver response
-            reqMap <- readTVarIO requestMap
-            case Map.lookup (respId resp) reqMap of
-                Nothing -> return () -- Unknown request ID, ignore
-                Just respVar -> putMVar respVar resp
+-- | Daemon connection type - core implementation for client-server communication
+-- Parameterized by privilege tier for type-level enforcement
+data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
+    connSocket :: Socket,                     -- ^ Socket connected to daemon
+    connHandle :: Handle,                     -- ^ Handle for socket I/O
+    connUserId :: UserId,                     -- ^ Authenticated user ID
+    connAuthToken :: AuthToken,               -- ^ Authentication token
+    connRequestMap :: TVar (Map Int (MVar Response)), -- ^ Map of pending requests
+    connNextReqId :: TVar Int,                -- ^ Next request ID
+    connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
+    connShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
+    connPrivEvidence :: SPrivilegeTier t      -- ^ Runtime evidence of privilege tier
+}
 
 -- | Running mode for Ten
 data RunMode
@@ -838,7 +817,130 @@ instance MonadIO (TenM p t) where
 instance MonadFail (TenM p t) where
     fail msg = throwError $ BuildFailed $ T.pack msg
 
--- | Helper functions to work with singletons
+-- | Create a new daemon connection with privilege tier singleton evidence
+createDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t -> IO (DaemonConnection t)
+createDaemonConnection sock handle userId authToken priEvidence = do
+    requestMap <- newTVarIO Map.empty
+    nextReqId <- newTVarIO 1
+    shutdownFlag <- newTVarIO False
+
+    -- Start background thread to read responses
+    readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
+
+    return DaemonConnection {
+        connSocket = sock,
+        connHandle = handle,
+        connUserId = userId,
+        connAuthToken = authToken,
+        connRequestMap = requestMap,
+        connNextReqId = nextReqId,
+        connReaderThread = readerThread,
+        connShutdown = shutdownFlag,
+        connPrivEvidence = priEvidence
+    }
+
+-- | Close a daemon connection, cleaning up resources
+closeDaemonConnection :: DaemonConnection t -> IO ()
+closeDaemonConnection conn = do
+    -- Signal reader thread to shut down
+    atomically $ writeTVar (connShutdown conn) True
+
+    -- Close socket handle
+    hClose (connHandle conn)
+
+    -- Close socket
+    close (connSocket conn)
+
+    -- Kill reader thread if it doesn't exit on its own
+    killThread (connReaderThread conn)
+
+-- | Execute an action with a daemon connection
+withDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t
+                     -> (DaemonConnection t -> IO a) -> IO a
+withDaemonConnection sock handle userId authToken priEvidence =
+    bracket
+        (createDaemonConnection sock handle userId authToken priEvidence)
+        closeDaemonConnection
+
+-- | Send a request to the daemon
+sendRequest :: DaemonConnection t -> Request -> IO Int
+sendRequest conn request = do
+    -- Generate request ID
+    reqId <- atomically $ do
+        rid <- readTVar (connNextReqId conn)
+        writeTVar (connNextReqId conn) (rid + 1)
+        return rid
+
+    -- Create response variable
+    respVar <- newEmptyMVar
+
+    -- Register the pending request
+    atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
+
+    -- Update the request with the ID
+    let request' = request { reqId = reqId }
+
+    -- Serialize and send the request
+    let encoded = encodeRequest request'
+    BS.hPut (connHandle conn) encoded
+    hFlush (connHandle conn)
+
+    -- Return the request ID for tracking
+    return reqId
+
+-- | Receive a response for a specific request
+receiveResponse :: DaemonConnection t -> Int -> Int -> IO (Either BuildError Response)
+receiveResponse conn reqId timeoutMicros = do
+    -- Get response MVar
+    reqMap <- readTVarIO (connRequestMap conn)
+    case Map.lookup reqId reqMap of
+        Nothing ->
+            -- No such request ID
+            return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
+
+        Just respVar -> do
+            -- Wait for response with timeout
+            result <- timeout timeoutMicros $ takeMVar respVar
+
+            -- Clean up request map
+            atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
+
+            -- Return response or error
+            case result of
+                Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
+                Just resp -> return $ Right resp
+
+-- | Send a request and wait for response (synchronous)
+sendRequestSync :: DaemonConnection t -> Request -> Int -> IO (Either BuildError Response)
+sendRequestSync conn request timeoutMicros = do
+    -- Send the request
+    reqId <- sendRequest conn request
+
+    -- Wait for response
+    receiveResponse conn reqId timeoutMicros
+
+-- | Background thread to read and dispatch responses
+responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> IO ()
+responseReaderThread handle requestMap shutdownFlag = forever $ do
+    -- Check if we should shut down
+    shutdown <- readTVarIO shutdownFlag
+    when shutdown $ return ()
+
+    -- Try to read a response
+    response <- try $ readResponseWithTimeout handle 30000000 -- 30 second timeout
+    case response of
+        Left (e :: SomeException) -> do
+            -- Connection error, exit thread
+            return ()
+
+        Right resp -> do
+            -- Look up request and deliver response
+            reqMap <- readTVarIO requestMap
+            case Map.lookup (respId resp) reqMap of
+                Nothing -> return () -- Unknown request ID, ignore
+                Just respVar -> putMVar respVar resp
+
+-- | Helper function to work with singletons
 withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a
 withSPhase sp f = TenM $ \_ st -> do
     let (TenM g) = f sp
@@ -985,9 +1087,8 @@ storeDerivationDaemon :: (CanAccessStore 'Daemon ~ 'True) => Derivation -> TenM 
 storeDerivationDaemon deriv = do
     env <- ask
 
-    -- Serialize the derivation - implementation provided by Ten.Derivation
-    -- Placeholder: actual serialization would be imported from Ten.Derivation
-    let serialized = BS.pack []  -- Placeholder
+    -- Serialize the derivation
+    let serialized = serializeDerivation deriv
 
     -- Calculate a hash for the content
     let contentHash = hashByteString serialized
@@ -1011,9 +1112,6 @@ storeDerivationDaemon deriv = do
 
     -- Return the store path
     return storePath
-  where
-    hashByteString :: BS.ByteString -> Int
-    hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
 -- | Store a derivation in builder context
 storeDerivationBuilder :: Derivation -> TenM 'Eval 'Builder StorePath
@@ -1048,7 +1146,6 @@ storeDerivationBuilder deriv = do
 
         _ -> throwError $ PrivilegeError "Cannot store derivation in builder context without daemon connection"
 
-
 -- | Read a derivation from the store (Daemon context with direct store access)
 readDerivationDaemon :: (CanAccessStore 'Daemon ~ 'True) => StorePath -> TenM p 'Daemon (Either BuildError Derivation)
 readDerivationDaemon path = do
@@ -1062,9 +1159,7 @@ readDerivationDaemon path = do
         else do
             -- Read and deserialize
             content <- liftIO $ BS.readFile fullPath
-
-            -- Placeholder: deserialization would be imported from Ten.Derivation
-            return $ Left $ SerializationError "Derivation deserialization not implemented"
+            return $ deserializeDerivation content
 
 -- | Request a derivation via the daemon protocol (Builder context)
 readDerivationBuilder :: StorePath -> TenM p 'Builder (Either BuildError Derivation)
@@ -1102,8 +1197,8 @@ storeBuildResultDaemon :: (CanAccessStore 'Daemon ~ 'True) => BuildId -> BuildRe
 storeBuildResultDaemon buildId result = do
     env <- ask
 
-    -- Placeholder: serialization would be imported from appropriate module
-    let serialized = BS.pack []  -- Placeholder
+    -- Serialize the build result
+    let serialized = serializeBuildResult result
 
     -- Calculate a hash for the content
     let contentHash = hashByteString serialized
@@ -1127,9 +1222,6 @@ storeBuildResultDaemon buildId result = do
 
     -- Return the store path
     return storePath
-  where
-    hashByteString :: BS.ByteString -> Int
-    hashByteString bs = fromIntegral $ BS.foldl' (\acc byte -> acc * 33 + fromIntegral byte) 5381 bs
 
 -- | Read a build result from the store (Daemon context with direct store access)
 readBuildResultDaemon :: (CanAccessStore 'Daemon ~ 'True) => StorePath -> TenM p 'Daemon (Either BuildError BuildResult)
@@ -1144,9 +1236,7 @@ readBuildResultDaemon path = do
         else do
             -- Read and deserialize
             content <- liftIO $ BS.readFile fullPath
-
-            -- Placeholder: deserialization would be imported from appropriate module
-            return $ Left $ SerializationError "BuildResult deserialization not implemented"
+            return $ deserializeBuildResult content
 
 -- | Read build result via daemon protocol (Builder context)
 readBuildResultBuilder :: StorePath -> TenM p 'Builder (Either BuildError BuildResult)
@@ -1182,9 +1272,13 @@ readBuildResultBuilder path = do
 -- | Encode a request for transmission
 encodeRequest :: Request -> BS.ByteString
 encodeRequest req =
-    let reqJson = "Placeholder JSON serialization" -- Placeholder
-        header = BS.pack [1, 2, 3, 4] -- Placeholder
-        headerLen = BS.length header
+    let reqJson = Aeson.encode $ Aeson.object [
+            "id" Aeson..= reqId req,
+            "type" Aeson..= reqType req,
+            "params" Aeson..= reqParams req,
+            "hasPayload" Aeson..= isJust (reqPayload req)
+            ]
+        headerLen = BS.length (LBS.toStrict reqJson)
         lenBytes = BS.pack [
             fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
             fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
@@ -1194,7 +1288,7 @@ encodeRequest req =
     in
         case reqPayload req of
             Nothing ->
-                BS.concat [lenBytes, header]
+                BS.concat [lenBytes, LBS.toStrict reqJson]
             Just payload ->
                 let payloadLen = BS.length payload
                     payloadLenBytes = BS.pack [
@@ -1203,31 +1297,316 @@ encodeRequest req =
                         fromIntegral (payloadLen `shiftR` 8) .&. 0xFF,
                         fromIntegral payloadLen .&. 0xFF
                         ]
-                in BS.concat [lenBytes, header, payloadLenBytes, payload]
+                in BS.concat [lenBytes, LBS.toStrict reqJson, payloadLenBytes, payload]
 
 -- | Decode a response from bytes
 decodeResponse :: BS.ByteString -> Either Text Response
 decodeResponse bs =
-    -- This is a placeholder implementation
-    Right Response {
-        respId = 0,
-        respStatus = "ok",
-        respMessage = "Success",
-        respData = Map.empty,
-        respPayload = Nothing
-    }
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "JSON decode error: " <> T.pack err
+        Right val -> case Aeson.fromJSON val of
+            Aeson.Error err -> Left $ "JSON conversion error: " <> T.pack err
+            Aeson.Success resp -> Right resp
 
 -- | Read a message with timeout
 readResponseWithTimeout :: Handle -> Int -> IO Response
 readResponseWithTimeout handle timeoutMicros = do
-    -- Placeholder implementation
-    return Response {
-        respId = 0,
-        respStatus = "ok",
-        respMessage = "Success",
-        respData = Map.empty,
-        respPayload = Nothing
-    }
+    -- Read the length prefix (4 bytes)
+    lenBytes <- BS.hGet handle 4
+    when (BS.length lenBytes /= 4) $
+        throwIO $ DaemonError "Incomplete response length"
+
+    -- Decode message length
+    let len :: Int
+        len = fromIntegral (
+            (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+            (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+            (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+            (fromIntegral (BS.index lenBytes 3) :: Word32))
+
+    -- Check if message is too large
+    when (len > 100 * 1024 * 1024) $ -- 100 MB limit
+        throwIO $ DaemonError $ "Response too large: " <> T.pack (show len) <> " bytes"
+
+    -- Read the message body
+    respJson <- BS.hGet handle len
+    when (BS.length respJson /= len) $
+        throwIO $ DaemonError "Incomplete response body"
+
+    -- Check if there's a payload
+    case Aeson.eitherDecodeStrict respJson of
+        Left err -> throwIO $ DaemonError $ "Invalid JSON: " <> T.pack err
+        Right val -> case Aeson.fromJSON val of
+            Aeson.Error err -> throwIO $ DaemonError $ "JSON conversion error: " <> T.pack err
+            Aeson.Success (resp :: Response) -> do
+                -- Check if there's a payload
+                if Map.member "hasPayload" (respData resp) &&
+                   Map.lookup "hasPayload" (respData resp) == Just "true"
+                    then do
+                        -- Read payload length
+                        payloadLenBytes <- BS.hGet handle 4
+                        when (BS.length payloadLenBytes /= 4) $
+                            throwIO $ DaemonError "Incomplete payload length"
+
+                        let payloadLen :: Int
+                            payloadLen = fromIntegral (
+                                (fromIntegral (BS.index payloadLenBytes 0) :: Word32) `shiftL` 24 .|.
+                                (fromIntegral (BS.index payloadLenBytes 1) :: Word32) `shiftL` 16 .|.
+                                (fromIntegral (BS.index payloadLenBytes 2) :: Word32) `shiftL` 8 .|.
+                                (fromIntegral (BS.index payloadLenBytes 3) :: Word32))
+
+                        -- Read payload
+                        payload <- BS.hGet handle payloadLen
+                        when (BS.length payload /= payloadLen) $
+                            throwIO $ DaemonError "Incomplete payload"
+
+                        return resp { respPayload = Just payload }
+                    else return resp
+
+-- | Send a message to a socket
+sendMessage :: Socket -> Message -> IO ()
+sendMessage sock msg = do
+    -- Encode the message
+    let encoded = encodeMessage msg
+    -- Send the message
+    sendAll sock encoded
+
+-- | Receive a message from a socket
+receiveMessage :: Socket -> IO (Either BuildError Message)
+receiveMessage sock = do
+    -- Try to read the message
+    result <- try $ do
+        -- Read the length prefix (4 bytes)
+        lenBytes <- recv sock 4
+        when (BS.length lenBytes /= 4) $
+            throwIO $ DaemonError "Incomplete message length"
+
+        -- Decode message length
+        let len :: Int
+            len = fromIntegral (
+                (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+                (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+                (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+                (fromIntegral (BS.index lenBytes 3) :: Word32))
+
+        -- Check if message is too large
+        when (len > 100 * 1024 * 1024) $ -- 100 MB limit
+            throwIO $ DaemonError $ "Message too large: " <> T.pack (show len) <> " bytes"
+
+        -- Read the message body
+        msgBytes <- recv sock len
+        when (BS.length msgBytes /= len) $
+            throwIO $ DaemonError "Incomplete message body"
+
+        -- Decode the message
+        case decodeMessage msgBytes of
+            Left err -> throwIO $ DaemonError $ "Failed to decode message: " <> err
+            Right msg -> return msg
+
+    case result of
+        Left (e :: SomeException) -> return $ Left $ DaemonError $ T.pack $ show e
+        Right msg -> return $ Right msg
+
+-- | Encode a message
+encodeMessage :: Message -> BS.ByteString
+encodeMessage msg =
+    let encoded = case msg of
+            AuthMessage payload ->
+                let header = Aeson.encode $ Aeson.object [
+                        "type" Aeson..= ("auth" :: Text),
+                        "hasPayload" Aeson..= True
+                        ]
+                    headerLen = BS.length (LBS.toStrict header)
+                    payloadLen = BS.length payload
+                    headerLenBytes = BS.pack [
+                        fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
+                        fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
+                        fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
+                        fromIntegral headerLen .&. 0xFF
+                        ]
+                    payloadLenBytes = BS.pack [
+                        fromIntegral (payloadLen `shiftR` 24) .&. 0xFF,
+                        fromIntegral (payloadLen `shiftR` 16) .&. 0xFF,
+                        fromIntegral (payloadLen `shiftR` 8) .&. 0xFF,
+                        fromIntegral payloadLen .&. 0xFF
+                        ]
+                in BS.concat [headerLenBytes, LBS.toStrict header, payloadLenBytes, payload]
+
+            RequestMessage req ->
+                encodeRequest req
+
+            ResponseMessage resp ->
+                let header = Aeson.encode $ Aeson.object [
+                        "type" Aeson..= ("response" :: Text),
+                        "id" Aeson..= respId resp,
+                        "status" Aeson..= respStatus resp,
+                        "message" Aeson..= respMessage resp,
+                        "data" Aeson..= respData resp,
+                        "hasPayload" Aeson..= isJust (respPayload resp)
+                        ]
+                    headerLen = BS.length (LBS.toStrict header)
+                    headerLenBytes = BS.pack [
+                        fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
+                        fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
+                        fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
+                        fromIntegral headerLen .&. 0xFF
+                        ]
+                in case respPayload resp of
+                    Nothing -> BS.concat [headerLenBytes, LBS.toStrict header]
+                    Just payload ->
+                        let payloadLen = BS.length payload
+                            payloadLenBytes = BS.pack [
+                                fromIntegral (payloadLen `shiftR` 24) .&. 0xFF,
+                                fromIntegral (payloadLen `shiftR` 16) .&. 0xFF,
+                                fromIntegral (payloadLen `shiftR` 8) .&. 0xFF,
+                                fromIntegral payloadLen .&. 0xFF
+                                ]
+                        in BS.concat [headerLenBytes, LBS.toStrict header, payloadLenBytes, payload]
+
+            ErrorMessage err ->
+                let header = Aeson.encode $ Aeson.object [
+                        "type" Aeson..= ("error" :: Text),
+                        "errorType" Aeson..= errorTypeString err,
+                        "message" Aeson..= buildErrorToText err
+                        ]
+                    headerLen = BS.length (LBS.toStrict header)
+                    headerLenBytes = BS.pack [
+                        fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
+                        fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
+                        fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
+                        fromIntegral headerLen .&. 0xFF
+                        ]
+                in BS.concat [headerLenBytes, LBS.toStrict header]
+    in encoded
+  where
+    errorTypeString :: BuildError -> Text
+    errorTypeString (EvalError _) = "eval"
+    errorTypeString (BuildFailed _) = "build"
+    errorTypeString (StoreError _) = "store"
+    errorTypeString (SandboxError _) = "sandbox"
+    errorTypeString (InputNotFound _) = "input"
+    errorTypeString (HashError _) = "hash"
+    errorTypeString (GraphError _) = "graph"
+    errorTypeString (ResourceError _) = "resource"
+    errorTypeString (DaemonError _) = "daemon"
+    errorTypeString (AuthError _) = "auth"
+    errorTypeString (CyclicDependency _) = "cycle"
+    errorTypeString (SerializationError _) = "serialization"
+    errorTypeString (RecursionLimit _) = "recursion"
+    errorTypeString (NetworkError _) = "network"
+    errorTypeString (ParseError _) = "parse"
+    errorTypeString (DBError _) = "db"
+    errorTypeString (GCError _) = "gc"
+    errorTypeString (PhaseError _) = "phase"
+    errorTypeString (PrivilegeError _) = "privilege"
+    errorTypeString (ProtocolError _) = "protocol"
+    errorTypeString (InternalError _) = "internal"
+    errorTypeString (ConfigError _) = "config"
+
+-- | Decode a message
+decodeMessage :: BS.ByteString -> Either Text Message
+decodeMessage bs =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "JSON decode error: " <> T.pack err
+        Right val -> case Aeson.fromJSON val of
+            Aeson.Error err -> Left $ "JSON conversion error: " <> T.pack err
+            Aeson.Success obj -> do
+                -- Get the message type
+                case AKeyMap.lookup "type" obj of
+                    Nothing -> Left "Missing message type"
+                    Just (Aeson.String "auth") -> do
+                        -- This is an auth message
+                        -- Auth messages always have a payload
+                        case AKeyMap.lookup "hasPayload" obj of
+                            Just (Aeson.Bool True) -> do
+                                -- Need to read the payload bytes which should follow
+                                -- But we can't do that here - this needs to be handled by the caller
+                                -- For now, return a placeholder
+                                Right $ AuthMessage BS.empty
+                            _ -> Left "Auth message missing payload indicator"
+
+                    Just (Aeson.String "request") -> do
+                        -- This is a request message
+                        case parseRequest obj of
+                            Left err -> Left $ "Failed to parse request: " <> err
+                            Right req -> Right $ RequestMessage req
+
+                    Just (Aeson.String "response") -> do
+                        -- This is a response message
+                        case parseResponse obj of
+                            Left err -> Left $ "Failed to parse response: " <> err
+                            Right resp -> Right $ ResponseMessage resp
+
+                    Just (Aeson.String "error") -> do
+                        -- This is an error message
+                        case parseError obj of
+                            Left err -> Left $ "Failed to parse error: " <> err
+                            Right err -> Right $ ErrorMessage err
+
+                    Just (Aeson.String typ) -> Left $ "Unknown message type: " <> typ
+                    _ -> Left "Invalid message type"
+  where
+    parseRequest :: Aeson.Object -> Either Text Request
+    parseRequest obj = do
+        reqId <- maybe (Left "Missing request ID") Right $ AKeyMap.lookup "id" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        reqType <- maybe (Left "Missing request type") Right $ AKeyMap.lookup "type" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        reqParams <- maybe (Left "Missing request params") Right $ AKeyMap.lookup "params" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        hasPayload <- maybe (Left "Missing payload indicator") Right $ AKeyMap.lookup "hasPayload" obj >>= Aeson.parseMaybe Aeson.parseJSON
+
+        -- Payload not included in this parse - it should follow the JSON in the byte stream
+        -- For now, just return a placeholder
+        Right $ Request reqId reqType reqParams (if hasPayload then Just BS.empty else Nothing)
+
+    parseResponse :: Aeson.Object -> Either Text Response
+    parseResponse obj = do
+        respId <- maybe (Left "Missing response ID") Right $ AKeyMap.lookup "id" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        respStatus <- maybe (Left "Missing response status") Right $ AKeyMap.lookup "status" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        respMessage <- maybe (Left "Missing response message") Right $ AKeyMap.lookup "message" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        respData <- maybe (Left "Missing response data") Right $ AKeyMap.lookup "data" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        hasPayload <- maybe (Left "Missing payload indicator") Right $ AKeyMap.lookup "hasPayload" obj >>= Aeson.parseMaybe Aeson.parseJSON
+
+        -- Payload not included in this parse - it should follow the JSON in the byte stream
+        -- For now, just return a placeholder
+        Right $ Response respId respStatus respMessage respData (if hasPayload then Just BS.empty else Nothing)
+
+    parseError :: Aeson.Object -> Either Text BuildError
+    parseError obj = do
+        errType <- maybe (Left "Missing error type") Right $ AKeyMap.lookup "errorType" obj >>= Aeson.parseMaybe Aeson.parseJSON
+        msg <- maybe (Left "Missing error message") Right $ AKeyMap.lookup "message" obj >>= Aeson.parseMaybe Aeson.parseJSON
+
+        case errType of
+            "eval" -> Right $ EvalError msg
+            "build" -> Right $ BuildFailed msg
+            "store" -> Right $ StoreError msg
+            "sandbox" -> Right $ SandboxError msg
+            "input" -> Right $ InputNotFound (T.unpack msg)
+            "hash" -> Right $ HashError msg
+            "graph" -> Right $ GraphError msg
+            "resource" -> Right $ ResourceError msg
+            "daemon" -> Right $ DaemonError msg
+            "auth" -> Right $ AuthError msg
+            "cycle" -> Right $ CyclicDependency msg
+            "serialization" -> Right $ SerializationError msg
+            "recursion" -> Right $ RecursionLimit msg
+            "network" -> Right $ NetworkError msg
+            "parse" -> Right $ ParseError msg
+            "db" -> Right $ DBError msg
+            "gc" -> Right $ GCError msg
+            "phase" -> Right $ PhaseError msg
+            "privilege" -> Right $ PrivilegeError msg
+            "protocol" -> Right $ ProtocolError msg
+            "internal" -> Right $ InternalError msg
+            "config" -> Right $ ConfigError msg
+            _ -> Right $ InternalError $ "Unknown error type: " <> errType <> " - " <> msg
+
+-- | Receive a request from the socket
+receiveRequest :: Socket -> IO (Either BuildError Request)
+receiveRequest sock = do
+    msgResult <- receiveMessage sock
+    case msgResult of
+        Left err -> return $ Left err
+        Right (RequestMessage req) -> return $ Right req
+        Right _ -> return $ Left $ ProtocolError "Expected request message, got something else"
 
 -- | Generate a new unique build ID
 newBuildId :: TenM p t BuildId
@@ -1347,7 +1726,7 @@ spawnBuilderProcess programPath args env = do
         -- 6. Execute the builder program
 
         -- For now, just execute the program
-    --ENVIRONMENT VARIABLE CONVERSION
+        --ENVIRONMENT VARIABLE CONVERSION
         executeFile programPath True args (Just $ map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList env)
 
     return pid
@@ -1414,8 +1793,12 @@ timeout micros action = do
         then Just <$> readMVar result
         else return Nothing
 
+-- | Hash a ByteString
+hashByteString :: BS.ByteString -> Digest SHA256
+hashByteString = Crypto.hash
+
 -- | Serialize a derivation to a ByteString for cross-boundary transmission
-serializeDerivation :: Derivation -> ByteString
+serializeDerivation :: Derivation -> BS.ByteString
 serializeDerivation drv =
     -- Convert to JSON and then to ByteString with proper formatting
     LBS.toStrict $ Aeson.encode $ Aeson.object
@@ -1452,7 +1835,7 @@ serializeDerivation drv =
         ]
 
 -- | Deserialize a derivation from ByteString format
-deserializeDerivation :: ByteString -> Either BuildError Derivation
+deserializeDerivation :: BS.ByteString -> Either BuildError Derivation
 deserializeDerivation bs =
     case Aeson.eitherDecodeStrict bs of
         Left err -> Left $ SerializationError $ "JSON parse error: " <> T.pack err
@@ -1460,11 +1843,11 @@ deserializeDerivation bs =
             Aeson.Error err -> Left $ SerializationError $ "JSON conversion error: " <> T.pack err
             Aeson.Success drv -> Right drv
   where
-fromJSON :: Aeson.Value -> Aeson.Result Derivation
-fromJSON val = case Aeson.parseEither parser val of
-    Left err -> Aeson.Error err
-    Right x -> Aeson.Success x
-  where
+    fromJSON :: Aeson.Value -> Aeson.Result Derivation
+    fromJSON val = case Aeson.parseEither parser val of
+        Left err -> Aeson.Error err
+        Right x -> Aeson.Success x
+
     parser = Aeson.withObject "Derivation" $ \o -> do
         name <- o Aeson..: "name"
         hash <- o Aeson..: "hash"
@@ -1513,8 +1896,33 @@ fromJSON val = case Aeson.parseEither parser val of
     parseEnvMap = Aeson.withObject "Environment" $ \o ->
         return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- AKeyMap.toList o]
 
--- | Helper to deserialize a BuildResult properly
-deserializeBuildResult :: ByteString -> Either BuildError BuildResult
+-- | Serialize BuildResult to ByteString
+serializeBuildResult :: BuildResult -> BS.ByteString
+serializeBuildResult result =
+    LBS.toStrict $ Aeson.encode $ Aeson.object
+        [ "outputs" Aeson..= map encodeStorePath (Set.toList $ brOutputPaths result)
+        , "exitCode" Aeson..= encodeExitCode (brExitCode result)
+        , "log" Aeson..= brLog result
+        , "references" Aeson..= map encodeStorePath (Set.toList $ brReferences result)
+        ]
+  where
+    encodeStorePath :: StorePath -> Aeson.Value
+    encodeStorePath (StorePath hash name) = Aeson.object
+        [ "hash" Aeson..= hash
+        , "name" Aeson..= name
+        ]
+
+    encodeExitCode :: ExitCode -> Aeson.Value
+    encodeExitCode ExitSuccess = Aeson.object
+        [ "type" Aeson..= ("success" :: Text)
+        ]
+    encodeExitCode (ExitFailure code) = Aeson.object
+        [ "type" Aeson..= ("failure" :: Text)
+        , "code" Aeson..= code
+        ]
+
+-- | Deserialize BuildResult from ByteString
+deserializeBuildResult :: BS.ByteString -> Either BuildError BuildResult
 deserializeBuildResult bs =
     case Aeson.eitherDecodeStrict bs of
         Left err -> Left $ SerializationError $ "JSON parse error: " <> T.pack err
@@ -1544,7 +1952,6 @@ deserializeBuildResult bs =
             , brReferences = Set.fromList refs
             }
 
-
     parseStorePath :: Aeson.Value -> Parser StorePath
     parseStorePath = Aeson.withObject "StorePath" $ \o -> do
         hash <- o Aeson..: "hash"
@@ -1559,3 +1966,49 @@ deserializeBuildResult bs =
             else do
                 code <- o Aeson..: "code"
                 return $ ExitFailure code
+
+instance Aeson.FromJSON Response where
+  parseJSON = Aeson.withObject "Response" $ \o -> do
+    id <- o Aeson..: "id"
+    status <- o Aeson..: "status"
+    message <- o Aeson..: "message"
+    respData <- o Aeson..: "data"
+    hasPayload <- o Aeson..:? "hasPayload" Aeson..!= False
+    return Response {
+      respId = id,
+      respStatus = status,
+      respMessage = message,
+      respData = respData,
+      respPayload = if hasPayload then Just BS.empty else Nothing
+    }
+
+instance Aeson.ToJSON Response where
+  toJSON resp = Aeson.object [
+      "id" Aeson..= respId resp,
+      "status" Aeson..= respStatus resp,
+      "message" Aeson..= respMessage resp,
+      "data" Aeson..= respData resp,
+      "hasPayload" Aeson..= isJust (respPayload resp)
+    ]
+
+-- Similarly for Request
+instance Aeson.FromJSON Request where
+  parseJSON = Aeson.withObject "Request" $ \o -> do
+    id <- o Aeson..: "id"
+    reqType <- o Aeson..: "type"
+    params <- o Aeson..: "params"
+    hasPayload <- o Aeson..:? "hasPayload" Aeson..!= False
+    return Request {
+      reqId = id,
+      reqType = reqType,
+      reqParams = params,
+      reqPayload = if hasPayload then Just BS.empty else Nothing
+    }
+
+instance Aeson.ToJSON Request where
+  toJSON req = Aeson.object [
+      "id" Aeson..= reqId req,
+      "type" Aeson..= reqType req,
+      "params" Aeson..= reqParams req,
+      "hasPayload" Aeson..= isJust (reqPayload req)
+    ]
