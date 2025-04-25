@@ -71,7 +71,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Bits ((.|.), (.&.))
-import Data.Maybe (isJust, fromMaybe, listToMaybe, catMaybes)
+import Data.Maybe (isJust, fromMaybe, listToMaybe, catMaybes, mapMaybe)
 import qualified Data.Binary as Binary
 import Data.Binary.Get (runGet)
 import Data.Binary.Put (runPut)
