@@ -52,7 +52,7 @@ module Ten.Daemon.Protocol (
     -- GC status
     GCRequestParams(..),
     GCStatusRequestParams(..),
-    GCStatusResponse(..),
+    GCStatusInfo(..),
 
     -- Privilege transition
     PrivilegeTransition(..),
@@ -146,6 +146,8 @@ import Data.Binary (Binary(..), Get, put, get, encode, decode)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Unique (Unique, hashUnique)
 
+import Ten.Derivation
+
 -- Import Ten.Core types and functions
 import Ten.Core (
     -- Core types
@@ -154,8 +156,8 @@ import Ten.Core (
     UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
     Derivation, BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
     Request(..), Response(..), Message(..), AuthResult(..),
-    GCStats(..), GCRoot,
-    DaemonConfig(..),
+    GCStats(..), GCRoot(..),
+    DaemonConfig(..), parseStorePath,
 
     -- Type families for permissions
     CanAccessStore, CanCreateSandbox, CanDropPrivileges, CanModifyStore,
@@ -168,7 +170,8 @@ import Ten.Core (
     buildErrorToText,
 
     -- Helper functions
-    hashByteString)
+    hashByteString
+    )
 
 -- | List of compatible protocol versions
 compatibleVersions :: [ProtocolVersion]
@@ -213,7 +216,7 @@ data ProtocolError
     | AuthenticationFailed Text
     | OperationFailed Text
     | InvalidRequest Text
-    | InternalError Text
+    | ProtocolInternalError Text
     | PrivilegeViolation Text
     deriving (Show, Eq)
 
@@ -452,14 +455,14 @@ data GCStatusInfo = GCStatusInfo {
     gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON GCStatusResponse where
+instance Aeson.ToJSON GCStatusInfo where
     toJSON GCStatusInfo{..} = Aeson.object [
             "running" .= gcRunning,
             "owner" .= gcOwner,
             "lockTime" .= gcLockTime
         ]
 
-instance Aeson.FromJSON GCStatusResponse where
+instance Aeson.FromJSON GCStatusInfo where
     parseJSON = Aeson.withObject "GCStatusResponse" $ \v -> do
         gcRunning <- v .: "running"
         gcOwner <- v .: "owner"
@@ -1322,7 +1325,7 @@ serializeDaemonResponse resp =
     errorTypeString (PhaseError _) = "phase"
     errorTypeString (PrivilegeError _) = "privilege"
     errorTypeString (ProtocolError _) = "protocol"
-    errorTypeString (InternalError _) = "internal"
+    errorTypeString (ProtocolInternalError _) = "internal"
     errorTypeString (ConfigError _) = "config"
 
 -- | Deserialize a daemon response from ByteString
@@ -1428,6 +1431,20 @@ sendDaemonRequest handle req = do
                 case deserializeDaemonResponse respData mRespPayload of
                     Left err -> return $ Left $ ProtocolParseError err
                     Right resp -> return $ Right resp
+
+-- | Receive a daemon response from a socket
+receiveDaemonResponse :: Socket -> IO (Either ProtocolError DaemonResponse)
+receiveDaemonResponse sock = do
+    -- Try to read the response
+    result <- try $ receiveFramedResponse sock
+    case result of
+        Left (e :: SomeException) ->
+            return $ Left ConnectionClosed
+        Right (respData, mRespPayload) -> do
+            -- Deserialize response
+            case deserializeDaemonResponse respData mRespPayload of
+                Left err -> return $ Left $ ProtocolParseError err
+                Right resp -> return $ Right resp
 
 -- | Receive a daemon response from a socket
 receiveFramedResponse :: Socket -> IO (BS.ByteString, Maybe BS.ByteString)
@@ -1674,6 +1691,19 @@ requestToText = \case
 
     ConfigRequest ->
         "Get daemon configuration"
+
+-- | Convert a ProtocolError to a BuildError
+protocolErrorToBuildError :: ProtocolError -> BuildError
+protocolErrorToBuildError = \case
+    ProtocolParseError text -> ParseError $ "Protocol parse error: " <> text
+    VersionMismatch v1 v2 -> ProtocolError $ "Protocol version mismatch: " <> T.pack (show v1) <> " vs " <> T.pack (show v2)
+    MessageTooLarge size -> ProtocolError $ "Message too large: " <> T.pack (show size)
+    ConnectionClosed -> NetworkError "Connection closed unexpectedly"
+    AuthenticationFailed text -> AuthError text
+    OperationFailed text -> ProtocolError $ "Operation failed: " <> text
+    InvalidRequest text -> ProtocolError $ "Invalid request: " <> text
+    ProtocolInternalError text -> InternalError $ "Protocol internal error: " <> text
+    PrivilegeViolation text -> PrivilegeError text
 
 -- | Convert a response to human-readable text
 responseToText :: DaemonResponse -> Text
