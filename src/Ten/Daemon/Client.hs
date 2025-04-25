@@ -103,7 +103,7 @@ import Ten.Core
 import Ten.Daemon.Protocol
 import Ten.Daemon.Auth (UserCredentials(..))
 import Ten.Daemon.Config (getDefaultSocketPath)
-import Ten.Derivation (Derivation, serializeDerivation, deserializeDerivation)
+import Ten.Derivation (serializeDerivation, deserializeDerivation)
 
 -- | Connect to the Ten daemon - always in Builder context
 connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError (DaemonConnection 'Builder))
@@ -216,7 +216,7 @@ createSocketAndConnect socketPath = do
         (return sock)
         close
         (\s -> do
-            connect s (SockAddr​Unix socketPath)
+            connect s (SockAddrUnix socketPath)
             handle <- socketToHandle s ReadWriteMode
             return (s, handle))
 
