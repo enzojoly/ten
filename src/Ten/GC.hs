@@ -229,7 +229,7 @@ addRoot path name permanent = do
     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db ->
         dbExecute db
             "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
-            (storePathToText path, name, if permanent then "permanent" else "user")
+            (storePathToText path, name, (if permanent then "permanent" else "user") :: Text)
 
     logMsg 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
 
@@ -604,9 +604,14 @@ collectGarbageWithStats = do
                 -- Skip paths in gc-roots directory
                 let pathText = storePathToText path
                 let fsPath = storeLocationPath </> T.unpack pathText
-                unless ("gc-roots/" `T.isPrefixOf` pathText) $
-                    -- Attempt to delete, ignoring errors
-                    catch (removePathForcibly fsPath) $ \(_ :: IOError) -> return ()
+                unless ("gc-roots/" `T.isPrefixOf` pathText) $ do
+                    -- Attempt to delete, catching and logging any errors but continuing
+                    -- This is critical for Nix-like robustness during GC
+                    catch (removePathForcibly fsPath) $ \(e :: SomeException) -> do
+                        -- Log the error but continue with GC
+                        hPutStrLn stderr $ "Warning: Could not remove path: " ++ fsPath
+                        hPutStrLn stderr $ "  Error: " ++ show e
+                        return ()
 
             return $ Set.size deletablePaths
 
@@ -724,7 +729,7 @@ getFileSystemRootPaths rootsDir = do
 
                 if isLink
                     then do
-                        target <- try @IOException $ ByteString.readSymbolicLink srcPath
+                        target <- try @SomeException $ ByteString.readSymbolicLink srcPath
                         case target of
                             Left (_ :: SomeException) -> return acc
                             Right targetPath ->
@@ -761,15 +766,21 @@ getRuntimeRootPaths storeLocation = do
     if not exists
         then return Set.empty
         else do
-            -- Look for active build locks
-            files <- listFilesBS locksDirBS `catch` \(_ :: IOException) -> return []
+            -- Look for active build locks - robust against all kinds of errors
+            files <- listFilesBS locksDirBS `catch` \(e :: SomeException) -> do
+                -- Log but continue - GC should be maximally robust
+                hPutStrLn stderr $ "Warning: Error accessing lock directory: " ++ show e
+                return []
 
             -- Process each lock file to find references to store paths
             foldM (\acc lockFile -> do
                 -- Read lock file
-                content <- try @IOException $ BS.readFile (BC.unpack lockFile)
+                content <- try @SomeException $ BS.readFile (BC.unpack lockFile)
                 case content of
-                    Left (_ :: SomeException) -> return acc
+                    Left e -> do
+                        -- Log error but continue GC process, following Nix philosophy
+                        liftIO $ hPutStrLn stderr $ "Warning: Error reading lock file: " ++ BC.unpack lockFile
+                        return acc
                     Right fileContent -> do
                         -- Extract store paths from lock file content
                         let storePaths = extractStorePaths (BC.unpack fileContent)
@@ -956,9 +967,11 @@ breakStaleLock lockPath = do
                 -- Log that we're breaking a stale lock
                 hPutStrLn stderr $ "Breaking stale GC lock: " ++ lockPath
 
-                -- Remove the lock file
-                removeFile lockPath `catch` \(_ :: SomeException) ->
+                -- Remove the lock file - catch any exception but log it
+                -- This ensures GC can proceed even when lock removal fails
+                removeFile lockPath `catch` \(e :: SomeException) -> do
                     hPutStrLn stderr $ "Warning: Failed to remove stale lock file: " ++ lockPath
+                    hPutStrLn stderr $ "  Error: " ++ show e
 
 -- | Check if a lock file exists and is valid
 checkLockFile :: FilePath -> IO Bool
@@ -993,7 +1006,7 @@ breakStaleLock' lockPath = do
     exists <- doesFileExist lockPath
     when exists $ do
         -- Read the lock file
-        content <- try @IOException $ readFile lockPath
+        content <- try @SomeException $ readFile lockPath
         case content of
             Right pidStr -> do
                 case reads pidStr of
@@ -1065,14 +1078,22 @@ acquireFileLock lockPath = do
 -- | Release a file lock
 releaseFileLock :: GCLock -> IO ()
 releaseFileLock lock = do
-    -- Release the lock
-    setLock (lockFd lock) (Unlock, AbsoluteSeek, 0, 0)
+    -- Release the lock - catch any errors but always try to continue
+    catch (setLock (lockFd lock) (Unlock, AbsoluteSeek, 0, 0)) $ \(e :: SomeException) -> do
+        hPutStrLn stderr $ "Warning: Error releasing lock: " ++ show e
+        return ()
 
-    -- Close the file descriptor
-    closeFd (lockFd lock)
+    -- Close the file descriptor - again, be robust against errors
+    catch (closeFd (lockFd lock)) $ \(e :: SomeException) -> do
+        hPutStrLn stderr $ "Warning: Error closing lock file descriptor: " ++ show e
+        return ()
 
-    -- Remove the lock file
-    catchIOError (removeFile (lockPath lock)) (\_ -> return ())
+    -- Remove the lock file - if this fails, log but continue
+    -- This approach ensures maximum resilience during GC, following Nix's philosophy
+    catchIOError (removeFile (lockPath lock)) $ \err -> do
+        hPutStrLn stderr $ "Warning: Error removing lock file: " ++ lockPath lock
+        hPutStrLn stderr $ "  Error: " ++ show err
+        return ()
 
 -- | Get active build paths (to prevent GC during builds)
 getActiveBuildPaths :: TenM 'Build 'Daemon (Set StorePath)
@@ -1171,8 +1192,12 @@ repairStore = do
                                     -- Mark as invalid in database
                                     SQLite.execute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?" (Only pathText)
 
-                                    -- Delete the file
-                                    catchIOError (removeFile path) (\_ -> return ())
+                                    -- Delete the file - robust against any kind of error
+                                    catchIOError (removeFile path) $ \err -> do
+                                        -- Log but continue with GC process
+                                        hPutStrLn stderr $ "Warning: Could not remove invalid path: " ++ path
+                                        hPutStrLn stderr $ "  Error: " ++ show err
+                                        return ()
 
                                     return (v, i + 1, size + pathSize)
             ) (0, 0, 0) paths
@@ -1472,8 +1497,11 @@ isGCRoot path = do
         then return True
         else do
             -- If not in database, check filesystem
-            -- List all roots
-            roots <- liftIO $ listFilesBS (BC.pack rootsDir) `catch` \(_ :: IOException) -> return []
+            -- List all roots - catch any exception for Nix-like robustness
+            roots <- liftIO $ listFilesBS (BC.pack rootsDir) `catch` \(e :: SomeException) -> do
+                -- Log but continue with GC
+                hPutStrLn stderr $ "Warning: Error listing GC roots: " ++ show e
+                return []
 
             -- Check if any root links to this path
             isFileRoot <- liftIO $ foldM (\found root -> do
@@ -1494,7 +1522,7 @@ isGCRoot path = do
 
             -- If found in filesystem but not in DB, register it
             when (isFileRoot && not isDbRoot) $
-                registerGCRoot path (T.pack "filesystem-found") "symlink"
+                registerGCRoot path (T.pack "filesystem-found") ("symlink" :: Text)
 
             return isFileRoot
   where
