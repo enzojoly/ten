@@ -18,9 +18,6 @@ module Ten.GC
     , withGCLock
     , breakStaleLock
 
-    -- GC statistics
-    , GCStats(..)
-
     -- GC roots management (daemon privileges only)
     , addRoot
     , removeRoot
@@ -98,27 +95,27 @@ import Data.Singletons.TH
 import Data.Maybe (fromMaybe, isJust, listToMaybe, catMaybes)
 import Network.Socket (Socket)
 import qualified Network.Socket as Network
-import Crypto.Hash (hash, SHA256(..), Digest)
-import qualified Crypto.Hash as Crypto
-import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
-import Control.Concurrent.MVar
 
-import Ten.Core
+-- Import Ten.Core with explicit import list to avoid ambiguity
+import Ten.Core (
+    -- Core types
+    TenM(..), Phase(..), PrivilegeTier(..), BuildEnv(..), BuildError(..), BuildId(..),
+    StorePath(..), storeHash, storeName, storePathToText, storePathToFilePath,
+    GCStats(..), GCRoot(..), rootPath, rootName, rootType, rootTime,
+    Request(..), Response(..), RootType(..), SPhase(..), SPrivilegeTier(..),
+    sDaemon, sBuilder, sBuild,
+    -- Functions
+    parseStorePath, sendRequest, sendRequestSync, receiveResponse,
+    currentBuildId, logMsg, defaultDBPath, filePathToStorePath, gcLockPath,
+    -- Error handling
+    throwError, catchError
+    )
 
 -- | Lock information returned by daemon
 data GCLockInfo = GCLockInfo
     { lockOwnerPid :: ProcessID
     , lockAcquiredTime :: UTCTime
     , lockIsStale :: Bool
-    } deriving (Show, Eq)
-
--- | Statistics from a garbage collection run
-data GCStats = GCStats
-    { gcTotal :: Int               -- Total number of paths in store
-    , gcLive :: Int                -- Number of live paths
-    , gcCollected :: Int           -- Number of paths collected
-    , gcBytes :: Integer           -- Number of bytes freed
-    , gcElapsedTime :: NominalDiffTime  -- Time taken for GC
     } deriving (Show, Eq)
 
 -- | File lock structure for GC coordination
@@ -141,12 +138,12 @@ addRoot st path name permanent = do
     -- Verify the path exists in the store
     exists <- storePathExists path
     unless exists $
-        throwError $ StoreError $ "Cannot add root for non-existent path: " <> storeHash path
+        throwError $ Ten.Core.StoreError $ "Cannot add root for non-existent path: " <> storeHash path
 
     -- Create the root
     now <- liftIO getCurrentTime
     let rootType = if permanent then PermanentRoot else SymlinkRoot
-    let root = GCRoot path name rootType now
+    let root = Ten.Core.GCRoot path name rootType now
 
     -- Write the root to the roots directory
     let rootsDir = storeLocation env </> "gc-roots"
@@ -165,7 +162,7 @@ addRoot st path name permanent = do
             "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
             (storePathToText path, name, if permanent then "permanent" else "user")
 
-    logMsg 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
+    Ten.Core.logMsg 1 $ "Added GC root: " <> name <> " -> " <> storeHash path
 
     return root
 
@@ -175,37 +172,37 @@ requestAddRoot _ path name permanent = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case runMode env of
-        ClientMode conn -> do
+    case Ten.Core.runMode env of
+        Ten.Core.ClientMode conn -> do
             -- Create a request
-            let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "add-gc-root",
-                    reqParams = Map.fromList [
+            let request = Ten.Core.Request {
+                    Ten.Core.reqId = 0,  -- Will be set by sendRequest
+                    Ten.Core.reqType = "add-gc-root",
+                    Ten.Core.reqParams = Map.fromList [
                         ("path", storePathToText path),
                         ("name", name),
                         ("permanent", if permanent then "true" else "false")
                     ],
-                    reqPayload = Nothing
+                    Ten.Core.reqPayload = Nothing
                 }
 
             -- Send request through daemon connection
-            reqId <- liftIO $ sendRequest conn request
-            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+            reqId <- liftIO $ Ten.Core.sendRequest conn request
+            responseResult <- liftIO $ Ten.Core.receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
             -- Handle response
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if respStatus response == "ok"
+                    if Ten.Core.respStatus response == "ok"
                         then do
                             -- Construct a GC root from the response
                             now <- liftIO getCurrentTime
                             let rootType = if permanent then PermanentRoot else SymlinkRoot
-                            return $ GCRoot path name rootType now
-                        else throwError $ DaemonError $ respMessage response
+                            return $ Ten.Core.GCRoot path name rootType now
+                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
 
-        _ -> throwError $ DaemonError "Not connected to daemon"
+        _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Remove a root (daemon privilege only)
 removeRoot :: SPrivilegeTier 'Daemon -> GCRoot -> TenM 'Build 'Daemon ()
@@ -214,7 +211,7 @@ removeRoot st root = do
 
     -- Generate the root file path
     let rootsDir = storeLocation env </> "gc-roots"
-    let rootFile = rootsDir </> (T.unpack $ storeHash (rootPath root) <> "-" <> rootName root)
+    let rootFile = rootsDir </> (T.unpack $ storeHash (Ten.Core.rootPath root) <> "-" <> Ten.Core.rootName root)
 
     -- Check if it exists
     exists <- liftIO $ doesFileExist rootFile
@@ -222,7 +219,7 @@ removeRoot st root = do
     -- Remove from filesystem and database
     when exists $ do
         -- Don't remove permanent roots unless forced
-        unless (rootType root == PermanentRoot) $ do
+        unless (Ten.Core.rootType root == PermanentRoot) $ do
             -- Remove from filesystem
             liftIO $ removeFile rootFile
 
@@ -230,9 +227,9 @@ removeRoot st root = do
             withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
                 execute db
                     "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
-                    (storePathToText (rootPath root), rootName root)
+                    (storePathToText (Ten.Core.rootPath root), Ten.Core.rootName root)
 
-            logMsg 1 $ "Removed GC root: " <> rootName root <> " -> " <> storeHash (rootPath root)
+            Ten.Core.logMsg 1 $ "Removed GC root: " <> Ten.Core.rootName root <> " -> " <> storeHash (Ten.Core.rootPath root)
 
 -- | Request to remove a root from builder context via protocol
 requestRemoveRoot :: SPrivilegeTier 'Builder -> GCRoot -> TenM 'Build 'Builder ()
@@ -240,28 +237,28 @@ requestRemoveRoot _ root = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case runMode env of
-        ClientMode conn -> do
+    case Ten.Core.runMode env of
+        Ten.Core.ClientMode conn -> do
             -- Create a request
-            let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "remove-gc-root",
-                    reqParams = Map.singleton "name" (rootName root),
-                    reqPayload = Nothing
+            let request = Ten.Core.Request {
+                    Ten.Core.reqId = 0,  -- Will be set by sendRequest
+                    Ten.Core.reqType = "remove-gc-root",
+                    Ten.Core.reqParams = Map.singleton "name" (Ten.Core.rootName root),
+                    Ten.Core.reqPayload = Nothing
                 }
 
             -- Send request through daemon connection
-            reqId <- liftIO $ sendRequest conn request
-            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+            reqId <- liftIO $ Ten.Core.sendRequest conn request
+            responseResult <- liftIO $ Ten.Core.receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
             -- Handle response
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    unless (respStatus response == "ok") $
-                        throwError $ DaemonError $ respMessage response
+                    unless (Ten.Core.respStatus response == "ok") $
+                        throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
 
-        _ -> throwError $ DaemonError "Not connected to daemon"
+        _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | List all current GC roots
 -- Works in both contexts through different mechanisms
@@ -297,8 +294,8 @@ listRootsPrivileged st = do
         liftIO $ buildDatabaseRoots results
 
     -- Combine both sources, with filesystem taking precedence for duplicates
-    let allRoots = Map.union (Map.fromList [(rootPath r, r) | r <- fsRoots])
-                           (Map.fromList [(rootPath r, r) | r <- dbRoots])
+    let allRoots = Map.union (Map.fromList [(Ten.Core.rootPath r, r) | r <- fsRoots])
+                           (Map.fromList [(Ten.Core.rootPath r, r) | r <- dbRoots])
 
     return $ Map.elems allRoots
 
@@ -308,37 +305,37 @@ requestListRoots _ = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case runMode env of
-        ClientMode conn -> do
+    case Ten.Core.runMode env of
+        Ten.Core.ClientMode conn -> do
             -- Create a request
-            let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "list-gc-roots",
-                    reqParams = Map.empty,
-                    reqPayload = Nothing
+            let request = Ten.Core.Request {
+                    Ten.Core.reqId = 0,  -- Will be set by sendRequest
+                    Ten.Core.reqType = "list-gc-roots",
+                    Ten.Core.reqParams = Map.empty,
+                    Ten.Core.reqPayload = Nothing
                 }
 
             -- Send request through daemon connection
-            reqId <- liftIO $ sendRequest conn request
-            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+            reqId <- liftIO $ Ten.Core.sendRequest conn request
+            responseResult <- liftIO $ Ten.Core.receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
             -- Handle response
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if respStatus response == "ok"
+                    if Ten.Core.respStatus response == "ok"
                         then do
                             -- Parse roots from response data
-                            let rootCount = read $ T.unpack $ Map.findWithDefault "0" "count" (respData response)
+                            let rootCount = read $ T.unpack $ Map.findWithDefault "0" "count" (Ten.Core.respData response)
                                 roots = [0..(rootCount-1)]
                                 parseRoot i = do
                                     let prefix = "root." <> T.pack (show i) <> "."
-                                        pathText = Map.findWithDefault "" (prefix <> "path") (respData response)
-                                        name = Map.findWithDefault "" (prefix <> "name") (respData response)
-                                        typeText = Map.findWithDefault "symlink" (prefix <> "type") (respData response)
-                                        timeText = Map.findWithDefault "" (prefix <> "time") (respData response)
+                                        pathText = Map.findWithDefault "" (prefix <> "path") (Ten.Core.respData response)
+                                        name = Map.findWithDefault "" (prefix <> "name") (Ten.Core.respData response)
+                                        typeText = Map.findWithDefault "symlink" (prefix <> "type") (Ten.Core.respData response)
+                                        timeText = Map.findWithDefault "" (prefix <> "time") (Ten.Core.respData response)
 
-                                    case parseStorePath pathText of
+                                    case Ten.Core.parseStorePath pathText of
                                         Nothing -> return Nothing
                                         Just path -> do
                                             let rootType = case typeText of
@@ -351,20 +348,20 @@ requestListRoots _ = do
                                                     [(t, "")] -> t
                                                     _ -> posixSecondsToUTCTime 0
 
-                                            return $ Just $ GCRoot path name rootType time
+                                            return $ Just $ Ten.Core.GCRoot path name rootType time
 
                             roots <- mapM parseRoot roots
                             return $ catMaybes roots
-                        else throwError $ DaemonError $ respMessage response
+                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
 
-        _ -> throwError $ DaemonError "Not connected to daemon"
+        _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Build database roots from query results
 buildDatabaseRoots :: [(Text, Text, Text, Int)] -> IO [GCRoot]
 buildDatabaseRoots results = do
     now <- getCurrentTime
     forM results $ \(pathText, name, typeStr, timestamp) -> do
-        case parseStorePath pathText of
+        case Ten.Core.parseStorePath pathText of
             Just path -> do
                 -- Convert timestamp to UTCTime
                 let rootTime = posixSecondsToUTCTime (fromIntegral timestamp)
@@ -376,11 +373,11 @@ buildDatabaseRoots results = do
                       "registry" -> RegistryRoot
                       _ -> SymlinkRoot
 
-                return $ GCRoot
-                    { rootPath = path
-                    , rootName = name
-                    , rootType = rootType
-                    , rootTime = rootTime
+                return $ Ten.Core.GCRoot
+                    { Ten.Core.rootPath = path
+                    , Ten.Core.rootName = name
+                    , Ten.Core.rootType = rootType
+                    , Ten.Core.rootTime = rootTime
                     }
             Nothing -> throwIO $ userError $ "Invalid store path in database: " ++ T.unpack pathText
 
@@ -411,7 +408,7 @@ getFileSystemRoots rootsDir = do
                     case target of
                         Left (_ :: SomeException) -> return Nothing
                         Right linkTarget -> do
-                            let path = case filePathToStorePath linkTarget of
+                            let path = case Ten.Core.filePathToStorePath linkTarget of
                                     Just p -> p
                                     Nothing -> StorePath "unknown" "unknown"
 
@@ -425,11 +422,11 @@ getFileSystemRoots rootsDir = do
                                           then PermanentRoot
                                           else SymlinkRoot
 
-                            return $ Just $ GCRoot
-                                { rootPath = path
-                                , rootName = name
-                                , rootType = rootType
-                                , rootTime = now
+                            return $ Just $ Ten.Core.GCRoot
+                                { Ten.Core.rootPath = path
+                                , Ten.Core.rootName = name
+                                , Ten.Core.rootType = rootType
+                                , Ten.Core.rootTime = now
                                 }
                 else return Nothing
         else return Nothing)
@@ -451,37 +448,37 @@ requestGarbageCollection _ force = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case runMode env of
-        ClientMode conn -> do
+    case Ten.Core.runMode env of
+        Ten.Core.ClientMode conn -> do
             -- Create a request
-            let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "gc",
-                    reqParams = Map.singleton "force" (if force then "true" else "false"),
-                    reqPayload = Nothing
+            let request = Ten.Core.Request {
+                    Ten.Core.reqId = 0,  -- Will be set by sendRequest
+                    Ten.Core.reqType = "gc",
+                    Ten.Core.reqParams = Map.singleton "force" (if force then "true" else "false"),
+                    Ten.Core.reqPayload = Nothing
                 }
 
             -- Send request through daemon connection
-            reqId <- liftIO $ sendRequest conn request
-            responseResult <- liftIO $ receiveResponse conn reqId 300000000 -- 5 minutes timeout
+            reqId <- liftIO $ Ten.Core.sendRequest conn request
+            responseResult <- liftIO $ Ten.Core.receiveResponse conn reqId 300000000 -- 5 minutes timeout
 
             -- Handle response
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if respStatus response == "ok"
+                    if Ten.Core.respStatus response == "ok"
                         then do
                             -- Parse GC stats from response data
-                            let total = read $ T.unpack $ Map.findWithDefault "0" "total" (respData response)
-                                live = read $ T.unpack $ Map.findWithDefault "0" "live" (respData response)
-                                collected = read $ T.unpack $ Map.findWithDefault "0" "collected" (respData response)
-                                bytes = read $ T.unpack $ Map.findWithDefault "0" "bytes" (respData response)
-                                time = read $ T.unpack $ Map.findWithDefault "0" "elapsedTime" (respData response)
+                            let total = read $ T.unpack $ Map.findWithDefault "0" "total" (Ten.Core.respData response)
+                                live = read $ T.unpack $ Map.findWithDefault "0" "live" (Ten.Core.respData response)
+                                collected = read $ T.unpack $ Map.findWithDefault "0" "collected" (Ten.Core.respData response)
+                                bytes = read $ T.unpack $ Map.findWithDefault "0" "bytes" (Ten.Core.respData response)
+                                time = read $ T.unpack $ Map.findWithDefault "0" "elapsedTime" (Ten.Core.respData response)
 
-                            return $ GCStats total live collected bytes time
-                        else throwError $ DaemonError $ respMessage response
+                            return $ Ten.Core.GCStats total live collected bytes time
+                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
 
-        _ -> throwError $ DaemonError "Not connected to daemon"
+        _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Run garbage collection with stats (internal implementation)
 collectGarbageWithStats :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon GCStats
@@ -499,18 +496,18 @@ collectGarbageWithStats st = do
         rootPaths <- liftIO $ findAllRoots db storeLocationPath
 
         -- Log information about roots
-        logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
+        Ten.Core.logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
 
         -- Find all paths reachable from roots (transitive closure)
         reachablePaths <- liftIO $ computeReachablePathsFromRoots db rootPaths
 
         -- Log information about reachable paths
-        logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
+        Ten.Core.logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
 
         -- Get active build paths (if in daemon mode)
         activePaths <- getActiveBuildPaths st
         when (not $ Set.null activePaths) $
-            logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
+            Ten.Core.logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
 
         -- Combine reachable and active paths
         let protectedPaths = Set.union reachablePaths activePaths
@@ -543,12 +540,12 @@ collectGarbageWithStats st = do
         let elapsed = diffUTCTime endTime startTime
 
         -- Return statistics
-        return GCStats
-            { gcTotal = Set.size allStorePaths
-            , gcLive = Set.size reachablePaths
-            , gcCollected = deleted
-            , gcBytes = totalSize
-            , gcElapsedTime = elapsed
+        return Ten.Core.GCStats
+            { Ten.Core.gcTotal = Set.size allStorePaths
+            , Ten.Core.gcLive = Set.size reachablePaths
+            , Ten.Core.gcCollected = deleted
+            , Ten.Core.gcBytes = totalSize
+            , Ten.Core.gcElapsedTime = elapsed
             }
 
 -- | Get file/path size in bytes
@@ -575,7 +572,7 @@ findAllStorePaths db storeLocation = do
     results <- SQLite.query_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
     -- Parse StorePaths and create set
-    let dbPaths = Set.fromList $ catMaybes $ map (\(Only p) -> parseStorePath p) results
+    let dbPaths = Set.fromList $ catMaybes $ map (\(Only p) -> Ten.Core.parseStorePath p) results
 
     -- If DB is empty, fall back to filesystem scan
     if Set.null dbPaths
@@ -601,7 +598,7 @@ scanFilesystemForPaths storeLocation = do
                         unless (file `elem` ["gc-roots", "tmp", "locks", "var"] ||
                               any (`isPrefixOf` file) ["gc-roots", "tmp.", ".",  ".."]) $ do
                             -- Check if it's a store path (hash-name format)
-                            case parseStorePath (T.pack file) of
+                            case Ten.Core.parseStorePath (T.pack file) of
                                 Just path -> return $ Set.insert path acc
                                 Nothing -> return acc
                         return acc
@@ -646,7 +643,7 @@ getFileSystemRootPaths rootsDir = do
                         case target of
                             Left (_ :: SomeException) -> return acc
                             Right targetPath ->
-                                case filePathToStorePath targetPath of
+                                case Ten.Core.filePathToStorePath targetPath of
                                     Just sp -> return $ Set.insert sp acc
                                     Nothing -> return acc
                     else return acc
@@ -659,7 +656,7 @@ getDatabaseRootPaths db = do
     results <- SQLite.query_ db "SELECT path FROM GCRoots WHERE active = 1" :: IO [Only Text]
 
     -- Parse paths and return as set
-    return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+    return $ Set.fromList $ catMaybes $ map (\(Only text) -> Ten.Core.parseStorePath text) results
 
 -- | Get runtime roots from active builds
 getRuntimeRootPaths :: FilePath -> IO (Set StorePath)
@@ -695,7 +692,7 @@ getRuntimeRootPaths storeLocation = do
         -- This is a simplified approach; in practice you'd use a proper parser
         let words = lines text
             paths = filter (\w -> length w > 10 && '-' `elem` w) words
-        in Set.fromList $ catMaybes $ map (parseStorePath . T.pack) paths
+        in Set.fromList $ catMaybes $ map (Ten.Core.parseStorePath . T.pack) paths
 
 -- | Check if a path is reachable from any root
 -- Works in both contexts through different mechanisms
@@ -729,30 +726,30 @@ requestPathReachability _ path = do
     env <- ask
 
     -- Send request to daemon using protocol
-    case runMode env of
-        ClientMode conn -> do
+    case Ten.Core.runMode env of
+        Ten.Core.ClientMode conn -> do
             -- Create a request
-            let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "path-reachability",
-                    reqParams = Map.singleton "path" (storePathToText path),
-                    reqPayload = Nothing
+            let request = Ten.Core.Request {
+                    Ten.Core.reqId = 0,  -- Will be set by sendRequest
+                    Ten.Core.reqType = "path-reachability",
+                    Ten.Core.reqParams = Map.singleton "path" (storePathToText path),
+                    Ten.Core.reqPayload = Nothing
                 }
 
             -- Send request through daemon connection
-            reqId <- liftIO $ sendRequest conn request
-            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+            reqId <- liftIO $ Ten.Core.sendRequest conn request
+            responseResult <- liftIO $ Ten.Core.receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
             -- Handle response
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if respStatus response == "ok"
+                    if Ten.Core.respStatus response == "ok"
                         then
-                            return $ Map.findWithDefault "false" "reachable" (respData response) == "true"
-                        else throwError $ DaemonError $ respMessage response
+                            return $ Map.findWithDefault "false" "reachable" (Ten.Core.respData response) == "true"
+                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
 
-        _ -> throwError $ DaemonError "Not connected to daemon"
+        _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Find all paths reachable from roots (daemon privilege only)
 findReachablePaths :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon (Set StorePath)
@@ -771,16 +768,16 @@ findReachablePaths st = do
 acquireGCLock :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon ()
 acquireGCLock _ = do
     env <- ask
-    let lockPath = gcLockPath (storeLocation env)
+    let lockPath = Ten.Core.gcLockPath (storeLocation env)
 
     -- Ensure the lock directory exists
-    liftIO $ ensureLockDirExists (takeDirectory lockPath)
+    liftIO $ Ten.Core.ensureLockDirExists (takeDirectory lockPath)
 
     -- Try to acquire the lock with proper privilege verification
     result <- liftIO $ try $ acquireFileLock lockPath
 
     case result of
-        Left (e :: SomeException) -> throwError $ ResourceError $ "Could not acquire GC lock: " <> T.pack (show e)
+        Left (e :: SomeException) -> throwError $ Ten.Core.ResourceError $ "Could not acquire GC lock: " <> T.pack (show e)
         Right lock -> do
             -- Keep the fd in a global reference to avoid GC
             liftIO $ writeIORef globalGCLockFdRef (Just (lockFd lock, lockPath))
@@ -789,7 +786,7 @@ acquireGCLock _ = do
 releaseGCLock :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon ()
 releaseGCLock _ = do
     env <- ask
-    let lockPath = gcLockPath (storeLocation env)
+    let lockPath = Ten.Core.gcLockPath (storeLocation env)
 
     -- Check if the lock file exists and we own it
     exists <- liftIO $ doesFileExist lockPath
@@ -823,11 +820,11 @@ withGCLock st action = do
     acquireGCLock st
 
     -- Run the action with proper error handling
-    result <- action st `catchError` \e -> do
+    result <- action st `Ten.Core.catchError` \e -> do
         -- Always release the lock on error
         releaseGCLock st
         -- Re-throw the error
-        throwError e
+        Ten.Core.throwError e
 
     -- Always release the lock on completion
     releaseGCLock st
@@ -843,7 +840,7 @@ breakStaleLock _ lockPath = do
 
     case status of
         Left (e :: SomeException) ->
-            logMsg 1 $ "Cannot check lock status: " <> T.pack (show e)
+            Ten.Core.logMsg 1 $ "Cannot check lock status: " <> T.pack (show e)
         Right isValid ->
             unless isValid $ liftIO $ do
                 -- Log that we're breaking a stale lock
@@ -911,7 +908,7 @@ isProcessRunning pid = do
 acquireFileLock :: FilePath -> IO GCLock
 acquireFileLock lockPath = do
     -- Ensure parent directory exists
-    ensureLockDirExists (takeDirectory lockPath)
+    Ten.Core.ensureLockDirExists (takeDirectory lockPath)
 
     -- Get our process ID
     pid <- getProcessID
@@ -976,7 +973,7 @@ getActiveBuildPaths st = do
             "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: TenM 'Build 'Daemon [Only Text]
 
         -- Parse paths
-        return $ Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) results
+        return $ Set.fromList $ catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) results
 
 -- | Verify the store integrity
 verifyStore :: FilePath -> TenM 'Build 'Daemon Bool
@@ -990,7 +987,7 @@ verifyStore storeDir = do
 
         -- Verify each path
         results <- forM paths $ \(Only pathText) -> do
-            case parseStorePath pathText of
+            case Ten.Core.parseStorePath pathText of
                 Nothing -> return False
                 Just storePath -> do
                     -- Verify that the store file exists and has the correct hash
@@ -1000,7 +997,7 @@ verifyStore storeDir = do
                         if fileExists
                             then do
                                 content <- BS.readFile fullPath
-                                let actualHash = showHash $ hashByteString content
+                                let actualHash = showHash $ Ten.Core.hashByteString content
                                 return $ actualHash == storeHash storePath
                             else return False
                     case result of
@@ -1023,7 +1020,7 @@ repairStore st = do
 
         -- Verify and repair each path
         (valid, invalid, totalSize) <- foldM (\(v, i, size) (Only pathText) -> do
-            case parseStorePath pathText of
+            case Ten.Core.parseStorePath pathText of
                 Nothing -> return (v, i + 1, size)  -- Invalid path format
                 Just storePath -> do
                     -- Check if file exists and has correct hash
@@ -1033,7 +1030,7 @@ repairStore st = do
                         if fileExists
                             then do
                                 content <- BS.readFile fullPath
-                                let actualHash = showHash $ hashByteString content
+                                let actualHash = showHash $ Ten.Core.hashByteString content
                                 return (actualHash == storeHash storePath, fullPath)
                             else return (False, fullPath)
 
@@ -1063,12 +1060,12 @@ repairStore st = do
         let elapsed = diffUTCTime endTime startTime
 
         -- Return statistics
-        return GCStats
-            { gcTotal = valid + invalid
-            , gcLive = valid
-            , gcCollected = invalid
-            , gcBytes = totalSize
-            , gcElapsedTime = elapsed
+        return Ten.Core.GCStats
+            { Ten.Core.gcTotal = valid + invalid
+            , Ten.Core.gcLive = valid
+            , Ten.Core.gcCollected = invalid
+            , Ten.Core.gcBytes = totalSize
+            , Ten.Core.gcElapsedTime = elapsed
             }
 
 -- | Helper function for database interaction - Path reachability
@@ -1117,7 +1114,7 @@ findPathsClosure db startingPaths = do
     results <- query_ db closureQuery :: IO [Only Text]
 
     -- Parse paths and return as set
-    return $ Set.fromList $ catMaybes $ map (\(Only p) -> parseStorePath p) results
+    return $ Set.fromList $ catMaybes $ map (\(Only p) -> Ten.Core.parseStorePath p) results
 
 -- | Helper function to mark paths as invalid in the database
 markPathsAsInvalid :: Connection -> Set StorePath -> IO ()
@@ -1205,7 +1202,7 @@ getReferencesFromDB path = do
     liftIO $ SQLite.close conn
 
     -- Convert to StorePath objects
-    let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
+    let paths = catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) rows
     return $ Set.fromList paths
 
 -- | Register a reference between paths
@@ -1272,10 +1269,10 @@ findStorePaths content storeDir =
         | "/" `T.isPrefixOf` text =
             -- Handle full paths starting with /
             let fileName = T.pack $ takeFileName $ T.unpack text
-            in parseStorePath fileName
+            in Ten.Core.parseStorePath fileName
         | otherwise =
             -- Handle just hash-name format
-            parseStorePath text
+            Ten.Core.parseStorePath text
 
 -- | Check if a path is a GC root
 -- This is a daemon-only operation
@@ -1370,9 +1367,9 @@ withDatabase _ dbPath timeout action = do
     liftIO $ SQLite.execute_ connection "PRAGMA foreign_keys = ON"
 
     -- Run action with proper error handling
-    result <- action connection `catchError` \e -> do
+    result <- action connection `Ten.Core.catchError` \e -> do
         liftIO $ SQLite.close connection
-        throwError e
+        Ten.Core.throwError e
 
     -- Close the connection
     liftIO $ SQLite.close connection
@@ -1461,11 +1458,7 @@ findPathsWithPrefix _ prefix = do
     liftIO $ SQLite.close conn
 
     -- Convert to StorePath objects
-    return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
-
--- | Calculate hash of ByteString content
-hashByteString :: BS.ByteString -> Digest SHA256
-hashByteString = Crypto.hash
+    return $ catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) rows
 
 -- | Convert hash to string representation
 showHash :: Digest SHA256 -> Text
