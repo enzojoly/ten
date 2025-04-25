@@ -66,6 +66,8 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Time
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Set (Set)
+import System.Directory (doesFileExist, removeFile)
+import Data.Char (isHexDigit)
 import qualified Data.Set as Set
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -1041,7 +1043,7 @@ acquireFileLock lockPath = do
             }
 
         -- Open the file with proper flags for locking
-        fd <- openFd lockPath WriteOnly (Just 0o644) oflags
+        fd <- openFd lockPath WriteOnly defaultFileFlags{creat = Just 0o644, exclusive = True}
 
         unmask $ do
             -- Write our PID to it
