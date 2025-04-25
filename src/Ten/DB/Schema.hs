@@ -67,8 +67,8 @@ currentSchemaVersion = 1
 data Migration = Migration {
     migrationVersion :: SchemaVersion,
     migrationDescription :: Text,
-    migrationUp :: DBCore.Database -> TenM 'Build 'Daemon (),
-    migrationDown :: DBCore.Database -> TenM 'Build 'Daemon ()
+    migrationUp :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon (),
+    migrationDown :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 }
 
 -- | Schema element types
@@ -106,7 +106,7 @@ schemaErrorToBuildError (SchemaValidationFailed reason) =
     DBError $ "Schema validation failed: " <> reason
 
 -- | Ensure the database schema is properly set up
-ensureSchema :: DBCore.Database -> TenM 'Build 'Daemon ()
+ensureSchema :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 ensureSchema db = do
     -- Get current schema version
     currentVersion <- DBCore.getSchemaVersion db
@@ -133,40 +133,40 @@ ensureSchema db = do
                     validateSchema db
 
 -- | Create all database tables
-createTables :: DBCore.Database -> TenM 'Build 'Daemon ()
-createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
+createTables :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
+createTables db = DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
     -- Create Derivations table
-    DBCore.dbExecuteSimple_ db derivationsTableDef
+    DBCore.tenExecuteSimple_ db derivationsTableDef
 
     -- Create Outputs table
-    DBCore.dbExecuteSimple_ db outputsTableDef
+    DBCore.tenExecuteSimple_ db outputsTableDef
 
     -- Create References table
-    DBCore.dbExecuteSimple_ db referencesTableDef
+    DBCore.tenExecuteSimple_ db referencesTableDef
 
     -- Create ValidPaths table
-    DBCore.dbExecuteSimple_ db validPathsTableDef
+    DBCore.tenExecuteSimple_ db validPathsTableDef
 
 -- | Create all indices for performance
-createIndices :: DBCore.Database -> TenM 'Build 'Daemon ()
-createIndices db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
+createIndices :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
+createIndices db = DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
     -- Derivations indices
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
 
     -- Outputs indices
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
 
     -- References indices
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
 
     -- ValidPaths indices
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
-    DBCore.dbExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
 
 -- | Validate the schema is correct
-validateSchema :: DBCore.Database -> TenM 'Build 'Daemon ()
+validateSchema :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 validateSchema db = do
     -- Get all required tables
     let requiredTables = [
@@ -189,7 +189,7 @@ validateSchema db = do
     validateValidPathsTable db
 
 -- | Validate Derivations table structure
-validateDerivationsTable :: DBCore.Database -> TenM 'Build 'Daemon ()
+validateDerivationsTable :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 validateDerivationsTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "Derivations" col
@@ -197,7 +197,7 @@ validateDerivationsTable db = do
     requiredColumns = ["id", "hash", "store_path", "timestamp"]
 
 -- | Validate Outputs table structure
-validateOutputsTable :: DBCore.Database -> TenM 'Build 'Daemon ()
+validateOutputsTable :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 validateOutputsTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "Outputs" col
@@ -205,7 +205,7 @@ validateOutputsTable db = do
     requiredColumns = ["derivation_id", "output_name", "path"]
 
 -- | Validate References table structure
-validateReferencesTable :: DBCore.Database -> TenM 'Build 'Daemon ()
+validateReferencesTable :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 validateReferencesTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "References" col
@@ -213,7 +213,7 @@ validateReferencesTable db = do
     requiredColumns = ["referrer", "reference"]
 
 -- | Validate ValidPaths table structure
-validateValidPathsTable :: DBCore.Database -> TenM 'Build 'Daemon ()
+validateValidPathsTable :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 validateValidPathsTable db = do
     forM_ requiredColumns $ \col ->
         ensureColumnExists db "ValidPaths" col
@@ -221,22 +221,22 @@ validateValidPathsTable db = do
     requiredColumns = ["path", "hash", "registration_time", "deriver", "is_valid"]
 
 -- | Ensure a column exists in a table
-ensureColumnExists :: DBCore.Database -> Text -> Text -> TenM 'Build 'Daemon ()
+ensureColumnExists :: DBCore.Database 'Daemon -> Text -> Text -> TenM 'Build 'Daemon ()
 ensureColumnExists db tableName columnName = do
     exists <- columnExists db tableName columnName
     unless exists $
         throwError $ schemaErrorToBuildError $ SchemaMissingColumn tableName columnName
 
 -- | Check if a table exists
-tableExists :: DBCore.Database -> Text -> TenM 'Build 'Daemon Bool
+tableExists :: DBCore.Database 'Daemon -> Text -> TenM 'Build 'Daemon Bool
 tableExists db tableName = do
-    results <- DBCore.dbQuery db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName] :: TenM 'Build 'Daemon [DBCore.Only Int]
+    results <- DBCore.tenQuery db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName] :: TenM 'Build 'Daemon [DBCore.Only Int]
     case results of
         [DBCore.Only count] -> return $ count > 0
         _ -> return False
 
 -- | Check if a column exists in a table
-columnExists :: DBCore.Database -> Text -> Text -> TenM 'Build 'Daemon Bool
+columnExists :: DBCore.Database 'Daemon -> Text -> Text -> TenM 'Build 'Daemon Bool
 columnExists db tableName columnName = do
     -- First check table exists
     tableExists' <- tableExists db tableName
@@ -247,33 +247,33 @@ columnExists db tableName columnName = do
             let pragmaQuery = Query $ "PRAGMA table_info(" <> tableName <> ")"
             catchError
                 (do
-                    rows <- DBCore.dbQuery_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
+                    rows <- DBCore.tenQuery_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
                     return $ any (\(_, name, _, _, _, _) -> name == columnName) rows)
                 (\_ -> return False)
 
 -- | Check if an index exists
-indexExists :: DBCore.Database -> Text -> TenM 'Build 'Daemon Bool
+indexExists :: DBCore.Database 'Daemon -> Text -> TenM 'Build 'Daemon Bool
 indexExists db indexName = do
-    results <- DBCore.dbQuery db "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName] :: TenM 'Build 'Daemon [DBCore.Only Int]
+    results <- DBCore.tenQuery db "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName] :: TenM 'Build 'Daemon [DBCore.Only Int]
     case results of
         [DBCore.Only count] -> return $ count > 0
         _ -> return False
 
 -- | Get all schema elements (tables, indices, etc.)
-getSchemaElements :: DBCore.Database -> TenM 'Build 'Daemon [SchemaElement]
+getSchemaElements :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon [SchemaElement]
 getSchemaElements db = do
     -- Get all tables
-    tables <- DBCore.dbQuery_ db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    tables <- DBCore.tenQuery_ db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         :: TenM 'Build 'Daemon [[Text]]
     let tableElements = map (Table . head) tables
 
     -- Get all indices
-    indices <- DBCore.dbQuery_ db "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+    indices <- DBCore.tenQuery_ db "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
         :: TenM 'Build 'Daemon [[Text]]
     let indexElements = map (Index . head) indices
 
     -- Get all triggers
-    triggers <- DBCore.dbQuery_ db "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
+    triggers <- DBCore.tenQuery_ db "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
         :: TenM 'Build 'Daemon [[Text]]
     let triggerElements = map (Trigger . head) triggers
 
@@ -288,12 +288,12 @@ getSchemaElements db = do
         let pragmaQuery = Query $ "PRAGMA table_info(" <> tableName <> ")"
         catchError
             (do
-                cols <- DBCore.dbQuery_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
+                cols <- DBCore.tenQuery_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
                 return $ map (\(_, name, _, _, _, _) -> Column tableName name) cols)
             (\_ -> return [])
 
 -- | Migrate the schema from one version to another
-migrateSchema :: DBCore.Database -> SchemaVersion -> SchemaVersion -> TenM 'Build 'Daemon ()
+migrateSchema :: DBCore.Database 'Daemon -> SchemaVersion -> SchemaVersion -> TenM 'Build 'Daemon ()
 migrateSchema db fromVersion toVersion =
     if fromVersion >= toVersion
         then return () -- Nothing to do
@@ -305,7 +305,7 @@ migrateSchema db fromVersion toVersion =
 
             -- Apply each migration in a transaction
             forM_ requiredMigrations $ \migration ->
-                DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
+                DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
                     -- Run the migration
                     catchError
                         (migrationUp migration db)
@@ -328,10 +328,10 @@ migrations = [
             createTables db
             createIndices db,
         migrationDown = \db -> do
-            DBCore.dbExecuteSimple_ db "DROP TABLE IF EXISTS Outputs;"
-            DBCore.dbExecuteSimple_ db "DROP TABLE IF EXISTS References;"
-            DBCore.dbExecuteSimple_ db "DROP TABLE IF EXISTS ValidPaths;"
-            DBCore.dbExecuteSimple_ db "DROP TABLE IF EXISTS Derivations;"
+            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS Outputs;"
+            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS References;"
+            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS ValidPaths;"
+            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS Derivations;"
     }
 
     -- Add new migrations here as the schema evolves
