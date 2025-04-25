@@ -84,7 +84,8 @@ import System.Process (createProcess, proc, readCreateProcessWithExitCode, Creat
 import System.Exit
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Posix.Files as Posix
-import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
+import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus,
+                          ProcessStatus(..), exitImmediately)
 import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
 import qualified System.Posix.User as User
 import qualified System.Posix.Resource as Resource
@@ -98,7 +99,7 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes, malloc, free)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
 import Foreign.Storable
 import System.IO.Error (IOError, catchIOError, isPermissionError, isDoesNotExistError)
-import System.IO (hPutStrLn, stderr, hClose, Handle, hFlush)
+import System.IO (hPutStrLn, stderr, hClose, Handle, hFlush, hGetContents)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (Socket)
 import qualified Network.Socket as Network
@@ -118,8 +119,17 @@ import qualified Crypto.Hash as Crypto
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Text.Encoding as TE
 
-import Ten.Core
-import Ten.Daemon.Protocol (DaemonConnection(..))
+import Ten.Core (
+    -- Re-export essential types and functions
+    Phase(..), SPhase(..), PrivilegeTier(..), SPrivilegeTier(..), TenM(..),
+    BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), storePathToText,
+    UserId(..), AuthToken(..), BuildEnv(..), BuildState(..),
+    DaemonConnection(..), TenM, runTen, addProof, throwError,
+    workDir, storeLocation, currentBuildId, currentPhase, runMode,
+    logMsg, sBuild, sDaemon, RunMode(..), storePathToFilePath,
+    BuildError(..), timeout, Proof(..)
+    )
+import qualified Ten.Daemon.Protocol as Protocol
 
 -- | Sandbox connection type for proper process separation
 data SandboxConnection = SandboxConnection {
@@ -148,7 +158,7 @@ closeSandboxConnection :: SandboxConnection -> IO ()
 closeSandboxConnection conn = do
     Network.close (sandboxConnSocket conn)
 
--- | Sandbox request message format for daemon-builder communication
+-- | Sandbox request message types for daemon-builder communication
 data SandboxRequest
     = SandboxCreateRequest {
         sandboxReqBuildId :: BuildId,
@@ -166,7 +176,7 @@ data SandboxRequest
     }
     deriving (Show, Eq)
 
--- | Sandbox response message format for daemon-builder communication
+-- | Sandbox response message types for daemon-builder communication
 data SandboxResponse
     = SandboxCreatedResponse {
         sandboxRespId :: Text,
@@ -485,25 +495,33 @@ instance Storable RLimit where
         pokeByteOff ptr 0 cur
         pokeByteOff ptr 8 max
 
--- | Core function to run an action within a build sandbox with clear privilege separation
+-- | Core function to run an action within a build sandbox with proper privilege separation
+-- This function delegates to the appropriate implementation based on privilege tier
 withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
 withSandbox inputs config action = do
     env <- ask
-    state <- State.get
+    currState <- get
 
     -- Verify we are in Build phase
-    unless (currentPhase state == Build) $
+    unless (currentPhase currState == Build) $
         throwError $ PhaseError "Sandbox can only be created in Build phase"
 
     -- Use the right implementation based on privilege tier
     case currentPrivilegeTier env of
         -- When running as daemon, we can create the sandbox directly
         Daemon ->
-            withSandboxDaemon inputs config action
-
+            withSandboxDaemon' inputs config action
         -- When running as builder, we must use the protocol
         Builder ->
-            withSandboxViaProtocol inputs config action
+            withSandboxViaProtocol' inputs config action
+
+-- | Daemon-specific implementation of withSandbox
+withSandboxDaemon' :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
+withSandboxDaemon' = withSandboxDaemon
+
+-- | Builder-specific implementation of withSandbox
+withSandboxViaProtocol' :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Builder a) -> TenM 'Build 'Builder a
+withSandboxViaProtocol' = withSandboxViaProtocol
 
 -- | Create a sandbox in daemon context (privileged operation)
 withSandboxDaemon :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
@@ -565,13 +583,16 @@ withSandboxDaemon inputs config action = do
                 Right setupDir -> do
                     -- Run the action inside the sandbox
                     -- This now requires a separate unprivileged process
-                    runTen sBuild sDaemon (action setupDir) env state
+                    runTen sBuild sDaemon (action setupDir) env currState
         )
 
     -- Handle result
     case result of
         Left err -> throwError err
-        Right (val, _) -> return val
+        Right (val, newState) -> do
+            -- Make sure to update our state with any changes
+            put newState
+            return val
 
 -- | Create a sandbox via daemon protocol (for builder context)
 withSandboxViaProtocol :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Builder a) -> TenM 'Build 'Builder a
@@ -610,7 +631,7 @@ withSandboxViaProtocol inputs config action = do
         _ -> throwError $ SandboxError "Builder cannot create sandboxes without daemon connection"
 
 -- | Get a sandbox connection from a daemon connection
-getSandboxConnection :: DaemonConnection -> IO SandboxConnection
+getSandboxConnection :: DaemonConnection 'Builder -> IO SandboxConnection
 getSandboxConnection conn = do
     -- Create request counter and response map
     requestCounter <- newTVarIO 0
@@ -629,13 +650,14 @@ getSandboxConnection conn = do
 setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build 'Daemon ()
 setupSandbox sandboxDir config = do
     env <- ask
+    currState <- get
     bid <- gets currentBuildId
 
     -- Delegate to the internal implementation
     liftIO $ setupSandbox' env bid sandboxDir config
 
     -- Add sandbox proof
-    addProof BuildProof
+    addProof (BuildProof)
 
 -- | Internal implementation of sandbox setup
 setupSandbox' :: BuildEnv -> BuildId -> FilePath -> SandboxConfig -> IO ()
@@ -1437,7 +1459,7 @@ requestSandbox conn buildId inputs config = do
         NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
         -- Wait for response with a reasonable timeout (30 seconds)
-        response <- timeout 30000000 $ takeMVar responseMVar
+        response <- Ten.Core.timeout 30000000 $ takeMVar responseMVar
 
         -- Clean up the request entry
         atomically $ modifyTVar' (sandboxConnResponses conn) $
@@ -1481,7 +1503,7 @@ releaseSandbox conn sandboxId = do
     NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (10 seconds)
-    _ <- timeout 10000000 $ takeMVar responseMVar
+    _ <- Ten.Core.timeout 10000000 $ takeMVar responseMVar
 
     -- Clean up the request entry
     atomically $ modifyTVar' (sandboxConnResponses conn) $
@@ -1523,7 +1545,7 @@ notifySandboxError conn sandboxId err = do
     NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (5 seconds)
-    _ <- timeout 5000000 $ takeMVar responseMVar
+    _ <- Ten.Core.timeout 5000000 $ takeMVar responseMVar
 
     -- Clean up the request entry
     atomically $ modifyTVar' (sandboxConnResponses conn) $
@@ -1755,22 +1777,4 @@ createFileLink target link =
 canonicalizePath :: FilePath -> IO FilePath
 canonicalizePath = Directory.canonicalizePath
 
--- | Helper function for timeouts
-timeout :: Int -> IO a -> IO (Maybe a)
-timeout micros action = do
-    result <- newEmptyMVar
-    tid <- forkIO $ do
-        r <- try action
-        case r of
-            Left (e :: SomeException) -> return ()
-            Right v -> putMVar result v
-
-    -- Wait for result or timeout
-    threadDelay micros
-    filled <- isJust <$> tryTakeMVar result
-
-    unless filled $ killThread tid
-
-    if filled
-        then Just <$> readMVar result
-        else return Nothing
+-- | Helper function for timeouts is now imported from Ten.Core
