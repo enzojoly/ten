@@ -28,3 +28,4 @@ cabal.project.local~
 output
 **/hello.c
 cabal-build-output
+total_lines_of_code.sh

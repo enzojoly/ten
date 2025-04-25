@@ -75,14 +75,13 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Text.Encoding as TE
-import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMissing,
-                         listDirectory, removeFile, getPermissions, removePathForcibly)
+import System.Directory (createDirectoryIfMissing, getPermissions, removePathForcibly)
 import qualified System.Directory as Dir
 import System.FilePath
 import System.IO.Error (isDoesNotExistError, catchIOError, isPermissionError)
 import qualified System.Posix.Files as Posix
 import System.IO (Handle, hPutStrLn, stderr, hFlush, hGetContents)
-import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
+import System.Posix.IO (openFd, closeFd, setLock, getLock,
                         defaultFileFlags, OpenMode(..), OpenFileFlags(..),
                         fdToHandle, LockRequest(WriteLock, Unlock))
 import System.Posix.Types (Fd, ProcessID, FileMode)
@@ -282,8 +281,6 @@ removeRoot root = do
 
     -- Check if it exists
     exists <- liftIO $ doesFileExist rootFile
-
-    -- Remove from filesystem and database
     when exists $ do
         -- Don't remove permanent roots unless forced
         unless (Ten.Core.rootType root == Ten.Core.PermanentRoot) $ do
@@ -370,34 +367,36 @@ getFileSystemRoots rootsDir = do
     liftIO $ createDirectoryIfMissing True rootsDir
 
     -- List all files in the roots directory
-    files <- liftIO $ listDirectory rootsDir
+    paths <- liftIO $ listDirectoryBS (BC.pack rootsDir)
 
     -- Parse each file into a GCRoot
     now <- liftIO getCurrentTime
-    liftIO $ catMaybes <$> forM files (\file -> do
+    liftIO $ catMaybes <$> forM paths (\filePath -> do
         -- Read the symlink target
-        let rootFile = rootsDir </> file
-        targetExists <- doesFileExist rootFile
+        let rootFile = BC.unpack filePath
+        targetExists <- ByteString.fileExist filePath
 
         if targetExists then do
             -- Check if it's a symlink
-            isLink <- Posix.isSymbolicLink <$> Posix.getFileStatus rootFile `catch` \(_ :: IOException) ->
-                return False
+            fileStatus <- ByteString.getFileStatus filePath `catch` \(_ :: IOException) ->
+                return undefined
+            let isLink = isSymbolicLink fileStatus
 
             if isLink
                 then do
-                    target <- try $ Posix.readSymbolicLink rootFile
+                    target <- try $ ByteString.readSymbolicLink filePath
                     case target of
                         Left (_ :: SomeException) -> return Nothing
                         Right linkTarget -> do
-                            let path = case Ten.Core.filePathToStorePath linkTarget of
+                            let path = case Ten.Core.filePathToStorePath (BC.unpack linkTarget) of
                                     Just p -> p
                                     Nothing -> StorePath "unknown" "unknown"
 
                             -- Parse name from file
-                            let name = case break (== '-') file of
+                            let fileName = takeFileName (BC.unpack filePath)
+                            let name = case break (== '-') fileName of
                                     (_, '-':rest) -> T.pack rest
-                                    _ -> T.pack file
+                                    _ -> T.pack fileName
 
                             -- Determine root type based on file name pattern
                             let rootType = if "permanent-" `T.isPrefixOf` name
@@ -412,6 +411,17 @@ getFileSystemRoots rootsDir = do
                                 }
                 else return Nothing
         else return Nothing)
+  where
+    isSymbolicLink fileStatus = ByteString.isSymbolicLink fileStatus
+
+    -- ByteString version of listDirectory
+    listDirectoryBS :: ByteString -> IO [ByteString]
+    listDirectoryBS dir = do
+        -- Convert to FilePath for standard directory listing
+        let dirPath = BC.unpack dir
+        fileNames <- Dir.listDirectory dirPath
+        -- Convert back to ByteString
+        return $ map (BC.pack . (dirPath </>)) fileNames
 
 -- | Request to list roots from builder context via protocol
 requestListRoots :: TenM 'Build 'Builder [GCRoot]
@@ -613,15 +623,15 @@ collectGarbageWithStats = do
 -- | Get file/path size in bytes
 getPathSize :: FilePath -> Text -> IO Integer
 getPathSize storeLocation pathText = do
-    let fullPath = storeLocation </> T.unpack pathText
+    let fullPath = BC.pack $ storeLocation </> T.unpack pathText
 
     -- Check if path exists
-    exists <- doesFileExist fullPath
+    exists <- ByteString.fileExist fullPath
     if exists
         then do
             -- Get file size
-            fileStatus <- Posix.getFileStatus fullPath
-            return $ fromIntegral $ Posix.fileSize fileStatus
+            fileStatus <- ByteString.getFileStatus fullPath
+            return $ fromIntegral $ ByteString.fileSize fileStatus
         else
             -- If it doesn't exist, return 0
             return 0
@@ -644,23 +654,36 @@ findAllStorePaths db storeLocation = do
 -- | Scan filesystem for store paths (fallback)
 scanFilesystemForPaths :: FilePath -> IO (Set StorePath)
 scanFilesystemForPaths storeLocation = do
+    -- Convert to ByteString path
+    let storePathBS = BC.pack storeLocation
+
     -- Check if store exists
-    exists <- doesDirectoryExist storeLocation
+    exists <- ByteString.fileExist storePathBS
     if not exists
         then return Set.empty
         else do
             -- List all entries in store directory
-            entries <- try $ listDirectory storeLocation
-            case entries of
-                Left (_ :: SomeException) -> return Set.empty
-                Right files -> do
-                    -- Filter for valid store path format and handle return type
-                    Set.fromList . catMaybes <$> mapM (\file -> do
-                        -- Skip special directories and non-store paths
-                        if (file `elem` ["gc-roots", "tmp", "locks", "var"] ||
-                            any (`isPrefixOf` file) ["gc-roots", "tmp.", ".", ".."])
-                        then return Nothing
-                        else return $ Ten.Core.parseStorePath (T.pack file)) files
+            files <- listFilesBS storePathBS `catch` \(_ :: IOException) -> return []
+
+            -- Filter for valid store path format and handle return type
+            Set.fromList . catMaybes <$> mapM (\file -> do
+                let fileName = BC.unpack $ getFileName file
+                -- Skip special directories and non-store paths
+                if (fileName `elem` ["gc-roots", "tmp", "locks", "var"] ||
+                    any (`isPrefixOf` fileName) ["gc-roots", "tmp.", ".", ".."])
+                then return Nothing
+                else return $ Ten.Core.parseStorePath (T.pack fileName)) files
+  where
+    -- List files in a directory, returning ByteString paths
+    listFilesBS :: ByteString -> IO [ByteString]
+    listFilesBS dirPath = do
+        let dirPathStr = BC.unpack dirPath
+        entries <- Dir.listDirectory dirPathStr
+        return $ map (BC.pack . (dirPathStr </>)) entries
+
+    -- Get the file name part of a path
+    getFileName :: ByteString -> ByteString
+    getFileName = BC.pack . takeFileName . BC.unpack
 
 -- | Find all roots for garbage collection (daemon context)
 findAllRoots :: Connection -> FilePath -> IO (Set StorePath)
@@ -682,30 +705,38 @@ findAllRoots db storeLocation = do
 getFileSystemRootPaths :: FilePath -> IO (Set StorePath)
 getFileSystemRootPaths rootsDir = do
     -- Check if the directory exists
-    exists <- doesDirectoryExist rootsDir
+    let rootsDirBS = BC.pack rootsDir
+    exists <- ByteString.fileExist rootsDirBS
     if not exists
         then return Set.empty
         else do
             -- List all symlinks in the directory
-            files <- listDirectory rootsDir
+            files <- listFilesBS rootsDirBS `catch` \(_ :: IOException) -> return []
 
             -- Process each symlink to get target
             foldM (\acc file -> do
-                let srcPath = rootsDir </> file
-                isLink <- (Posix.isSymbolicLink <$> Posix.getFileStatus srcPath) `catch`
+                let srcPath = file
+                isLink <- (ByteString.isSymbolicLink <$> ByteString.getFileStatus srcPath) `catch`
                     \(_ :: SomeException) -> pure False
 
                 if isLink
                     then do
-                        target <- try $ Posix.readSymbolicLink srcPath
+                        target <- try $ ByteString.readSymbolicLink srcPath
                         case target of
                             Left (_ :: SomeException) -> return acc
                             Right targetPath ->
-                                case Ten.Core.filePathToStorePath targetPath of
+                                case Ten.Core.filePathToStorePath (BC.unpack targetPath) of
                                     Just sp -> return $ Set.insert sp acc
                                     Nothing -> return acc
                     else return acc
                 ) Set.empty files
+  where
+    -- List files in a directory, returning ByteString paths
+    listFilesBS :: ByteString -> IO [ByteString]
+    listFilesBS dirPath = do
+        let dirPathStr = BC.unpack dirPath
+        entries <- Dir.listDirectory dirPathStr
+        return $ map (BC.pack . (dirPathStr </>)) entries
 
 -- | Get root paths from database
 getDatabaseRootPaths :: Connection -> IO (Set StorePath)
@@ -721,29 +752,34 @@ getRuntimeRootPaths :: FilePath -> IO (Set StorePath)
 getRuntimeRootPaths storeLocation = do
     -- Check for runtime locks directory
     let locksDir = storeLocation </> "var/ten/locks"
-    exists <- doesDirectoryExist locksDir
+    let locksDirBS = BC.pack locksDir
+    exists <- ByteString.fileExist locksDirBS
 
     if not exists
         then return Set.empty
         else do
             -- Look for active build locks
-            files <- try $ listDirectory locksDir
-            case files of
-                Left (_ :: SomeException) -> return Set.empty
-                Right locks -> do
-                    -- Process each lock file to find references to store paths
-                    foldM (\acc lockFile -> do
-                        let lockPath = locksDir </> lockFile
-                        -- Check if lock file contains a reference to a store path
-                        content <- try $ readFile lockPath
-                        case content of
-                            Left (_ :: SomeException) -> return acc
-                            Right text -> do
-                                -- Extract store paths from lock file content
-                                let storePaths = extractStorePaths text
-                                return $ Set.union acc storePaths
-                        ) Set.empty locks
+            files <- listFilesBS locksDirBS `catch` \(_ :: IOException) -> return []
+
+            -- Process each lock file to find references to store paths
+            foldM (\acc lockFile -> do
+                -- Read lock file
+                content <- try $ BS.readFile (BC.unpack lockFile)
+                case content of
+                    Left (_ :: SomeException) -> return acc
+                    Right fileContent -> do
+                        -- Extract store paths from lock file content
+                        let storePaths = extractStorePaths (BC.unpack fileContent)
+                        return $ Set.union acc storePaths
+                ) Set.empty files
   where
+    -- List files in a directory, returning ByteString paths
+    listFilesBS :: ByteString -> IO [ByteString]
+    listFilesBS dirPath = do
+        let dirPathStr = BC.unpack dirPath
+        entries <- Dir.listDirectory dirPathStr
+        return $ map (BC.pack . (dirPathStr </>)) entries
+
     -- Function to extract store paths from text
     extractStorePaths :: String -> Set StorePath
     extractStorePaths text =
@@ -922,24 +958,26 @@ breakStaleLock lockPath = do
                     hPutStrLn stderr $ "Warning: Failed to remove stale lock file: " ++ lockPath
 
 -- | Check if a lock file exists and is valid
--- Fix: Return a boolean to indicate if the lock is valid (not a FileStatus)
 checkLockFile :: FilePath -> IO Bool
 checkLockFile lockPath = do
+    -- Convert to ByteString path
+    let lockPathBS = BC.pack lockPath
+
     -- Check if lock file exists
-    exists <- doesFileExist lockPath
+    exists <- ByteString.fileExist lockPathBS
 
     if not exists
         then return False  -- Lock file doesn't exist
         else do
             -- Read the lock file to get PID
-            result <- try $ readFile lockPath
+            result <- try $ BS.readFile lockPath
             case result of
                 Left (_ :: SomeException) ->
                     return False  -- Error reading lock file, treat as invalid
 
                 Right content -> do
                     -- Parse the PID
-                    case reads content of
+                    case reads (BC.unpack content) of
                         [(pid, "")] -> do
                             -- Check if the process is still running
                             isProcessRunning pid
@@ -977,7 +1015,6 @@ isProcessRunning pid = do
         Right _ -> return True  -- Process exists
 
 -- | Create and acquire a lock file
--- Fix: Use createFile instead of openFd for lock file creation
 acquireFileLock :: FilePath -> IO GCLock
 acquireFileLock lockPath = do
     -- Ensure parent directory exists
@@ -997,9 +1034,14 @@ acquireFileLock lockPath = do
 
     -- Create the lock file with our PID
     result <- try $ mask $ \unmask -> do
-        -- Use createFile instead of openFd (superior option)
-        let fileMode = Posix.unionFileModes Posix.ownerReadMode Posix.ownerWriteMode
-        fd <- createFile lockPath fileMode (defaultFileFlags{exclusive=True})
+        -- Create and open the lock file
+        let oflags = defaultFileFlags {
+                exclusive = True,  -- Fail if file exists (atomic creation)
+                trunc = True       -- Truncate if we somehow get here and file exists
+            }
+
+        -- Open the file with proper flags for locking
+        fd <- openFd lockPath WriteOnly (Just 0o644) oflags
 
         unmask $ do
             -- Write our PID to it
@@ -1067,7 +1109,8 @@ verifyStore storeDir = do
                     -- Verify that the store file exists and has the correct hash
                     result <- try $ do
                         let fullPath = storePathToFilePath storePath env
-                        fileExists <- doesFileExist fullPath
+                        let fullPathBS = BC.pack fullPath
+                        fileExists <- ByteString.fileExist fullPathBS
                         if fileExists
                             then do
                                 content <- BS.readFile fullPath
@@ -1104,7 +1147,8 @@ repairStore = do
                     -- Check if file exists and has correct hash
                     result <- try $ do
                         let fullPath = storePathToFilePath storePath env
-                        fileExists <- doesFileExist fullPath
+                        let fullPathBS = BC.pack fullPath
+                        fileExists <- ByteString.fileExist fullPathBS
                         if fileExists
                             then do
                                 content <- BS.readFile fullPath
@@ -1120,9 +1164,11 @@ repairStore = do
                                 else do
                                     -- Invalid path, mark as invalid and remove
                                     -- Get size before deletion
-                                    fileStatus <- try $ Posix.getFileStatus path
+                                    fileStatus <- try $ do
+                                        status <- ByteString.getFileStatus (BC.pack path)
+                                        return $ fromIntegral $ ByteString.fileSize status
                                     let pathSize = case fileStatus of
-                                            Right status -> fromIntegral $ Posix.fileSize status
+                                            Right size -> size
                                             Left _ -> 0
 
                                     -- Mark as invalid in database
@@ -1254,7 +1300,8 @@ storePathExists :: StorePath -> TenM p t Bool
 storePathExists path = do
     env <- ask
     let fullPath = storePathToFilePath path env
-    liftIO $ doesFileExist fullPath
+    let fullPathBS = BC.pack fullPath
+    liftIO $ ByteString.fileExist fullPathBS
 
 -- | Compute reachable paths from a set of roots
 computeReachablePaths :: Set StorePath -> TenM 'Build 'Daemon (Set StorePath)
@@ -1317,9 +1364,10 @@ findPathReferences path = do
         else do
             -- Fall back to file scanning if database has no entries
             let filePath = storePathToFilePath path env
+            let filePathBS = BC.pack filePath
 
             -- Check file existence
-            exists <- liftIO $ doesFileExist filePath
+            exists <- liftIO $ ByteString.fileExist filePathBS
             if not exists
                 then return Set.empty
                 else do
@@ -1400,7 +1448,7 @@ findStorePaths content storeDir =
         -- Or just a store path without the store dir
         (T.length text >= 10 && "-" `T.isInfixOf` text && allHex (T.takeWhile (/= '-') text))
       where
-        allHex = T.all (\c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
+        allHex = T.all isHexDigit
 
     extractStorePath :: Text -> Maybe StorePath
     extractStorePath text
@@ -1428,7 +1476,7 @@ isGCRoot path = do
         else do
             -- If not in database, check filesystem
             -- List all roots
-            roots <- liftIO $ listDirectory rootsDir `catch` \(_ :: IOException) -> return []
+            roots <- liftIO $ listFilesBS (BC.pack rootsDir) `catch` \(_ :: IOException) -> return []
 
             -- Check if any root links to this path
             isFileRoot <- liftIO $ foldM (\found root -> do
@@ -1436,13 +1484,13 @@ isGCRoot path = do
                     then return True
                     else do
                         -- Check if this root points to our path
-                        let rootPath = rootsDir </> root
-                        isLink <- (Posix.isSymbolicLink <$> Posix.getFileStatus rootPath) `catch`
+                        let rootPath = root
+                        isLink <- (ByteString.isSymbolicLink <$> ByteString.getFileStatus rootPath) `catch`
                             \(_ :: SomeException) -> pure False
                         if isLink
                             then do
-                                target <- liftIO $ Posix.readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
-                                let targetPath = storePathToFilePath path env
+                                target <- ByteString.readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
+                                let targetPath = BC.pack $ storePathToFilePath path env
                                 return $ targetPath == target
                             else return False
                 ) False roots
@@ -1452,7 +1500,13 @@ isGCRoot path = do
                 registerGCRoot path (T.pack "filesystem-found") "symlink"
 
             return isFileRoot
-
+  where
+    -- List files in a directory, returning ByteString paths
+    listFilesBS :: ByteString -> IO [ByteString]
+    listFilesBS dirPath = do
+        let dirPathStr = BC.unpack dirPath
+        entries <- Dir.listDirectory dirPathStr
+        return $ map (BC.pack . (dirPathStr </>)) entries
 
 -- | Check if a path is a GC root in the database
 isGCRootInDB :: StorePath -> TenM 'Build 'Daemon Bool
