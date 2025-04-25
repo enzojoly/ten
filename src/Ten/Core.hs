@@ -201,7 +201,9 @@ module Ten.Core (
 
     -- State access helpers
     currentBuildId,
-    verbosity
+    verbosity,
+
+    hashByteString
 ) where
 
 import Control.Concurrent.STM
