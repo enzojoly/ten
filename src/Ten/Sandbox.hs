@@ -129,7 +129,7 @@ import Ten.Core (
     UserId(..), AuthToken(..), BuildEnv(..), BuildState(..),
     DaemonConnection(..), TenM, runTen, addProof, throwError,
     workDir, storeLocation, currentBuildId, currentPhase, runMode,
-    logMsg, sBuild, sDaemon, RunMode(..), storePathToFilePath,
+    logMsg, sBuild, sDaemon, RunMode(..), storePathToFilePath, buildErrorToText,
     BuildError(..), timeout, Proof(..), validateStorePath, validateStorePathWithContext
     )
 import qualified Ten.Daemon.Protocol as Protocol
@@ -204,6 +204,36 @@ data SandboxStatus = SandboxStatus {
     sandboxStatusCreatedTime :: UTCTime
 } deriving (Show, Eq)
 
+-- | Type to safely handle environment variables with proper sanitization
+data SandboxEnvironment = SandboxEnvironment {
+    -- Original unprocessed environment
+    rawEnv :: Map Text Text,
+    -- Processed environment ready for building
+    processedEnv :: [(String, String)],
+    -- Whether environment was sanitized for safety
+    envSanitized :: Bool
+} deriving (Show)
+
+-- | Whitelist of environment variables allowed to cross privilege boundaries
+-- This is similar to Nix's approach of explicitly allowing certain variables
+allowedEnvironmentVars :: Set String
+allowedEnvironmentVars = Set.fromList [
+    -- Basic system environment
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM",
+    -- Temp directories
+    "TMPDIR", "TMP", "TEMP",
+    -- Locale settings
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_TIME", "LC_NUMERIC",
+    "LC_MONETARY", "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS",
+    "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
+    -- Ten-specific variables
+    "TEN_STORE", "TEN_BUILD_ID", "TEN_BUILD_DIR", "TEN_OUT", "TEN_SANDBOX",
+    "TEN_RETURN_PATH", "TEN_SYSTEM", "TEN_DERIVATION_NAME",
+    -- Allow some proxy settings but sanitize values
+    "http_proxy", "https_proxy", "ftp_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "NO_PROXY"
+    ]
+
 -- | Configuration for a build sandbox
 data SandboxConfig = SandboxConfig {
     sandboxAllowNetwork :: Bool,           -- Allow network access
@@ -248,6 +278,39 @@ defaultSandboxConfig = SandboxConfig {
     sandboxTimeoutSecs = 0,                -- No timeout by default
     sandboxKeepBuildOutput = False         -- Don't keep build output by default
 }
+
+-- | Sanitize environment variables for crossing privilege boundaries
+-- Returns a safe, filtered environment based on the whitelist
+sanitizeEnvironment :: Map Text Text -> Bool -> SandboxEnvironment
+sanitizeEnvironment env strict =
+    let
+        -- Convert from Map Text Text to [(String, String)]
+        convertedEnv = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList env
+
+        -- Apply whitelist filtering if strict mode is on
+        filteredEnv = if strict
+                      then filter (\(k, _) -> k `Set.member` allowedEnvironmentVars) convertedEnv
+                      else convertedEnv
+
+        -- Remove any potentially harmful variables
+        safeEnv = filter (\(k, _) -> not $ k `elem` ["LD_PRELOAD", "LD_LIBRARY_PATH"]) filteredEnv
+    in
+        SandboxEnvironment {
+            rawEnv = env,
+            processedEnv = safeEnv,
+            envSanitized = strict
+        }
+
+-- | Parse environment variables from string format (KEY=VALUE)
+-- This is used when receiving environment variables across boundaries
+parseEnvVars :: [String] -> [(String, String)]
+parseEnvVars = mapMaybe parseEnvVar
+  where
+    parseEnvVar :: String -> Maybe (String, String)
+    parseEnvVar s =
+        case break (=='=') s of
+            (key, '=':value) -> Just (key, value)
+            _ -> Nothing
 
 -- | Binary instance for SandboxRequest for serialization
 instance Binary.Binary SandboxRequest where
@@ -1171,9 +1234,13 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
     unless programExists $
         throwError $ SandboxError $ "Program does not exist: " <> T.pack programPath
 
-    -- Create builder environment variables
-    buildEnv <- gets currentBuildId >>= \bid ->
+    -- Create builder environment variables with proper sanitization
+    buildEnvMap <- gets currentBuildId >>= \bid ->
         return $ Map.insert "TEN_BUILD_ID" (T.pack $ showBuildId bid) env
+
+    -- Create a sanitized environment for security
+    let sandboxEnv = sanitizeEnvironment buildEnvMap True
+        envVars = processedEnv sandboxEnv
 
     -- Spawn the process with proper privilege
     pid <- liftIO $ do
@@ -1195,9 +1262,6 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
             -- Set resource limits
             setResourceLimits' config
 
-            -- Properly convert environment variables
-            let envVars = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList buildEnv
-
             -- Execute the program
             executeFile programPath True args (Just envVars)
 
@@ -1209,22 +1273,25 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
 -- | Run a builder process with proper privilege isolation
 runBuilderProcess :: FilePath -> [String] -> [String] -> UserID -> GroupID ->
                     IO (ExitCode, String, String)
-runBuilderProcess program args env uid gid = do
+runBuilderProcess program args envStrings uid gid = do
     -- Validate program path
     programExists <- doesFileExist program
     unless programExists $
         throwIO $ userError $ "Builder program does not exist: " ++ program
+
+    -- Parse environment variables from strings (VAR=value) to key-value pairs
+    let envVars = parseEnvVars envStrings
 
     -- Check if we need to drop privileges (are we root?)
     currentUid <- User.getRealUserID
 
     -- Create process configuration
     let process = (proc program args) {
-            env = Just env,
-            std_in = NoStream,
-            std_out = CreatePipe,
-            std_err = CreatePipe
-        }
+        env = Just envVars,  -- Use properly parsed environment variables
+        std_in = NoStream,
+        std_out = CreatePipe,
+        std_err = CreatePipe
+    }
 
     if currentUid == 0
         then do
@@ -1266,7 +1333,7 @@ runBuilderProcess program args env uid gid = do
                         User.setUserID uid
 
                         -- Execute the program
-                        executeFile program True args (Just env)
+                        executeFile program True args (Just envVars)
                         -- Should never reach here
                         exitImmediately (ExitFailure 127)
 
