@@ -1967,8 +1967,8 @@ deserializeBuildResult bs =
   where
     fromJSON :: Aeson.Value -> Aeson.Result BuildResult
     fromJSON val = case Aeson.parseEither parseBuildResult val of
-        Left err -> Left $ Aeson.Error err
-        Right x -> Right $ Aeson.Success x
+        Left err -> Aeson.Error err  -- Return Aeson.Error directly, not wrapped in Left
+        Right x -> Aeson.Success x   -- Return Aeson.Success directly, not wrapped in Right
 
     parseBuildResult :: Aeson.Value -> Parser BuildResult
     parseBuildResult = Aeson.withObject "BuildResult" $ \o -> do

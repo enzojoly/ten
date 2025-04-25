@@ -130,7 +130,7 @@ import Ten.Core (
     DaemonConnection(..), TenM, runTen, addProof, throwError,
     workDir, storeLocation, currentBuildId, currentPhase, runMode,
     logMsg, sBuild, sDaemon, RunMode(..), storePathToFilePath,
-    BuildError(..), timeout, Proof(..), buildErrorToText
+    BuildError(..), timeout, Proof(..), validateStorePath, validateStorePathWithContext
     )
 import qualified Ten.Daemon.Protocol as Protocol
 
@@ -223,7 +223,7 @@ data SandboxConfig = SandboxConfig {
     sandboxDiskLimit :: Int,               -- Disk space limit in MB (0 = no limit)
     sandboxMaxProcesses :: Int,            -- Maximum number of processes (0 = no limit)
     sandboxTimeoutSecs :: Int,             -- Timeout in seconds (0 = no timeout)
-    sandboxKeepBuildOutput :: Bool         -- Whether to keep build output for debugging
+    sandboxKeepBuildOutput :: Bool         -- Flag to keep build output directory after completion
 } deriving (Show, Eq)
 
 -- | Default sandbox configuration (restrictive)
@@ -254,7 +254,11 @@ instance Binary.Binary SandboxRequest where
     put (SandboxCreateRequest buildId inputs config) = do
         Binary.put (0 :: Word8)  -- Tag for CreateRequest
         Binary.put (show buildId)
-        Binary.put (Set.toList inputs)
+        -- Serialize the set of store paths
+        Binary.put (length $ Set.toList inputs)
+        forM_ (Set.toList inputs) $ \path -> do
+            Binary.put (storeHash path)
+            Binary.put (storeName path)
         Binary.put (encodeConfig config)
 
     put (SandboxReleaseRequest sandboxId) = do
@@ -274,9 +278,19 @@ instance Binary.Binary SandboxRequest where
         case tag of
             0 -> do  -- CreateRequest
                 buildIdStr <- Binary.get
-                inputs <- Set.fromList <$> Binary.get
+                -- Deserialize the list of store paths with validation
+                count <- Binary.get :: Binary.Get Int
+                inputsList <- forM [1..count] $ \_ -> do
+                    hash <- Binary.get
+                    name <- Binary.get
+                    let path = StorePath hash name
+                    -- Validate the path during deserialization
+                    if validateStorePath path
+                        then return path
+                        else fail $ "Invalid StorePath during deserialization: " ++
+                             T.unpack hash ++ "-" ++ T.unpack name
                 configData <- Binary.get
-                return $ SandboxCreateRequest (read buildIdStr) inputs (decodeConfig configData)
+                return $ SandboxCreateRequest (read buildIdStr) (Set.fromList inputsList) (decodeConfig configData)
             1 -> SandboxReleaseRequest <$> Binary.get
             2 -> SandboxStatusRequest <$> Binary.get
             3 -> SandboxAbortRequest <$> Binary.get
@@ -592,6 +606,11 @@ withSandboxViaProtocol inputs config action = do
     unless (currentPhase currState == Build) $
         throwError $ PhaseError "Sandbox can only be created in Build phase"
 
+    -- Validate all inputs before sending across privilege boundary
+    forM_ (Set.toList inputs) $ \path ->
+        unless (validateStorePath path) $
+            throwError $ SandboxError $ "Invalid store path: " <> storePathToText path
+
     -- Get sandbox connection from run mode
     case runMode env of
         ClientMode conn -> do
@@ -885,6 +904,11 @@ copyDirectoryRecursive src dst = do
 makeInputsAvailable :: FilePath -> Set StorePath -> TenM 'Build t ()
 makeInputsAvailable sandboxDir inputs = do
     env <- ask
+
+    -- Validate all inputs before processing
+    forM_ (Set.toList inputs) $ \path ->
+        unless (validateStorePath path) $
+            throwError $ SandboxError $ "Invalid store path: " <> storePathToText path
 
     -- Process each input
     forM_ (Set.toList inputs) $ \input -> do
@@ -1183,7 +1207,8 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
     return pid
 
 -- | Run a builder process with proper privilege isolation
-runBuilderProcess :: FilePath -> [String] -> [(String, String)] -> UserID -> GroupID -> IO (ExitCode, String, String)
+runBuilderProcess :: FilePath -> [String] -> [String] -> UserID -> GroupID ->
+                    IO (ExitCode, String, String)
 runBuilderProcess program args env uid gid = do
     -- Validate program path
     programExists <- doesFileExist program
@@ -1259,10 +1284,12 @@ runBuilderProcess program args env uid gid = do
 
                     -- Wait for process to exit
                     exitStatus <- getProcessStatus True True pid
-                    exitCode <- case exitStatus of
-                        Just (Exited code) -> return $
-                            if code == ExitSuccess then ExitSuccess else ExitFailure (fromIntegral code)
-                        _ -> return $ ExitFailure 1
+                    let exitCode = case exitStatus of
+                         Just (Exited ExitSuccess) -> ExitSuccess
+                         Just (Exited (ExitFailure n)) -> ExitFailure n
+                         Just (Terminated _ _) -> ExitFailure 128 -- Standard Unix signal exit
+                         Just (Stopped _) -> ExitFailure 127 -- Stopped processes
+                         Nothing -> ExitFailure 1 -- Unknown status
 
                     -- Close handles
                     hClose stdoutHandle
@@ -1402,6 +1429,11 @@ getSandboxConnection conn = do
 requestSandbox :: SandboxConnection -> BuildId -> Set StorePath -> SandboxConfig ->
                 TenM 'Build 'Builder SandboxResponse
 requestSandbox conn buildId inputs config = do
+    -- Validate all inputs before sending across privilege boundary
+    forM_ (Set.toList inputs) $ \path ->
+        unless (validateStorePath path) $
+            throwError $ SandboxError $ "Invalid store path: " <> storePathToText path
+
     -- Create the request
     let request = SandboxCreateRequest buildId inputs config
 
@@ -1433,7 +1465,7 @@ requestSandbox conn buildId inputs config = do
         NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
         -- Wait for response with a reasonable timeout (30 seconds)
-        response <- Ten.Core.timeout 30000000 $ takeMVar responseMVar
+        response <- timeout 30000000 $ takeMVar responseMVar
 
         -- Clean up the request entry
         atomically $ modifyTVar' (sandboxConnResponses conn) $
@@ -1477,7 +1509,7 @@ releaseSandbox conn sandboxId = do
     NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (10 seconds)
-    _ <- Ten.Core.timeout 10000000 $ takeMVar responseMVar
+    _ <- timeout 10000000 $ takeMVar responseMVar
 
     -- Clean up the request entry
     atomically $ modifyTVar' (sandboxConnResponses conn) $
@@ -1519,7 +1551,7 @@ notifySandboxError conn sandboxId err = do
     NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (5 seconds)
-    _ <- Ten.Core.timeout 5000000 $ takeMVar responseMVar
+    _ <- timeout 5000000 $ takeMVar responseMVar
 
     -- Clean up the request entry
     atomically $ modifyTVar' (sandboxConnResponses conn) $
@@ -1534,6 +1566,11 @@ sandboxProtocolHandler :: SPrivilegeTier 'Daemon -> SandboxRequest ->
 sandboxProtocolHandler st request = do
     case request of
         SandboxCreateRequest buildId inputs config -> do
+            -- Validate all inputs before processing
+            forM_ (Set.toList inputs) $ \path ->
+                unless (validateStorePath path) $
+                    throwError $ SandboxError $ "Invalid store path: " <> storePathToText path
+
             -- Create a new sandbox
             sandboxDir <- getSandboxDir
 
@@ -1599,16 +1636,16 @@ sandboxProtocolHandler st request = do
                     return $ SandboxErrorResponse $ "Failed to find sandbox: " <> buildErrorToText e
                 Right sandboxDir -> do
                     -- Force cleanup
-                    result <- liftIO $ do
+                    result <- liftIO $ try $ do
                         unmountAllBindMounts sandboxDir
                         removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> do
                             setRecursiveWritePermissions sandboxDir
                             removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> return ()
-                        return $ Right ()
+                        return ()
 
                     case result of
                         Left e ->
-                            return $ SandboxErrorResponse $ "Failed to abort sandbox: " <> T.pack (show e)
+                            return $ SandboxErrorResponse $ "Failed to abort sandbox: " <> T.pack (show (e :: SomeException))
                         Right _ ->
                             return $ SandboxReleasedResponse True
 
