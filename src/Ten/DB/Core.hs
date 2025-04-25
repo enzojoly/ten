@@ -92,6 +92,21 @@ data DBError
 
 instance Exception DBError
 
+-- | Convert DBError to BuildError
+toBuilderError :: DBError -> BuildError
+toBuilderError (DBConnectionError msg) = DBError msg
+toBuilderError (DBQueryError msg) = DBError msg
+toBuilderError (DBSchemaError msg) = DBError msg
+toBuilderError (DBTransactionError msg) = DBError msg
+toBuilderError (DBLockError msg) = DBError msg
+toBuilderError (DBResourceError msg) = DBError msg
+toBuilderError (DBMigrationError msg) = DBError msg
+toBuilderError (DBInvalidStateError msg) = DBError msg
+toBuilderError (DBPhaseError msg) = DBError msg
+toBuilderError (DBPermissionError msg) = DBError msg
+toBuilderError (DBPrivilegeError msg) = DBError msg
+toBuilderError (DBProtocolError msg) = DBError msg
+
 -- | Transaction modes
 data TransactionMode
     = ReadOnly     -- ^ Read-only transaction
@@ -255,8 +270,8 @@ instance CanManageTransactions 'Builder where
                                     Right resp' ->
                                         if respStatus resp' == "ok"
                                             then return result
-                                            else throwError $ DBTransactionError $ respMessage resp'
-                            else throwError $ DBTransactionError $ respMessage resp
+                                            else throwError $ toBuilderError $ DBTransactionError $ respMessage resp'
+                            else throwError $ toBuilderError $ DBTransactionError $ respMessage resp
 
             _ -> throwError $ privilegeError "Transaction management requires daemon connection"
 
@@ -310,8 +325,8 @@ instance CanExecuteQuery 'Builder where
                                 Just payload ->
                                     -- In a real impl, would properly deserialize the payload to type r
                                     deserializeQueryResults payload
-                                Nothing -> throwError $ DBQueryError "Missing query results"
-                            else throwError $ DBQueryError $ respMessage resp
+                                Nothing -> throwError $ toBuilderError $ DBQueryError "Missing query results"
+                            else throwError $ toBuilderError $ DBQueryError $ respMessage resp
 
             _ -> throwError $ privilegeError "Query execution requires daemon connection"
 
@@ -370,9 +385,9 @@ instance CanExecuteStatement 'Builder where
                             then case Map.lookup "rowsAffected" (respData resp) of
                                 Just countText -> case reads (T.unpack countText) of
                                     [(count, "")] -> return count
-                                    _ -> throwError $ DBQueryError "Invalid row count format"
-                                Nothing -> throwError $ DBQueryError "Missing row count"
-                            else throwError $ DBQueryError $ respMessage resp
+                                    _ -> throwError $ toBuilderError $ DBQueryError "Invalid row count format"
+                                Nothing -> throwError $ toBuilderError $ DBQueryError "Missing row count"
+                            else throwError $ toBuilderError $ DBQueryError $ respMessage resp
 
             _ -> throwError $ privilegeError "Statement execution requires daemon connection"
 
@@ -434,9 +449,9 @@ instance CanManageSchema 'Builder where
                             then case Map.lookup "version" (respData resp) of
                                 Just versionText -> case reads (T.unpack versionText) of
                                     [(version, "")] -> return version
-                                    _ -> throwError $ DBSchemaError "Invalid version format"
-                                Nothing -> throwError $ DBSchemaError "Missing version"
-                            else throwError $ DBSchemaError $ respMessage resp
+                                    _ -> throwError $ toBuilderError $ DBSchemaError "Invalid version format"
+                                Nothing -> throwError $ toBuilderError $ DBSchemaError "Missing version"
+                            else throwError $ toBuilderError $ DBSchemaError $ respMessage resp
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
 
@@ -457,7 +472,7 @@ instance CanManageSchema 'Builder where
                     Right resp ->
                         if respStatus resp == "ok"
                             then return ()
-                            else throwError $ DBSchemaError $ respMessage resp
+                            else throwError $ toBuilderError $ DBSchemaError $ respMessage resp
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
 
