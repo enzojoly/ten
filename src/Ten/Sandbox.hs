@@ -8,6 +8,9 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Ten.Sandbox (
     -- Core sandbox functions
@@ -495,10 +498,26 @@ instance Storable RLimit where
         pokeByteOff ptr 0 cur
         pokeByteOff ptr 8 max
 
+-- | Type class for sandbox operations with privilege-specific implementations
+class SandboxCreator (t :: PrivilegeTier) where
+    withSandboxImpl :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
+
+-- | Daemon instance for direct sandbox creation (privileged)
+instance SandboxCreator 'Daemon where
+    withSandboxImpl = withSandboxDaemon
+
+-- | Builder instance for protocol-based sandbox creation (unprivileged)
+instance SandboxCreator 'Builder where
+    withSandboxImpl = withSandboxViaProtocol
+
 -- | Core function to run an action within a build sandbox with proper privilege separation
 -- This function delegates to the appropriate implementation based on privilege tier
-withSandbox :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
-withSandbox inputs config action = do
+withSandbox :: SandboxCreator t => Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
+withSandbox = withSandboxImpl
+
+-- | Daemon-specific implementation of withSandbox
+withSandboxDaemon :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
+withSandboxDaemon inputs config action = do
     env <- ask
     currState <- get
 
@@ -506,27 +525,6 @@ withSandbox inputs config action = do
     unless (currentPhase currState == Build) $
         throwError $ PhaseError "Sandbox can only be created in Build phase"
 
-    -- Use the right implementation based on privilege tier
-    case currentPrivilegeTier env of
-        -- When running as daemon, we can create the sandbox directly
-        Daemon ->
-            withSandboxDaemon' inputs config action
-        -- When running as builder, we must use the protocol
-        Builder ->
-            withSandboxViaProtocol' inputs config action
-
--- | Daemon-specific implementation of withSandbox
-withSandboxDaemon' :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withSandboxDaemon' = withSandboxDaemon
-
--- | Builder-specific implementation of withSandbox
-withSandboxViaProtocol' :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Builder a) -> TenM 'Build 'Builder a
-withSandboxViaProtocol' = withSandboxViaProtocol
-
--- | Create a sandbox in daemon context (privileged operation)
-withSandboxDaemon :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withSandboxDaemon inputs config action = do
-    env <- ask
     bid <- gets currentBuildId
 
     -- Get unique sandbox directory
@@ -540,65 +538,55 @@ withSandboxDaemon inputs config action = do
     -- Set proper permissions immediately
     liftIO $ Posix.setFileMode sandboxDir 0o755
 
-    -- Use bracket to ensure proper cleanup even on exceptions
-    result <- liftIO $ bracket
-        (return sandboxDir)  -- Acquire sandbox dir
-        (\dir -> do          -- Release/cleanup sandbox
-            -- Unmount any bind mounts
-            unmountAllBindMounts dir `catch` \(_ :: SomeException) ->
-                hPutStrLn stderr $ "Warning: Failed to unmount sandbox paths in " ++ dir
+    -- Acquire resource
+    result <- (do
+        -- Set up the sandbox with appropriate namespaces and mounts
+        setupSandbox sandboxDir config
 
-            -- Remove the sandbox directory
-            removePathForcibly dir `catch` \(e :: SomeException) -> do
-                hPutStrLn stderr $ "Warning: Failed to remove sandbox: " ++ show e
-                -- Try to fix permissions and retry
-                setRecursiveWritePermissions dir
-                removePathForcibly dir `catch` \(e2 :: SomeException) ->
-                    hPutStrLn stderr $ "Warning: Failed on second attempt: " ++ show e2
-        )
-        (\dir -> do          -- Run the operation
-            -- Create the sandbox with appropriate namespaces and mounts
-            setupResult <- try $ do
-                -- Set up the sandbox structure
-                setupSandbox' env bid dir config
+        -- Make inputs available in the sandbox
+        makeInputsAvailable sandboxDir inputs
 
-                -- Make inputs available in the sandbox
-                makeInputsAvailable' env dir inputs
+        -- Add read-only and writable paths from config
+        forM_ (Set.toList $ sandboxReadOnlyPaths config) $
+            makePathAvailable sandboxDir False
 
-                -- Add read-only and writable paths from config
-                forM_ (Set.toList $ sandboxReadOnlyPaths config) $
-                    makePathAvailable' env dir False
-                forM_ (Set.toList $ sandboxWritablePaths config) $
-                    makePathAvailable' env dir True
+        forM_ (Set.toList $ sandboxWritablePaths config) $
+            makePathAvailable sandboxDir True
 
-                -- Add additional system paths specified in config
-                forM_ (Set.toList $ sandboxExtraPaths config) $
-                    makeSystemPathAvailable' env dir
+        -- Add additional system paths specified in config
+        forM_ (Set.toList $ sandboxExtraPaths config) $
+            makeSystemPathAvailable sandboxDir
 
-                return dir
+        -- Run the action inside the sandbox
+        action sandboxDir) `catchError` \e -> do
+            -- Clean up sandbox on error
+            liftIO $ unmountAllBindMounts sandboxDir
+            liftIO $ removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> do
+                liftIO $ setRecursiveWritePermissions sandboxDir
+                liftIO $ removePathForcibly sandboxDir `catch` \(_ :: SomeException) ->
+                    return ()
+            throwError e
 
-            case setupResult of
-                Left (e :: SomeException) ->
-                    throwIO $ SandboxError $ "Failed to set up sandbox: " <> T.pack (show e)
-                Right setupDir -> do
-                    -- Run the action inside the sandbox
-                    -- This now requires a separate unprivileged process
-                    runTen sBuild sDaemon (action setupDir) env currState
-        )
+    -- Clean up sandbox unless config says to keep it
+    unless (sandboxKeepBuildOutput config) $ do
+        liftIO $ unmountAllBindMounts sandboxDir
+        liftIO $ removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> do
+            liftIO $ setRecursiveWritePermissions sandboxDir
+            liftIO $ removePathForcibly sandboxDir `catch` \(_ :: SomeException) ->
+                return ()
 
-    -- Handle result
-    case result of
-        Left err -> throwError err
-        Right (val, newState) -> do
-            -- Make sure to update our state with any changes
-            put newState
-            return val
+    return result
 
--- | Create a sandbox via daemon protocol (for builder context)
+-- | Builder-specific implementation of withSandbox using protocol communication
 withSandboxViaProtocol :: Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build 'Builder a) -> TenM 'Build 'Builder a
 withSandboxViaProtocol inputs config action = do
     env <- ask
     bid <- gets currentBuildId
+
+    -- Verify we are in Build phase
+    currState <- get
+    unless (currentPhase currState == Build) $
+        throwError $ PhaseError "Sandbox can only be created in Build phase"
 
     -- Get sandbox connection from run mode
     case runMode env of
@@ -607,12 +595,12 @@ withSandboxViaProtocol inputs config action = do
             sandboxConn <- liftIO $ getSandboxConnection conn
 
             -- Request a sandbox from the daemon via protocol
-            sandboxResp <- requestSandbox sandboxConn bid inputs config
+            sandboxCreation <- requestSandbox sandboxConn bid inputs config
 
-            case sandboxResp of
+            case sandboxCreation of
                 SandboxCreatedResponse sandboxId sandboxPath -> do
-                    -- Run the action in the sandbox
-                    result <- action sandboxPath `catchError` \e -> do
+                    -- Run the action in the sandbox with proper error handling
+                    result <- (action sandboxPath) `catchError` \e -> do
                         -- Notify daemon of error
                         liftIO $ notifySandboxError sandboxConn sandboxId e
                         -- Re-throw the error
@@ -630,82 +618,59 @@ withSandboxViaProtocol inputs config action = do
 
         _ -> throwError $ SandboxError "Builder cannot create sandboxes without daemon connection"
 
--- | Get a sandbox connection from a daemon connection
-getSandboxConnection :: DaemonConnection 'Builder -> IO SandboxConnection
-getSandboxConnection conn = do
-    -- Create request counter and response map
-    requestCounter <- newTVarIO 0
-    responses <- newTVarIO Map.empty
-
-    -- Create the sandbox connection
-    return SandboxConnection {
-        sandboxConnSocket = connSocket conn,
-        sandboxConnAuthToken = connAuthToken conn,
-        sandboxConnUserId = connUserId conn,
-        sandboxConnRequestCounter = requestCounter,
-        sandboxConnResponses = responses
-    }
-
 -- | Set up a sandbox with proper namespaces and isolation
 setupSandbox :: FilePath -> SandboxConfig -> TenM 'Build 'Daemon ()
 setupSandbox sandboxDir config = do
     env <- ask
-    currState <- get
     bid <- gets currentBuildId
 
-    -- Delegate to the internal implementation
-    liftIO $ setupSandbox' env bid sandboxDir config
-
-    -- Add sandbox proof
-    addProof (BuildProof)
-
--- | Internal implementation of sandbox setup
-setupSandbox' :: BuildEnv -> BuildId -> FilePath -> SandboxConfig -> IO ()
-setupSandbox' env bid sandboxDir config = do
     -- Create basic directory structure with proper permissions
-    createAndSetupDir sandboxDir 0o755
-    createAndSetupDir (sandboxDir </> "tmp") 0o1777  -- Set tmp directory with sticky bit
-    createAndSetupDir (sandboxDir </> "build") 0o755
-    createAndSetupDir (sandboxDir </> "out") 0o755
-    createAndSetupDir (sandboxDir </> "store") 0o755
+    liftIO $ createAndSetupDir sandboxDir 0o755
+    liftIO $ createAndSetupDir (sandboxDir </> "tmp") 0o1777  -- Set tmp directory with sticky bit
+    liftIO $ createAndSetupDir (sandboxDir </> "build") 0o755
+    liftIO $ createAndSetupDir (sandboxDir </> "out") 0o755
+    liftIO $ createAndSetupDir (sandboxDir </> "store") 0o755
 
     -- Create return derivation directory if needed
     when (sandboxReturnSupport config) $ do
         let returnDir = takeDirectory $ returnDerivationPath sandboxDir
-        createAndSetupDir returnDir 0o755
+        liftIO $ createAndSetupDir returnDir 0o755
 
     -- Set ownership for unprivileged user if configured
-    uid <- User.getRealUserID
+    uid <- liftIO $ User.getRealUserID
     when (uid == 0 && not (sandboxPrivileged config)) $ do
         -- Get user/group IDs for sandbox
-        uid' <- safeGetUserUID (sandboxUser config)
-        gid <- safeGetGroupGID (sandboxGroup config)
+        uid' <- liftIO $ safeGetUserUID (sandboxUser config)
+        gid <- liftIO $ safeGetGroupGID (sandboxGroup config)
 
         -- Set ownership of key directories
-        setOwnerAndGroup sandboxDir uid' gid
-        setOwnerAndGroup (sandboxDir </> "out") uid' gid
-        setOwnerAndGroup (sandboxDir </> "tmp") uid' gid
-        setOwnerAndGroup (sandboxDir </> "build") uid' gid
+        liftIO $ setOwnerAndGroup sandboxDir uid' gid
+        liftIO $ setOwnerAndGroup (sandboxDir </> "out") uid' gid
+        liftIO $ setOwnerAndGroup (sandboxDir </> "tmp") uid' gid
+        liftIO $ setOwnerAndGroup (sandboxDir </> "build") uid' gid
 
         -- Set ownership for return path if enabled
         when (sandboxReturnSupport config) $ do
             let returnDir = takeDirectory $ returnDerivationPath sandboxDir
-            setOwnerAndGroup returnDir uid' gid
+            liftIO $ setOwnerAndGroup returnDir uid' gid
 
     -- Set up Linux namespaces if running as root
     when (uid == 0 && (sandboxUseMountNamespace config || sandboxUseNetworkNamespace config)) $ do
-        setupNamespaces config sandboxDir
+        liftIO $ setupNamespaces config sandboxDir
 
     -- Make /proc available if using mount namespace
     when (uid == 0 && sandboxUseMountNamespace config) $ do
         let procDir = sandboxDir </> "proc"
-        createAndSetupDir procDir 0o555
-        mountProc procDir `catch` \(_ :: SomeException) ->
+        liftIO $ createAndSetupDir procDir 0o555
+        liftIO $ mountProc procDir `catch` \(_ :: SomeException) ->
             hPutStrLn stderr $ "Warning: Failed to mount proc in sandbox: " ++ procDir
 
     -- Set up minimal /dev if using mount namespace
     when (uid == 0 && sandboxUseMountNamespace config) $ do
-        setupMinimalDev sandboxDir
+        liftIO $ setupMinimalDev sandboxDir
+
+    -- Add sandbox proof
+    addProof (BuildProof)
 
 -- | Tear down a sandbox, cleaning up resources
 teardownSandbox :: FilePath -> TenM 'Build t ()
@@ -827,22 +792,18 @@ createAndSetupDir dir mode = do
 makePathAvailable :: FilePath -> Bool -> FilePath -> TenM 'Build t ()
 makePathAvailable sandboxDir writable sourcePath = do
     env <- ask
-    liftIO $ makePathAvailable' env sandboxDir writable sourcePath
 
--- | Internal implementation of makePathAvailable
-makePathAvailable' :: BuildEnv -> FilePath -> Bool -> FilePath -> IO ()
-makePathAvailable' env sandboxDir writable sourcePath = do
     -- Sanitize and normalize source path
     let sourcePath' = FilePath.normalise sourcePath
 
     -- Security check - prevent escaping the sandbox through .. paths
     when (".." `isInfixOf` sourcePath') $
-        throwIO $ SandboxError $ "Path contains .. segments: " <> T.pack sourcePath'
+        throwError $ SandboxError $ "Path contains .. segments: " <> T.pack sourcePath'
 
     -- Skip if source doesn't exist
-    sourceExists <- doesPathExist sourcePath'
+    sourceExists <- liftIO $ doesPathExist sourcePath'
     unless sourceExists $ do
-        hPutStrLn stderr $ "Path does not exist, skipping: " ++ sourcePath'
+        liftIO $ hPutStrLn stderr $ "Path does not exist, skipping: " ++ sourcePath'
         return ()
 
     -- Determine destination path within sandbox
@@ -852,38 +813,38 @@ makePathAvailable' env sandboxDir writable sourcePath = do
     -- Security check - ensure destination is within sandbox
     let sandboxPath' = FilePath.normalise sandboxDir
     when (not $ sandboxPath' `isPrefixOf` destPath) $
-        throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack destPath
+        throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack destPath
 
     -- Create parent directory structure
-    createDirectoryIfMissing True (takeDirectory destPath)
+    liftIO $ createDirectoryIfMissing True (takeDirectory destPath)
 
     -- Bind mount the source to the destination
-    isDir <- doesDirectoryExist sourcePath'
+    isDir <- liftIO $ doesDirectoryExist sourcePath'
 
     if isDir
         then do
             -- For directories, create the destination and bind mount
-            createAndSetupDir destPath 0o755
-            bindMount sourcePath' destPath writable `catchIOError` \e -> do
-                hPutStrLn stderr $ "Warning: Failed to bind mount directory " ++
+            liftIO $ createAndSetupDir destPath 0o755
+            liftIO $ bindMount sourcePath' destPath writable `catchIOError` \e -> do
+                liftIO $ hPutStrLn stderr $ "Warning: Failed to bind mount directory " ++
                                   sourcePath' ++ " to " ++ destPath ++ ": " ++ show e
                 -- Try copying instead as fallback
-                copyDirectoryRecursive sourcePath' destPath
+                liftIO $ copyDirectoryRecursive sourcePath' destPath
         else do
             -- For files, create an empty file and bind mount
             -- Create parent directory if needed
-            createDirectoryIfMissing True (takeDirectory destPath)
+            liftIO $ createDirectoryIfMissing True (takeDirectory destPath)
 
             -- Create an empty file as mount point
-            writeFile destPath ""
-            Posix.setFileMode destPath 0o644
+            liftIO $ writeFile destPath ""
+            liftIO $ Posix.setFileMode destPath 0o644
 
             -- Try to mount the source file
-            bindMount sourcePath' destPath writable `catchIOError` \e -> do
-                hPutStrLn stderr $ "Warning: Failed to bind mount file " ++
+            liftIO $ bindMount sourcePath' destPath writable `catchIOError` \e -> do
+                liftIO $ hPutStrLn stderr $ "Warning: Failed to bind mount file " ++
                                   sourcePath' ++ " to " ++ destPath ++ ": " ++ show e
                 -- Try copying instead as fallback
-                copyFile sourcePath' destPath
+                liftIO $ copyFile sourcePath' destPath
                 when (not writable) $ do
                     -- Make read-only
                     perms <- getPermissions destPath
@@ -920,11 +881,7 @@ copyDirectoryRecursive src dst = do
 makeInputsAvailable :: FilePath -> Set StorePath -> TenM 'Build t ()
 makeInputsAvailable sandboxDir inputs = do
     env <- ask
-    liftIO $ makeInputsAvailable' env sandboxDir inputs
 
--- | Internal implementation of makeInputsAvailable
-makeInputsAvailable' :: BuildEnv -> FilePath -> Set StorePath -> IO ()
-makeInputsAvailable' env sandboxDir inputs = do
     -- Process each input
     forM_ (Set.toList inputs) $ \input -> do
         -- Get source path
@@ -943,30 +900,30 @@ makeInputsAvailable' env sandboxDir inputs = do
         -- Security checks
         let sandboxPath' = FilePath.normalise sandboxDir
         when (not $ sandboxPath' `isPrefixOf` storeDest') $
-            throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack storeDest'
+            throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack storeDest'
         when (not $ sandboxPath' `isPrefixOf` nameDest') $
-            throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack nameDest'
+            throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack nameDest'
 
         -- Mount or copy the input to both destinations
         -- Create destination directories
-        createDirectoryIfMissing True (takeDirectory storeDest')
-        createDirectoryIfMissing True (takeDirectory nameDest')
+        liftIO $ createDirectoryIfMissing True (takeDirectory storeDest')
+        liftIO $ createDirectoryIfMissing True (takeDirectory nameDest')
 
         -- Create mount points
-        isDir <- doesDirectoryExist sourcePath
+        isDir <- liftIO $ doesDirectoryExist sourcePath
         if isDir then do
-            createAndSetupDir storeDest' 0o755
-            createAndSetupDir nameDest' 0o755
+            liftIO $ createAndSetupDir storeDest' 0o755
+            liftIO $ createAndSetupDir nameDest' 0o755
         else do
-            writeFile storeDest' ""
-            writeFile nameDest' ""
+            liftIO $ writeFile storeDest' ""
+            liftIO $ writeFile nameDest' ""
 
             -- Make sure they are writable for the bind mount
-            Posix.setFileMode storeDest' 0o644
-            Posix.setFileMode nameDest' 0o644
+            liftIO $ Posix.setFileMode storeDest' 0o644
+            liftIO $ Posix.setFileMode nameDest' 0o644
 
         -- Try to mount the input (read-only)
-        catchIOError
+        liftIO $ catchIOError
             (bindMountReadOnly sourcePath storeDest')
             (\e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount store path " ++
@@ -976,7 +933,7 @@ makeInputsAvailable' env sandboxDir inputs = do
                     then copyDirectoryRecursive sourcePath storeDest'
                     else copyFile sourcePath storeDest')
 
-        catchIOError
+        liftIO $ catchIOError
             (bindMountReadOnly sourcePath nameDest')
             (\e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount store path " ++
@@ -993,22 +950,18 @@ makeInputsAvailable' env sandboxDir inputs = do
 makeSystemPathAvailable :: FilePath -> FilePath -> TenM 'Build t ()
 makeSystemPathAvailable sandboxDir systemPath = do
     env <- ask
-    liftIO $ makeSystemPathAvailable' env sandboxDir systemPath
 
--- | Internal implementation of makeSystemPathAvailable
-makeSystemPathAvailable' :: BuildEnv -> FilePath -> FilePath -> IO ()
-makeSystemPathAvailable' env sandboxDir systemPath = do
     -- Sanitize and normalize system path
     let systemPath' = FilePath.normalise systemPath
 
     -- Security check - prevent escaping the sandbox through .. paths
     when (".." `isInfixOf` systemPath') $
-        throwIO $ SandboxError $ "Path contains .. segments: " <> T.pack systemPath'
+        throwError $ SandboxError $ "Path contains .. segments: " <> T.pack systemPath'
 
     -- Skip if the path doesn't exist
-    pathExists <- doesPathExist systemPath'
+    pathExists <- liftIO $ doesPathExist systemPath'
     unless pathExists $ do
-        hPutStrLn stderr $ "System path does not exist, skipping: " ++ systemPath'
+        liftIO $ hPutStrLn stderr $ "System path does not exist, skipping: " ++ systemPath'
         return ()
 
     -- Determine the relative path in the sandbox
@@ -1018,25 +971,25 @@ makeSystemPathAvailable' env sandboxDir systemPath = do
     -- Security check - ensure destination is within sandbox
     let sandboxPath' = FilePath.normalise sandboxDir
     when (not $ sandboxPath' `isPrefixOf` sandboxPath) $
-        throwIO $ SandboxError $ "Path escapes sandbox: " <> T.pack sandboxPath
+        throwError $ SandboxError $ "Path escapes sandbox: " <> T.pack sandboxPath
 
     -- Skip if already mounted
-    destExists <- doesPathExist sandboxPath
+    destExists <- liftIO $ doesPathExist sandboxPath
     when destExists $ do
-        hPutStrLn stderr $ "Path already exists in sandbox, skipping: " ++ sandboxPath
+        liftIO $ hPutStrLn stderr $ "Path already exists in sandbox, skipping: " ++ sandboxPath
         return ()
 
     -- Create parent directories
-    createDirectoryIfMissing True (takeDirectory sandboxPath)
+    liftIO $ createDirectoryIfMissing True (takeDirectory sandboxPath)
 
     -- Mount the system path
-    isDir <- doesDirectoryExist systemPath'
+    isDir <- liftIO $ doesDirectoryExist systemPath'
     if isDir
         then do
             -- Create directory
-            createAndSetupDir sandboxPath 0o755
+            liftIO $ createAndSetupDir sandboxPath 0o755
             -- Mount directory (read-only)
-            bindMountReadOnly systemPath' sandboxPath `catchIOError` \e -> do
+            liftIO $ bindMountReadOnly systemPath' sandboxPath `catchIOError` \e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount system directory " ++
                                   systemPath' ++ " to " ++ sandboxPath ++ ": " ++ show e
                 -- Try copying instead as fallback for important system directories
@@ -1044,11 +997,11 @@ makeSystemPathAvailable' env sandboxDir systemPath = do
                     copyDirectoryRecursive systemPath' sandboxPath
         else do
             -- Create empty file
-            writeFile sandboxPath ""
+            liftIO $ writeFile sandboxPath ""
             -- Set proper permissions
-            Posix.setFileMode sandboxPath 0o644
+            liftIO $ Posix.setFileMode sandboxPath 0o644
             -- Mount file (read-only)
-            bindMountReadOnly systemPath' sandboxPath `catchIOError` \e -> do
+            liftIO $ bindMountReadOnly systemPath' sandboxPath `catchIOError` \e -> do
                 hPutStrLn stderr $ "Warning: Failed to bind mount system file " ++
                                   systemPath' ++ " to " ++ sandboxPath ++ ": " ++ show e
                 -- Try copying instead as fallback
@@ -1214,9 +1167,11 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
             -- Set resource limits
             setResourceLimits' config
 
+            -- Properly convert environment variables
+            let envVars = map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList buildEnv
+
             -- Execute the program
-            executeFile programPath True args (Just $ map (\(k, v) -> (T.unpack k, T.unpack v)) $
-                                                    Map.toList buildEnv)
+            executeFile programPath True args (Just envVars)
 
             -- Should never reach here
             exitImmediately (ExitFailure 127)
@@ -1424,6 +1379,22 @@ sandboxInputPath sandboxDir inputName = sandboxDir </> inputName
 sandboxOutputPath :: FilePath -> FilePath -> FilePath
 sandboxOutputPath sandboxDir outputName = sandboxDir </> "out" </> outputName
 
+-- | Get a sandbox connection from a daemon connection
+getSandboxConnection :: DaemonConnection 'Builder -> IO SandboxConnection
+getSandboxConnection conn = do
+    -- Create request counter and response map
+    requestCounter <- newTVarIO 0
+    responses <- newTVarIO Map.empty
+
+    -- Create the sandbox connection
+    return SandboxConnection {
+        sandboxConnSocket = connSocket conn,
+        sandboxConnAuthToken = connAuthToken conn,
+        sandboxConnUserId = connUserId conn,
+        sandboxConnRequestCounter = requestCounter,
+        sandboxConnResponses = responses
+    }
+
 -- | Request a sandbox from the daemon via protocol
 requestSandbox :: SandboxConnection -> BuildId -> Set StorePath -> SandboxConfig ->
                 TenM 'Build 'Builder SandboxResponse
@@ -1558,7 +1529,6 @@ notifySandboxError conn sandboxId err = do
 sandboxProtocolHandler :: SPrivilegeTier 'Daemon -> SandboxRequest ->
                          TenM 'Build 'Daemon SandboxResponse
 sandboxProtocolHandler st request = do
-    -- Process sandbox request based on its type
     case request of
         SandboxCreateRequest buildId inputs config -> do
             -- Create a new sandbox
@@ -1568,67 +1538,73 @@ sandboxProtocolHandler st request = do
             sandboxId <- liftIO UUID.nextRandom >>= return . T.pack . UUID.toString
 
             -- Set up the sandbox
-            result <- try $ do
+            setupSandboxResult <- (do
                 setupSandbox sandboxDir config
                 makeInputsAvailable sandboxDir inputs
-
-                -- Add path configuration
                 mapM_ (makePathAvailable sandboxDir False) (Set.toList $ sandboxReadOnlyPaths config)
                 mapM_ (makePathAvailable sandboxDir True) (Set.toList $ sandboxWritablePaths config)
                 mapM_ (makeSystemPathAvailable sandboxDir) (Set.toList $ sandboxExtraPaths config)
+                return $ Right $ SandboxCreatedResponse sandboxId sandboxDir
+                ) `catchError` \e -> do
+                return $ Left e
 
-                return $ SandboxCreatedResponse sandboxId sandboxDir
-
-            case result of
-                Left (e :: SomeException) ->
-                    return $ SandboxErrorResponse $ "Failed to create sandbox: " <> T.pack (show e)
+            case setupSandboxResult of
+                Left e ->
+                    return $ SandboxErrorResponse $ "Failed to create sandbox: " <> buildErrorToText e
                 Right response ->
                     return response
 
         SandboxReleaseRequest sandboxId -> do
             -- Get the sandbox path
-            maybeDir <- try $ getSandboxDirFromId sandboxId
+            getSandboxDirResult <- (Right <$> getSandboxDirFromId sandboxId) `catchError` \e -> do
+                return $ Left e
 
-            case maybeDir of
-                Left (e :: SomeException) ->
-                    return $ SandboxErrorResponse $ "Failed to find sandbox: " <> T.pack (show e)
+            case getSandboxDirResult of
+                Left e ->
+                    return $ SandboxErrorResponse $ "Failed to find sandbox: " <> buildErrorToText e
                 Right sandboxDir -> do
                     -- Tear down the sandbox
-                    result <- try $ teardownSandbox sandboxDir
+                    teardownResult <- (do
+                        teardownSandbox sandboxDir
+                        return $ Right ()) `catchError` \e -> do
+                            return $ Left e
 
-                    case result of
-                        Left (e :: SomeException) ->
-                            return $ SandboxErrorResponse $ "Failed to release sandbox: " <> T.pack (show e)
+                    case teardownResult of
+                        Left e ->
+                            return $ SandboxErrorResponse $ "Failed to release sandbox: " <> buildErrorToText e
                         Right _ ->
                             return $ SandboxReleasedResponse True
 
         SandboxStatusRequest sandboxId -> do
             -- Get sandbox info
-            result <- try $ getSandboxInfo sandboxId
+            statusResult <- (Right <$> getSandboxInfo sandboxId) `catchError` \e -> do
+                return $ Left e
 
-            case result of
-                Left (e :: SomeException) ->
-                    return $ SandboxErrorResponse $ "Failed to get sandbox status: " <> T.pack (show e)
+            case statusResult of
+                Left e ->
+                    return $ SandboxErrorResponse $ "Failed to get sandbox status: " <> buildErrorToText e
                 Right status ->
                     return $ SandboxStatusResponse status
 
         SandboxAbortRequest sandboxId -> do
             -- Force cleanup of a sandbox
-            maybeDir <- try $ getSandboxDirFromId sandboxId
+            getSandboxDirResult <- (Right <$> getSandboxDirFromId sandboxId) `catchError` \e -> do
+                return $ Left e
 
-            case maybeDir of
-                Left (e :: SomeException) ->
-                    return $ SandboxErrorResponse $ "Failed to find sandbox: " <> T.pack (show e)
+            case getSandboxDirResult of
+                Left e ->
+                    return $ SandboxErrorResponse $ "Failed to find sandbox: " <> buildErrorToText e
                 Right sandboxDir -> do
                     -- Force cleanup
-                    result <- try $ liftIO $ do
+                    result <- liftIO $ do
                         unmountAllBindMounts sandboxDir
                         removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> do
                             setRecursiveWritePermissions sandboxDir
-                            removePathForcibly sandboxDir
+                            removePathForcibly sandboxDir `catch` \(_ :: SomeException) -> return ()
+                        return $ Right ()
 
                     case result of
-                        Left (e :: SomeException) ->
+                        Left e ->
                             return $ SandboxErrorResponse $ "Failed to abort sandbox: " <> T.pack (show e)
                         Right _ ->
                             return $ SandboxReleasedResponse True
@@ -1776,5 +1752,3 @@ createFileLink target link =
 -- | Get the absolute path of a file
 canonicalizePath :: FilePath -> IO FilePath
 canonicalizePath = Directory.canonicalizePath
-
--- | Helper function for timeouts is now imported from Ten.Core
