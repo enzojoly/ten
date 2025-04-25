@@ -87,8 +87,6 @@ import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Vector as Vector
 
 import Ten.Core
-import Ten.DB.Core
-import Ten.Daemon.Protocol (DaemonRequest(..), DaemonResponse(..))
 
 -- | Information about a stored derivation
 data DerivationInfo = DerivationInfo {
@@ -154,10 +152,14 @@ instance FromRow PathInfo where
 
 -- Helper function to parse StorePath from a database field
 parseStorePathField :: RowParser StorePath
-parseStorePathField = field
+parseStorePathField = do
+    text <- field :: RowParser Text
+    case parseStorePath text of
+        Just path -> return path
+        Nothing -> fail $ "Invalid store path: " ++ T.unpack text
 
--- | Store a derivation in the database - privileged operation
-storeDerivation :: Database -> Derivation -> StorePath -> TenM p 'Privileged Int64
+-- | Store a derivation in the database - daemon operation
+storeDerivation :: Database -> Derivation -> StorePath -> TenM p 'Daemon Int64
 storeDerivation db derivation storePath = do
     -- Check if derivation already exists
     existing <- isDerivationRegistered db (derivHash derivation)
@@ -184,7 +186,7 @@ storeDerivation db derivation storePath = do
 
 -- | New function to handle database operations for storing a derivation
 -- This replaces Ten.Derivation.storeDerivationFile's database operations
-storeDerivationInDB :: Derivation -> StorePath -> FilePath -> TenM p 'Privileged Int64
+storeDerivationInDB :: Derivation -> StorePath -> FilePath -> TenM p 'Daemon Int64
 storeDerivationInDB drv derivPath dbPath = do
     -- Initialize database
     db <- liftIO $ initDatabase dbPath 5000
@@ -197,8 +199,8 @@ storeDerivationInDB drv derivPath dbPath = do
 
     return derivId
 
--- | Register a derivation file in the database with proper reference tracking - privileged operation
-registerDerivationFile :: Database -> Derivation -> StorePath -> TenM p 'Privileged Int64
+-- | Register a derivation file in the database with proper reference tracking - daemon operation
+registerDerivationFile :: Database -> Derivation -> StorePath -> TenM p 'Daemon Int64
 registerDerivationFile db derivation storePath = withTenTransaction db ReadWrite $ \_ -> do
     -- Store in database
     derivId <- storeDerivation db derivation storePath
@@ -229,8 +231,8 @@ registerDerivationFile db derivation storePath = withTenTransaction db ReadWrite
 
     return derivId
 
--- | Retrieve a derivation from the database - privileged operation
-retrieveDerivation :: Database -> Text -> TenM p 'Privileged (Maybe Derivation)
+-- | Retrieve a derivation from the database - daemon operation
+retrieveDerivation :: Database -> Text -> TenM p 'Daemon (Maybe Derivation)
 retrieveDerivation db hash = do
     env <- ask
 
@@ -257,14 +259,14 @@ retrieveDerivation db hash = do
         _ -> throwError $ DBError "Multiple derivations with same hash - database corruption"
 
 -- | Retrieve a derivation by hash - this is now properly context-aware
-retrieveDerivationByHash :: FilePath -> Text -> TenM p 'Privileged (Maybe Derivation)
+retrieveDerivationByHash :: FilePath -> Text -> TenM p 'Daemon (Maybe Derivation)
 retrieveDerivationByHash dbPath hash = do
     env <- ask
 
     -- Open database
     db <- liftIO $ initDatabase dbPath 5000
 
-    -- Query for store path - explicitly in the privileged context
+    -- Query for store path - explicitly in the daemon context
     storePaths <- tenQuery db
         "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
         (Only hash)
@@ -283,37 +285,55 @@ retrieveDerivationByHash dbPath hash = do
     -- Return the result
     return result
 
--- | Request derivation by hash - unprivileged operation using protocol
-requestDerivationByHash :: Text -> TenM p 'Unprivileged (Maybe Derivation)
+-- | Request derivation by hash - builder operation using protocol
+requestDerivationByHash :: Text -> TenM p 'Builder (Maybe Derivation)
 requestDerivationByHash hash = do
     env <- ask
 
     -- Must use daemon connection to request derivation
     case runMode env of
         ClientMode conn -> do
-            -- Send request through daemon protocol
-            result <- sendDaemonRequest conn (RetrieveDerivationCmd $ RetrieveDerivationRequest {
-                derivationHash = hash,
-                includeOutputs = True
-            })
+            -- Create a request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "retrieve-derivation",
+                    reqParams = Map.fromList [
+                        ("hash", hash),
+                        ("includeOutputs", "true")
+                    ],
+                    reqPayload = Nothing
+                }
 
-            -- Process response
-            case result of
-                DerivationRetrievedResponse mDrv -> return mDrv
-                ErrorResponse err -> throwError err
-                _ -> throwError $ ProtocolError $ "Unexpected response type for derivation request"
+            -- Send request through daemon connection
+            reqId <- liftIO $ sendRequest conn request
+            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+            -- Handle response
+            case responseResult of
+                Left err -> throwError err
+                Right response ->
+                    if respStatus response == "ok"
+                        then case respPayload response of
+                            Just content ->
+                                -- Deserialize derivation
+                                case Ten.Core.deserializeDerivation content of
+                                    Left err -> throwError $ SerializationError $ "Failed to deserialize derivation: " <> errorToText err
+                                    Right drv -> return $ Just drv
+                            Nothing -> return Nothing
+                        else throwError $ DaemonError $ respMessage response
 
         _ -> throwError $ BuildFailed "Cannot request derivation: not connected to daemon"
 
 -- | Helper to read derivation from store - available in both contexts with different implementations
-readDerivationFromStore :: BuildEnv -> StorePath -> TenM p ctx (Maybe Derivation)
+readDerivationFromStore :: BuildEnv -> StorePath -> TenM p t (Maybe Derivation)
 readDerivationFromStore env sp = do
-    -- Implementation depends on privilege context
-    ctxType <- asks privilegeContext
+    -- Implementation depends on privilege tier
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
-            -- Privileged context can access store directly
+    case tier of
+        -- Daemon context can access store directly
+        Daemon -> do
+            -- Direct store access
             let fullPath = storePathToFilePath sp env
 
             -- Check if file exists
@@ -323,90 +343,50 @@ readDerivationFromStore env sp = do
                 else do
                     -- Read and deserialize
                     content <- liftIO $ BS.readFile fullPath
-                    case deserializeDerivation content of
+                    case Ten.Core.deserializeDerivation content of
                         Left _ -> return Nothing
                         Right drv -> return $ Just drv
 
-        Unprivileged -> do
-            -- Unprivileged context must use protocol
+        -- Builder context must use protocol
+        Builder -> do
+            -- Must use daemon connection
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (RetrieveDerivationCmd $ RetrieveDerivationRequest {
-                        derivationPath = sp,
-                        includeOutputs = False
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "retrieve-derivation",
+                            reqParams = Map.singleton "path" (storePathToText sp),
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        DerivationRetrievedResponse mDrv -> return mDrv
-                        _ -> return Nothing
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then case respPayload response of
+                                    Just content ->
+                                        -- Deserialize derivation
+                                        case Ten.Core.deserializeDerivation content of
+                                            Left err -> return Nothing
+                                            Right drv -> return $ Just drv
+                                    Nothing -> return Nothing
+                                else return Nothing
 
                 _ -> return Nothing  -- Cannot access without daemon connection
 
--- | Helper function to deserialize a derivation
-deserializeDerivation :: ByteString -> Either Text Derivation
-deserializeDerivation bs =
-    case Aeson.eitherDecode (LBS.fromStrict bs) of
-        Left err -> Left $ T.pack $ "JSON parse error: " ++ err
-        Right json -> derivationFromJSON json
+-- | Local helper function to deserialize a derivation
+-- This avoids the ambiguous import issue
+localDeserializeDerivation :: ByteString -> Either Text Derivation
+localDeserializeDerivation bs =
+    Ten.Core.deserializeDerivation bs
 
--- | Convert JSON to Derivation
-derivationFromJSON :: Aeson.Value -> Either Text Derivation
-derivationFromJSON value = case Aeson.parseEither parseDerivation value of
-    Left err -> Left $ T.pack err
-    Right drv -> Right drv
-  where
-    parseDerivation = Aeson.withObject "Derivation" $ \o -> do
-        name <- o Aeson..: "name"
-        hash <- o Aeson..: "hash"
-        builderObj <- o Aeson..: "builder"
-        builder <- parseStorePath' builderObj
-        args <- o Aeson..: "args"
-        inputsArray <- o Aeson..: "inputs"
-        inputs <- parseInputs inputsArray
-        outputsArray <- o Aeson..: "outputs"
-        outputs <- parseOutputs outputsArray
-        envObj <- o Aeson..: "env"
-        env <- parseEnvMap envObj
-        system <- o Aeson..: "system"
-        strategyText <- o Aeson..: "strategy"
-        let strategy = if strategyText == ("monadic" :: Text) then MonadicStrategy else ApplicativeStrategy
-        metaObj <- o Aeson..: "meta"
-        meta <- parseEnvMap metaObj
-
-        return $ Derivation name hash builder args
-                           (Set.fromList inputs) (Set.fromList outputs)
-                           env system strategy meta
-
-    parseStorePath' = Aeson.withObject "StorePath" $ \o -> do
-        hash <- o Aeson..: "hash"
-        name <- o Aeson..: "name"
-        return $ StorePath hash name
-
-    parseInputs = Aeson.withArray "Inputs" $ \arr ->
-        mapM parseInput (Vector.toList arr)
-
-    parseInput = Aeson.withObject "DerivationInput" $ \o -> do
-        pathObj <- o Aeson..: "path"
-        path <- parseStorePath' pathObj
-        name <- o Aeson..: "name"
-        return $ DerivationInput path name
-
-    parseOutputs = Aeson.withArray "Outputs" $ \arr ->
-        mapM parseOutput (Vector.toList arr)
-
-    parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
-        name <- o Aeson..: "name"
-        pathObj <- o Aeson..: "path"
-        path <- parseStorePath' pathObj
-        return $ DerivationOutput name path
-
-    parseEnvMap :: Aeson.Object -> Aeson.Parser (Map Text Text)
-    parseEnvMap o =
-        return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- KeyMap.toList o]
-
--- | Read and deserialize a derivation file - privileged operation
+-- | Read and deserialize a derivation file - daemon operation
 readDerivationFile :: BuildEnv -> StorePath -> IO (Either Text Derivation)
 readDerivationFile env path = do
     -- Construct the full path
@@ -420,10 +400,10 @@ readDerivationFile env path = do
             -- Read the file
             content <- BS.readFile filePath
             -- Return the result of deserialization
-            return $ deserializeDerivation content
+            return $ Ten.Core.deserializeDerivation content
 
--- | Register an output for a derivation - privileged operation
-registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> TenM p 'Privileged ()
+-- | Register an output for a derivation - daemon operation
+registerDerivationOutput :: Database -> Int64 -> Text -> StorePath -> TenM p 'Daemon ()
 registerDerivationOutput db derivId outputName outPath = do
     -- Insert output record
     void $ tenExecute db
@@ -431,41 +411,61 @@ registerDerivationOutput db derivId outputName outPath = do
         (derivId, outputName, storePathToText outPath)
 
 -- | Get all outputs for a derivation - available in both contexts with different implementations
-getOutputsForDerivation :: Database -> Int64 -> TenM p ctx [OutputInfo]
+getOutputsForDerivation :: Database -> Int64 -> TenM p t [OutputInfo]
 getOutputsForDerivation db derivId = do
-    -- Implementation depends on privilege context
-    ctxType <- asks privilegeContext
+    -- Implementation depends on privilege tier
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged ->
-            -- Direct database access
+    case tier of
+        -- Daemon context has direct database access
+        Daemon ->
             tenQuery db
                 "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
                 (Only derivId)
 
-        Unprivileged -> do
-            -- Must use daemon protocol
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "outputs",
-                        queryValue = T.pack $ show derivId,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "outputs"),
+                                ("queryValue", T.pack $ show derivId)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response and convert to OutputInfo
-                    case result of
-                        DerivationOutputResponse paths ->
-                            -- Convert paths to OutputInfo (simplified)
-                            return $ map (\path -> OutputInfo derivId (storeName path) path) (Set.toList paths)
-                        _ -> return []
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- Parse outputs from response data
+                                    let outputTexts = T.splitOn "," $
+                                            Map.findWithDefault "" "outputs" (respData response)
+                                        paths = catMaybes $ map parseStorePath $
+                                            filter (not . T.null) outputTexts
+                                    in
+                                        -- Convert paths to OutputInfo (simplified)
+                                        return $ zipWith
+                                            (\i path -> OutputInfo derivId
+                                                (T.pack $ "output" ++ show i) path)
+                                            [1..] paths
+                                else return []
 
                 _ -> throwError $ BuildFailed "Cannot query outputs: not connected to daemon"
 
--- | Find the derivation that produced a particular output - privileged operation
-getDerivationForOutput :: Database -> StorePath -> TenM p 'Privileged (Maybe DerivationInfo)
+-- | Find the derivation that produced a particular output - daemon operation
+getDerivationForOutput :: Database -> StorePath -> TenM p 'Daemon (Maybe DerivationInfo)
 getDerivationForOutput db outputPath = do
     results <- tenQuery db
         "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d \
@@ -476,14 +476,15 @@ getDerivationForOutput db outputPath = do
     return $ listToMaybe results
 
 -- | Find derivations that produced the given outputs - appropriately context-aware
-findDerivationsByOutputs :: Database -> [StorePath] -> TenM p ctx (Map String Derivation)
+findDerivationsByOutputs :: Database -> [StorePath] -> TenM p t (Map String Derivation)
 findDerivationsByOutputs db [] = return Map.empty
 findDerivationsByOutputs db outputPaths = do
     env <- ask
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             -- Convert StorePath to text for query
             let pathTexts = map storePathToText outputPaths
 
@@ -505,24 +506,44 @@ findDerivationsByOutputs db outputPaths = do
             -- Filter out Nothings and convert to Map
             return $ Map.fromList $ catMaybes derivations
 
-        Unprivileged -> do
-            -- Must use daemon protocol
+        -- Builder context must use protocol
+        Builder -> do
             case runMode env of
                 ClientMode conn -> do
-                    -- Request derivations for outputs through protocol
+                    -- Create a request
                     let pathText = T.intercalate "," $ map storePathToText outputPaths
-                    result <- sendDaemonRequest conn (GetDerivationForOutputRequest pathText)
+                        request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "get-derivation-for-output",
+                            reqParams = Map.singleton "paths" pathText,
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        DerivationQueryResponse drvs ->
-                            return $ Map.fromList $ zip (map (T.unpack . derivHash) drvs) drvs
-                        _ -> return Map.empty
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- If payload contains derivations
+                                    case respPayload response of
+                                        Just content ->
+                                            -- Deserialize derivations (assuming a single derivation for simplicity)
+                                            -- A real implementation would handle multiple derivations
+                                            case Ten.Core.deserializeDerivation content of
+                                                Left _ -> return Map.empty
+                                                Right drv -> return $ Map.singleton (T.unpack $ derivHash drv) drv
+                                        Nothing -> return Map.empty
+                                else return Map.empty
 
                 _ -> throwError $ BuildFailed "Cannot find derivations: not connected to daemon"
 
--- | Add a reference between two paths - privileged operation
-addDerivationReference :: Database -> StorePath -> StorePath -> TenM p 'Privileged ()
+-- | Add a reference between two paths - daemon operation
+addDerivationReference :: Database -> StorePath -> StorePath -> TenM p 'Daemon ()
 addDerivationReference db referrer reference =
     when (referrer /= reference) $ do
         -- Skip self-references
@@ -530,8 +551,8 @@ addDerivationReference db referrer reference =
             "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
             (storePathToText referrer, storePathToText reference)
 
--- | Bulk register multiple references for efficiency - privileged operation
-bulkRegisterReferences :: Database -> [(StorePath, StorePath)] -> TenM p 'Privileged Int
+-- | Bulk register multiple references for efficiency - daemon operation
+bulkRegisterReferences :: Database -> [(StorePath, StorePath)] -> TenM p 'Daemon Int
 bulkRegisterReferences db [] = return 0
 bulkRegisterReferences db references = withTenTransaction db ReadWrite $ \_ -> do
     -- Filter out self-references
@@ -547,12 +568,13 @@ bulkRegisterReferences db references = withTenTransaction db ReadWrite $ \_ -> d
     return count
 
 -- | Get all direct references from a path - available in both contexts
-getDerivationReferences :: Database -> StorePath -> TenM p ctx [StorePath]
+getDerivationReferences :: Database -> StorePath -> TenM p t [StorePath]
 getDerivationReferences db path = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             -- Direct database access
             results <- tenQuery db
                 "SELECT reference FROM References WHERE referrer = ?"
@@ -561,33 +583,50 @@ getDerivationReferences db path = do
             -- Parse each path
             return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
 
-        Unprivileged -> do
-            -- Must use protocol
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "references",
-                        queryValue = storePathToText path,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "references"),
+                                ("queryValue", storePathToText path)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        DerivationOutputResponse paths -> return $ Set.toList paths
-                        _ -> return []
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- Parse paths from response data
+                                    let refTexts = T.splitOn "," $
+                                            Map.findWithDefault "" "references" (respData response)
+                                    in
+                                        return $ catMaybes $ map parseStorePath $
+                                            filter (not . T.null) refTexts
+                                else return []
 
                 _ -> throwError $ BuildFailed "Cannot get references: not connected to daemon"
 
--- | Get all direct referrers to a path
-getReferrers :: Database -> StorePath -> TenM p ctx [StorePath]
+-- | Get all direct referrers to a path - available in both contexts
+getReferrers :: Database -> StorePath -> TenM p t [StorePath]
 getReferrers db path = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
-            -- Direct database access
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             results <- tenQuery db
                 "SELECT referrer FROM References WHERE reference = ?"
                 (Only (storePathToText path))
@@ -595,32 +634,50 @@ getReferrers db path = do
             -- Parse each path
             return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
 
-        Unprivileged -> do
-            -- Must use protocol
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "referrers",
-                        queryValue = storePathToText path,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "referrers"),
+                                ("queryValue", storePathToText path)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        DerivationOutputResponse paths -> return $ Set.toList paths
-                        _ -> return []
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- Parse paths from response data
+                                    let refTexts = T.splitOn "," $
+                                            Map.findWithDefault "" "referrers" (respData response)
+                                    in
+                                        return $ catMaybes $ map parseStorePath $
+                                            filter (not . T.null) refTexts
+                                else return []
 
                 _ -> throwError $ BuildFailed "Cannot get referrers: not connected to daemon"
 
--- | Get all transitive references (closure)
-getTransitiveReferences :: Database -> StorePath -> TenM p ctx (Set StorePath)
+-- | Get all transitive references (closure) - available in both contexts
+getTransitiveReferences :: Database -> StorePath -> TenM p t (Set StorePath)
 getTransitiveReferences db path = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             -- Use recursive CTE to efficiently query the closure
             let query = "WITH RECURSIVE\n\
                         \  closure(p) AS (\n\
@@ -635,32 +692,51 @@ getTransitiveReferences db path = do
             -- Parse paths and return as set
             return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
 
-        Unprivileged -> do
-            -- Must use protocol
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "transitive-references",
-                        queryValue = storePathToText path,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "transitive-references"),
+                                ("queryValue", storePathToText path)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        DerivationOutputResponse paths -> return paths
-                        _ -> return Set.empty
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- Parse paths from response data
+                                    let refTexts = T.splitOn "," $
+                                            Map.findWithDefault "" "references" (respData response)
+                                        paths = catMaybes $ map parseStorePath $
+                                            filter (not . T.null) refTexts
+                                    in
+                                        return $ Set.fromList paths
+                                else return Set.empty
 
                 _ -> throwError $ BuildFailed "Cannot get transitive references: not connected to daemon"
 
--- | Get all transitive referrers (reverse closure)
-getTransitiveReferrers :: Database -> StorePath -> TenM p ctx (Set StorePath)
+-- | Get all transitive referrers (reverse closure) - available in both contexts
+getTransitiveReferrers :: Database -> StorePath -> TenM p t (Set StorePath)
 getTransitiveReferrers db path = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             -- Use recursive CTE to efficiently query the closure
             let query = "WITH RECURSIVE\n\
                         \  closure(p) AS (\n\
@@ -675,90 +751,142 @@ getTransitiveReferrers db path = do
             -- Parse paths and return as set
             return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
 
-        Unprivileged -> do
-            -- Must use protocol
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "transitive-referrers",
-                        queryValue = storePathToText path,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "transitive-referrers"),
+                                ("queryValue", storePathToText path)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        DerivationOutputResponse paths -> return paths
-                        _ -> return Set.empty
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- Parse paths from response data
+                                    let refTexts = T.splitOn "," $
+                                            Map.findWithDefault "" "referrers" (respData response)
+                                        paths = catMaybes $ map parseStorePath $
+                                            filter (not . T.null) refTexts
+                                    in
+                                        return $ Set.fromList paths
+                                else return Set.empty
 
                 _ -> throwError $ BuildFailed "Cannot get transitive referrers: not connected to daemon"
 
--- | Check if a derivation is already registered
-isDerivationRegistered :: Database -> Text -> TenM p ctx Bool
+-- | Check if a derivation is already registered - available in both contexts
+isDerivationRegistered :: Database -> Text -> TenM p t Bool
 isDerivationRegistered db hash = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             results <- tenQuery db
                 "SELECT 1 FROM Derivations WHERE hash = ? LIMIT 1"
                 (Only hash)
             return $ not (null results)
 
-        Unprivileged -> do
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "exists",
-                        queryValue = hash,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "exists"),
+                                ("queryValue", hash)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response - simplified, assumes boolean in some response field
-                    return $ case result of
-                        StoreVerifyResponse exists -> exists
-                        _ -> False
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            return $ Map.findWithDefault "false" "exists" (respData response) == "true"
 
                 _ -> throwError $ BuildFailed "Cannot check derivation: not connected to daemon"
 
--- | List all registered derivations
-listRegisteredDerivations :: Database -> TenM p ctx [DerivationInfo]
+-- | List all registered derivations - available in both contexts
+listRegisteredDerivations :: Database -> TenM p t [DerivationInfo]
 listRegisteredDerivations db = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged ->
+    case tier of
+        -- Daemon context has direct database access
+        Daemon ->
             tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
 
-        Unprivileged -> do
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (ListDerivationsRequest (Just 100))
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "list-derivations",
+                            reqParams = Map.singleton "limit" "100",  -- Reasonable limit
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response - simplified implementation
-                    case result of
-                        DerivationListResponse paths ->
-                            -- Convert paths to basic DerivationInfo objects
-                            return $ zipWith (\i p -> DerivationInfo i
-                                                             (storeHash p)
-                                                             p
-                                                             0) [1..] paths
-                        _ -> return []
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    -- Parse derivation paths from response data
+                                    let pathTexts = T.splitOn "," $
+                                            Map.findWithDefault "" "paths" (respData response)
+                                        paths = catMaybes $ map parseStorePath $
+                                            filter (not . T.null) pathTexts
+                                    in
+                                        -- Convert paths to basic DerivationInfo objects
+                                        return $ zipWith
+                                            (\i p -> DerivationInfo i
+                                                (storeHash p)
+                                                p
+                                                0)
+                                            [1..] paths
+                                else return []
 
                 _ -> throwError $ BuildFailed "Cannot list derivations: not connected to daemon"
 
--- | Get the store path for a derivation by hash
-getDerivationPath :: Database -> Text -> TenM p ctx (Maybe StorePath)
+-- | Get the store path for a derivation by hash - available in both contexts
+getDerivationPath :: Database -> Text -> TenM p t (Maybe StorePath)
 getDerivationPath db hash = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             results <- tenQuery db
                 "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
                 (Only hash)
@@ -767,26 +895,43 @@ getDerivationPath db hash = do
                 [Only path] -> return $ parseStorePath path
                 _ -> return Nothing
 
-        Unprivileged -> do
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (QueryDerivationCmd $ QueryDerivationRequest {
-                        queryType = "path",
-                        queryValue = hash,
-                        queryLimit = Nothing
-                    })
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "query-derivation",
+                            reqParams = Map.fromList [
+                                ("queryType", "path"),
+                                ("queryValue", hash)
+                            ],
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        StorePathResponse path -> return $ Just path
-                        _ -> return Nothing
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    let pathText = Map.findWithDefault "" "path" (respData response)
+                                    in
+                                        if T.null pathText
+                                            then return Nothing
+                                            else return $ parseStorePath pathText
+                                else return Nothing
 
                 _ -> throwError $ BuildFailed "Cannot get derivation path: not connected to daemon"
 
--- | Register a valid path in the store - privileged operation
-registerValidPath :: Database -> StorePath -> Maybe StorePath -> TenM p 'Privileged ()
+-- | Register a valid path in the store - daemon operation
+registerValidPath :: Database -> StorePath -> Maybe StorePath -> TenM p 'Daemon ()
 registerValidPath db path mDeriver = do
     let deriverText = case mDeriver of
             Just deriver -> Just (storePathToText deriver)
@@ -797,20 +942,21 @@ registerValidPath db path mDeriver = do
         \VALUES (?, ?, strftime('%s','now'), ?, 1)"
         (storePathToText path, storeHash path, deriverText)
 
--- | Mark a path as invalid - privileged operation
-invalidatePath :: Database -> StorePath -> TenM p 'Privileged ()
+-- | Mark a path as invalid - daemon operation
+invalidatePath :: Database -> StorePath -> TenM p 'Daemon ()
 invalidatePath db path =
     void $ tenExecute db
         "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
         (Only (storePathToText path))
 
 -- | Check if a path is valid - available in both contexts
-isPathValid :: Database -> StorePath -> TenM p ctx Bool
+isPathValid :: Database -> StorePath -> TenM p t Bool
 isPathValid db path = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             results <- tenQuery db
                 "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
                 (Only (storePathToText path))
@@ -819,52 +965,85 @@ isPathValid db path = do
                 [Only valid] -> return (valid == 1)
                 _ -> return False
 
-        Unprivileged -> do
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (StoreVerifyRequest (storePathToText path))
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "store-verify",
+                            reqParams = Map.singleton "path" (storePathToText path),
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response
-                    case result of
-                        StoreVerifyResponse valid -> return valid
-                        _ -> return False
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            return $ respStatus response == "ok" &&
+                                     Map.findWithDefault "false" "valid" (respData response) == "true"
 
                 _ -> throwError $ BuildFailed "Cannot check path validity: not connected to daemon"
 
 -- | Get detailed information about a path - available in both contexts
-getPathInfo :: Database -> StorePath -> TenM p ctx (Maybe PathInfo)
+getPathInfo :: Database -> StorePath -> TenM p t (Maybe PathInfo)
 getPathInfo db path = do
-    ctxType <- asks privilegeContext
+    tier <- asks currentPrivilegeTier
 
-    case ctxType of
-        Privileged -> do
+    case tier of
+        -- Daemon context has direct database access
+        Daemon -> do
             results <- tenQuery db
                 "SELECT path, hash, deriver, registration_time, is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
                 (Only (storePathToText path))
 
             return $ listToMaybe results
 
-        Unprivileged -> do
+        -- Builder context must use protocol
+        Builder -> do
             env <- ask
             case runMode env of
                 ClientMode conn -> do
-                    -- Request through protocol
-                    result <- sendDaemonRequest conn (StoreVerifyRequest (storePathToText path))
+                    -- Create a request
+                    let request = Request {
+                            reqId = 0,  -- Will be set by sendRequest
+                            reqType = "store-verify",
+                            reqParams = Map.singleton "path" (storePathToText path),
+                            reqPayload = Nothing
+                        }
 
-                    -- Process response - simplified implementation
-                    case result of
-                        StoreVerifyResponse valid ->
-                            if valid
-                                then return $ Just (PathInfo path (storeHash path) Nothing (posixSecondsToUTCTime 0) True)
+                    -- Send request through daemon connection
+                    reqId <- liftIO $ sendRequest conn request
+                    responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
+
+                    -- Handle response - simplified implementation
+                    case responseResult of
+                        Left err -> throwError err
+                        Right response ->
+                            if respStatus response == "ok"
+                                then
+                                    let valid = Map.findWithDefault "false" "valid" (respData response) == "true"
+                                    in
+                                        if valid
+                                            then return $ Just (PathInfo
+                                                    path
+                                                    (storeHash path)
+                                                    Nothing
+                                                    (posixSecondsToUTCTime 0)
+                                                    True)
+                                            else return Nothing
                                 else return Nothing
-                        _ -> return Nothing
 
                 _ -> throwError $ BuildFailed "Cannot get path info: not connected to daemon"
 
--- | Register a derivation with all its outputs in a single transaction - privileged operation
-registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> TenM p 'Privileged Int64
+-- | Register a derivation with all its outputs in a single transaction - daemon operation
+registerDerivationWithOutputs :: Database -> Derivation -> StorePath -> TenM p 'Daemon Int64
 registerDerivationWithOutputs db derivation storePath = withTenTransaction db ReadWrite $ \_ -> do
     -- Register the derivation
     derivId <- storeDerivation db derivation storePath
@@ -896,9 +1075,38 @@ registerDerivationWithOutputs db derivation storePath = withTenTransaction db Re
 
     return derivId
 
--- | Helper function to send a daemon request in unprivileged context
-sendDaemonRequest :: DaemonConnection -> DaemonRequest -> TenM p 'Unprivileged DaemonResponse
+-- | Helper function to send a daemon request in builder context
+sendDaemonRequest :: DaemonConnection t -> Request -> TenM p 'Builder Response
 sendDaemonRequest conn request = do
-    -- This would use the actual daemon client protocol
-    -- For now, a placeholder that would be implemented in Ten.Daemon.Client
-    throwError $ BuildFailed "Daemon client protocol not implemented"
+    -- Generate a request ID
+    reqId <- liftIO $ atomically $ do
+        currentId <- readTVar (connNextReqId conn)
+        writeTVar (connNextReqId conn) (currentId + 1)
+        return currentId
+
+    -- Create a response MVar
+    responseMVar <- liftIO $ newEmptyMVar
+
+    -- Register the request
+    liftIO $ atomically $ modifyTVar' (connRequestMap conn) $
+        Map.insert reqId responseMVar
+
+    -- Update the request with the ID
+    let request' = request { reqId = reqId }
+
+    -- Serialize and send the request
+    liftIO $ do
+        BS.hPut (connHandle conn) (encodeRequest request')
+        hFlush (connHandle conn)
+
+    -- Wait for response with a reasonable timeout (30 seconds)
+    result <- liftIO $ timeout 30000000 $ takeMVar responseMVar
+
+    -- Clean up the request entry
+    liftIO $ atomically $ modifyTVar' (connRequestMap conn) $
+        Map.delete reqId
+
+    -- Return the response or error
+    case result of
+        Just resp -> return resp
+        Nothing -> throwError $ DaemonError "Timeout waiting for daemon response"

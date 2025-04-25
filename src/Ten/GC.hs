@@ -104,8 +104,6 @@ import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Control.Concurrent.MVar
 
 import Ten.Core
-import Ten.Daemon.Protocol (DaemonConnection, DaemonRequest(..), DaemonResponse(..),
-                           sendDaemonRequest, encodeRequest, decodeResponse)
 
 -- | Lock information returned by daemon
 data GCLockInfo = GCLockInfo
@@ -173,22 +171,39 @@ addRoot st path name permanent = do
 
 -- | Request to add a root from builder context via protocol
 requestAddRoot :: SPrivilegeTier 'Builder -> StorePath -> Text -> Bool -> TenM 'Build 'Builder GCRoot
-requestAddRoot st path name permanent = do
+requestAddRoot _ path name permanent = do
     env <- ask
 
     -- Send request to daemon using protocol
     case runMode env of
         ClientMode conn -> do
-            -- Create a request message
-            let requestMsg = AddGCRootRequest path name permanent
+            -- Create a request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "add-gc-root",
+                    reqParams = Map.fromList [
+                        ("path", storePathToText path),
+                        ("name", name),
+                        ("permanent", if permanent then "true" else "false")
+                    ],
+                    reqPayload = Nothing
+                }
 
-            -- Send the request via the daemon protocol
-            response <- sendDaemonRequest conn requestMsg
+            -- Send request through daemon connection
+            reqId <- liftIO $ sendRequest conn request
+            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
-            case response of
-                GCRootResponse root -> return root
-                ErrorResponse err -> throwError $ DaemonError $ "Failed to add GC root: " <> T.pack (show err)
-                _ -> throwError $ DaemonError $ "Unexpected response for add GC root: " <> T.pack (show response)
+            -- Handle response
+            case responseResult of
+                Left err -> throwError err
+                Right response ->
+                    if respStatus response == "ok"
+                        then do
+                            -- Construct a GC root from the response
+                            now <- liftIO getCurrentTime
+                            let rootType = if permanent then PermanentRoot else SymlinkRoot
+                            return $ GCRoot path name rootType now
+                        else throwError $ DaemonError $ respMessage response
 
         _ -> throwError $ DaemonError "Not connected to daemon"
 
@@ -221,22 +236,30 @@ removeRoot st root = do
 
 -- | Request to remove a root from builder context via protocol
 requestRemoveRoot :: SPrivilegeTier 'Builder -> GCRoot -> TenM 'Build 'Builder ()
-requestRemoveRoot st root = do
+requestRemoveRoot _ root = do
     env <- ask
 
     -- Send request to daemon using protocol
     case runMode env of
         ClientMode conn -> do
-            -- Create a request message
-            let requestMsg = RemoveGCRootRequest root
+            -- Create a request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "remove-gc-root",
+                    reqParams = Map.singleton "name" (rootName root),
+                    reqPayload = Nothing
+                }
 
-            -- Send the request via the daemon protocol
-            response <- sendDaemonRequest conn requestMsg
+            -- Send request through daemon connection
+            reqId <- liftIO $ sendRequest conn request
+            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
-            case response of
-                SuccessResponse -> return ()
-                ErrorResponse err -> throwError $ DaemonError $ "Failed to remove root: " <> T.pack (show err)
-                _ -> throwError $ DaemonError $ "Unexpected response for remove GC root: " <> T.pack (show response)
+            -- Handle response
+            case responseResult of
+                Left err -> throwError err
+                Right response ->
+                    unless (respStatus response == "ok") $
+                        throwError $ DaemonError $ respMessage response
 
         _ -> throwError $ DaemonError "Not connected to daemon"
 
@@ -281,22 +304,58 @@ listRootsPrivileged st = do
 
 -- | Request to list roots from builder context via protocol
 requestListRoots :: SPrivilegeTier 'Builder -> TenM 'Build 'Builder [GCRoot]
-requestListRoots st = do
+requestListRoots _ = do
     env <- ask
 
     -- Send request to daemon using protocol
     case runMode env of
         ClientMode conn -> do
-            -- Create a request message
-            let requestMsg = ListGCRootsRequest
+            -- Create a request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "list-gc-roots",
+                    reqParams = Map.empty,
+                    reqPayload = Nothing
+                }
 
-            -- Send the request via the daemon protocol
-            response <- sendDaemonRequest conn requestMsg
+            -- Send request through daemon connection
+            reqId <- liftIO $ sendRequest conn request
+            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
-            case response of
-                GCRootListResponse roots -> return roots
-                ErrorResponse err -> throwError $ DaemonError $ "Failed to list GC roots: " <> T.pack (show err)
-                _ -> throwError $ DaemonError $ "Unexpected response for list GC roots: " <> T.pack (show response)
+            -- Handle response
+            case responseResult of
+                Left err -> throwError err
+                Right response ->
+                    if respStatus response == "ok"
+                        then do
+                            -- Parse roots from response data
+                            let rootCount = read $ T.unpack $ Map.findWithDefault "0" "count" (respData response)
+                                roots = [0..(rootCount-1)]
+                                parseRoot i = do
+                                    let prefix = "root." <> T.pack (show i) <> "."
+                                        pathText = Map.findWithDefault "" (prefix <> "path") (respData response)
+                                        name = Map.findWithDefault "" (prefix <> "name") (respData response)
+                                        typeText = Map.findWithDefault "symlink" (prefix <> "type") (respData response)
+                                        timeText = Map.findWithDefault "" (prefix <> "time") (respData response)
+
+                                    case parseStorePath pathText of
+                                        Nothing -> return Nothing
+                                        Just path -> do
+                                            let rootType = case typeText of
+                                                    "permanent" -> PermanentRoot
+                                                    "profile" -> ProfileRoot
+                                                    "runtime" -> RuntimeRoot
+                                                    "registry" -> RegistryRoot
+                                                    _ -> SymlinkRoot
+                                                time = case reads (T.unpack timeText) of
+                                                    [(t, "")] -> t
+                                                    _ -> posixSecondsToUTCTime 0
+
+                                            return $ Just $ GCRoot path name rootType time
+
+                            roots <- mapM parseRoot roots
+                            return $ catMaybes roots
+                        else throwError $ DaemonError $ respMessage response
 
         _ -> throwError $ DaemonError "Not connected to daemon"
 
@@ -388,22 +447,39 @@ collectGarbage st = do
 
 -- | Request garbage collection from builder context via protocol
 requestGarbageCollection :: SPrivilegeTier 'Builder -> Bool -> TenM 'Build 'Builder GCStats
-requestGarbageCollection st force = do
+requestGarbageCollection _ force = do
     env <- ask
 
     -- Send request to daemon using protocol
     case runMode env of
         ClientMode conn -> do
-            -- Create a request message
-            let requestMsg = GCRequest force
+            -- Create a request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "gc",
+                    reqParams = Map.singleton "force" (if force then "true" else "false"),
+                    reqPayload = Nothing
+                }
 
-            -- Send the request via the daemon protocol
-            response <- sendDaemonRequest conn requestMsg
+            -- Send request through daemon connection
+            reqId <- liftIO $ sendRequest conn request
+            responseResult <- liftIO $ receiveResponse conn reqId 300000000 -- 5 minutes timeout
 
-            case response of
-                GCResultResponse stats -> return stats
-                ErrorResponse err -> throwError $ DaemonError $ "Failed to request garbage collection: " <> T.pack (show err)
-                _ -> throwError $ DaemonError $ "Unexpected response for GC request: " <> T.pack (show response)
+            -- Handle response
+            case responseResult of
+                Left err -> throwError err
+                Right response ->
+                    if respStatus response == "ok"
+                        then do
+                            -- Parse GC stats from response data
+                            let total = read $ T.unpack $ Map.findWithDefault "0" "total" (respData response)
+                                live = read $ T.unpack $ Map.findWithDefault "0" "live" (respData response)
+                                collected = read $ T.unpack $ Map.findWithDefault "0" "collected" (respData response)
+                                bytes = read $ T.unpack $ Map.findWithDefault "0" "bytes" (respData response)
+                                time = read $ T.unpack $ Map.findWithDefault "0" "elapsedTime" (respData response)
+
+                            return $ GCStats total live collected bytes time
+                        else throwError $ DaemonError $ respMessage response
 
         _ -> throwError $ DaemonError "Not connected to daemon"
 
@@ -491,7 +567,7 @@ getPathSize storeLocation pathText = do
             -- If it doesn't exist, return 0
             return 0
 
--- | Find all store paths (daemon privilege context)
+-- | Find all store paths (daemon context)
 findAllStorePaths :: Connection -> FilePath -> IO (Set StorePath)
 findAllStorePaths db storeLocation = do
     -- Get paths from database (preferred, more reliable)
@@ -531,7 +607,7 @@ scanFilesystemForPaths storeLocation = do
                         return acc
                         ) Set.empty files
 
--- | Find all roots for garbage collection (daemon privilege context)
+-- | Find all roots for garbage collection (daemon context)
 findAllRoots :: Connection -> FilePath -> IO (Set StorePath)
 findAllRoots db storeLocation = do
     -- Get roots from filesystem (gc-roots directory)
@@ -649,22 +725,32 @@ isReachablePrivileged st path = do
 
 -- | Request path reachability check from builder context via protocol
 requestPathReachability :: SPrivilegeTier 'Builder -> StorePath -> TenM 'Build 'Builder Bool
-requestPathReachability st path = do
+requestPathReachability _ path = do
     env <- ask
 
     -- Send request to daemon using protocol
     case runMode env of
         ClientMode conn -> do
-            -- Create a request message
-            let requestMsg = PathReachabilityRequest path
+            -- Create a request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "path-reachability",
+                    reqParams = Map.singleton "path" (storePathToText path),
+                    reqPayload = Nothing
+                }
 
-            -- Send the request via the daemon protocol
-            response <- sendDaemonRequest conn requestMsg
+            -- Send request through daemon connection
+            reqId <- liftIO $ sendRequest conn request
+            responseResult <- liftIO $ receiveResponse conn reqId 30000000 -- 30 seconds timeout
 
-            case response of
-                PathReachabilityResponse reachable -> return reachable
-                ErrorResponse err -> throwError $ DaemonError $ "Failed to check path reachability: " <> T.pack (show err)
-                _ -> throwError $ DaemonError $ "Unexpected response for reachability check: " <> T.pack (show response)
+            -- Handle response
+            case responseResult of
+                Left err -> throwError err
+                Right response ->
+                    if respStatus response == "ok"
+                        then
+                            return $ Map.findWithDefault "false" "reachable" (respData response) == "true"
+                        else throwError $ DaemonError $ respMessage response
 
         _ -> throwError $ DaemonError "Not connected to daemon"
 
@@ -683,9 +769,9 @@ findReachablePaths st = do
 
 -- | Acquire the GC lock (daemon privilege only)
 acquireGCLock :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon ()
-acquireGCLock st = do
+acquireGCLock _ = do
     env <- ask
-    let lockPath = gcLockPath env
+    let lockPath = gcLockPath (storeLocation env)
 
     -- Ensure the lock directory exists
     liftIO $ ensureLockDirExists (takeDirectory lockPath)
@@ -701,9 +787,9 @@ acquireGCLock st = do
 
 -- | Release the GC lock (daemon privilege only)
 releaseGCLock :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon ()
-releaseGCLock st = do
+releaseGCLock _ = do
     env <- ask
-    let lockPath = gcLockPath env
+    let lockPath = gcLockPath (storeLocation env)
 
     -- Check if the lock file exists and we own it
     exists <- liftIO $ doesFileExist lockPath
@@ -751,7 +837,7 @@ withGCLock st action = do
 
 -- | Break a stale lock (daemon privilege only)
 breakStaleLock :: SPrivilegeTier 'Daemon -> FilePath -> TenM 'Build 'Daemon ()
-breakStaleLock st lockPath = do
+breakStaleLock _ lockPath = do
     -- Check lock status
     status <- liftIO $ try $ checkLockFile lockPath
 
@@ -1179,7 +1265,7 @@ findStorePaths content storeDir =
         -- Or just a store path without the store dir
         (T.length text >= 10 && "-" `T.isInfixOf` text && allHex (T.takeWhile (/= '-') text))
       where
-        allHex = T.all isHexDigit
+        allHex = T.all (\c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
 
     extractStorePath :: Text -> Maybe StorePath
     extractStorePath text
@@ -1273,7 +1359,7 @@ registerGCRoot path name rootType = do
 
 -- | Access the database with proper daemon privileges
 withDatabase :: SPrivilegeTier 'Daemon -> FilePath -> Int -> (Connection -> TenM p 'Daemon a) -> TenM p 'Daemon a
-withDatabase st dbPath timeout action = do
+withDatabase _ dbPath timeout action = do
     -- Initialize database and ensure schema exists
     connection <- liftIO $ initializeDatabase dbPath
 
@@ -1359,7 +1445,7 @@ ensureSchema conn = do
 
 -- | Find paths with prefix in the store
 findPathsWithPrefix :: SPrivilegeTier 'Daemon -> Text -> TenM 'Build 'Daemon [StorePath]
-findPathsWithPrefix st prefix = do
+findPathsWithPrefix _ prefix = do
     env <- ask
     let dbPath = defaultDBPath (storeLocation env)
 
@@ -1384,3 +1470,20 @@ hashByteString = Crypto.hash
 -- | Convert hash to string representation
 showHash :: Digest SHA256 -> Text
 showHash = T.pack . show
+
+-- | Helper function to check if a path exists in store
+storePathExists :: StorePath -> TenM p t Bool
+storePathExists path = do
+    env <- ask
+    let fullPath = storePathToFilePath path env
+    liftIO $ doesFileExist fullPath
+
+-- | Compute reachable paths from a set of roots
+computeReachablePaths :: SPrivilegeTier 'Daemon -> Set StorePath -> TenM 'Build 'Daemon (Set StorePath)
+computeReachablePaths st roots = do
+    env <- ask
+
+    -- Initialize database with proper privilege
+    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Compute all reachable paths
+        liftIO $ computeReachablePathsFromRoots db roots

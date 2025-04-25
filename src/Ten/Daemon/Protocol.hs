@@ -155,7 +155,8 @@ import Ten.Core (
     Phase(..), SPhase(..), PrivilegeTier(..), SPrivilegeTier(..), TenM(..),
     BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), storePathToText,
     UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
-    Derivation(..), BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
+    Derivation(..), DerivationInput(..), DerivationOutput(..),
+    BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
     Request(..), Response(..), Message(..), AuthResult(..),
     GCStats(..), GCRoot(..),
     DaemonConfig(..), parseStorePath,
@@ -1855,10 +1856,10 @@ instance Aeson.FromJSON Derivation where
             name <- o Aeson..: "name"
 
             -- Parse the StorePath object
-            path <- Aeson.withObject "StorePath" $ \p -> do
-                hash <- p Aeson..: "hash"
-                name' <- p Aeson..: "name"
-                return $ StorePath hash name'
+            path <- Aeson.withObject "StorePath" (\p -> do
+                hash <- p .: "hash"
+                name' <- p .: "name"
+                return $ StorePath hash name') pathObj
 
             return $ DerivationInput path name
 
@@ -1872,10 +1873,10 @@ instance Aeson.FromJSON Derivation where
             pathObj <- o Aeson..: "path"
 
             -- Parse the StorePath object
-            path <- Aeson.withObject "StorePath" $ \p -> do
-                hash <- p Aeson..: "hash"
-                name' <- p Aeson..: "name"
-                return $ StorePath hash name'
+            path <- Aeson.withObject "StorePath" (\p -> do
+                hash <- p .: "hash"
+                name' <- p .: "name"
+                return $ StorePath hash name') pathObj
 
             return $ DerivationOutput name path
 

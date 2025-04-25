@@ -7,6 +7,10 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE FunctionalDependencies #-}
 
 module Ten.DB.Core (
     -- Database types
@@ -15,30 +19,31 @@ module Ten.DB.Core (
     TransactionMode(..),
     Only(..),  -- Re-export the Only type needed by modules like Ten.GC
 
-    -- Database initialization (daemon-only)
-    initDatabase,
-    closeDatabase,
-    withDatabase,
+    -- Type classes for database capabilities
+    CanAccessDatabase(..),
+    CanManageTransactions(..),
+    CanExecuteQuery(..),
+    CanExecuteStatement(..),
+    CanManageSchema(..),
 
-    -- Transaction management (daemon-only)
-    withTransaction,
-    withReadTransaction,
-    withWriteTransaction,
+    -- Evidence passing
+    withDbPrivileges,
 
-    -- Low-level query functions (daemon-only)
-    dbExecute,
-    dbExecute_,
-    dbQuery,
-    dbQuery_,
-    dbExecuteSimple_,
+    -- Database initialization and access
+    initDatabaseDaemon,
+    closeDatabaseDaemon,
+    getDatabaseFromEnv,
 
-    -- Database metadata (daemon-only)
-    getSchemaVersion,
-    updateSchemaVersion,
-
-    -- Utility functions for database access
+    -- Utility functions
     retryOnBusy,
-    ensureDBDirectories
+    ensureDBDirectories,
+
+    -- Helper functions for implementing protocol-based operations
+    sendDbRequest,
+    receiveDbResponse,
+
+    -- Re-exported types for convenience
+    Query(..)
 ) where
 
 import Control.Concurrent (threadDelay)
@@ -52,6 +57,8 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
+import Data.ByteString (ByteString)
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), Only(..))
 import System.Directory (createDirectoryIfMissing, doesFileExist)
@@ -62,8 +69,10 @@ import System.IO (withFile, IOMode(..), hPutStrLn, stderr)
 -- Import from Ten.Core, including all necessary items for database operations
 import Ten.Core (
     TenM, BuildEnv(..), BuildError(..), privilegeError, StorePath, Phase(..),
-    PrivilegeTier(..), SPrivilegeTier(..), sDaemon, defaultDBPath, BuildState(..),
-    currentBuildId, initBuildState, runTen, sBuild, verbosity, logMsg)
+    PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuilder, SPhase(..), sBuild, sEval,
+    fromSing, defaultDBPath, BuildState(..),
+    currentBuildId, initBuildState, runTen, verbosity, logMsg,
+    runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..), Response(..))
 
 -- | Database error types
 data DBError
@@ -78,6 +87,7 @@ data DBError
     | DBPhaseError Text
     | DBPermissionError Text
     | DBPrivilegeError Text  -- Error type for privilege violations
+    | DBProtocolError Text   -- Error with client-daemon protocol
     deriving (Show, Eq)
 
 instance Exception DBError
@@ -89,18 +99,371 @@ data TransactionMode
     | Exclusive    -- ^ Exclusive access
     deriving (Show, Eq)
 
--- | Database connection wrapper
-data Database = Database {
-    dbConn :: Connection,         -- ^ SQLite connection
+-- | Database connection wrapper, parameterized by privilege tier
+data Database (t :: PrivilegeTier) = Database {
+    dbConn :: Connection,         -- ^ SQLite connection (Daemon) or Nothing (Builder)
     dbPath :: FilePath,           -- ^ Path to database file
     dbInitialized :: Bool,        -- ^ Whether schema is initialized
     dbBusyTimeout :: Int,         -- ^ Busy timeout in milliseconds
-    dbMaxRetries :: Int           -- ^ Maximum number of retries for busy operations
+    dbMaxRetries :: Int,          -- ^ Maximum number of retries for busy operations
+    dbPrivEvidence :: SPrivilegeTier t  -- ^ Runtime evidence of privilege tier
 }
 
+-- | Helper to unwrap the evidence from a Database
+getDbPrivEvidence :: Database t -> SPrivilegeTier t
+getDbPrivEvidence = dbPrivEvidence
+
+-- | Evidence passing function for Database operations
+withDbPrivileges :: Database t -> (SPrivilegeTier t -> TenM p t a) -> TenM p t a
+withDbPrivileges db f = f (getDbPrivEvidence db)
+
+-- | Type class for database access capabilities
+class CanAccessDatabase (t :: PrivilegeTier) where
+    -- | Get database connection, creating if needed
+    getDatabaseConn :: TenM p t (Database t)
+
+    -- | Run an action with a database connection
+    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
+
+-- | Instance for Daemon (direct database access)
+instance CanAccessDatabase 'Daemon where
+    getDatabaseConn = do
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
+        db <- liftIO $ initDatabaseDaemon sDaemon dbPath 5000
+        return db
+
+    withDatabaseAccess action = do
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
+        -- Get the current build ID from the TenM context
+        bid <- gets currentBuildId
+
+        -- Use bracket to ensure proper cleanup
+        db <- liftIO $ initDatabaseDaemon sDaemon dbPath 5000
+        result <- action db
+        liftIO $ closeDatabaseDaemon db
+        return result
+
+-- | Instance for Builder (protocol-based access)
+instance CanAccessDatabase 'Builder where
+    getDatabaseConn = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                -- Create a Database with Builder evidence but no actual connection
+                let dbPath = defaultDBPath (storeLocation env)
+                return $ Database {
+                    dbConn = error "Cannot access direct DB connection in Builder context",
+                    dbPath = dbPath,
+                    dbInitialized = True,
+                    dbBusyTimeout = 5000,
+                    dbMaxRetries = 5,
+                    dbPrivEvidence = sBuilder
+                }
+            _ -> throwError $ privilegeError "Database access requires daemon connection"
+
+    withDatabaseAccess action = do
+        -- For Builder, just get the virtual Database and pass it to the action
+        db <- getDatabaseConn
+        action db
+
+-- | Type class for transaction management
+class CanManageTransactions (t :: PrivilegeTier) where
+    withTenTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+    withTenReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withTenWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+
+-- | Daemon instance for direct transaction management
+instance CanManageTransactions 'Daemon where
+    withTenTransaction db mode action =
+        -- Start transaction with appropriate mode
+        let beginStmt = case mode of
+                ReadOnly -> "BEGIN TRANSACTION READONLY;"
+                ReadWrite -> "BEGIN TRANSACTION;"
+                Exclusive -> "BEGIN EXCLUSIVE TRANSACTION;"
+        in
+        -- Execute transaction with proper error handling
+        catchError
+            (do
+                -- Begin transaction
+                tenExecuteSimple_ db (Query beginStmt)
+
+                -- Run the action
+                result <- action db
+
+                -- Commit transaction
+                tenExecuteSimple_ db "COMMIT;"
+
+                return result)
+            (\e -> do
+                -- Try to roll back on error
+                liftIO $ rollbackOnError db
+                throwError e)
+
+    withTenReadTransaction db = withTenTransaction db ReadOnly
+    withTenWriteTransaction db = withTenTransaction db ReadWrite
+
+-- | Builder instance for transaction management via protocol
+instance CanManageTransactions 'Builder where
+    withTenTransaction db mode action = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                -- Send transaction begin request
+                let txnType = case mode of
+                        ReadOnly -> "readonly"
+                        ReadWrite -> "readwrite"
+                        Exclusive -> "exclusive"
+
+                let beginReq = Request {
+                        reqId = 0,
+                        reqType = "db-begin-transaction",
+                        reqParams = Map.singleton "mode" txnType,
+                        reqPayload = Nothing
+                    }
+
+                beginResp <- liftIO $ sendRequestSync conn beginReq 30000000
+                case beginResp of
+                    Left err -> throwError err
+                    Right resp ->
+                        if respStatus resp == "ok"
+                            then do
+                                -- Run the action
+                                result <- catchError (action db) $ \e -> do
+                                    -- Roll back on error
+                                    let rollbackReq = Request {
+                                            reqId = 0,
+                                            reqType = "db-rollback-transaction",
+                                            reqParams = Map.empty,
+                                            reqPayload = Nothing
+                                        }
+                                    void $ liftIO $ sendRequestSync conn rollbackReq 30000000
+                                    throwError e
+
+                                -- Commit transaction
+                                let commitReq = Request {
+                                        reqId = 0,
+                                        reqType = "db-commit-transaction",
+                                        reqParams = Map.empty,
+                                        reqPayload = Nothing
+                                    }
+
+                                commitResp <- liftIO $ sendRequestSync conn commitReq 30000000
+                                case commitResp of
+                                    Left err -> throwError err
+                                    Right resp' ->
+                                        if respStatus resp' == "ok"
+                                            then return result
+                                            else throwError $ DBTransactionError $ respMessage resp'
+                            else throwError $ DBTransactionError $ respMessage resp
+
+            _ -> throwError $ privilegeError "Transaction management requires daemon connection"
+
+    withTenReadTransaction db = withTenTransaction db ReadOnly
+    withTenWriteTransaction db = withTenTransaction db ReadWrite
+
+-- | Type class for query execution
+class CanExecuteQuery (t :: PrivilegeTier) where
+    tenQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
+    tenQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
+
+-- | Daemon instance for direct query execution
+instance CanExecuteQuery 'Daemon where
+    tenQuery db q params = do
+        -- Execute query with retry
+        liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
+
+    tenQuery_ db q = do
+        -- Execute simple query with retry
+        liftIO $ retryOnBusy db $ SQLite.query_ (dbConn db) q
+
+-- | Builder instance for query execution via protocol
+instance CanExecuteQuery 'Builder where
+    tenQuery db q params = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                -- Serialize query and parameters
+                let queryStr = case q of
+                        Query qs -> qs
+
+                -- Convert params to JSON (in real impl would use proper serialization)
+                let serializedParams = serializeQueryParams params
+
+                let queryReq = Request {
+                        reqId = 0,
+                        reqType = "db-query",
+                        reqParams = Map.fromList [
+                            ("query", queryStr),
+                            ("params", serializedParams)
+                        ],
+                        reqPayload = Nothing
+                    }
+
+                queryResp <- liftIO $ sendRequestSync conn queryReq 30000000
+                case queryResp of
+                    Left err -> throwError err
+                    Right resp ->
+                        if respStatus resp == "ok"
+                            then case respPayload resp of
+                                Just payload ->
+                                    -- In a real impl, would properly deserialize the payload to type r
+                                    deserializeQueryResults payload
+                                Nothing -> throwError $ DBQueryError "Missing query results"
+                            else throwError $ DBQueryError $ respMessage resp
+
+            _ -> throwError $ privilegeError "Query execution requires daemon connection"
+
+    tenQuery_ db q = tenQuery db q ()
+
+-- | Type class for statement execution
+class CanExecuteStatement (t :: PrivilegeTier) where
+    tenExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+    tenExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+    tenExecuteSimple_ :: Database t -> Query -> TenM p t ()
+
+-- | Daemon instance for direct statement execution
+instance CanExecuteStatement 'Daemon where
+    tenExecute db query params = do
+        -- Execute the query with retry on busy
+        liftIO $ retryOnBusy db $ do
+            -- Execute the query
+            SQLite.execute (dbConn db) query params
+            -- Get the number of changes (rows affected) and convert from Int to Int64
+            fromIntegral <$> SQLite.changes (dbConn db)
+
+    tenExecute_ db query params = void $ tenExecute db query params
+
+    tenExecuteSimple_ db query = do
+        -- Execute simple query
+        liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) query
+
+-- | Builder instance for statement execution via protocol
+instance CanExecuteStatement 'Builder where
+    tenExecute db query params = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                -- Serialize query and parameters
+                let queryStr = case query of
+                        Query qs -> qs
+
+                -- Convert params to JSON (in real impl would use proper serialization)
+                let serializedParams = serializeQueryParams params
+
+                let execReq = Request {
+                        reqId = 0,
+                        reqType = "db-execute",
+                        reqParams = Map.fromList [
+                            ("query", queryStr),
+                            ("params", serializedParams)
+                        ],
+                        reqPayload = Nothing
+                    }
+
+                execResp <- liftIO $ sendRequestSync conn execReq 30000000
+                case execResp of
+                    Left err -> throwError err
+                    Right resp ->
+                        if respStatus resp == "ok"
+                            then case Map.lookup "rowsAffected" (respData resp) of
+                                Just countText -> case reads (T.unpack countText) of
+                                    [(count, "")] -> return count
+                                    _ -> throwError $ DBQueryError "Invalid row count format"
+                                Nothing -> throwError $ DBQueryError "Missing row count"
+                            else throwError $ DBQueryError $ respMessage resp
+
+            _ -> throwError $ privilegeError "Statement execution requires daemon connection"
+
+    tenExecute_ db query params = void $ tenExecute db query params
+
+    tenExecuteSimple_ db query = tenExecute_ db query ()
+
+-- | Type class for schema management
+class CanManageSchema (t :: PrivilegeTier) where
+    getSchemaVersion :: Database t -> TenM p t Int
+    updateSchemaVersion :: Database t -> Int -> TenM p t ()
+
+-- | Daemon instance for direct schema management
+instance CanManageSchema 'Daemon where
+    getSchemaVersion db = do
+        -- Check if the version table exists
+        hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
+
+        case hasVersionTable of
+            [Only count] | count > 0 -> do
+                -- Table exists, get the version
+                results <- tenQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM p 'Daemon [Only Int]
+                case results of
+                    [Only version] -> return version
+                    _ -> return 0  -- No version record found
+            _ -> return 0  -- Table doesn't exist
+
+    updateSchemaVersion db version = do
+        -- Check if the version table exists
+        hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
+
+        case hasVersionTable of
+            [Only count] | count > 0 -> do
+                -- Table exists, update the version
+                tenExecute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
+            _ -> do
+                -- Table doesn't exist, create it
+                tenExecuteSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+                tenExecute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
+
+-- | Builder instance for schema management via protocol
+instance CanManageSchema 'Builder where
+    getSchemaVersion db = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                let versionReq = Request {
+                        reqId = 0,
+                        reqType = "db-get-schema-version",
+                        reqParams = Map.empty,
+                        reqPayload = Nothing
+                    }
+
+                versionResp <- liftIO $ sendRequestSync conn versionReq 30000000
+                case versionResp of
+                    Left err -> throwError err
+                    Right resp ->
+                        if respStatus resp == "ok"
+                            then case Map.lookup "version" (respData resp) of
+                                Just versionText -> case reads (T.unpack versionText) of
+                                    [(version, "")] -> return version
+                                    _ -> throwError $ DBSchemaError "Invalid version format"
+                                Nothing -> throwError $ DBSchemaError "Missing version"
+                            else throwError $ DBSchemaError $ respMessage resp
+
+            _ -> throwError $ privilegeError "Schema management requires daemon connection"
+
+    updateSchemaVersion db version = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                let updateReq = Request {
+                        reqId = 0,
+                        reqType = "db-update-schema-version",
+                        reqParams = Map.singleton "version" (T.pack $ show version),
+                        reqPayload = Nothing
+                    }
+
+                updateResp <- liftIO $ sendRequestSync conn updateReq 30000000
+                case updateResp of
+                    Left err -> throwError err
+                    Right resp ->
+                        if respStatus resp == "ok"
+                            then return ()
+                            else throwError $ DBSchemaError $ respMessage resp
+
+            _ -> throwError $ privilegeError "Schema management requires daemon connection"
+
 -- | Initialize the database - this is a daemon operation
-initDatabase :: SPrivilegeTier 'Daemon -> FilePath -> Int -> IO Database
-initDatabase _ dbPath busyTimeout = do
+initDatabaseDaemon :: SPrivilegeTier 'Daemon -> FilePath -> Int -> IO (Database 'Daemon)
+initDatabaseDaemon st dbPath busyTimeout = do
     -- Create directory if needed
     createDirectoryIfMissing True (takeDirectory dbPath)
 
@@ -126,7 +489,8 @@ initDatabase _ dbPath busyTimeout = do
         dbPath = dbPath,
         dbInitialized = False,
         dbBusyTimeout = busyTimeout,
-        dbMaxRetries = 5
+        dbMaxRetries = 5,
+        dbPrivEvidence = st
     }
 
     -- Initialize schema if new database
@@ -143,167 +507,25 @@ initDatabase _ dbPath busyTimeout = do
     return db'
 
 -- | Close the database connection
-closeDatabase :: Database -> IO ()
-closeDatabase db = catch
+closeDatabaseDaemon :: Database 'Daemon -> IO ()
+closeDatabaseDaemon db = catch
     (SQLite.close (dbConn db))
     (\(e :: SomeException) ->
         hPutStrLn stderr $ "Warning: Error closing database: " ++ show e)
 
--- | Run an action with a database connection - requires daemon privileges
-withDatabase :: SPrivilegeTier 'Daemon -> FilePath -> Int -> (Database -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withDatabase st dbPath busyTimeout action = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Database operations require daemon privileges"
-
-    -- Get the current build ID from the TenM context BEFORE entering IO
-    bid <- gets currentBuildId
-
-    -- Create a bracket operation in the daemon TenM context
-    liftIO (bracket
-        (initDatabase st dbPath busyTimeout)
-        closeDatabase
-        (\db -> do
-            -- Run the action with privilege verification inside IO
-            let env' = env { currentPrivilegeTier = Daemon }
-            let state = initBuildState Build bid
-            result <- runTen sBuild st (action db) env' state
-            case result of
-                Left err -> throwIO err
-                Right (val, _) -> return val))
-
--- | Run a transaction with the specified mode - requires daemon privileges
-withTransaction :: Database -> TransactionMode -> (Database -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withTransaction db mode action = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Transaction operations require daemon privileges"
-
-    -- Start transaction with appropriate mode
-    let beginStmt = case mode of
-            ReadOnly -> "BEGIN TRANSACTION READONLY;"
-            ReadWrite -> "BEGIN TRANSACTION;"
-            Exclusive -> "BEGIN EXCLUSIVE TRANSACTION;"
-
-    -- Execute transaction with proper error handling
-    catchError
-        (do
-            -- Begin transaction
-            dbExecuteSimple_ db (Query beginStmt)
-
-            -- Run the action
-            result <- action db
-
-            -- Commit transaction
-            dbExecuteSimple_ db "COMMIT;"
-
-            return result)
-        (\e -> do
-            -- Try to roll back on error
-            liftIO $ rollbackOnError db
-            throwError e)
-
--- | Shorthand for read-only transaction
-withReadTransaction :: Database -> (Database -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withReadTransaction db = withTransaction db ReadOnly
-
--- | Shorthand for read-write transaction
-withWriteTransaction :: Database -> (Database -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withWriteTransaction db = withTransaction db ReadWrite
+-- | Get the database from environment
+getDatabaseFromEnv :: (CanAccessDatabase t) => TenM p t (Database t)
+getDatabaseFromEnv = getDatabaseConn
 
 -- | Roll back transaction on error
-rollbackOnError :: Database -> IO ()
+rollbackOnError :: Database 'Daemon -> IO ()
 rollbackOnError db = catch
     (void $ SQLite.execute_ (dbConn db) "ROLLBACK;")
     (\(e :: SomeException) ->
         hPutStrLn stderr $ "Warning: Error rolling back transaction: " ++ show e)
 
--- | Execute a statement with parameters, returning the number of rows affected - requires daemon privileges
-dbExecute :: ToRow q => Database -> Query -> q -> TenM 'Build 'Daemon Int64
-dbExecute db query params = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Database execute operations require daemon privileges"
-
-    -- Execute the query with retry on busy
-    liftIO $ retryOnBusy db $ do
-        -- Execute the query
-        SQLite.execute (dbConn db) query params
-        -- Get the number of changes (rows affected) and convert from Int to Int64
-        fromIntegral <$> SQLite.changes (dbConn db)
-
--- | Execute a statement with parameters, discarding the result - requires daemon privileges
-dbExecute_ :: ToRow q => Database -> Query -> q -> TenM 'Build 'Daemon ()
-dbExecute_ db query params = void $ dbExecute db query params
-
--- | Execute a simple SQL statement without parameters - requires daemon privileges
-dbExecuteSimple_ :: Database -> Query -> TenM 'Build 'Daemon ()
-dbExecuteSimple_ db query = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Database execute operations require daemon privileges"
-
-    -- Execute simple query
-    liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) query
-
--- | Execute a query with parameters - requires daemon privileges
-dbQuery :: (ToRow q, FromRow r) => Database -> Query -> q -> TenM 'Build 'Daemon [r]
-dbQuery db q params = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Database query operations require daemon privileges"
-
-    -- Execute query with retry
-    liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
-
--- | Execute a query without parameters - requires daemon privileges
-dbQuery_ :: FromRow r => Database -> Query -> TenM 'Build 'Daemon [r]
-dbQuery_ db q = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Database query operations require daemon privileges"
-
-    -- Execute simple query with retry
-    liftIO $ retryOnBusy db $ SQLite.query_ (dbConn db) q
-
--- | Get the current schema version
-getSchemaVersion :: Database -> TenM 'Build 'Daemon Int
-getSchemaVersion db = do
-    -- Check if the version table exists
-    hasVersionTable <- dbQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM 'Build 'Daemon [Only Int]
-
-    case hasVersionTable of
-        [Only count] | count > 0 -> do
-            -- Table exists, get the version
-            results <- dbQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM 'Build 'Daemon [Only Int]
-            case results of
-                [Only version] -> return version
-                _ -> return 0  -- No version record found
-        _ -> return 0  -- Table doesn't exist
-
--- | Update the schema version
-updateSchemaVersion :: Database -> Int -> TenM 'Build 'Daemon ()
-updateSchemaVersion db version = do
-    -- Check if the version table exists
-    hasVersionTable <- dbQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM 'Build 'Daemon [Only Int]
-
-    case hasVersionTable of
-        [Only count] | count > 0 -> do
-            -- Table exists, update the version
-            dbExecute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
-        _ -> do
-            -- Table doesn't exist, create it
-            dbExecuteSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
-            dbExecute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
-
 -- | Initialize the database schema
-initializeSchema :: Database -> IO ()
+initializeSchema :: Database 'Daemon -> IO ()
 initializeSchema db = do
     -- Use IO-level transaction for initial schema setup
     withTransactionIO db Exclusive $ \_ -> do
@@ -339,14 +561,6 @@ initializeSchema db = do
                 \deriver TEXT, \
                 \is_valid INTEGER NOT NULL DEFAULT 1);"
 
-        -- Create ActiveBuilds table
-        SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS ActiveBuilds (\
-                \build_id TEXT PRIMARY KEY, \
-                \path TEXT NOT NULL, \
-                \status TEXT NOT NULL, \
-                \start_time INTEGER NOT NULL DEFAULT (strftime('%s','now')), \
-                \update_time INTEGER NOT NULL DEFAULT (strftime('%s','now')));"
-
         -- Create GCRoots table
         SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS GCRoots (\
                 \path TEXT NOT NULL, \
@@ -362,7 +576,6 @@ initializeSchema db = do
         SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
         SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
         SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
-        SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_activebuilds_status ON ActiveBuilds(status);"
         SQLite.execute_ (dbConn db) "CREATE INDEX IF NOT EXISTS idx_gcroots_active ON GCRoots(active);"
 
         -- Set schema version
@@ -370,7 +583,7 @@ initializeSchema db = do
         return ()
 
 -- | Helper function for direct IO-level transactions
-withTransactionIO :: Database -> TransactionMode -> (Database -> IO a) -> IO a
+withTransactionIO :: Database 'Daemon -> TransactionMode -> (Database 'Daemon -> IO a) -> IO a
 withTransactionIO db mode action = do
     -- Start transaction with appropriate mode
     let beginStmt = case mode of
@@ -391,14 +604,8 @@ withTransactionIO db mode action = do
             return result)
 
 -- | Ensure database directories exist (privileged daemon-only operation)
--- This is now the ONLY implementation of this function in the codebase
-ensureDBDirectories :: FilePath -> TenM 'Build 'Daemon ()
+ensureDBDirectories :: FilePath -> TenM p 'Daemon ()
 ensureDBDirectories storeDir = do
-    -- Verify daemon privileges
-    env <- ask
-    when (currentPrivilegeTier env /= Daemon) $
-        throwError $ privilegeError "Database directory creation requires daemon privileges"
-
     -- Use defaultDBPath from Ten.Core to calculate the path
     let dbDir = takeDirectory (defaultDBPath storeDir)
 
@@ -411,7 +618,7 @@ ensureDBDirectories storeDir = do
     logMsg 2 $ "Created database directory: " <> T.pack dbDir
 
 -- | Retry an operation if the database is busy
-retryOnBusy :: Database -> IO a -> IO a
+retryOnBusy :: Database 'Daemon -> IO a -> IO a
 retryOnBusy db action = retryWithCount 0
   where
     retryWithCount attempt = catch
@@ -429,3 +636,38 @@ retryOnBusy db action = retryWithCount 0
                     threadDelay delayMicros
                     retryWithCount (attempt + 1)
                 _ -> throwIO e)
+
+-- | Helper function for sending database requests to daemon
+sendDbRequest :: Text -> Map.Map Text Text -> Maybe ByteString -> TenM p 'Builder Response
+sendDbRequest reqType params payload = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            let req = Request {
+                    reqId = 0,
+                    reqType = reqType,
+                    reqParams = params,
+                    reqPayload = payload
+                }
+
+            respEither <- liftIO $ sendRequestSync conn req 30000000
+            case respEither of
+                Left err -> throwError err
+                Right resp -> return resp
+
+        _ -> throwError $ privilegeError "Cannot send database request without daemon connection"
+
+-- | Helper function to receive and process database responses
+receiveDbResponse :: Response -> (Response -> Either BuildError a) -> TenM p 'Builder a
+receiveDbResponse resp parser =
+    case parser resp of
+        Left err -> throwError err
+        Right result -> return result
+
+-- | Serialize query parameters (real implementation would use proper binary protocol)
+serializeQueryParams :: (ToRow q) => q -> Text
+serializeQueryParams _ = "[]"  -- Placeholder for actual implementation
+
+-- | Deserialize query results (real implementation would use proper binary protocol)
+deserializeQueryResults :: (FromRow r) => ByteString -> TenM p 'Builder [r]
+deserializeQueryResults _ = return []  -- Placeholder for actual implementation
