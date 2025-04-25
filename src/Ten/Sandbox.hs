@@ -130,7 +130,7 @@ import Ten.Core (
     DaemonConnection(..), TenM, runTen, addProof, throwError,
     workDir, storeLocation, currentBuildId, currentPhase, runMode,
     logMsg, sBuild, sDaemon, RunMode(..), storePathToFilePath,
-    BuildError(..), timeout, Proof(..)
+    BuildError(..), timeout, Proof(..), buildErrorToText
     )
 import qualified Ten.Daemon.Protocol as Protocol
 
@@ -222,7 +222,8 @@ data SandboxConfig = SandboxConfig {
     sandboxMemoryLimit :: Int,             -- Memory limit in MB (0 = no limit)
     sandboxDiskLimit :: Int,               -- Disk space limit in MB (0 = no limit)
     sandboxMaxProcesses :: Int,            -- Maximum number of processes (0 = no limit)
-    sandboxTimeoutSecs :: Int              -- Timeout in seconds (0 = no timeout)
+    sandboxTimeoutSecs :: Int,             -- Timeout in seconds (0 = no timeout)
+    sandboxKeepBuildOutput :: Bool         -- Whether to keep build output for debugging
 } deriving (Show, Eq)
 
 -- | Default sandbox configuration (restrictive)
@@ -244,7 +245,8 @@ defaultSandboxConfig = SandboxConfig {
     sandboxMemoryLimit = 2048,             -- 2GB memory by default
     sandboxDiskLimit = 5120,               -- 5GB disk space by default
     sandboxMaxProcesses = 32,              -- Maximum 32 processes by default
-    sandboxTimeoutSecs = 0                 -- No timeout by default
+    sandboxTimeoutSecs = 0,                -- No timeout by default
+    sandboxKeepBuildOutput = False         -- Don't keep build output by default
 }
 
 -- | Binary instance for SandboxRequest for serialization
@@ -345,7 +347,8 @@ configToList config = [
     ("memoryLimit", show $ sandboxMemoryLimit config),
     ("diskLimit", show $ sandboxDiskLimit config),
     ("maxProcesses", show $ sandboxMaxProcesses config),
-    ("timeoutSecs", show $ sandboxTimeoutSecs config)
+    ("timeoutSecs", show $ sandboxTimeoutSecs config),
+    ("keepBuildOutput", show $ sandboxKeepBuildOutput config)
     ]
 
 listToConfig :: [(String, String)] -> SandboxConfig
@@ -379,7 +382,8 @@ listToConfig items =
             sandboxMemoryLimit = getInt "memoryLimit",
             sandboxDiskLimit = getInt "diskLimit",
             sandboxMaxProcesses = getInt "maxProcesses",
-            sandboxTimeoutSecs = getInt "timeoutSecs"
+            sandboxTimeoutSecs = getInt "timeoutSecs",
+            sandboxKeepBuildOutput = getBool "keepBuildOutput"
         }
 
 -- | Helper function to convert BuildId to String for filesystem paths
@@ -1179,8 +1183,7 @@ spawnSandboxedProcess sandboxDir programPath args env config = do
     return pid
 
 -- | Run a builder process with proper privilege isolation
-runBuilderProcess :: FilePath -> [String] -> [String] -> UserID -> GroupID ->
-                    IO (ExitCode, String, String)
+runBuilderProcess :: FilePath -> [String] -> [(String, String)] -> UserID -> GroupID -> IO (ExitCode, String, String)
 runBuilderProcess program args env uid gid = do
     -- Validate program path
     programExists <- doesFileExist program

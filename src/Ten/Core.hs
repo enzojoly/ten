@@ -105,6 +105,7 @@ module Ten.Core (
     parseStorePath,
     parseStorePathText,
     validateStorePath,
+    validateStorePathWithContext,
 
     -- Reference tracking types
     StoreReference(..),
@@ -267,6 +268,9 @@ import Network.Socket.ByteString (sendAll, recv)
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
 import System.Random (randomRIO)
+import qualified Data.Binary as Binary
+import qualified Data.Binary.Put as Binary
+import qualified Data.Binary.Get as Binary
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -443,6 +447,21 @@ data StorePath = StorePath
     , storeName :: !Text             -- Human-readable name component
     } deriving (Show, Eq, Ord)
 
+-- | Binary instance for StorePath
+instance Binary.Binary StorePath where
+    put (StorePath hash name) = do
+        Binary.put hash
+        Binary.put name
+
+    get = do
+        hash <- Binary.get
+        name <- Binary.get
+        let path = StorePath hash name
+        if validateStorePath path
+            then return path
+            else fail $ "Invalid store path format during deserialization: " ++
+                       T.unpack hash ++ "-" ++ T.unpack name
+
 -- | Convert StorePath to a standard text representation
 storePathToText :: StorePath -> Text
 storePathToText (StorePath hash name) = hash <> "-" <> name
@@ -470,6 +489,15 @@ parseStorePathText = parseStorePath
 validateStorePath :: StorePath -> Bool
 validateStorePath (StorePath hash name) =
     T.length hash >= 8 && T.all isHexDigit hash && not (T.null name)
+
+-- | Validate a StorePath with context for logging
+validateStorePathWithContext :: StorePath -> Text -> IO Bool
+validateStorePathWithContext path context = do
+    let isValid = validateStorePath path
+    unless isValid $
+        hPutStrLn stderr $ "Invalid StorePath detected: " ++ T.unpack (storePathToText path) ++
+                          " [context: " ++ T.unpack context ++ "]"
+    return isValid
 
 -- | Message types for protocol communication
 data MessageType
@@ -1880,7 +1908,10 @@ deserializeDerivation bs =
     parseStorePath = Aeson.withObject "StorePath" $ \o -> do
         hash <- o Aeson..: "hash"
         name <- o Aeson..: "name"
-        return $ StorePath hash name
+        let path = StorePath hash name
+        if validateStorePath path
+            then return path
+            else fail $ "Invalid store path format: " ++ T.unpack hash ++ "-" ++ T.unpack name
 
     parseInput :: Aeson.Value -> Parser DerivationInput
     parseInput = Aeson.withObject "DerivationInput" $ \o -> do
@@ -1936,8 +1967,8 @@ deserializeBuildResult bs =
   where
     fromJSON :: Aeson.Value -> Aeson.Result BuildResult
     fromJSON val = case Aeson.parseEither parseBuildResult val of
-        Left err -> Aeson.Error err
-        Right x -> Aeson.Success x
+        Left err -> Left $ Aeson.Error err
+        Right x -> Right $ Aeson.Success x
 
     parseBuildResult :: Aeson.Value -> Parser BuildResult
     parseBuildResult = Aeson.withObject "BuildResult" $ \o -> do
@@ -1960,7 +1991,11 @@ deserializeBuildResult bs =
     parseStorePath = Aeson.withObject "StorePath" $ \o -> do
         hash <- o Aeson..: "hash"
         name <- o Aeson..: "name"
-        return $ StorePath hash name
+        let path = StorePath hash name
+        if validateStorePath path
+            then return path
+            else fail $ "Invalid store path format during deserialization: " ++
+                       T.unpack hash ++ "-" ++ T.unpack name
 
     parseExitCode :: Aeson.Value -> Parser ExitCode
     parseExitCode = Aeson.withObject "ExitCode" $ \o -> do
@@ -2043,7 +2078,10 @@ instance Aeson.FromJSON StorePath where
     parseJSON = Aeson.withObject "StorePath" $ \v -> do
         hash <- v Aeson..: "hash"
         name <- v Aeson..: "name"
-        return $ StorePath hash name
+        let path = StorePath hash name
+        if validateStorePath path
+            then return path
+            else fail $ "Invalid store path format: " ++ T.unpack hash ++ "-" ++ T.unpack name
 
 -- JSON instances for AuthResult
 instance Aeson.ToJSON AuthResult where
@@ -2120,7 +2158,7 @@ instance Aeson.FromJSON BuildResult where
         -- Parse exit code
         exitCode <- parseExitCode exitCodeObj
 
-        -- Parse store paths
+        -- Parse store paths with validation
         let outputs = Set.fromList $ catMaybes $ map parseStorePath outputTexts
         let references = Set.fromList $ catMaybes $ map parseStorePath referenceTexts
 
