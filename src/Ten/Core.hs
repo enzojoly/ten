@@ -185,6 +185,8 @@ module Ten.Core (
     makeStorePath,
 
     -- Error utilities
+    throwError,
+    catchError,
     privilegeError,
     buildErrorToText,
 
