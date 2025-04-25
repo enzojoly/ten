@@ -138,7 +138,7 @@ import Control.Concurrent (forkIO, killThread, threadDelay, myThreadId)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (Exception, throwIO, bracket, try, SomeException)
-import Control.Monad (unless, when, foldM)
+import Control.Monad (unless, when, foldM, forM)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
@@ -861,6 +861,546 @@ data ResponseContent
     | ErrorResponseContent BuildError
     deriving (Show, Eq)
 
+-- | Define ToJSON instance for RequestContent
+instance Aeson.ToJSON RequestContent where
+    toJSON req = case req of
+        BuildRequestContent{..} -> Aeson.object [
+                "type" .= ("build" :: Text),
+                "path" .= buildFilePath,
+                "hasContent" .= isJust buildFileContent,
+                "options" .= buildOptions
+            ]
+        EvalRequestContent{..} -> Aeson.object [
+                "type" .= ("eval" :: Text),
+                "path" .= evalFilePath,
+                "hasContent" .= isJust evalFileContent,
+                "options" .= evalOptions
+            ]
+        BuildDerivationRequestContent{..} -> Aeson.object [
+                "type" .= ("build-derivation" :: Text),
+                "hasDerivation" .= True,
+                "options" .= buildDerivOptions
+            ]
+        BuildStatusRequestContent{..} -> Aeson.object [
+                "type" .= ("build-status" :: Text),
+                "buildId" .= renderBuildId statusBuildId
+            ]
+        CancelBuildRequestContent{..} -> Aeson.object [
+                "type" .= ("cancel-build" :: Text),
+                "buildId" .= renderBuildId cancelBuildId
+            ]
+        QueryBuildOutputRequestContent{..} -> Aeson.object [
+                "type" .= ("build-output" :: Text),
+                "buildId" .= renderBuildId outputBuildId
+            ]
+        ListBuildsRequestContent{..} -> Aeson.object [
+                "type" .= ("list-builds" :: Text),
+                "limit" .= listLimit
+            ]
+        StoreAddRequestContent{..} -> Aeson.object [
+                "type" .= ("store-add" :: Text),
+                "path" .= storeAddPath,
+                "hasContent" .= True
+            ]
+        StoreVerifyRequestContent{..} -> Aeson.object [
+                "type" .= ("store-verify" :: Text),
+                "path" .= storeVerifyPath
+            ]
+        StorePathRequestContent{..} -> Aeson.object [
+                "type" .= ("store-path" :: Text),
+                "path" .= storePathForFile,
+                "hasContent" .= True
+            ]
+        StoreListRequestContent -> Aeson.object [
+                "type" .= ("store-list" :: Text)
+            ]
+        StoreDerivationRequestContent{..} -> Aeson.object [
+                "type" .= ("store-derivation" :: Text),
+                "hasContent" .= True
+            ]
+        RetrieveDerivationRequestContent{..} -> Aeson.object [
+                "type" .= ("retrieve-derivation" :: Text),
+                "path" .= encodePath derivationPath
+            ]
+        QueryDerivationRequestContent{..} -> Aeson.object [
+                "type" .= ("query-derivation" :: Text),
+                "queryType" .= queryType,
+                "queryValue" .= queryValue,
+                "limit" .= queryLimit
+            ]
+        GetDerivationForOutputRequestContent{..} -> Aeson.object [
+                "type" .= ("get-derivation-for-output" :: Text),
+                "path" .= getDerivationForPath
+            ]
+        ListDerivationsRequestContent{..} -> Aeson.object [
+                "type" .= ("list-derivations" :: Text),
+                "limit" .= listDerivLimit
+            ]
+        GCRequestContent params -> Aeson.object [
+                "type" .= ("gc" :: Text),
+                "force" .= gcForce params
+            ]
+        GCStatusRequestContent params -> Aeson.object [
+                "type" .= ("gc-status" :: Text),
+                "forceCheck" .= gcForceCheck params
+            ]
+        AddGCRootRequestContent{..} -> Aeson.object [
+                "type" .= ("add-gc-root" :: Text),
+                "path" .= encodePath rootPath,
+                "name" .= rootName,
+                "permanent" .= rootPermanent
+            ]
+        RemoveGCRootRequestContent{..} -> Aeson.object [
+                "type" .= ("remove-gc-root" :: Text),
+                "name" .= rootNameToRemove
+            ]
+        ListGCRootsRequestContent -> Aeson.object [
+                "type" .= ("list-gc-roots" :: Text)
+            ]
+        PingRequestContent -> Aeson.object [
+                "type" .= ("ping" :: Text)
+            ]
+        ShutdownRequestContent -> Aeson.object [
+                "type" .= ("shutdown" :: Text)
+            ]
+        StatusRequestContent -> Aeson.object [
+                "type" .= ("status" :: Text)
+            ]
+        ConfigRequestContent -> Aeson.object [
+                "type" .= ("config" :: Text)
+            ]
+      where
+        encodePath (StorePath hash name) = Aeson.object [
+                "hash" .= hash,
+                "name" .= name
+            ]
+
+-- | Define FromJSON instance for RequestContent
+instance Aeson.FromJSON RequestContent where
+    parseJSON = Aeson.withObject "RequestContent" $ \v -> do
+        reqType <- v .: "type" :: Aeson.Parser Text
+        case reqType of
+            "build" -> do
+                path <- v .: "path"
+                hasContent <- v .: "hasContent"
+                options <- v .: "options"
+                return $ BuildRequestContent path (if hasContent then Just BS.empty else Nothing) options
+            "eval" -> do
+                path <- v .: "path"
+                hasContent <- v .: "hasContent"
+                options <- v .: "options"
+                return $ EvalRequestContent path (if hasContent then Just BS.empty else Nothing) options
+            "build-derivation" -> do
+                -- Derivation content is transmitted separately
+                options <- v .: "options"
+                return $ BuildDerivationRequestContent undefined options
+            "build-status" -> do
+                buildIdStr <- v .: "buildId"
+                case parseBuildId buildIdStr of
+                    Left err -> fail $ T.unpack err
+                    Right bid -> return $ BuildStatusRequestContent bid
+            "cancel-build" -> do
+                buildIdStr <- v .: "buildId"
+                case parseBuildId buildIdStr of
+                    Left err -> fail $ T.unpack err
+                    Right bid -> return $ CancelBuildRequestContent bid
+            "build-output" -> do
+                buildIdStr <- v .: "buildId"
+                case parseBuildId buildIdStr of
+                    Left err -> fail $ T.unpack err
+                    Right bid -> return $ QueryBuildOutputRequestContent bid
+            "list-builds" -> do
+                limit <- v .:? "limit"
+                return $ ListBuildsRequestContent limit
+            "store-add" -> do
+                path <- v .: "path"
+                -- Content is transmitted separately
+                return $ StoreAddRequestContent path BS.empty
+            "store-verify" -> do
+                path <- v .: "path"
+                return $ StoreVerifyRequestContent path
+            "store-path" -> do
+                path <- v .: "path"
+                -- Content is transmitted separately
+                return $ StorePathRequestContent path BS.empty
+            "store-list" -> return StoreListRequestContent
+            "store-derivation" -> do
+                -- Content is transmitted separately
+                return $ StoreDerivationRequestContent BS.empty
+            "retrieve-derivation" -> do
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                return $ RetrieveDerivationRequestContent path
+            "query-derivation" -> do
+                qType <- v .: "queryType"
+                qValue <- v .: "queryValue"
+                limit <- v .:? "limit"
+                return $ QueryDerivationRequestContent qType qValue limit
+            "get-derivation-for-output" -> do
+                path <- v .: "path"
+                return $ GetDerivationForOutputRequestContent path
+            "list-derivations" -> do
+                limit <- v .:? "limit"
+                return $ ListDerivationsRequestContent limit
+            "gc" -> do
+                force <- v .: "force"
+                return $ GCRequestContent (GCRequestParams force)
+            "gc-status" -> do
+                forceCheck <- v .: "forceCheck"
+                return $ GCStatusRequestContent (GCStatusRequestParams forceCheck)
+            "add-gc-root" -> do
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                name <- v .: "name"
+                permanent <- v .: "permanent"
+                return $ AddGCRootRequestContent path name permanent
+            "remove-gc-root" -> do
+                name <- v .: "name"
+                return $ RemoveGCRootRequestContent name
+            "list-gc-roots" -> return ListGCRootsRequestContent
+            "ping" -> return PingRequestContent
+            "shutdown" -> return ShutdownRequestContent
+            "status" -> return StatusRequestContent
+            "config" -> return ConfigRequestContent
+            _ -> fail $ "Unknown request type: " ++ T.unpack reqType
+        where
+            decodePath = Aeson.withObject "StorePath" $ \p -> do
+                hash <- p .: "hash"
+                name <- p .: "name"
+                return $ StorePath hash name
+
+-- | Define ToJSON instance for ResponseContent
+instance Aeson.ToJSON ResponseContent where
+    toJSON resp = case resp of
+        AuthResponseContent result -> Aeson.object [
+                "type" .= ("auth" :: Text),
+                "result" .= result
+            ]
+        BuildStartedResponseContent buildId -> Aeson.object [
+                "type" .= ("build-started" :: Text),
+                "buildId" .= renderBuildId buildId
+            ]
+        BuildResponseContent result -> Aeson.object [
+                "type" .= ("build-result" :: Text),
+                "result" .= result
+            ]
+        BuildStatusResponseContent status -> Aeson.object [
+                "type" .= ("build-status" :: Text),
+                "status" .= status
+            ]
+        BuildOutputResponseContent output -> Aeson.object [
+                "type" .= ("build-output" :: Text),
+                "output" .= output
+            ]
+        BuildListResponseContent builds -> Aeson.object [
+                "type" .= ("build-list" :: Text),
+                "builds" .= map encodeListBuild builds
+            ]
+        CancelBuildResponseContent success -> Aeson.object [
+                "type" .= ("build-cancelled" :: Text),
+                "success" .= success
+            ]
+        StoreAddResponseContent path -> Aeson.object [
+                "type" .= ("store-add" :: Text),
+                "path" .= encodePath path
+            ]
+        StoreVerifyResponseContent valid -> Aeson.object [
+                "type" .= ("store-verify" :: Text),
+                "valid" .= valid
+            ]
+        StorePathResponseContent path -> Aeson.object [
+                "type" .= ("store-path" :: Text),
+                "path" .= encodePath path
+            ]
+        StoreListResponseContent paths -> Aeson.object [
+                "type" .= ("store-list" :: Text),
+                "paths" .= map encodePath paths
+            ]
+        DerivationResponseContent drv -> Aeson.object [
+                "type" .= ("derivation" :: Text),
+                "derivation" .= TE.decodeUtf8 (Ten.Derivation.serializeDerivation drv)
+            ]
+        DerivationStoredResponseContent path -> Aeson.object [
+                "type" .= ("derivation-stored" :: Text),
+                "path" .= encodePath path
+            ]
+        DerivationRetrievedResponseContent mDrv -> Aeson.object [
+                "type" .= ("derivation-retrieved" :: Text),
+                "found" .= isJust mDrv,
+                "derivation" .= maybe Aeson.Null
+                    (\drv -> Aeson.toJSON $ derivationToJSON drv) mDrv
+            ]
+        DerivationQueryResponseContent drvs -> Aeson.object [
+                "type" .= ("derivation-query" :: Text),
+                "count" .= length drvs,
+                "derivations" .= map (\drv -> TE.decodeUtf8 (Ten.Derivation.serializeDerivation drv)) drvs
+            ]
+        DerivationOutputResponseContent paths -> Aeson.object [
+                "type" .= ("derivation-outputs" :: Text),
+                "outputs" .= map encodePath (Set.toList paths)
+            ]
+        DerivationListResponseContent paths -> Aeson.object [
+                "type" .= ("derivation-list" :: Text),
+                "paths" .= map encodePath paths
+            ]
+        GCResponseContent stats -> Aeson.object [
+                "type" .= ("gc-result" :: Text),
+                "stats" .= stats
+            ]
+        GCStartedResponseContent -> Aeson.object [
+                "type" .= ("gc-started" :: Text)
+            ]
+        GCStatusResponseContent status -> Aeson.object [
+                "type" .= ("gc-status" :: Text),
+                "status" .= status
+            ]
+        GCRootAddedResponseContent name -> Aeson.object [
+                "type" .= ("gc-root-added" :: Text),
+                "name" .= name
+            ]
+        GCRootRemovedResponseContent name -> Aeson.object [
+                "type" .= ("gc-root-removed" :: Text),
+                "name" .= name
+            ]
+        GCRootsListResponseContent roots -> Aeson.object [
+                "type" .= ("gc-roots-list" :: Text),
+                "roots" .= map encodeRoot roots
+            ]
+        PongResponseContent -> Aeson.object [
+                "type" .= ("pong" :: Text)
+            ]
+        ShutdownResponseContent -> Aeson.object [
+                "type" .= ("shutdown" :: Text)
+            ]
+        StatusResponseContent status -> Aeson.object [
+                "type" .= ("status" :: Text),
+                "status" .= status
+            ]
+        ConfigResponseContent config -> Aeson.object [
+                "type" .= ("config" :: Text),
+                "config" .= config
+            ]
+        EvalResponseContent drv -> Aeson.object [
+                "type" .= ("eval" :: Text),
+                "derivation" .= TE.decodeUtf8 (Ten.Derivation.serializeDerivation drv)
+            ]
+        ErrorResponseContent err -> Aeson.object [
+                "type" .= ("error" :: Text),
+                "error" .= encodeError err
+            ]
+      where
+        encodePath (StorePath hash name) = Aeson.object [
+                "hash" .= hash,
+                "name" .= name
+            ]
+        encodeListBuild (bid, status, progress) = Aeson.object [
+                "id" .= renderBuildId bid,
+                "status" .= showStatus status,
+                "progress" .= progress
+            ]
+        encodeRoot (path, name, permanent) = Aeson.object [
+                "path" .= encodePath path,
+                "name" .= name,
+                "permanent" .= permanent
+            ]
+        encodeError err = Aeson.object [
+                "errorType" .= errorTypeString err,
+                "message" .= errorToText err
+            ]
+        errorTypeString :: BuildError -> Text
+        errorTypeString (EvalError _) = "eval"
+        errorTypeString (BuildFailed _) = "build"
+        errorTypeString (StoreError _) = "store"
+        errorTypeString (SandboxError _) = "sandbox"
+        errorTypeString (InputNotFound _) = "input"
+        errorTypeString (HashError _) = "hash"
+        errorTypeString (GraphError _) = "graph"
+        errorTypeString (ResourceError _) = "resource"
+        errorTypeString (DaemonError _) = "daemon"
+        errorTypeString (AuthError _) = "auth"
+        errorTypeString (CyclicDependency _) = "cycle"
+        errorTypeString (SerializationError _) = "serialization"
+        errorTypeString (RecursionLimit _) = "recursion"
+        errorTypeString (NetworkError _) = "network"
+        errorTypeString (ParseError _) = "parse"
+        errorTypeString (DBError _) = "db"
+        errorTypeString (GCError _) = "gc"
+        errorTypeString (PhaseError _) = "phase"
+        errorTypeString (PrivilegeError _) = "privilege"
+        errorTypeString (ProtocolError _) = "protocol"
+        errorTypeString _ = "unknown"
+        showStatus :: BuildStatus -> Text
+        showStatus BuildPending = "pending"
+        showStatus (BuildRunning _) = "running"
+        showStatus (BuildRecursing _) = "recursing"
+        showStatus BuildCompleted = "completed"
+        showStatus BuildFailed' = "failed"
+
+-- | Define FromJSON instance for ResponseContent
+instance Aeson.FromJSON ResponseContent where
+    parseJSON = Aeson.withObject "ResponseContent" $ \v -> do
+        respType <- v .: "type" :: Aeson.Parser Text
+        case respType of
+            "auth" -> do
+                result <- v .: "result"
+                return $ AuthResponseContent result
+            "build-started" -> do
+                buildIdStr <- v .: "buildId"
+                case parseBuildId buildIdStr of
+                    Left err -> fail $ T.unpack err
+                    Right bid -> return $ BuildStartedResponseContent bid
+            "build-result" -> do
+                result <- v .: "result"
+                return $ BuildResponseContent result
+            "build-status" -> do
+                status <- v .: "status"
+                return $ BuildStatusResponseContent status
+            "build-output" -> do
+                output <- v .: "output"
+                return $ BuildOutputResponseContent output
+            "build-list" -> do
+                builds <- v .: "builds"
+                buildsList <- parseBuilds builds
+                return $ BuildListResponseContent buildsList
+            "build-cancelled" -> do
+                success <- v .: "success"
+                return $ CancelBuildResponseContent success
+            "store-add" -> do
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                return $ StoreAddResponseContent path
+            "store-verify" -> do
+                valid <- v .: "valid"
+                return $ StoreVerifyResponseContent valid
+            "store-path" -> do
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                return $ StorePathResponseContent path
+            "store-list" -> do
+                pathsJson <- v .: "paths"
+                paths <- mapM decodePath pathsJson
+                return $ StoreListResponseContent paths
+            "derivation" -> do
+                derivText <- v .: "derivation" :: Aeson.Parser Text
+                case Ten.Derivation.deserializeDerivation (TE.encodeUtf8 derivText) of
+                    Left err -> fail $ "Invalid derivation: " ++ T.unpack (buildErrorToText err)
+                    Right d -> return $ DerivationResponseContent d
+            "derivation-stored" -> do
+                pathObj <- v .: "path"
+                path <- decodePath pathObj
+                return $ DerivationStoredResponseContent path
+            "derivation-retrieved" -> do
+                found <- v .: "found"
+                if found
+                    then do
+                        derivText <- v .: "derivation" :: Aeson.Parser Text
+                        case Ten.Derivation.deserializeDerivation (TE.encodeUtf8 derivText) of
+                            Left err -> fail $ "Invalid derivation: " ++ T.unpack (buildErrorToText err)
+                            Right d -> return $ DerivationRetrievedResponseContent (Just d)
+                    else return $ DerivationRetrievedResponseContent Nothing
+            "derivation-query" -> do
+                derivTexts <- v .: "derivations" :: Aeson.Parser [Text]
+                drvs <- forM derivTexts $ \derivText ->
+                    case Ten.Derivation.deserializeDerivation (TE.encodeUtf8 derivText) of
+                        Left err -> fail $ "Invalid derivation: " ++ T.unpack (buildErrorToText err)
+                        Right d -> return d
+                return $ DerivationQueryResponseContent drvs
+            "derivation-outputs" -> do
+                outputsJson <- v .: "outputs"
+                outputs <- mapM decodePath outputsJson
+                return $ DerivationOutputResponseContent (Set.fromList outputs)
+            "derivation-list" -> do
+                pathsJson <- v .: "paths"
+                paths <- mapM decodePath pathsJson
+                return $ DerivationListResponseContent paths
+            "gc-result" -> do
+                stats <- v .: "stats"
+                return $ GCResponseContent stats
+            "gc-started" -> return GCStartedResponseContent
+            "gc-status" -> do
+                status <- v .: "status"
+                return $ GCStatusResponseContent status
+            "gc-root-added" -> do
+                name <- v .: "name"
+                return $ GCRootAddedResponseContent name
+            "gc-root-removed" -> do
+                name <- v .: "name"
+                return $ GCRootRemovedResponseContent name
+            "gc-roots-list" -> do
+                rootsJson <- v .: "roots"
+                roots <- mapM parseRoot rootsJson
+                return $ GCRootsListResponseContent roots
+            "pong" -> return PongResponseContent
+            "shutdown" -> return ShutdownResponseContent
+            "status" -> do
+                status <- v .: "status"
+                return $ StatusResponseContent status
+            "config" -> do
+                config <- v .: "config"
+                return $ ConfigResponseContent config
+            "eval" -> do
+                derivText <- v .: "derivation" :: Aeson.Parser Text
+                case Ten.Derivation.deserializeDerivation (TE.encodeUtf8 derivText) of
+                    Left err -> fail $ "Invalid derivation: " ++ T.unpack (buildErrorToText err)
+                    Right d -> return $ EvalResponseContent d
+            "error" -> do
+                errObj <- v .: "error"
+                err <- parseError errObj
+                return $ ErrorResponseContent err
+            _ -> fail $ "Unknown response type: " ++ T.unpack respType
+        where
+            decodePath = Aeson.withObject "StorePath" $ \p -> do
+                hash <- p .: "hash"
+                name <- p .: "name"
+                return $ StorePath hash name
+            parseBuilds builds = forM builds $ \build -> Aeson.withObject "Build" (\b -> do
+                idStr <- b .: "id"
+                statusStr <- b .: "status"
+                progress <- b .: "progress"
+                bid <- case parseBuildId idStr of
+                    Left err -> fail $ T.unpack err
+                    Right bid' -> return bid'
+                let status = case statusStr of
+                        "pending" -> BuildPending
+                        "running" -> BuildRunning progress
+                        "recursing" -> BuildRecursing bid  -- Simplified
+                        "completed" -> BuildCompleted
+                        "failed" -> BuildFailed'
+                        _ -> BuildPending
+                return (bid, status, progress)
+                ) build
+            parseRoot = Aeson.withObject "GCRoot" $ \r -> do
+                pathObj <- r .: "path"
+                path <- decodePath pathObj
+                name <- r .: "name"
+                permanent <- r .: "permanent"
+                return (path, name, permanent)
+            parseError = Aeson.withObject "Error" $ \e -> do
+                errType <- e .: "errorType" :: Aeson.Parser Text
+                msg <- e .: "message" :: Aeson.Parser Text
+                case errType of
+                    "eval" -> return $ EvalError msg
+                    "build" -> return $ BuildFailed msg
+                    "store" -> return $ StoreError msg
+                    "sandbox" -> return $ SandboxError msg
+                    "input" -> return $ InputNotFound (T.unpack msg)
+                    "hash" -> return $ HashError msg
+                    "graph" -> return $ GraphError msg
+                    "resource" -> return $ ResourceError msg
+                    "daemon" -> return $ DaemonError msg
+                    "auth" -> return $ AuthError msg
+                    "cycle" -> return $ CyclicDependency msg
+                    "serialization" -> return $ SerializationError msg
+                    "recursion" -> return $ RecursionLimit msg
+                    "network" -> return $ NetworkError msg
+                    "parse" -> return $ ParseError msg
+                    "db" -> return $ DBError msg
+                    "gc" -> return $ GCError msg
+                    "phase" -> return $ PhaseError msg
+                    "privilege" -> return $ PrivilegeError msg
+                    "protocol" -> return $ ProtocolError msg
+                    _ -> return $ BuildFailed $ "Unknown error: " <> msg
+
 -- | GC Statistics
 data GCStats = GCStats {
     gcTotal :: Int,            -- Total paths in store
@@ -1034,7 +1574,7 @@ closeHandle handle = do
 -- Format: [4-byte message length][message data]
 createRequestFrame :: BS.ByteString -> BS.ByteString
 createRequestFrame content = do
-    let len = fromIntegral $ BS.length content
+    let len = fromIntegral (BS.length content) :: Word32
     let lenBytes = LBS.toStrict $ Builder.toLazyByteString $
                    Builder.word32BE len
     lenBytes `BS.append` content
@@ -1045,11 +1585,11 @@ parseRequestFrame bs
     | BS.length bs < 4 = Left "Message too short to contain length"
     | otherwise = do
         let (lenBytes, rest) = BS.splitAt 4 bs
-    let len = (fromIntegral :: Word32 -> Int) $
-          ((fromIntegral (BS.index lenBytes 0) :: Word8 -> Word32) `shiftL` 24) .|.
-          ((fromIntegral (BS.index lenBytes 1) :: Word8 -> Word32) `shiftL` 16) .|.
-          ((fromIntegral (BS.index lenBytes 2) :: Word8 -> Word32) `shiftL` 8) .|.
-          ((fromIntegral (BS.index lenBytes 3) :: Word8 -> Word32))
+        let len = (fromIntegral :: Word32 -> Int) $
+              (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+              (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+              (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+              (fromIntegral (BS.index lenBytes 3) :: Word32)
 
         if len > 100 * 1024 * 1024  -- 100 MB limit
             then Left $ T.pack $ "Message too large (" ++ show len ++ " bytes)"
@@ -1611,6 +2151,12 @@ createResponseUnprivileged resp =
             ]
     in createResponseFrame $ LBS.toStrict $ Aeson.encode content
 
+createErrorRequest :: BuildError -> BS.ByteString
+createErrorRequest err = createRequestFrame $ LBS.toStrict $ Aeson.encode $ Aeson.object [
+        "type" .= ("error" :: Text),
+        "error" .= encodeError err
+    ]
+
 -- | Create an error response
 createErrorResponse :: BuildError -> BS.ByteString
 createErrorResponse err =
@@ -1716,44 +2262,6 @@ createBuilderRequest msgType content =
             ]
     in createRequestFrame $ LBS.toStrict $ Aeson.encode jsonContent
 
--- | Create an error request
-createErrorRequest :: BuildError -> BS.ByteString
-createErrorRequest err =
-    let jsonContent = Aeson.object [
-            "type" .= ("error" :: Text),
-            "error" .= Aeson.object [
-                "errorType" .= errorTypeString err,
-                "message" .= errorMessage err
-            ]
-            ]
-    in createRequestFrame $ LBS.toStrict $ Aeson.encode jsonContent
-  where
-    errorTypeString :: BuildError -> Text
-    errorTypeString (EvalError _) = "eval"
-    errorTypeString (BuildFailed _) = "build"
-    errorTypeString (StoreError _) = "store"
-    errorTypeString (SandboxError _) = "sandbox"
-    errorTypeString (InputNotFound _) = "input"
-    errorTypeString (HashError _) = "hash"
-    errorTypeString (GraphError _) = "graph"
-    errorTypeString (ResourceError _) = "resource"
-    errorTypeString (DaemonError _) = "daemon"
-    errorTypeString (AuthError _) = "auth"
-    errorTypeString (CyclicDependency _) = "cycle"
-    errorTypeString (SerializationError _) = "serialization"
-    errorTypeString (RecursionLimit _) = "recursion"
-    errorTypeString (NetworkError _) = "network"
-    errorTypeString (ParseError _) = "parse"
-    errorTypeString (DBError _) = "db"
-    errorTypeString (GCError _) = "gc"
-    errorTypeString (PhaseError _) = "phase"
-    errorTypeString (PrivilegeError _) = "privilege"
-    errorTypeString (ProtocolError _) = "protocol"
-    errorTypeString _ = "unknown"
-
-    errorMessage :: BuildError -> Text
-    errorMessage = errorToText
-
 -- | Receive a response
 receiveResponse :: ProtocolHandle -> IO (Either ProtocolError ResponseContent)
 receiveResponse handle = do
@@ -1846,12 +2354,12 @@ readMessage sock = do
     when (BS.length lenBytes /= 4) $
         throwIO ConnectionClosed
 
-    -- Decode message length
+    -- Decode message length (fixed the ambiguous type variable issue)
     let len = fromIntegral $
-              (fromIntegral (BS.index lenBytes 0) `shiftL` 24) .|.
-              (fromIntegral (BS.index lenBytes 1) `shiftL` 16) .|.
-              (fromIntegral (BS.index lenBytes 2) `shiftL` 8) .|.
-              (fromIntegral (BS.index lenBytes 3))
+              (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+              (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+              (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+              (fromIntegral (BS.index lenBytes 3) :: Word32)
 
     -- Check if message is too large
     when (len > 100 * 1024 * 1024) $ -- 100 MB limit
