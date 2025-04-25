@@ -97,6 +97,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Database.SQLite.Simple (Connection, Query(..), Only(..), query, query_, execute, execute_)
 import qualified Database.SQLite.Simple as SQLite
+import Control.Exception (try, IOException)
 import Data.List (isPrefixOf, isInfixOf, sort)
 import Data.Singletons
 import Data.Singletons.TH
@@ -386,9 +387,9 @@ getFileSystemRoots rootsDir = do
 
             if isLink
                 then do
-                    target <- try $ ByteString.readSymbolicLink filePath
+                    target <- try @IOException $ ByteString.readSymbolicLink filePath
                     case target of
-                        Left (_ :: SomeException) -> return Nothing
+                        Left (_ :: IOException) -> return Nothing
                         Right linkTarget -> do
                             let path = case Ten.Core.filePathToStorePath (BC.unpack linkTarget) of
                                     Just p -> p
@@ -723,7 +724,7 @@ getFileSystemRootPaths rootsDir = do
 
                 if isLink
                     then do
-                        target <- try $ ByteString.readSymbolicLink srcPath
+                        target <- try @IOException $ ByteString.readSymbolicLink srcPath
                         case target of
                             Left (_ :: SomeException) -> return acc
                             Right targetPath ->
@@ -766,7 +767,7 @@ getRuntimeRootPaths storeLocation = do
             -- Process each lock file to find references to store paths
             foldM (\acc lockFile -> do
                 -- Read lock file
-                content <- try $ BS.readFile (BC.unpack lockFile)
+                content <- try @IOException $ BS.readFile (BC.unpack lockFile)
                 case content of
                     Left (_ :: SomeException) -> return acc
                     Right fileContent -> do
@@ -883,10 +884,10 @@ acquireGCLock = do
     liftIO $ Ten.Core.ensureLockDirExists (takeDirectory lockPath)
 
     -- Try to acquire the lock with proper privilege verification
-    result <- liftIO $ try $ acquireFileLock lockPath
+    result <- liftIO $ try @SomeException $ acquireFileLock lockPath
 
     case result of
-        Left (e :: SomeException) -> throwError $ Ten.Core.ResourceError $ "Could not acquire GC lock: " <> T.pack (show e)
+        Left e -> throwError $ Ten.Core.ResourceError $ "Could not acquire GC lock: " <> T.pack (show e)
         Right lock -> do
             -- Keep the fd in a global reference to avoid GC
             liftIO $ writeIORef globalGCLockFdRef (Just (lockFd lock, lockPath))
@@ -901,7 +902,7 @@ releaseGCLock = do
     exists <- liftIO $ doesFileExist lockPath
     when exists $ do
         -- Read the lock file to check the owner
-        content <- liftIO $ try $ readFile lockPath
+        content <- liftIO $ try @IOException $ readFile lockPath
         case content of
             Right pidStr -> do
                 case reads pidStr of
@@ -945,10 +946,10 @@ withGCLock action = do
 breakStaleLock :: FilePath -> TenM 'Build 'Daemon ()
 breakStaleLock lockPath = do
     -- Check lock status
-    status <- liftIO $ try $ checkLockFile lockPath
+    status <- liftIO $ try @SomeException $ checkLockFile lockPath
 
     case status of
-        Left (e :: SomeException) ->
+        Left e ->
             logMsg 1 $ "Cannot check lock status: " <> T.pack (show e)
         Right isValid ->
             unless isValid $ liftIO $ do
@@ -972,9 +973,9 @@ checkLockFile lockPath = do
         then return False  -- Lock file doesn't exist
         else do
             -- Read the lock file to get PID
-            result <- try $ BS.readFile lockPath
+            result <- try @IOException $ BS.readFile lockPath
             case result of
-                Left (_ :: SomeException) ->
+                Left _ ->
                     return False  -- Error reading lock file, treat as invalid
 
                 Right content -> do
@@ -992,7 +993,7 @@ breakStaleLock' lockPath = do
     exists <- doesFileExist lockPath
     when exists $ do
         -- Read the lock file
-        content <- try $ readFile lockPath
+        content <- try @IOException $ readFile lockPath
         case content of
             Right pidStr -> do
                 case reads pidStr of
@@ -1011,9 +1012,9 @@ breakStaleLock' lockPath = do
 isProcessRunning :: ProcessID -> IO Bool
 isProcessRunning pid = do
     -- Try to send signal 0 to the process (doesn't actually send a signal, just checks existence)
-    result <- try $ signalProcess 0 pid
+    result <- try @SomeException $ signalProcess 0 pid
     case result of
-        Left (_ :: SomeException) -> return False  -- Process doesn't exist
+        Left _ -> return False  -- Process doesn't exist
         Right _ -> return True  -- Process exists
 
 -- | Create and acquire a lock file
@@ -1026,7 +1027,7 @@ acquireFileLock lockPath = do
     pid <- getProcessID
 
     -- Check if lock already exists
-    result <- try $ checkLockFile lockPath
+    result <- try @SomeException $ checkLockFile lockPath
     active <- case result of
         Left _ -> return False
         Right isActive -> return isActive
@@ -1035,14 +1036,8 @@ acquireFileLock lockPath = do
         throwIO $ userError "Another garbage collection is in progress"
 
     -- Create the lock file with our PID
-    result <- try $ mask $ \unmask -> do
-        -- Create and open the lock file
-        let oflags = defaultFileFlags {
-                exclusive = True,  -- Fail if file exists (atomic creation)
-                trunc = True       -- Truncate if we somehow get here and file exists
-            }
-
-        -- Open the file with proper flags for locking
+    result <- try @SomeException $ mask $ \unmask -> do
+        -- Create and open the lock file with proper flags for locking
         fd <- openFd lockPath WriteOnly defaultFileFlags{creat = Just 0o644, exclusive = True}
 
         unmask $ do
@@ -1062,7 +1057,7 @@ acquireFileLock lockPath = do
             }
 
     case result of
-        Left (e :: SomeException) ->
+        Left e ->
             throwIO $ userError $ "Failed to create lock file: " ++ show e
         Right lock ->
             return lock
@@ -1109,7 +1104,7 @@ verifyStore storeDir = do
                 Nothing -> return False
                 Just storePath -> do
                     -- Verify that the store file exists and has the correct hash
-                    result <- try $ do
+                    result <- try @SomeException $ do
                         let fullPath = storePathToFilePath storePath env
                         let fullPathBS = BC.pack fullPath
                         fileExists <- ByteString.fileExist fullPathBS
@@ -1120,7 +1115,7 @@ verifyStore storeDir = do
                                 return $ actualHash == storeHash storePath
                             else return False
                     case result of
-                        Left (_ :: SomeException) -> return False
+                        Left _ -> return False
                         Right valid -> return valid
 
         -- Return true if all paths verify
@@ -1147,7 +1142,7 @@ repairStore = do
                 Nothing -> return (v, i + 1, size)  -- Invalid path format
                 Just storePath -> do
                     -- Check if file exists and has correct hash
-                    result <- try $ do
+                    result <- try @SomeException $ do
                         let fullPath = storePathToFilePath storePath env
                         let fullPathBS = BC.pack fullPath
                         fileExists <- ByteString.fileExist fullPathBS
@@ -1159,14 +1154,14 @@ repairStore = do
                             else return (False, fullPath)
 
                     case result of
-                        Left (_ :: SomeException) -> return (v, i + 1, size)
+                        Left _ -> return (v, i + 1, size)
                         Right (isValid, path) ->
                             if isValid
                                 then return (v + 1, i, size)
                                 else do
                                     -- Invalid path, mark as invalid and remove
                                     -- Get size before deletion
-                                    fileStatus <- try $ do
+                                    fileStatus <- try @IOException $ do
                                         status <- ByteString.getFileStatus (BC.pack path)
                                         return $ fromIntegral $ ByteString.fileSize status
                                     let pathSize = case fileStatus of
