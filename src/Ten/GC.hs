@@ -144,8 +144,8 @@ globalGCLockFdRef :: IORef (Maybe (Fd, FilePath))
 globalGCLockFdRef = unsafePerformIO $ newIORef Nothing
 
 -- | Add a root to protect a path from garbage collection (daemon privilege only)
-addRoot :: SPrivilegeTier 'Daemon -> StorePath -> Text -> Bool -> TenM 'Build 'Daemon GCRoot
-addRoot st path name permanent = do
+addRoot :: StorePath -> Text -> Bool -> TenM 'Build 'Daemon GCRoot
+addRoot path name permanent = do
     env <- ask
 
     -- Verify the path exists in the store
@@ -170,7 +170,7 @@ addRoot st path name permanent = do
     liftIO $ Posix.createSymbolicLink targetPath rootFile
 
     -- Also register the root in the database with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db ->
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db ->
         liftIO $ execute db
             "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
             (storePathToText path, name, if permanent then "permanent" else "user")
@@ -180,8 +180,8 @@ addRoot st path name permanent = do
     return root
 
 -- | Request to add a root from builder context via protocol
-requestAddRoot :: SPrivilegeTier 'Builder -> StorePath -> Text -> Bool -> TenM 'Build 'Builder GCRoot
-requestAddRoot _ path name permanent = do
+requestAddRoot :: StorePath -> Text -> Bool -> TenM 'Build 'Builder GCRoot
+requestAddRoot path name permanent = do
     env <- ask
 
     -- Send request to daemon using protocol
@@ -218,8 +218,8 @@ requestAddRoot _ path name permanent = do
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Remove a root (daemon privilege only)
-removeRoot :: SPrivilegeTier 'Daemon -> GCRoot -> TenM 'Build 'Daemon ()
-removeRoot st root = do
+removeRoot :: GCRoot -> TenM 'Build 'Daemon ()
+removeRoot root = do
     env <- ask
 
     -- Generate the root file path
@@ -237,7 +237,7 @@ removeRoot st root = do
             liftIO $ removeFile rootFile
 
             -- Remove from database with proper privilege
-            withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db ->
+            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db ->
                 liftIO $ execute db
                     "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
                     (storePathToText (Ten.Core.rootPath root), Ten.Core.rootName root)
@@ -245,8 +245,8 @@ removeRoot st root = do
             Ten.Core.logMsg 1 $ "Removed GC root: " <> Ten.Core.rootName root <> " -> " <> storeHash (Ten.Core.rootPath root)
 
 -- | Request to remove a root from builder context via protocol
-requestRemoveRoot :: SPrivilegeTier 'Builder -> GCRoot -> TenM 'Build 'Builder ()
-requestRemoveRoot _ root = do
+requestRemoveRoot :: GCRoot -> TenM 'Build 'Builder ()
+requestRemoveRoot root = do
     env <- ask
 
     -- Send request to daemon using protocol
@@ -275,14 +275,14 @@ requestRemoveRoot _ root = do
 
 -- | List all current GC roots
 -- Works in both contexts through different mechanisms
-listRoots :: forall (t :: PrivilegeTier). SingI t => SPrivilegeTier t -> TenM 'Build t [GCRoot]
-listRoots st = case st of
-    SDaemon -> unsafeCoerce $ listRootsPrivileged st -- Type-safe casting between privilege tiers
-    SBuilder -> requestListRoots st
+listRoots :: forall (t :: PrivilegeTier). SingI t => TenM 'Build t [GCRoot]
+listRoots = case sing @t of
+    SDaemon -> listRootsPrivileged
+    SBuilder -> requestListRoots
 
 -- | Private implementation for listing roots with filesystem access
-listRootsPrivileged :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon [GCRoot]
-listRootsPrivileged st = do
+listRootsPrivileged :: TenM 'Build 'Daemon [GCRoot]
+listRootsPrivileged = do
     env <- ask
 
     -- Get the roots directory
@@ -292,10 +292,10 @@ listRootsPrivileged st = do
     liftIO $ createDirectoryIfMissing True rootsDir
 
     -- Get roots both from filesystem and database
-    fsRoots <- liftIO $ getFileSystemRoots rootsDir
+    fsRoots <- getFileSystemRoots rootsDir
 
     -- Get database roots with proper privilege
-    dbRootsResult <- withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db ->
+    dbRootsResult <- withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db ->
         liftIO $ do
             results <- query_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
                     :: IO [(Text, Text, Text, Int)]
@@ -307,9 +307,59 @@ listRootsPrivileged st = do
 
     return $ Map.elems allRoots
 
+-- | Get file system roots wrapped in TenM
+getFileSystemRoots :: FilePath -> TenM 'Build 'Daemon [GCRoot]
+getFileSystemRoots rootsDir = liftIO $ do
+    -- Create roots directory if it doesn't exist
+    createDirectoryIfMissing True rootsDir
+
+    -- List all files in the roots directory
+    files <- listDirectory rootsDir
+
+    -- Parse each file into a GCRoot
+    now <- getCurrentTime
+    catMaybes <$> forM files (\file -> do
+        -- Read the symlink target
+        let rootFile = rootsDir </> file
+        targetExists <- doesFileExist rootFile
+
+        if targetExists then do
+            -- Check if it's a symlink
+            isLink <- Posix.isSymbolicLink <$> Posix.getFileStatus rootFile `catch` \(_ :: IOException) ->
+                return False
+
+            if isLink
+                then do
+                    target <- try $ Posix.readSymbolicLink rootFile
+                    case target of
+                        Left (_ :: SomeException) -> return Nothing
+                        Right linkTarget -> do
+                            let path = case Ten.Core.filePathToStorePath linkTarget of
+                                    Just p -> p
+                                    Nothing -> StorePath "unknown" "unknown"
+
+                            -- Parse name from file
+                            let name = case break (== '-') file of
+                                    (_, '-':rest) -> T.pack rest
+                                    _ -> T.pack file
+
+                            -- Determine root type based on file name pattern
+                            let rootType = if "permanent-" `T.isPrefixOf` name
+                                          then Ten.Core.PermanentRoot
+                                          else Ten.Core.SymlinkRoot
+
+                            return $ Just $ Ten.Core.GCRoot
+                                { Ten.Core.rootPath = path
+                                , Ten.Core.rootName = name
+                                , Ten.Core.rootType = rootType
+                                , Ten.Core.rootTime = now
+                                }
+                else return Nothing
+        else return Nothing)
+
 -- | Request to list roots from builder context via protocol
-requestListRoots :: SPrivilegeTier 'Builder -> TenM 'Build 'Builder [GCRoot]
-requestListRoots _ = do
+requestListRoots :: TenM 'Build 'Builder [GCRoot]
+requestListRoots = do
     env <- ask
 
     -- Send request to daemon using protocol
@@ -389,70 +439,18 @@ buildDatabaseRoots results = do
                     }
             Nothing -> throwIO $ userError $ "Invalid store path in database: " ++ T.unpack pathText
 
--- | Get roots from filesystem
-getFileSystemRoots :: FilePath -> IO [GCRoot]
-getFileSystemRoots rootsDir = do
-    -- Create roots directory if it doesn't exist
-    createDirectoryIfMissing True rootsDir
-
-    -- List all files in the roots directory
-    files <- listDirectory rootsDir
-
-    -- Parse each file into a GCRoot
-    now <- getCurrentTime
-    catMaybes <$> forM files (\file -> do
-        -- Read the symlink target
-        let rootFile = rootsDir </> file
-        targetExists <- doesFileExist rootFile
-
-        if targetExists then do
-            -- Check if it's a symlink
-            isLink <- Posix.isSymbolicLink <$> Posix.getFileStatus rootFile `catch` \(_ :: IOException) ->
-                return False
-
-            if isLink
-                then do
-                    target <- try $ Posix.readSymbolicLink rootFile
-                    case target of
-                        Left (_ :: SomeException) -> return Nothing
-                        Right linkTarget -> do
-                            let path = case Ten.Core.filePathToStorePath linkTarget of
-                                    Just p -> p
-                                    Nothing -> StorePath "unknown" "unknown"
-
-                            -- Parse name from file
-                            let name = case break (== '-') file of
-                                    (_, '-':rest) -> T.pack rest
-                                    _ -> T.pack file
-
-                            -- Determine root type based on file name pattern
-                            let rootType = if "permanent-" `T.isPrefixOf` name
-                                          then Ten.Core.PermanentRoot
-                                          else Ten.Core.SymlinkRoot
-
-                            return $ Just $ Ten.Core.GCRoot
-                                { Ten.Core.rootPath = path
-                                , Ten.Core.rootName = name
-                                , Ten.Core.rootType = rootType
-                                , Ten.Core.rootTime = now
-                                }
-                else return Nothing
-        else return Nothing)
-
 -- | Run garbage collection (daemon privilege only)
-collectGarbage :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon GCStats
-collectGarbage st = do
+collectGarbage :: TenM 'Build 'Daemon GCStats
+collectGarbage = do
     env <- ask
     startTime <- liftIO getCurrentTime
 
     -- Acquire the GC lock first
-    withGCLock st $ \st' -> do
-        -- Run the actual garbage collection with GC lock held
-        collectGarbageWithStats st'
+    withGCLock $ collectGarbageWithStats
 
 -- | Request garbage collection from builder context via protocol
-requestGarbageCollection :: SPrivilegeTier 'Builder -> Bool -> TenM 'Build 'Builder GCStats
-requestGarbageCollection _ force = do
+requestGarbageCollection :: Bool -> TenM 'Build 'Builder GCStats
+requestGarbageCollection force = do
     env <- ask
 
     -- Send request to daemon using protocol
@@ -489,13 +487,13 @@ requestGarbageCollection _ force = do
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Run garbage collection with stats (internal implementation)
-collectGarbageWithStats :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon GCStats
-collectGarbageWithStats st = do
+collectGarbageWithStats :: TenM 'Build 'Daemon GCStats
+collectGarbageWithStats = do
     env <- ask
     startTime <- liftIO getCurrentTime
 
     -- Open database connection with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Find all paths in the store
         let storeLocationPath = storeLocation env
         allStorePaths <- liftIO $ findAllStorePaths db storeLocationPath
@@ -513,7 +511,7 @@ collectGarbageWithStats st = do
         Ten.Core.logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
 
         -- Get active build paths (if in daemon mode)
-        activePaths <- getActiveBuildPaths st
+        activePaths <- getActiveBuildPaths
         unless (Set.null activePaths) $
             Ten.Core.logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
 
@@ -545,7 +543,7 @@ collectGarbageWithStats st = do
 
         -- Calculate elapsed time
         endTime <- liftIO getCurrentTime
-        let elapsed = diffUTCTime endTime startTime
+        let elapsed = realToFrac $ diffUTCTime endTime startTime
 
         -- Return statistics
         return Ten.Core.GCStats
@@ -700,27 +698,46 @@ getRuntimeRootPaths storeLocation = do
 
 -- | Check if a path is reachable from any root
 -- Works in both contexts through different mechanisms
-isReachable :: forall (t :: PrivilegeTier). SingI t => SPrivilegeTier t -> StorePath -> TenM 'Build t Bool
-isReachable st = case st of
-    SDaemon -> unsafeCoerce . isReachablePrivileged st  -- Type-safe casting
-    SBuilder -> requestPathReachability st
+isReachable :: forall (t :: PrivilegeTier). SingI t => StorePath -> TenM 'Build t Bool
+isReachable path = case sing @t of
+    SDaemon -> isReachablePrivileged path
+    SBuilder -> requestPathReachability path
 
 -- | Internal implementation for privileged reachability check
-isReachablePrivileged :: SPrivilegeTier 'Daemon -> StorePath -> TenM 'Build 'Daemon Bool
-isReachablePrivileged st path = do
+isReachablePrivileged :: StorePath -> TenM 'Build 'Daemon Bool
+isReachablePrivileged path = do
     env <- ask
 
     -- Initialize database with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Get all roots
         roots <- liftIO $ findAllRoots db (storeLocation env)
 
         -- Use database to check reachability
         liftIO $ isPathReachable db roots path
 
+-- | Check if a path is reachable from roots
+isPathReachable :: Connection -> Set StorePath -> StorePath -> IO Bool
+isPathReachable db roots path = do
+    -- Check if path is directly in roots
+    if path `Set.member` roots
+        then return True
+        else do
+            -- Use reference tracking DB to check if path is reachable from roots
+            let rootPaths = Set.toList roots
+            reachable <- foldM (\found root ->
+                                if found
+                                   then return True
+                                   else do
+                                       -- Check if the path is reachable from this root
+                                       refs <- findPathsClosure db (Set.singleton root)
+                                       return $ path `Set.member` refs
+                               ) False rootPaths
+            return reachable
+
 -- | Request path reachability check from builder context via protocol
-requestPathReachability :: SPrivilegeTier 'Builder -> StorePath -> TenM 'Build 'Builder Bool
-requestPathReachability _ path = do
+requestPathReachability :: StorePath -> TenM 'Build 'Builder Bool
+requestPathReachability path = do
     env <- ask
 
     -- Send request to daemon using protocol
@@ -750,12 +767,12 @@ requestPathReachability _ path = do
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
 -- | Find all paths reachable from roots (daemon privilege only)
-findReachablePaths :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon (Set StorePath)
-findReachablePaths st = do
+findReachablePaths :: TenM 'Build 'Daemon (Set StorePath)
+findReachablePaths = do
     env <- ask
 
     -- Initialize database with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Find all roots
         roots <- liftIO $ findAllRoots db (storeLocation env)
 
@@ -763,8 +780,8 @@ findReachablePaths st = do
         liftIO $ computeReachablePathsFromRoots db roots
 
 -- | Acquire the GC lock (daemon privilege only)
-acquireGCLock :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon ()
-acquireGCLock _ = do
+acquireGCLock :: TenM 'Build 'Daemon ()
+acquireGCLock = do
     env <- ask
     let lockPath = Ten.Core.gcLockPath (storeLocation env)
 
@@ -781,8 +798,8 @@ acquireGCLock _ = do
             liftIO $ writeIORef globalGCLockFdRef (Just (lockFd lock, lockPath))
 
 -- | Release the GC lock (daemon privilege only)
-releaseGCLock :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon ()
-releaseGCLock _ = do
+releaseGCLock :: TenM 'Build 'Daemon ()
+releaseGCLock = do
     env <- ask
     let lockPath = Ten.Core.gcLockPath (storeLocation env)
 
@@ -812,27 +829,27 @@ releaseGCLock _ = do
             _ -> return ()
 
 -- | Execute an action with the GC lock (daemon privilege only)
-withGCLock :: SPrivilegeTier 'Daemon -> (SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withGCLock st action = do
+withGCLock :: TenM 'Build 'Daemon a -> TenM 'Build 'Daemon a
+withGCLock action = do
     -- First acquire the lock with privilege evidence
-    acquireGCLock st
+    acquireGCLock
 
     -- Run the action with proper error handling
-    result <- action st `Ten.Core.catchError` \e -> do
+    result <- action `Ten.Core.catchError` \e -> do
         -- Always release the lock on error
-        releaseGCLock st
+        releaseGCLock
         -- Re-throw the error
         Ten.Core.throwError e
 
     -- Always release the lock on completion
-    releaseGCLock st
+    releaseGCLock
 
     -- Return the result
     return result
 
 -- | Break a stale lock (daemon privilege only)
-breakStaleLock :: SPrivilegeTier 'Daemon -> FilePath -> TenM 'Build 'Daemon ()
-breakStaleLock _ lockPath = do
+breakStaleLock :: FilePath -> TenM 'Build 'Daemon ()
+breakStaleLock lockPath = do
     -- Check lock status
     status <- liftIO $ try $ checkLockFile lockPath
 
@@ -861,7 +878,7 @@ checkLockFile lockPath = do
             result <- try $ readFile lockPath
             case result of
                 Left (e :: SomeException) ->
-                    throwIO $ userError $ "Error reading lock file: " ++ show e
+                    return False  -- Error reading lock file, treat as invalid
 
                 Right content -> do
                     -- Parse the PID
@@ -869,7 +886,7 @@ checkLockFile lockPath = do
                         [(pid, "")] -> do
                             -- Check if the process is still running
                             isProcessRunning pid
-                        _ -> throwIO $ userError "Invalid lock file format"
+                        _ -> return False  -- Invalid lock file format
 
 -- | Helper function for breakStaleLock that can be used from non-TenM contexts
 breakStaleLock' :: FilePath -> IO ()
@@ -922,7 +939,7 @@ acquireFileLock lockPath = do
 
     -- Create the lock file with our PID
     result <- try $ mask $ \unmask -> do
-        -- Use file creation with EXCL flag to ensure atomicity
+        -- Use exclusive creation flag to ensure atomicity
         fd <- openFd lockPath WriteOnly (Just 0o644) defaultFileFlags{exclusive=True}
 
         unmask $ do
@@ -960,12 +977,12 @@ releaseFileLock lock = do
     catchIOError (removeFile (lockPath lock)) (\_ -> return ())
 
 -- | Get active build paths (to prevent GC during builds)
-getActiveBuildPaths :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon (Set StorePath)
-getActiveBuildPaths st = do
+getActiveBuildPaths :: TenM 'Build 'Daemon (Set StorePath)
+getActiveBuildPaths = do
     env <- ask
 
     -- Get runtime paths from database with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Query active build paths from database
         results <- liftIO $ SQLite.query_ db
             "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: IO [Only Text]
@@ -979,7 +996,7 @@ verifyStore storeDir = do
     env <- ask
 
     -- Open database with proper privilege
-    withDatabase sDaemon (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Get all valid paths from database
         paths <- liftIO $ SQLite.query_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
@@ -1005,14 +1022,18 @@ verifyStore storeDir = do
         -- Return true if all paths verify
         return $ all id results
 
+-- | Convert hash to string representation
+showHash :: Digest SHA256 -> Text
+showHash = T.pack . show
+
 -- | Repair the store (remove invalid paths) - daemon privilege only
-repairStore :: SPrivilegeTier 'Daemon -> TenM 'Build 'Daemon GCStats
-repairStore st = do
+repairStore :: TenM 'Build 'Daemon GCStats
+repairStore = do
     env <- ask
     startTime <- liftIO getCurrentTime
 
     -- Open database with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Get all valid paths from database
         paths <- liftIO $ SQLite.query_ db "SELECT path FROM ValidPaths WHERE is_valid = 1" :: IO [Only Text]
 
@@ -1056,7 +1077,7 @@ repairStore st = do
 
         -- Calculate elapsed time
         endTime <- liftIO getCurrentTime
-        let elapsed = diffUTCTime endTime startTime
+        let elapsed = realToFrac $ diffUTCTime endTime startTime
 
         -- Return statistics
         return Ten.Core.GCStats
@@ -1067,270 +1088,9 @@ repairStore st = do
             , Ten.Core.gcElapsedTime = elapsed
             }
 
--- | Helper function for database interaction - Path reachability
-isPathReachable :: Connection -> Set StorePath -> StorePath -> IO Bool
-isPathReachable db roots path = do
-    -- Check if path is directly in roots
-    if path `Set.member` roots
-        then return True
-        else do
-            -- Use reference tracking DB to check if path is reachable from roots
-            let rootPaths = Set.toList roots
-            reachable <- foldM (\found root ->
-                                if found
-                                   then return True
-                                   else do
-                                       -- Check if the path is reachable from this root
-                                       refs <- findPathsClosure db (Set.singleton root)
-                                       return $ path `Set.member` refs
-                               ) False rootPaths
-            return reachable
-
--- | Helper function to compute reachable paths from roots
-computeReachablePathsFromRoots :: Connection -> Set StorePath -> IO (Set StorePath)
-computeReachablePathsFromRoots db roots = do
-    -- Include the roots themselves
-    findPathsClosure db roots
-
--- | Find paths reachability closure (using properly optimized DB query)
-findPathsClosure :: Connection -> Set StorePath -> IO (Set StorePath)
-findPathsClosure db startingPaths = do
-    -- Create a temporary table for the closure calculation
-    execute_ db "CREATE TEMP TABLE IF NOT EXISTS temp_closure (path TEXT PRIMARY KEY)"
-    execute_ db "DELETE FROM temp_closure"
-
-    -- Insert all starting paths
-    forM_ (Set.toList startingPaths) $ \path ->
-        execute db "INSERT OR IGNORE INTO temp_closure VALUES (?)" (Only (storePathToText path))
-
-    -- Use recursive CTE to compute the transitive closure efficiently
-    let closureQuery = "WITH RECURSIVE closure(path) AS (\
-                      \  SELECT path FROM temp_closure\
-                      \  UNION\
-                      \  SELECT r.reference FROM References r JOIN closure c ON r.referrer = c.path\
-                      \) SELECT DISTINCT path FROM closure"
-
-    results <- query_ db closureQuery :: IO [Only Text]
-
-    -- Parse paths and return as set
-    return $ Set.fromList $ catMaybes $ map (\(Only p) -> Ten.Core.parseStorePath p) results
-
--- | Helper function to mark paths as invalid in the database
-markPathsAsInvalid :: Connection -> Set StorePath -> IO ()
-markPathsAsInvalid db paths = do
-    -- Mark each path as invalid in the ValidPaths table
-    forM_ (Set.toList paths) $ \path ->
-        execute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
-               (Only (storePathToText path))
-
--- | Scan a file for references to store paths
-scanFileForStoreReferences :: FilePath -> TenM p t (Set StorePath)
-scanFileForStoreReferences filePath = do
-    -- Check if file exists
-    exists <- liftIO $ doesFileExist filePath
-    unless exists $
-        return Set.empty
-
-    -- Get store location
-    env <- ask
-    let storeDir = storeLocation env
-
-    -- Read file content
-    contentResult <- liftIO $ try $ BS.readFile filePath
-    content <- case contentResult of
-        Right c -> return c
-        Left (_ :: IOException) -> return BS.empty
-
-    -- Extract store paths from binary content
-    let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
-    let paths = findStorePaths contentText storeDir
-
-    -- Filter for valid paths
-    validPaths <- filterM storePathExists paths
-
-    -- Return the set of found paths
-    return $ Set.fromList validPaths
-
--- | Find all references in a path
--- This is a daemon-only operation
-findPathReferences :: SPrivilegeTier 'Daemon -> StorePath -> TenM 'Build 'Daemon (Set StorePath)
-findPathReferences _ path = do
-    env <- ask
-
-    -- First try to get references from database (faster)
-    dbRefs <- getReferencesFromDB path
-
-    if not (Set.null dbRefs)
-        then return dbRefs
-        else do
-            -- Fall back to file scanning if database has no entries
-            let filePath = storePathToFilePath path env
-
-            -- Check file existence
-            exists <- liftIO $ doesFileExist filePath
-            if not exists
-                then return Set.empty
-                else do
-                    -- Read file content
-                    content <- liftIO $ BS.readFile filePath
-
-                    -- Scan for references
-                    refs <- scanForReferences content
-
-                    -- Register references in database for future use
-                    forM_ (Set.toList refs) $ \refPath ->
-                        registerReference path refPath
-
-                    return refs
-
--- | Get references from database
-getReferencesFromDB :: StorePath -> TenM p 'Daemon (Set StorePath)
-getReferencesFromDB path = do
-    env <- ask
-
-    withDatabase sDaemon (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Query for references
-        rows <- liftIO $ SQLite.query db
-            "SELECT reference FROM References WHERE referrer = ?"
-            (Only (storePathToText path)) :: IO [Only Text]
-
-        -- Convert to StorePath objects
-        return $ Set.fromList $ catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) rows
-
--- | Register a reference between paths
-registerReference :: StorePath -> StorePath -> TenM p 'Daemon ()
-registerReference referrer reference = do
-    env <- ask
-
-    withDatabase sDaemon (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Insert reference (ignore if already exists)
-        liftIO $ SQLite.execute db
-            "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'direct')"
-            (storePathToText referrer, storePathToText reference)
-
--- | Scan content for references to other store paths
--- This is a daemon-only operation
-scanForReferences :: BS.ByteString -> TenM p 'Daemon (Set StorePath)
-scanForReferences content = do
-    env <- ask
-    let storeDir = storeLocation env
-
-    -- Convert to text for easier scanning
-    let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
-
-    -- Find potential store paths
-    let paths = findStorePaths contentText storeDir
-
-    -- Verify each path exists
-    foldM (\acc path -> do
-        exists <- storePathExists path
-        if exists
-            then return $ Set.insert path acc
-            else return acc
-        ) Set.empty paths
-
--- | Find potential store paths in text
-findStorePaths :: Text -> FilePath -> [StorePath]
-findStorePaths content storeDir =
-    let storeDirText = T.pack storeDir
-        -- Split into lines and words
-        allWords = concatMap T.words $ T.lines content
-        -- Filter for words that could be store paths
-        potentialPaths = filter (isStorePath storeDirText) allWords
-        -- Extract and parse store paths
-        parsedPaths = catMaybes $ map extractStorePath potentialPaths
-    in parsedPaths
-  where
-    isStorePath :: Text -> Text -> Bool
-    isStorePath storeDir text =
-        -- Check if it's a full store path
-        (storeDir `T.isPrefixOf` text && "-" `T.isInfixOf` T.drop (T.length storeDir) text) ||
-        -- Or just a store path without the store dir
-        (T.length text >= 10 && "-" `T.isInfixOf` text && allHex (T.takeWhile (/= '-') text))
-      where
-        allHex = T.all (\c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
-
-    extractStorePath :: Text -> Maybe StorePath
-    extractStorePath text
-        | "/" `T.isPrefixOf` text =
-            -- Handle full paths starting with /
-            let fileName = T.pack $ takeFileName $ T.unpack text
-            in Ten.Core.parseStorePath fileName
-        | otherwise =
-            -- Handle just hash-name format
-            Ten.Core.parseStorePath text
-
--- | Check if a path is a GC root
--- This is a daemon-only operation
-isGCRoot :: SPrivilegeTier 'Daemon -> StorePath -> TenM p 'Daemon Bool
-isGCRoot _ path = do
-    env <- ask
-    let storeDir = storeLocation env
-    let rootsDir = storeDir </> "gc-roots"
-
-    -- Check database first
-    isDbRoot <- isGCRootInDB path
-
-    if isDbRoot
-        then return True
-        else do
-            -- If not in database, check filesystem
-            -- List all roots
-            roots <- liftIO $ listDirectory rootsDir `catch` \(_ :: IOException) -> return []
-
-            -- Check if any root links to this path
-            isFileRoot <- liftIO $ foldM (\found root -> do
-                if found
-                    then return True
-                    else do
-                        -- Check if this root points to our path
-                        let rootPath = rootsDir </> root
-                        isLink <- (Posix.isSymbolicLink <$> Posix.getFileStatus rootPath) `catch`
-                            \(_ :: SomeException) -> pure False
-                        if isLink
-                            then do
-                                target <- liftIO $ Posix.readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
-                                let targetPath = storePathToFilePath path env
-                                return $ targetPath == target
-                            else return False
-                ) False roots
-
-            -- If found in filesystem but not in DB, register it
-            when (isFileRoot && not isDbRoot) $
-                registerGCRoot path (T.pack "filesystem-found") "symlink"
-
-            return isFileRoot
-
--- | Check if a path is a GC root in the database
-isGCRootInDB :: StorePath -> TenM p 'Daemon Bool
-isGCRootInDB path = do
-    env <- ask
-
-    withDatabase sDaemon (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Query for roots
-        rows <- liftIO $ SQLite.query db
-            "SELECT COUNT(*) FROM GCRoots WHERE path = ? AND active = 1"
-            (Only (storePathToText path)) :: IO [Only Int]
-
-        -- Check if count > 0
-        return $ case rows of
-            [Only count] -> count > 0
-            _ -> False
-
--- | Register a GC root in the database
-registerGCRoot :: StorePath -> Text -> Text -> TenM p 'Daemon ()
-registerGCRoot path name rootType = do
-    env <- ask
-
-    withDatabase sDaemon (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Insert or update root
-        liftIO $ SQLite.execute db
-            "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
-            (storePathToText path, name, rootType)
-
--- | Access the database with proper daemon privileges
-withDatabase :: SPrivilegeTier 'Daemon -> FilePath -> Int -> (Connection -> IO a) -> TenM p 'Daemon a
-withDatabase _ dbPath timeout action = do
+-- | Helper function for database interaction with proper privilege handling
+withDatabase :: FilePath -> Int -> (Connection -> IO a) -> TenM 'Build 'Daemon a
+withDatabase dbPath timeout action = do
     -- Initialize database and ensure schema exists
     connection <- liftIO $ initializeDatabase dbPath
 
@@ -1341,9 +1101,9 @@ withDatabase _ dbPath timeout action = do
     liftIO $ SQLite.execute_ connection "PRAGMA foreign_keys = ON"
 
     -- Run action with proper error handling and lift IO to TenM
-    result <- (liftIO $ action connection) `catchError` \e -> do
+    result <- (liftIO $ action connection) `catch` \(e :: SomeException) -> do
         liftIO $ SQLite.close connection
-        throwError e
+        throwError $ Ten.Core.DBError $ T.pack $ show e
 
     -- Close the connection
     liftIO $ SQLite.close connection
@@ -1415,11 +1175,11 @@ ensureSchema conn = do
         execute_ conn "CREATE INDEX IF NOT EXISTS idx_activebuilds_status ON ActiveBuilds (status)"
 
 -- | Find paths with prefix in the store
-findPathsWithPrefix :: SPrivilegeTier 'Daemon -> Text -> TenM 'Build 'Daemon [StorePath]
-findPathsWithPrefix _ prefix = do
+findPathsWithPrefix :: Text -> TenM 'Build 'Daemon [StorePath]
+findPathsWithPrefix prefix = do
     env <- ask
 
-    withDatabase sDaemon (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Query for paths with prefix
         rows <- liftIO $ SQLite.query db
             "SELECT path FROM ValidPaths WHERE path LIKE ? || '%' AND is_valid = 1"
@@ -1427,10 +1187,6 @@ findPathsWithPrefix _ prefix = do
 
         -- Convert to StorePath objects
         return $ catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) rows
-
--- | Convert hash to string representation
-showHash :: Digest SHA256 -> Text
-showHash = T.pack . show
 
 -- | Helper function to check if a path exists in store
 storePathExists :: StorePath -> TenM p t Bool
@@ -1440,11 +1196,225 @@ storePathExists path = do
     liftIO $ doesFileExist fullPath
 
 -- | Compute reachable paths from a set of roots
-computeReachablePaths :: SPrivilegeTier 'Daemon -> Set StorePath -> TenM 'Build 'Daemon (Set StorePath)
-computeReachablePaths st roots = do
+computeReachablePaths :: Set StorePath -> TenM 'Build 'Daemon (Set StorePath)
+computeReachablePaths roots = do
     env <- ask
 
     -- Initialize database with proper privilege
-    withDatabase st (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Compute all reachable paths
         liftIO $ computeReachablePathsFromRoots db roots
+
+-- | Helper function to compute reachable paths from roots
+computeReachablePathsFromRoots :: Connection -> Set StorePath -> IO (Set StorePath)
+computeReachablePathsFromRoots db roots = do
+    -- Include the roots themselves
+    findPathsClosure db roots
+
+-- | Find paths reachability closure (using properly optimized DB query)
+findPathsClosure :: Connection -> Set StorePath -> IO (Set StorePath)
+findPathsClosure db startingPaths = do
+    -- Create a temporary table for the closure calculation
+    execute_ db "CREATE TEMP TABLE IF NOT EXISTS temp_closure (path TEXT PRIMARY KEY)"
+    execute_ db "DELETE FROM temp_closure"
+
+    -- Insert all starting paths
+    forM_ (Set.toList startingPaths) $ \path ->
+        execute db "INSERT OR IGNORE INTO temp_closure VALUES (?)" (Only (storePathToText path))
+
+    -- Use recursive CTE to compute the transitive closure efficiently
+    let closureQuery = "WITH RECURSIVE closure(path) AS (\
+                      \  SELECT path FROM temp_closure\
+                      \  UNION\
+                      \  SELECT r.reference FROM References r JOIN closure c ON r.referrer = c.path\
+                      \) SELECT DISTINCT path FROM closure"
+
+    results <- query_ db closureQuery :: IO [Only Text]
+
+    -- Parse paths and return as set
+    return $ Set.fromList $ catMaybes $ map (\(Only p) -> Ten.Core.parseStorePath p) results
+
+-- | Helper function to mark paths as invalid in the database
+markPathsAsInvalid :: Connection -> Set StorePath -> IO ()
+markPathsAsInvalid db paths = do
+    -- Mark each path as invalid in the ValidPaths table
+    forM_ (Set.toList paths) $ \path ->
+        execute db "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
+               (Only (storePathToText path))
+
+-- | Find all references in a path
+-- This is a daemon-only operation
+findPathReferences :: StorePath -> TenM 'Build 'Daemon (Set StorePath)
+findPathReferences path = do
+    env <- ask
+
+    -- First try to get references from database (faster)
+    dbRefs <- getReferencesFromDB path
+
+    if not (Set.null dbRefs)
+        then return dbRefs
+        else do
+            -- Fall back to file scanning if database has no entries
+            let filePath = storePathToFilePath path env
+
+            -- Check file existence
+            exists <- liftIO $ doesFileExist filePath
+            if not exists
+                then return Set.empty
+                else do
+                    -- Read file content
+                    content <- liftIO $ BS.readFile filePath
+
+                    -- Scan for references
+                    refs <- scanForReferences content
+
+                    -- Register references in database for future use
+                    forM_ (Set.toList refs) $ \refPath ->
+                        registerReference path refPath
+
+                    return refs
+
+-- | Get references from database
+getReferencesFromDB :: StorePath -> TenM 'Build 'Daemon (Set StorePath)
+getReferencesFromDB path = do
+    env <- ask
+
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Query for references
+        rows <- liftIO $ query db
+            "SELECT reference FROM References WHERE referrer = ?"
+            (Only (storePathToText path)) :: IO [Only Text]
+
+        -- Convert to StorePath objects
+        return $ Set.fromList $ catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) rows
+
+-- | Register a reference between paths
+registerReference :: StorePath -> StorePath -> TenM 'Build 'Daemon ()
+registerReference referrer reference = do
+    env <- ask
+
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Insert reference (ignore if already exists)
+        liftIO $ execute db
+            "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'direct')"
+            (storePathToText referrer, storePathToText reference)
+
+-- | Scan content for references to other store paths
+-- This is a daemon-only operation
+scanForReferences :: ByteString -> TenM 'Build 'Daemon (Set StorePath)
+scanForReferences content = do
+    env <- ask
+    let storeDir = storeLocation env
+
+    -- Convert to text for easier scanning
+    let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
+
+    -- Find potential store paths
+    let paths = findStorePaths contentText storeDir
+
+    -- Verify each path exists
+    foldM (\acc path -> do
+        exists <- storePathExists path
+        if exists
+            then return $ Set.insert path acc
+            else return acc
+        ) Set.empty paths
+
+-- | Find potential store paths in text
+findStorePaths :: Text -> FilePath -> [StorePath]
+findStorePaths content storeDir =
+    let storeDirText = T.pack storeDir
+        -- Split into lines and words
+        allWords = concatMap T.words $ T.lines content
+        -- Filter for words that could be store paths
+        potentialPaths = filter (isStorePath storeDirText) allWords
+        -- Extract and parse store paths
+        parsedPaths = catMaybes $ map extractStorePath potentialPaths
+    in parsedPaths
+  where
+    isStorePath :: Text -> Text -> Bool
+    isStorePath storeDir text =
+        -- Check if it's a full store path
+        (storeDir `T.isPrefixOf` text && "-" `T.isInfixOf` T.drop (T.length storeDir) text) ||
+        -- Or just a store path without the store dir
+        (T.length text >= 10 && "-" `T.isInfixOf` text && allHex (T.takeWhile (/= '-') text))
+      where
+        allHex = T.all (\c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
+
+    extractStorePath :: Text -> Maybe StorePath
+    extractStorePath text
+        | "/" `T.isPrefixOf` text =
+            -- Handle full paths starting with /
+            let fileName = T.pack $ takeFileName $ T.unpack text
+            in Ten.Core.parseStorePath fileName
+        | otherwise =
+            -- Handle just hash-name format
+            Ten.Core.parseStorePath text
+
+-- | Check if a path is a GC root
+-- This is a daemon-only operation
+isGCRoot :: StorePath -> TenM 'Build 'Daemon Bool
+isGCRoot path = do
+    env <- ask
+    let storeDir = storeLocation env
+    let rootsDir = storeDir </> "gc-roots"
+
+    -- Check database first
+    isDbRoot <- isGCRootInDB path
+
+    if isDbRoot
+        then return True
+        else do
+            -- If not in database, check filesystem
+            -- List all roots
+            roots <- liftIO $ listDirectory rootsDir `catch` \(_ :: IOException) -> return []
+
+            -- Check if any root links to this path
+            isFileRoot <- liftIO $ foldM (\found root -> do
+                if found
+                    then return True
+                    else do
+                        -- Check if this root points to our path
+                        let rootPath = rootsDir </> root
+                        isLink <- (Posix.isSymbolicLink <$> Posix.getFileStatus rootPath) `catch`
+                            \(_ :: SomeException) -> pure False
+                        if isLink
+                            then do
+                                target <- liftIO $ Posix.readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
+                                let targetPath = storePathToFilePath path env
+                                return $ targetPath == target
+                            else return False
+                ) False roots
+
+            -- If found in filesystem but not in DB, register it
+            when (isFileRoot && not isDbRoot) $
+                registerGCRoot path (T.pack "filesystem-found") "symlink"
+
+            return isFileRoot
+
+-- | Check if a path is a GC root in the database
+isGCRootInDB :: StorePath -> TenM 'Build 'Daemon Bool
+isGCRootInDB path = do
+    env <- ask
+
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Query for roots
+        rows <- liftIO $ query db
+            "SELECT COUNT(*) FROM GCRoots WHERE path = ? AND active = 1"
+            (Only (storePathToText path)) :: IO [Only Int]
+
+        -- Check if count > 0
+        return $ case rows of
+            [Only count] -> count > 0
+            _ -> False
+
+-- | Register a GC root in the database
+registerGCRoot :: StorePath -> Text -> Text -> TenM 'Build 'Daemon ()
+registerGCRoot path name rootType = do
+    env <- ask
+
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        -- Insert or update root
+        liftIO $ execute db
+            "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
+            (storePathToText path, name, rootType)
