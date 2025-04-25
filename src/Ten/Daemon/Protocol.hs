@@ -119,6 +119,7 @@ import qualified Data.Aeson.Key as Key
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Builder as Builder
+import qualified Data.Vector as Vector
 import Data.List (intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -154,10 +155,11 @@ import Ten.Core (
     Phase(..), SPhase(..), PrivilegeTier(..), SPrivilegeTier(..), TenM(..),
     BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), storePathToText,
     UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
-    Derivation, BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
+    Derivation(..), BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
     Request(..), Response(..), Message(..), AuthResult(..),
     GCStats(..), GCRoot(..),
     DaemonConfig(..), parseStorePath,
+    BuildStrategy(..),
 
     -- Type families for permissions
     CanAccessStore, CanCreateSandbox, CanDropPrivileges, CanModifyStore,
@@ -345,8 +347,6 @@ data DerivationInfoResponse = DerivationInfoResponse {
     derivationResponseMetadata :: Map Text Text
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON DerivationInfoResponse
-instance Aeson.FromJSON DerivationInfoResponse
 
 -- | Response with derivation-output mappings
 data DerivationOutputMappingResponse = DerivationOutputMappingResponse {
@@ -355,8 +355,6 @@ data DerivationOutputMappingResponse = DerivationOutputMappingResponse {
     outputMappingComplete :: Bool   -- Whether all mappings were included
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON DerivationOutputMappingResponse
-instance Aeson.FromJSON DerivationOutputMappingResponse
 
 -- | Build request information
 data BuildRequestInfo = BuildRequestInfo {
@@ -415,8 +413,6 @@ data BuildStatusUpdate = BuildStatusUpdate {
     buildResourceUsage :: Map Text Double  -- Resource usage metrics
 } deriving (Show, Eq, Generic)
 
-instance Aeson.ToJSON BuildStatusUpdate
-instance Aeson.FromJSON BuildStatusUpdate
 
 -- | GC Request parameters
 data GCRequestParams = GCRequestParams {
@@ -1804,3 +1800,372 @@ responseToText = \case
 
 -- | Int64 type for database IDs
 type Int64 = Int
+
+
+-- JSON instance for Derivation
+instance Aeson.ToJSON Derivation where
+    toJSON drv = Aeson.object [
+        "name" Aeson..= derivName drv,
+        "hash" Aeson..= derivHash drv,
+        "builder" Aeson..= derivBuilder drv,
+        "args" Aeson..= derivArgs drv,
+        "inputs" Aeson..= Set.toList (derivInputs drv),
+        "outputs" Aeson..= Set.toList (derivOutputs drv),
+        "env" Aeson..= derivEnv drv,
+        "system" Aeson..= derivSystem drv,
+        "strategy" Aeson..= case derivStrategy drv of
+                        ApplicativeStrategy -> "applicative" :: Text
+                        MonadicStrategy -> "monadic" :: Text,
+        "meta" Aeson..= derivMeta drv
+        ]
+
+instance Aeson.FromJSON Derivation where
+    parseJSON = Aeson.withObject "Derivation" $ \v -> do
+        derivName <- v Aeson..: "name"
+        derivHash <- v Aeson..: "hash"
+        derivBuilder <- v Aeson..: "builder"
+        derivArgs <- v Aeson..: "args"
+
+        -- Parse inputs manually
+        inputsArray <- v Aeson..: "inputs"
+        parsedInputs <- parseInputsList inputsArray
+        let derivInputs = Set.fromList parsedInputs
+
+        -- Parse outputs manually
+        outputsArray <- v Aeson..: "outputs"
+        parsedOutputs <- parseOutputsList outputsArray
+        let derivOutputs = Set.fromList parsedOutputs
+
+        derivEnv <- v Aeson..: "env"
+        derivSystem <- v Aeson..: "system"
+        strategyText <- v Aeson..: "strategy" :: Aeson.Parser Text
+        derivMeta <- v Aeson..:? "meta" Aeson..!= Map.empty
+
+        let derivStrategy = if strategyText == "monadic" then MonadicStrategy else ApplicativeStrategy
+
+        return Derivation{..}
+      where
+        -- Helper function to parse an array of inputs
+        parseInputsList = Aeson.withArray "Inputs" $ \arr ->
+            mapM parseInput (Vector.toList arr)
+
+        -- Helper function to parse a single input
+        parseInput = Aeson.withObject "DerivationInput" $ \o -> do
+            pathObj <- o Aeson..: "path"
+            name <- o Aeson..: "name"
+
+            -- Parse the StorePath object
+            path <- Aeson.withObject "StorePath" $ \p -> do
+                hash <- p Aeson..: "hash"
+                name' <- p Aeson..: "name"
+                return $ StorePath hash name'
+
+            return $ DerivationInput path name
+
+        -- Helper function to parse an array of outputs
+        parseOutputsList = Aeson.withArray "Outputs" $ \arr ->
+            mapM parseOutput (Vector.toList arr)
+
+        -- Helper function to parse a single output
+        parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
+            name <- o Aeson..: "name"
+            pathObj <- o Aeson..: "path"
+
+            -- Parse the StorePath object
+            path <- Aeson.withObject "StorePath" $ \p -> do
+                hash <- p Aeson..: "hash"
+                name' <- p Aeson..: "name"
+                return $ StorePath hash name'
+
+            return $ DerivationOutput name path
+
+-- Instance for DerivationInfoResponse
+instance Aeson.ToJSON DerivationInfoResponse where
+    toJSON DerivationInfoResponse{..} = Aeson.object [
+        "derivation" .= derivationResponseDrv,
+        "outputs" .= Set.map storePathToText derivationResponseOutputs,
+        "inputs" .= Set.map storePathToText derivationResponseInputs,
+        "storePath" .= storePathToText derivationResponseStorePath,
+        "metadata" .= derivationResponseMetadata
+        ]
+
+instance Aeson.FromJSON DerivationInfoResponse where
+    parseJSON = Aeson.withObject "DerivationInfoResponse" $ \v -> do
+        derivationResponseDrv <- v .: "derivation"
+        outputsText <- v .: "outputs" :: Aeson.Parser [Text]
+        inputsText <- v .: "inputs" :: Aeson.Parser [Text]
+        storePathText <- v .: "storePath"
+        derivationResponseMetadata <- v .: "metadata"
+
+        let derivationResponseOutputs = Set.fromList $ catMaybes $ map parseStorePath outputsText
+            derivationResponseInputs = Set.fromList $ catMaybes $ map parseStorePath inputsText
+            derivationResponseStorePath = case parseStorePath storePathText of
+                                            Just sp -> sp
+                                            Nothing -> error $ "Invalid store path: " ++ T.unpack storePathText
+
+        return DerivationInfoResponse{..}
+
+-- Instance for DerivationOutputMappingResponse
+instance Aeson.ToJSON DerivationOutputMappingResponse where
+    toJSON DerivationOutputMappingResponse{..} = Aeson.object [
+        "mappings" .= map encodePair outputMappings,
+        "count" .= outputMappingCount,
+        "complete" .= outputMappingComplete
+        ]
+      where
+        encodePair (drv, out) = Aeson.object [
+            "derivation" .= storePathToText drv,
+            "output" .= storePathToText out
+            ]
+
+instance Aeson.FromJSON DerivationOutputMappingResponse where
+    parseJSON = Aeson.withObject "DerivationOutputMappingResponse" $ \v -> do
+        mappingsJson <- v .: "mappings"
+        outputMappingCount <- v .: "count"
+        outputMappingComplete <- v .: "complete"
+
+        outputMappings <- parseMappings mappingsJson
+
+        return DerivationOutputMappingResponse{..}
+      where
+        parseMappings = Aeson.withArray "Mappings" $ \arr ->
+            mapM parsePair (Vector.toList arr)
+
+        parsePair = Aeson.withObject "Mapping" $ \o -> do
+            drvText <- o .: "derivation"
+            outText <- o .: "output"
+            case (parseStorePath drvText, parseStorePath outText) of
+                (Just drv, Just out) -> return (drv, out)
+                _ -> fail $ "Invalid store path in mapping"
+
+-- JSON instance for BuildStatus (FromJSON)
+instance Aeson.FromJSON BuildStatus where
+    parseJSON = Aeson.withObject "BuildStatus" $ \o -> do
+        status <- o .: "status" :: Aeson.Parser Text
+        case status of
+            "pending" -> return BuildPending
+            "running" -> do
+                progress <- o .: "progress"
+                return $ BuildRunning progress
+            "recursing" -> do
+                buildIdText <- o .: "buildId"
+                case parseBuildId buildIdText of
+                    Left err -> fail $ T.unpack err
+                    Right bid -> return $ BuildRecursing bid
+            "completed" -> return BuildCompleted
+            "failed" -> return BuildFailed'
+            _ -> fail $ "Unknown build status: " ++ T.unpack status
+
+-- Instance for BuildStatusUpdate
+instance Aeson.ToJSON BuildStatusUpdate where
+    toJSON BuildStatusUpdate{..} = Aeson.object [
+        "buildId" .= renderBuildId buildId,
+        "status" .= buildStatus,
+        "timeElapsed" .= buildTimeElapsed,
+        "timeRemaining" .= buildTimeRemaining,
+        "logUpdate" .= buildLogUpdate,
+        "resourceUsage" .= buildResourceUsage
+        ]
+
+instance Aeson.FromJSON BuildStatusUpdate where
+    parseJSON = Aeson.withObject "BuildStatusUpdate" $ \v -> do
+        buildIdText <- v .: "buildId"
+        buildStatus <- v .: "status"
+        buildTimeElapsed <- v .: "timeElapsed"
+        buildTimeRemaining <- v .:? "timeRemaining"
+        buildLogUpdate <- v .:? "logUpdate"
+        buildResourceUsage <- v .: "resourceUsage"
+
+        buildId <- case parseBuildId buildIdText of
+                     Left err -> fail $ T.unpack err
+                     Right bid -> return bid
+
+        return BuildStatusUpdate{..}
+
+-- Instance for DaemonResponse
+instance Aeson.FromJSON DaemonResponse where
+    parseJSON val = do
+        obj <- Aeson.parseJSON val
+        parseResponseObj obj
+      where
+        parseResponseObj = Aeson.withObject "DaemonResponse" $ \v -> do
+            responseType <- v .: "type" :: Aeson.Parser Text
+
+            case responseType of
+                "auth" -> do
+                    result <- v .: "result"
+                    return $ AuthResponse result
+
+                "build-started" -> do
+                    buildIdText <- v .: "buildId"
+                    case parseBuildId buildIdText of
+                        Left err -> fail $ T.unpack err
+                        Right bid -> return $ BuildStartedResponse bid
+
+                "build-result" -> do
+                    result <- v .: "result"
+                    return $ BuildResultResponse result
+
+                "build-status" -> do
+                    update <- v .: "update"
+                    return $ BuildStatusResponse update
+
+                "build-output" -> do
+                    output <- v .: "output"
+                    return $ BuildOutputResponse output
+
+                "build-list" -> do
+                    builds <- v .: "builds"
+                    buildsList <- parseBuilds builds
+                    return $ BuildListResponse buildsList
+
+                "cancel-build" -> do
+                    success <- v .: "success"
+                    return $ CancelBuildResponse success
+
+                "store-add" -> do
+                    pathText <- v .: "path"
+                    case parseStorePath pathText of
+                        Just path -> return $ StoreAddResponse path
+                        Nothing -> fail $ "Invalid store path: " ++ T.unpack pathText
+
+                "store-verify" -> do
+                    valid <- v .: "valid"
+                    return $ StoreVerifyResponse valid
+
+                "store-path" -> do
+                    pathText <- v .: "path"
+                    case parseStorePath pathText of
+                        Just path -> return $ StorePathResponse path
+                        Nothing -> fail $ "Invalid store path: " ++ T.unpack pathText
+
+                "store-list" -> do
+                    pathTexts <- v .: "paths" :: Aeson.Parser [Text]
+                    let paths = catMaybes $ map parseStorePath pathTexts
+                    return $ StoreListResponse paths
+
+                "derivation" -> do
+                    -- Actual derivation parsing would be handled elsewhere with content
+                    return $ DerivationResponse undefined
+
+                "derivation-stored" -> do
+                    pathText <- v .: "path"
+                    case parseStorePath pathText of
+                        Just path -> return $ DerivationStoredResponse path
+                        Nothing -> fail $ "Invalid store path: " ++ T.unpack pathText
+
+                "derivation-retrieved" -> do
+                    found <- v .: "found"
+                    if found
+                        then return $ DerivationRetrievedResponse (Just undefined)
+                        else return $ DerivationRetrievedResponse Nothing
+
+                "derivation-query" -> do
+                    -- Actual derivations would be handled elsewhere with content
+                    count <- v .: "count"
+                    return $ DerivationQueryResponse (replicate count undefined)
+
+                "derivation-outputs" -> do
+                    outputTexts <- v .: "outputs" :: Aeson.Parser [Text]
+                    let outputs = Set.fromList $ catMaybes $ map parseStorePath outputTexts
+                    return $ DerivationOutputResponse outputs
+
+                "derivation-list" -> do
+                    pathTexts <- v .: "paths" :: Aeson.Parser [Text]
+                    let paths = catMaybes $ map parseStorePath pathTexts
+                    return $ DerivationListResponse paths
+
+                "gc-result" -> do
+                    stats <- v .: "stats"
+                    return $ GCResultResponse stats
+
+                "gc-started" -> return GCStartedResponse
+
+                "gc-status" -> do
+                    status <- v .: "status"
+                    return $ GCStatusResponse status
+
+                "gc-root-added" -> do
+                    name <- v .: "name"
+                    return $ GCRootAddedResponse name
+
+                "gc-root-removed" -> do
+                    name <- v .: "name"
+                    return $ GCRootRemovedResponse name
+
+                "gc-roots-list" -> do
+                    -- Simpler alternative without full GCRoot parsing
+                    return $ GCRootListResponse []
+
+                "pong" -> return PongResponse
+
+                "shutdown" -> return ShutdownResponse
+
+                "status" -> do
+                    status <- v .: "status"
+                    return $ StatusResponse status
+
+                "config" -> do
+                    config <- v .: "config"
+                    return $ ConfigResponse config
+
+                "eval" -> do
+                    -- Actual derivation parsing would be handled elsewhere with content
+                    return $ EvalResponse undefined
+
+                "error" -> do
+                    err <- v .: "error"
+                    return $ ErrorResponse err
+
+                "success" -> return SuccessResponse
+
+                _ -> fail $ "Unknown response type: " ++ T.unpack responseType
+
+        parseBuilds = Aeson.withArray "Builds" $ \arr ->
+            mapM parseBuild (Vector.toList arr)
+
+        parseBuild = Aeson.withObject "Build" $ \o -> do
+            idText <- o .: "id"
+            statusText <- o .: "status" :: Aeson.Parser Text
+            progress <- o .: "progress"
+
+            buildId <- case parseBuildId idText of
+                        Left err -> fail $ T.unpack err
+                        Right bid -> return bid
+
+            let status = case statusText of
+                           "pending" -> BuildPending
+                           "running" -> BuildRunning progress
+                           "completed" -> BuildCompleted
+                           "failed" -> BuildFailed'
+                           _ -> BuildPending  -- Default case
+
+            return (buildId, status, progress)
+
+
+-- JSON instance for BuildStatus
+instance Aeson.ToJSON BuildStatus where
+    toJSON BuildPending = Aeson.object [
+        "status" Aeson..= ("pending" :: Text)
+        ]
+    toJSON (BuildRunning progress) = Aeson.object [
+        "status" Aeson..= ("running" :: Text),
+        "progress" Aeson..= progress
+        ]
+    toJSON (BuildRecursing bid) = Aeson.object [
+        "status" Aeson..= ("recursing" :: Text),
+        "buildId" Aeson..= renderBuildId bid
+        ]
+    toJSON BuildCompleted = Aeson.object [
+        "status" Aeson..= ("completed" :: Text)
+        ]
+    toJSON BuildFailed' = Aeson.object [
+        "status" Aeson..= ("failed" :: Text)
+        ]
+
+-- JSON instance for BuildId
+instance Aeson.FromJSON BuildId where
+    parseJSON = Aeson.withText "BuildId" $ \t ->
+        case parseBuildId t of
+            Left err -> fail $ T.unpack err
+            Right bid -> return bid

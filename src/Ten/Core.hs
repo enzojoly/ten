@@ -2014,3 +2014,203 @@ instance Aeson.ToJSON Request where
       "params" Aeson..= reqParams req,
       "hasPayload" Aeson..= isJust (reqPayload req)
     ]
+
+-- JSON instances for ProtocolVersion
+instance Aeson.ToJSON ProtocolVersion where
+    toJSON (ProtocolVersion major minor patch) = Aeson.object [
+        "major" Aeson..= major,
+        "minor" Aeson..= minor,
+        "patch" Aeson..= patch
+        ]
+
+instance Aeson.FromJSON ProtocolVersion where
+    parseJSON = Aeson.withObject "ProtocolVersion" $ \v -> do
+        major <- v Aeson..: "major"
+        minor <- v Aeson..: "minor"
+        patch <- v Aeson..: "patch"
+        return $ ProtocolVersion major minor patch
+
+-- JSON instances for StorePath
+instance Aeson.ToJSON StorePath where
+    toJSON (StorePath hash name) = Aeson.object [
+        "hash" Aeson..= hash,
+        "name" Aeson..= name
+        ]
+
+instance Aeson.FromJSON StorePath where
+    parseJSON = Aeson.withObject "StorePath" $ \v -> do
+        hash <- v Aeson..: "hash"
+        name <- v Aeson..: "name"
+        return $ StorePath hash name
+
+-- JSON instances for AuthResult
+instance Aeson.ToJSON AuthResult where
+    toJSON (AuthAccepted userId token capabilities) = Aeson.object [
+        "result" Aeson..= ("accepted" :: Text),
+        "userId" Aeson..= case userId of UserId u -> u,
+        "token" Aeson..= case token of AuthToken t -> t,
+        "capabilities" Aeson..= map show (Set.toList capabilities)
+        ]
+    toJSON (AuthRejected reason) = Aeson.object [
+        "result" Aeson..= ("rejected" :: Text),
+        "reason" Aeson..= reason
+        ]
+    toJSON (AuthSuccess userId token) = Aeson.object [
+        "result" Aeson..= ("success" :: Text),
+        "userId" Aeson..= case userId of UserId u -> u,
+        "token" Aeson..= case token of AuthToken t -> t
+        ]
+
+instance Aeson.FromJSON AuthResult where
+    parseJSON = Aeson.withObject "AuthResult" $ \v -> do
+        result <- v Aeson..: "result" :: Parser Text
+        case result of
+            "accepted" -> do
+                userIdText <- v Aeson..: "userId"
+                tokenText <- v Aeson..: "token"
+                capabilitiesStr <- v Aeson..:? "capabilities" Aeson..!= []
+                let capabilities = Set.fromList $ catMaybes $ map parseCapability capabilitiesStr
+                return $ AuthAccepted (UserId userIdText) (AuthToken tokenText) capabilities
+            "rejected" -> do
+                reason <- v Aeson..: "reason"
+                return $ AuthRejected reason
+            "success" -> do
+                userIdText <- v Aeson..: "userId"
+                tokenText <- v Aeson..: "token"
+                return $ AuthSuccess (UserId userIdText) (AuthToken tokenText)
+            _ -> fail $ "Unknown auth result: " ++ T.unpack result
+      where
+        parseCapability :: Text -> Maybe Capability
+        parseCapability "StoreAccess" = Just StoreAccess
+        parseCapability "SandboxCreation" = Just SandboxCreation
+        parseCapability "GarbageCollection" = Just GarbageCollection
+        parseCapability "DerivationRegistration" = Just DerivationRegistration
+        parseCapability "DerivationBuild" = Just DerivationBuild
+        parseCapability "StoreQuery" = Just StoreQuery
+        parseCapability "BuildQuery" = Just BuildQuery
+        parseCapability _ = Nothing
+
+-- JSON instances for BuildResult
+instance Aeson.ToJSON BuildResult where
+    toJSON BuildResult{..} = Aeson.object [
+        "outputs" Aeson..= Set.map storePathToText brOutputPaths,
+        "exitCode" Aeson..= encodeExitCode brExitCode,
+        "log" Aeson..= brLog,
+        "references" Aeson..= Set.map storePathToText brReferences
+        ]
+      where
+        encodeExitCode ExitSuccess = Aeson.object [
+            "code" Aeson..= (0 :: Int),
+            "success" Aeson..= True
+            ]
+        encodeExitCode (ExitFailure code) = Aeson.object [
+            "code" Aeson..= code,
+            "success" Aeson..= False
+            ]
+
+instance Aeson.FromJSON BuildResult where
+    parseJSON = Aeson.withObject "BuildResult" $ \v -> do
+        outputTexts <- v Aeson..: "outputs" :: Parser [Text]
+        exitCodeObj <- v Aeson..: "exitCode"
+        log <- v Aeson..: "log"
+        referenceTexts <- v Aeson..: "references" :: Parser [Text]
+
+        -- Parse exit code
+        exitCode <- parseExitCode exitCodeObj
+
+        -- Parse store paths
+        let outputs = Set.fromList $ catMaybes $ map parseStorePath outputTexts
+        let references = Set.fromList $ catMaybes $ map parseStorePath referenceTexts
+
+        return $ BuildResult outputs exitCode log references
+      where
+        parseExitCode = Aeson.withObject "ExitCode" $ \v -> do
+            success <- v Aeson..: "success"
+            code <- v Aeson..: "code"
+            return $ if success then ExitSuccess else ExitFailure code
+
+-- JSON instance for GCStats
+instance Aeson.ToJSON GCStats where
+    toJSON GCStats{..} = Aeson.object [
+        "total" Aeson..= gcTotal,
+        "live" Aeson..= gcLive,
+        "collected" Aeson..= gcCollected,
+        "bytes" Aeson..= gcBytes,
+        "elapsedTime" Aeson..= gcElapsedTime
+        ]
+
+instance Aeson.FromJSON GCStats where
+    parseJSON = Aeson.withObject "GCStats" $ \v -> do
+        gcTotal <- v Aeson..: "total"
+        gcLive <- v Aeson..: "live"
+        gcCollected <- v Aeson..: "collected"
+        gcBytes <- v Aeson..: "bytes"
+        gcElapsedTime <- v Aeson..: "elapsedTime"
+        return $ GCStats{..}
+
+-- JSON instance for DaemonConfig
+instance Aeson.ToJSON DaemonConfig where
+    toJSON DaemonConfig{..} = Aeson.object [
+        "socketPath" Aeson..= daemonSocketPath,
+        "storePath" Aeson..= daemonStorePath,
+        "stateFile" Aeson..= daemonStateFile,
+        "logFile" Aeson..= daemonLogFile,
+        "logLevel" Aeson..= daemonLogLevel,
+        "gcInterval" Aeson..= daemonGcInterval,
+        "user" Aeson..= daemonUser,
+        "group" Aeson..= daemonGroup,
+        "allowedUsers" Aeson..= Set.toList daemonAllowedUsers,
+        "maxJobs" Aeson..= daemonMaxJobs,
+        "foreground" Aeson..= daemonForeground,
+        "tmpDir" Aeson..= daemonTmpDir
+        ]
+
+instance Aeson.FromJSON DaemonConfig where
+    parseJSON = Aeson.withObject "DaemonConfig" $ \v -> do
+        daemonSocketPath <- v Aeson..: "socketPath"
+        daemonStorePath <- v Aeson..: "storePath"
+        daemonStateFile <- v Aeson..: "stateFile"
+        daemonLogFile <- v Aeson..:? "logFile"
+        daemonLogLevel <- v Aeson..: "logLevel"
+        daemonGcInterval <- v Aeson..:? "gcInterval"
+        daemonUser <- v Aeson..:? "user"
+        daemonGroup <- v Aeson..:? "group"
+        allowedUsersRaw <- v Aeson..:? "allowedUsers" Aeson..!= []
+        daemonMaxJobs <- v Aeson..: "maxJobs"
+        daemonForeground <- v Aeson..: "foreground"
+        daemonTmpDir <- v Aeson..: "tmpDir"
+
+        let daemonAllowedUsers = Set.fromList allowedUsersRaw
+
+        return DaemonConfig{..}
+
+-- JSON instance for BuildError
+instance Aeson.FromJSON BuildError where
+    parseJSON = Aeson.withObject "BuildError" $ \v -> do
+        errorType <- v Aeson..: "errorType" :: Parser Text
+        message <- v Aeson..: "message"
+
+        case errorType of
+            "eval" -> return $ EvalError message
+            "build" -> return $ BuildFailed message
+            "store" -> return $ StoreError message
+            "sandbox" -> return $ SandboxError message
+            "input" -> return $ InputNotFound (T.unpack message)
+            "hash" -> return $ HashError message
+            "graph" -> return $ GraphError message
+            "resource" -> return $ ResourceError message
+            "daemon" -> return $ DaemonError message
+            "auth" -> return $ AuthError message
+            "cycle" -> return $ CyclicDependency message
+            "serialization" -> return $ SerializationError message
+            "recursion" -> return $ RecursionLimit message
+            "network" -> return $ NetworkError message
+            "parse" -> return $ ParseError message
+            "db" -> return $ DBError message
+            "gc" -> return $ GCError message
+            "phase" -> return $ PhaseError message
+            "privilege" -> return $ PrivilegeError message
+            "protocol" -> return $ ProtocolError message
+            "internal" -> return $ InternalError message
+            "config" -> return $ ConfigError message
+            _ -> return $ InternalError $ "Unknown error type: " <> errorType <> " - " <> message
