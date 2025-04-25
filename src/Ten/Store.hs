@@ -274,7 +274,7 @@ addToStore _ nameHint content = do
     let storeDir = storeLocation env
 
     -- Calculate hash of content
-    let contentHashDigest = hashByteString content
+    let contentHashDigest = Ten.Core.hashByteString content
     let contentHash = T.pack $ show contentHashDigest
 
     -- Sanitize name hint (remove special characters, etc.)
@@ -292,7 +292,7 @@ addToStore _ nameHint content = do
         then do
             -- Verify hash of existing file matches
             existingContent <- liftIO $ BS.readFile filePath
-            let existingHashDigest = hashByteString existingContent
+            let existingHashDigest = Ten.Core.hashByteString existingContent
             let existingHash = T.pack $ show existingHashDigest
             if existingHash == contentHash
                 then do
@@ -396,7 +396,7 @@ verifyStorePath path = do
             content <- readFromStore path
 
             -- Calculate hash of the content
-            let contentHashDigest = hashByteString content
+            let contentHashDigest = Ten.Core.hashByteString content
             let contentHash = T.pack $ show contentHashDigest
 
             -- Compare with the expected hash from the path
@@ -979,7 +979,7 @@ hashPath path = do
     -- Read file content
     content <- liftIO $ BS.readFile path
     -- Calculate hash
-    let hashDigest = hashByteString content
+    let hashDigest = Ten.Core.hashByteString content
     return $ T.pack $ show hashDigest
 
 -- | Get the hash part of a store path
@@ -1199,9 +1199,6 @@ scanFileForStoreReferences filePath = do
             -- Return the set of found paths
             return $ Set.fromList validPaths
 
--- | Calculate hash of ByteString content
-hashByteString :: ByteString -> Digest SHA256
-hashByteString = Crypto.hash
 
 -- | Sanitize a name for use in store paths
 sanitizeName :: Text -> Text

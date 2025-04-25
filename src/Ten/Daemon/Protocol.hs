@@ -153,7 +153,8 @@ import Ten.Core (
     BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), storePathToText,
     UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
     Derivation, BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
-    Request(..), Response(..), Message(..), AuthResult(..), GCStats(..),
+    Request(..), Response(..), Message(..), AuthResult(..),
+    GCStats(..), GCRoot,
     DaemonConfig(..),
 
     -- Type families for permissions
@@ -445,14 +446,14 @@ instance Aeson.FromJSON GCStatusRequestParams where
         return GCStatusRequestParams{..}
 
 -- | GC Status Response content
-data GCStatusResponse = GCStatusResponse {
+data GCStatusInfo = GCStatusInfo {
     gcRunning :: Bool,           -- Whether GC is currently running
     gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
     gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
 } deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON GCStatusResponse where
-    toJSON GCStatusResponse{..} = Aeson.object [
+    toJSON GCStatusInfo{..} = Aeson.object [
             "running" .= gcRunning,
             "owner" .= gcOwner,
             "lockTime" .= gcLockTime
@@ -463,7 +464,7 @@ instance Aeson.FromJSON GCStatusResponse where
         gcRunning <- v .: "running"
         gcOwner <- v .: "owner"
         gcLockTime <- v .: "lockTime"
-        return GCStatusResponse{..}
+        return GCStatusInfo{..}
 
 -- | Daemon status information
 data DaemonStatus = DaemonStatus {
@@ -650,7 +651,7 @@ data DaemonResponse
     | DerivationListResponse [StorePath]
     | GCResultResponse GCStats
     | GCStartedResponse
-    | GCStatusResponse GCStatusResponse
+    | GCStatusResponse GCStatusInfo
     | GCRootAddedResponse Text
     | GCRootRemovedResponse Text
     | GCRootListResponse [GCRoot]
