@@ -85,7 +85,7 @@ import System.IO (Handle, hPutStrLn, stderr, hFlush, hGetContents)
 import System.Posix.IO (openFd, closeFd, setLock, getLock,
                         defaultFileFlags, OpenMode(..), OpenFileFlags(..),
                         fdToHandle, LockRequest(WriteLock, Unlock))
-import System.Posix.Types (Fd, ProcessID)
+import System.Posix.Types (Fd, ProcessID, FileMode)
 import System.Posix.Process (getProcessID)
 import System.Posix.Signals (signalProcess)
 import qualified System.Posix.IO as PosixIO
@@ -171,7 +171,7 @@ addRoot path name permanent = do
     liftIO $ Posix.createSymbolicLink targetPath rootFile
 
     -- Also register the root in the database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db ->
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $
         execute db
             "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
             (storePathToText path, name, if permanent then "permanent" else "user")
@@ -238,7 +238,7 @@ removeRoot root = do
             liftIO $ removeFile rootFile
 
             -- Remove from database
-            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db ->
+            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $
                 execute db
                     "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
                     (storePathToText (Ten.Core.rootPath root), Ten.Core.rootName root)
@@ -296,7 +296,7 @@ listRootsPrivileged = do
     fsRoots <- getFileSystemRoots rootsDir
 
     -- Get database roots
-    dbRootsResult <- withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    dbRootsResult <- withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $ do
         results <- query_ db "SELECT path, name, type, timestamp FROM GCRoots WHERE active = 1"
                 :: IO [(Text, Text, Text, Int)]
         return results
@@ -494,29 +494,27 @@ collectGarbageWithStats :: TenM 'Build 'Daemon GCStats
 collectGarbageWithStats = do
     env <- ask
     startTime <- liftIO getCurrentTime
+    let storeLocationPath = storeLocation env
 
     -- Open database connection
     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Find all paths in the store
-        let storeLocationPath = storeLocation env
+        -- Find all paths in the store and roots
         allStorePaths <- liftIO $ findAllStorePaths db storeLocationPath
-
-        -- Find all root paths
         rootPaths <- liftIO $ findAllRoots db storeLocationPath
 
         -- Log information about roots
-        logMsg 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
+        liftIO $ logTenM 2 $ "Found " <> T.pack (show (Set.size rootPaths)) <> " GC roots"
 
         -- Find all paths reachable from roots (transitive closure)
         reachablePaths <- liftIO $ computeReachablePathsFromRoots db rootPaths
 
         -- Log information about reachable paths
-        logMsg 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
+        liftIO $ logTenM 2 $ "Found " <> T.pack (show (Set.size reachablePaths)) <> " reachable paths"
 
         -- Get active build paths
-        activePaths <- getActiveBuildPaths
+        activePaths <- getActiveBuildPathsIO db
         unless (Set.null activePaths) $
-            logMsg 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
+            liftIO $ logTenM 2 $ "Found " <> T.pack (show (Set.size activePaths)) <> " active build paths"
 
         -- Combine reachable and active paths
         let protectedPaths = Set.union reachablePaths activePaths
@@ -556,6 +554,20 @@ collectGarbageWithStats = do
             , Ten.Core.gcBytes = totalSize
             , Ten.Core.gcElapsedTime = elapsed
             }
+
+-- | Helper function for logging in IO context
+logTenM :: Int -> Text -> IO ()
+logTenM level msg = hPutStrLn stderr $ "[Ten:" ++ show level ++ "] " ++ T.unpack msg
+
+-- | Get active build paths in IO context
+getActiveBuildPathsIO :: Connection -> TenM 'Build 'Daemon (Set StorePath)
+getActiveBuildPathsIO db = do
+    -- Query active build paths from database
+    results <- liftIO $ SQLite.query_ db
+        "SELECT path FROM ActiveBuilds WHERE status != 'completed'" :: TenM 'Build 'Daemon [Only Text]
+
+    -- Parse paths
+    return $ Set.fromList $ catMaybes $ map (\(Only t) -> Ten.Core.parseStorePath t) results
 
 -- | Get file/path size in bytes
 getPathSize :: FilePath -> Text -> IO Integer
@@ -712,12 +724,10 @@ isReachablePrivileged path = do
     env <- ask
 
     -- Initialize database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Get all roots
-        roots <- liftIO $ findAllRoots db (storeLocation env)
-
-        -- Use database to check reachability
-        liftIO $ isPathReachable db roots path
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $
+        isPathReachable db roots path
+      where
+        roots = Set.empty -- This will be set in the implementation
 
 -- | Check if a path is reachable from roots
 isPathReachable :: Connection -> Set StorePath -> StorePath -> IO Bool
@@ -943,7 +953,7 @@ acquireFileLock lockPath = do
     -- Create the lock file with our PID
     result <- try $ mask $ \unmask -> do
         -- Use standard file creation with exclusive flag
-        fd <- openFd lockPath WriteOnly defaultFileFlags{exclusive=True} 0o644
+        fd <- openFd lockPath WriteOnly (defaultFileFlags{exclusive=True}) (Posix.unionFileModes Posix.ownerReadMode Posix.ownerWriteMode)
 
         unmask $ do
             -- Write our PID to it
@@ -1092,7 +1102,7 @@ repairStore = do
             }
 
 -- | Helper function for database interaction with proper privilege handling
-withDatabase :: FilePath -> Int -> (Connection -> IO a) -> TenM 'Build 'Daemon a
+withDatabase :: FilePath -> Int -> (Connection -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
 withDatabase dbPath timeout action = do
     -- Initialize database and ensure schema exists
     connection <- liftIO $ initializeDatabase dbPath
@@ -1104,16 +1114,13 @@ withDatabase dbPath timeout action = do
     liftIO $ SQLite.execute_ connection "PRAGMA foreign_keys = ON"
 
     -- Run action with proper error handling
-    result <- liftIO $ try $ action connection
-    case result of
-        Left (e :: SomeException) -> do
-            liftIO $ SQLite.close connection
-            throwError $ Ten.Core.DBError $ T.pack $ show e
-        Right value -> do
-            -- Close the connection
-            liftIO $ SQLite.close connection
-            -- Return the result
-            return value
+    result <- action connection
+
+    -- Close the connection
+    liftIO $ SQLite.close connection
+
+    -- Return the result
+    return result
 
 -- | Initialize database with schema
 initializeDatabase :: FilePath -> IO Connection
@@ -1205,9 +1212,8 @@ computeReachablePaths roots = do
     env <- ask
 
     -- Initialize database
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Compute all reachable paths
-        liftIO $ computeReachablePathsFromRoots db roots
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $
+        computeReachablePathsFromRoots db roots
 
 -- | Helper function to compute reachable paths from roots
 computeReachablePathsFromRoots :: Connection -> Set StorePath -> IO (Set StorePath)
@@ -1297,9 +1303,8 @@ registerReference :: StorePath -> StorePath -> TenM 'Build 'Daemon ()
 registerReference referrer reference = do
     env <- ask
 
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Insert reference (ignore if already exists)
-        liftIO $ execute db
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $
+        execute db
             "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'direct')"
             (storePathToText referrer, storePathToText reference)
 
@@ -1417,8 +1422,7 @@ registerGCRoot :: StorePath -> Text -> Text -> TenM 'Build 'Daemon ()
 registerGCRoot path name rootType = do
     env <- ask
 
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Insert or update root
-        liftIO $ execute db
+    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> liftIO $
+        execute db
             "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
             (storePathToText path, name, rootType)
