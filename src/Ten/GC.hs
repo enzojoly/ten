@@ -754,8 +754,8 @@ getRuntimeRootPaths storeLocation = do
 
 -- | Check if a path is reachable from any root
 -- Works in both contexts through different mechanisms
-isReachable :: forall (t :: PrivilegeTier). SingI t => StorePath -> TenM 'Build t Bool
-isReachable path = case sing @t of
+tsReachable :: forall (t :: PrivilegeTier). SingI t => StorePath -> TenM 'Build t Bool
+tsReachable path = case sing @t of
     SDaemon -> isReachablePrivileged path
     SBuilder -> requestPathReachability path
 
@@ -1147,7 +1147,7 @@ repairStore = do
             , Ten.Core.gcElapsedTime = elapsed
             }
 
--- | Helper function for database interaction with proper privilege handling
+-- | Helper function for database with proper monad handling
 withDatabase :: FilePath -> Int -> (Connection -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
 withDatabase dbPath timeout action = do
     -- Initialize database and ensure schema exists
@@ -1159,17 +1159,18 @@ withDatabase dbPath timeout action = do
     -- Enable foreign keys
     liftIO $ SQLite.execute_ connection "PRAGMA foreign_keys = ON"
 
-    -- Run action with proper error handling
-    result <- try $ action connection
-    case result of
-        Left (e :: SomeException) -> do
-            liftIO $ SQLite.close connection
-            throwError $ Ten.Core.DBError $ T.pack $ show e
-        Right value -> do
-            -- Close the connection
-            liftIO $ SQLite.close connection
-            -- Return the result
-            return value
+    -- Run action with proper error handling in TenM monad
+    result <- action connection `catchError` \e -> do
+        -- Close the connection
+        liftIO $ SQLite.close connection
+        -- Re-throw the error
+        throwError e
+
+    -- Close the connection
+    liftIO $ SQLite.close connection
+
+    -- Return the result
+    return result
 
 -- | Initialize database with schema
 initializeDatabase :: FilePath -> IO Connection
@@ -1451,6 +1452,7 @@ isGCRoot path = do
                 registerGCRoot path (T.pack "filesystem-found") "symlink"
 
             return isFileRoot
+
 
 -- | Check if a path is a GC root in the database
 isGCRootInDB :: StorePath -> TenM 'Build 'Daemon Bool
