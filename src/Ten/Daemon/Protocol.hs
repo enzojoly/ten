@@ -24,9 +24,7 @@ module Ten.Daemon.Protocol (
     compatibleVersions,
 
     PrivilegeTier(..),
-    SPrivilegeTier(..),
-    SDaemon,
-    SBuilder,
+    SPrivilegeTier(SDaemon, SBuilder),
 
     -- Message types with privilege awareness
     Message(..),
@@ -1232,32 +1230,6 @@ instance Aeson.ToJSON ResponseContent where
                 "name" .= name,
                 "permanent" .= permanent
             ]
-        encodeError err = Aeson.object [
-                "errorType" .= errorTypeString err,
-                "message" .= errorToText err
-            ]
-        errorTypeString :: BuildError -> Text
-        errorTypeString (EvalError _) = "eval"
-        errorTypeString (BuildFailed _) = "build"
-        errorTypeString (StoreError _) = "store"
-        errorTypeString (SandboxError _) = "sandbox"
-        errorTypeString (InputNotFound _) = "input"
-        errorTypeString (HashError _) = "hash"
-        errorTypeString (GraphError _) = "graph"
-        errorTypeString (ResourceError _) = "resource"
-        errorTypeString (DaemonError _) = "daemon"
-        errorTypeString (AuthError _) = "auth"
-        errorTypeString (CyclicDependency _) = "cycle"
-        errorTypeString (SerializationError _) = "serialization"
-        errorTypeString (RecursionLimit _) = "recursion"
-        errorTypeString (NetworkError _) = "network"
-        errorTypeString (ParseError _) = "parse"
-        errorTypeString (DBError _) = "db"
-        errorTypeString (GCError _) = "gc"
-        errorTypeString (PhaseError _) = "phase"
-        errorTypeString (PrivilegeError _) = "privilege"
-        errorTypeString (ProtocolError _) = "protocol"
-        errorTypeString _ = "unknown"
         showStatus :: BuildStatus -> Text
         showStatus BuildPending = "pending"
         showStatus (BuildRunning _) = "running"
@@ -1382,28 +1354,32 @@ instance Aeson.FromJSON ResponseContent where
                 hash <- p .: "hash"
                 name <- p .: "name"
                 return $ StorePath hash name
-            parseBuilds builds = forM builds $ \build -> Aeson.withObject "Build" (\b -> do
-                idStr <- b .: "id"
-                statusStr <- b .: "status"
-                progress <- b .: "progress"
-                bid <- case parseBuildId idStr of
-                    Left err -> fail $ T.unpack err
-                    Right bid' -> return bid'
-                let status = case statusStr of
-                        "pending" -> BuildPending
-                        "running" -> BuildRunning progress
-                        "recursing" -> BuildRecursing bid  -- Simplified
-                        "completed" -> BuildCompleted
-                        "failed" -> BuildFailed'
-                        _ -> BuildPending
-                return (bid, status, progress)
+
+            parseBuilds builds = forM builds $ \build ->
+                Aeson.withObject "Build" (\b -> do
+                    idStr <- b .: "id" :: Aeson.Parser Text
+                    statusStr <- b .: "status" :: Aeson.Parser Text
+                    progress <- b .: "progress" :: Aeson.Parser Float
+                    bid <- case parseBuildId idStr of
+                        Left err -> fail $ T.unpack err
+                        Right bid' -> return bid'
+                    let status = case statusStr of
+                            "pending" -> BuildPending
+                            "running" -> BuildRunning progress
+                            "recursing" -> BuildRecursing bid  -- Simplified
+                            "completed" -> BuildCompleted
+                            "failed" -> BuildFailed'
+                            _ -> BuildPending
+                    return (bid, status, progress)
                 ) build
+
             parseRoot = Aeson.withObject "GCRoot" $ \r -> do
                 pathObj <- r .: "path"
                 path <- decodePath pathObj
                 name <- r .: "name"
                 permanent <- r .: "permanent"
                 return (path, name, permanent)
+
             parseError = Aeson.withObject "Error" $ \e -> do
                 errType <- e .: "errorType" :: Aeson.Parser Text
                 msg <- e .: "message" :: Aeson.Parser Text
