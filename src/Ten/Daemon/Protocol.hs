@@ -1325,7 +1325,7 @@ serializeDaemonResponse resp =
     errorTypeString (PhaseError _) = "phase"
     errorTypeString (PrivilegeError _) = "privilege"
     errorTypeString (ProtocolError _) = "protocol"
-    errorTypeString (ProtocolInternalError _) = "internal"
+    errorTypeString (InternalError _) = "internal"
     errorTypeString (ConfigError _) = "config"
 
 -- | Deserialize a daemon response from ByteString
@@ -1691,19 +1691,6 @@ requestToText = \case
 
     ConfigRequest ->
         "Get daemon configuration"
-
--- | Convert a ProtocolError to a BuildError
-protocolErrorToBuildError :: ProtocolError -> BuildError
-protocolErrorToBuildError = \case
-    ProtocolParseError text -> ParseError $ "Protocol parse error: " <> text
-    VersionMismatch v1 v2 -> ProtocolError $ "Protocol version mismatch: " <> T.pack (show v1) <> " vs " <> T.pack (show v2)
-    MessageTooLarge size -> ProtocolError $ "Message too large: " <> T.pack (show size)
-    ConnectionClosed -> NetworkError "Connection closed unexpectedly"
-    AuthenticationFailed text -> AuthError text
-    OperationFailed text -> ProtocolError $ "Operation failed: " <> text
-    InvalidRequest text -> ProtocolError $ "Invalid request: " <> text
-    ProtocolInternalError text -> InternalError $ "Protocol internal error: " <> text
-    PrivilegeViolation text -> PrivilegeError text
 
 -- | Convert a response to human-readable text
 responseToText :: DaemonResponse -> Text
