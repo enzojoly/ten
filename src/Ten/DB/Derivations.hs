@@ -27,11 +27,7 @@ module Ten.DB.Derivations (
     -- Information types
     DerivationInfo(..),
     OutputInfo(..),
-    PathInfo(..),
-
-    -- Core serialization functions
-    serializeDerivation,
-    deserializeDerivation
+    PathInfo(..)
 ) where
 
 import Control.Exception (try, catch, throwIO, finally, SomeException)
@@ -73,6 +69,7 @@ import qualified Data.Vector as Vector
 import Ten.Core
 import Ten.DB.Core
 import Ten.Daemon.Protocol (DaemonRequest(..), DaemonResponse(..))
+import qualified Ten.Derivation as Deriv
 
 -- | Information about a stored derivation
 data DerivationInfo = DerivationInfo {
@@ -155,74 +152,7 @@ class CanStoreDerivation (t :: PrivilegeTier) where
     -- | Register a derivation with all its outputs in a single transaction
     registerDerivationWithOutputs :: Derivation -> StorePath -> TenM p t Int64
 
--- | Type class for derivation retrieval operations
-class CanRetrieveDerivation (p :: Phase) (t :: PrivilegeTier) where
-    -- | Retrieve a derivation from the database
-    retrieveDerivation :: Text -> TenM p t (Maybe Derivation)
-
-    -- | Retrieve a derivation by hash
-    retrieveDerivationByHash :: Text -> TenM p t (Maybe Derivation)
-
-    -- | Find the derivation that produced a particular output
-    getDerivationForOutput :: StorePath -> TenM p t (Maybe DerivationInfo)
-
-    -- | Find derivations that produced the given outputs
-    findDerivationsByOutputs :: [StorePath] -> TenM p t (Map String Derivation)
-
--- | Type class for output management operations
-class CanManageOutputs (t :: PrivilegeTier) where
-    -- | Register an output for a derivation
-    registerDerivationOutput :: Int64 -> Text -> StorePath -> TenM p t ()
-
-    -- | Get all outputs for a derivation
-    getOutputsForDerivation :: Int64 -> TenM p t [OutputInfo]
-
--- | Type class for reference management operations
-class CanManageReferences (t :: PrivilegeTier) where
-    -- | Add a reference between two paths
-    addDerivationReference :: StorePath -> StorePath -> TenM p t ()
-
-    -- | Get all direct references from a path
-    getDerivationReferences :: StorePath -> TenM p t [StorePath]
-
-    -- | Get all direct referrers to a path
-    getReferrers :: StorePath -> TenM p t [StorePath]
-
-    -- | Get all transitive references (closure)
-    getTransitiveReferences :: StorePath -> TenM p t (Set StorePath)
-
-    -- | Get all transitive referrers (reverse closure)
-    getTransitiveReferrers :: StorePath -> TenM p t (Set StorePath)
-
-    -- | Bulk register multiple references for efficiency
-    bulkRegisterReferences :: [(StorePath, StorePath)] -> TenM p t Int
-
--- | Type class for derivation query operations
-class CanQueryDerivations (t :: PrivilegeTier) where
-    -- | Check if a derivation is already registered
-    isDerivationRegistered :: Text -> TenM p t Bool
-
-    -- | List all registered derivations
-    listRegisteredDerivations :: TenM p t [DerivationInfo]
-
-    -- | Get the store path for a derivation by hash
-    getDerivationPath :: Text -> TenM p t (Maybe StorePath)
-
--- | Type class for path validity operations
-class CanManagePathValidity (t :: PrivilegeTier) where
-    -- | Register a valid path in the store
-    registerValidPath :: StorePath -> Maybe StorePath -> TenM p t ()
-
-    -- | Mark a path as invalid
-    invalidatePath :: StorePath -> TenM p t ()
-
-    -- | Check if a path is valid
-    isPathValid :: StorePath -> TenM p t Bool
-
-    -- | Get detailed information about a path
-    getPathInfo :: StorePath -> TenM p t (Maybe PathInfo)
-
--- Daemon implementation of CanStoreDerivation
+-- | Daemon instance for storing derivations
 instance CanStoreDerivation 'Daemon where
     storeDerivation derivation storePath = do
         db <- getDatabaseConn
@@ -324,7 +254,7 @@ instance CanStoreDerivation 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create store request with derivation payload
-                let serialized = serializeDerivation derivation
+                let serialized = Deriv.serializeDerivation derivation
                 let request = Request {
                     reqId = 0,
                     reqType = "store-derivation",
@@ -355,7 +285,7 @@ instance CanStoreDerivation 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Serialize and prepare request
-                let serialized = serializeDerivation derivation
+                let serialized = Deriv.serializeDerivation derivation
                 let request = Request {
                     reqId = 0,
                     reqType = "register-derivation-file",
@@ -383,7 +313,7 @@ instance CanStoreDerivation 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Serialize and prepare request
-                let serialized = serializeDerivation derivation
+                let serialized = Deriv.serializeDerivation derivation
                 let request = Request {
                     reqId = 0,
                     reqType = "register-derivation-with-outputs",
@@ -405,6 +335,20 @@ instance CanStoreDerivation 'Builder where
                             else throwError $ DBError $ respMessage resp
 
             _ -> throwError $ privilegeError "Cannot register derivation with outputs without daemon connection"
+
+-- | Type class for derivation retrieval operations
+class CanRetrieveDerivation (p :: Phase) (t :: PrivilegeTier) where
+    -- | Retrieve a derivation from the database
+    retrieveDerivation :: Text -> TenM p t (Maybe Derivation)
+
+    -- | Retrieve a derivation by hash
+    retrieveDerivationByHash :: Text -> TenM p t (Maybe Derivation)
+
+    -- | Find the derivation that produced a particular output
+    getDerivationForOutput :: StorePath -> TenM p t (Maybe DerivationInfo)
+
+    -- | Find derivations that produced the given outputs
+    findDerivationsByOutputs :: [StorePath] -> TenM p t (Map String Derivation)
 
 -- Implementation for Daemon in Eval phase
 instance CanRetrieveDerivation 'Eval 'Daemon where
@@ -597,7 +541,7 @@ instance CanRetrieveDerivation 'Eval 'Builder where
                         if respStatus resp == "ok"
                             then case respPayload resp of
                                 Just serialized ->
-                                    case deserializeDerivation serialized of
+                                    case Deriv.deserializeDerivation serialized of
                                         Left err -> return Nothing
                                         Right drv -> return $ Just drv
                                 Nothing -> return Nothing
@@ -698,7 +642,7 @@ instance CanRetrieveDerivation 'Build 'Builder where
                         if respStatus resp == "ok"
                             then case respPayload resp of
                                 Just serialized ->
-                                    case deserializeDerivation serialized of
+                                    case Deriv.deserializeDerivation serialized of
                                         Left err -> return Nothing
                                         Right drv -> return $ Just drv
                                 Nothing -> return Nothing
@@ -778,6 +722,14 @@ instance CanRetrieveDerivation 'Build 'Builder where
 
             _ -> throwError $ privilegeError "Cannot find derivations by outputs without daemon connection"
 
+-- | Type class for output management operations
+class CanManageOutputs (t :: PrivilegeTier) where
+    -- | Register an output for a derivation
+    registerDerivationOutput :: Int64 -> Text -> StorePath -> TenM p t ()
+
+    -- | Get all outputs for a derivation
+    getOutputsForDerivation :: Int64 -> TenM p t [OutputInfo]
+
 -- Daemon implementation of CanManageOutputs
 instance CanManageOutputs 'Daemon where
     registerDerivationOutput derivId outputName outPath = do
@@ -848,6 +800,26 @@ instance CanManageOutputs 'Builder where
                             else return []
 
             _ -> throwError $ privilegeError "Cannot get outputs without daemon connection"
+
+-- | Type class for reference management operations
+class CanManageReferences (t :: PrivilegeTier) where
+    -- | Add a reference between two paths
+    addDerivationReference :: StorePath -> StorePath -> TenM p t ()
+
+    -- | Get all direct references from a path
+    getDerivationReferences :: StorePath -> TenM p t [StorePath]
+
+    -- | Get all direct referrers to a path
+    getReferrers :: StorePath -> TenM p t [StorePath]
+
+    -- | Get all transitive references (closure)
+    getTransitiveReferences :: StorePath -> TenM p t (Set StorePath)
+
+    -- | Get all transitive referrers (reverse closure)
+    getTransitiveReferrers :: StorePath -> TenM p t (Set StorePath)
+
+    -- | Bulk register multiple references for efficiency
+    bulkRegisterReferences :: [(StorePath, StorePath)] -> TenM p t Int
 
 -- Daemon implementation of CanManageReferences
 instance CanManageReferences 'Daemon where
@@ -1107,6 +1079,17 @@ instance CanManageReferences 'Builder where
 
             _ -> throwError $ privilegeError "Cannot bulk register references without daemon connection"
 
+-- | Type class for derivation query operations
+class CanQueryDerivations (t :: PrivilegeTier) where
+    -- | Check if a derivation is already registered
+    isDerivationRegistered :: Text -> TenM p t Bool
+
+    -- | List all registered derivations
+    listRegisteredDerivations :: TenM p t [DerivationInfo]
+
+    -- | Get the store path for a derivation by hash
+    getDerivationPath :: Text -> TenM p t (Maybe StorePath)
+
 -- Daemon implementation of CanQueryDerivations
 instance CanQueryDerivations 'Daemon where
     isDerivationRegistered hash = do
@@ -1212,6 +1195,20 @@ instance CanQueryDerivations 'Builder where
                             else return Nothing
 
             _ -> throwError $ privilegeError "Cannot get derivation path without daemon connection"
+
+-- | Type class for path validity operations
+class CanManagePathValidity (t :: PrivilegeTier) where
+    -- | Register a valid path in the store
+    registerValidPath :: StorePath -> Maybe StorePath -> TenM p t ()
+
+    -- | Mark a path as invalid
+    invalidatePath :: StorePath -> TenM p t ()
+
+    -- | Check if a path is valid
+    isPathValid :: StorePath -> TenM p t Bool
+
+    -- | Get detailed information about a path
+    getPathInfo :: StorePath -> TenM p t (Maybe PathInfo)
 
 -- Daemon implementation of CanManagePathValidity
 instance CanManagePathValidity 'Daemon where
@@ -1376,7 +1373,7 @@ readDerivationFromStore path = do
             content <- liftIO $ try $ BS.readFile filePath
             case content of
                 Right bs ->
-                    case deserializeDerivation bs of
+                    case Deriv.deserializeDerivation bs of
                         Left _ -> return Nothing
                         Right drv -> return $ Just drv
                 Left (_ :: SomeException) -> do
@@ -1419,103 +1416,6 @@ readDerivationFile env path = do
             -- Read the file
             content <- BS.readFile filePath
             -- Return the result of deserialization
-            return $ deserializeDerivation content
-
--- | Serialize a derivation to a ByteString for cross-boundary transmission
-serializeDerivation :: Derivation -> ByteString
-serializeDerivation drv =
-    -- Convert to JSON and then to ByteString with proper formatting
-    LBS.toStrict $ Aeson.encode $ Aeson.object
-        [ "name" Aeson..= derivName drv
-        , "hash" Aeson..= derivHash drv
-        , "builder" Aeson..= encodeStorePath (derivBuilder drv)
-        , "args" Aeson..= derivArgs drv
-        , "inputs" Aeson..= map encodeDerivationInput (Set.toList $ derivInputs drv)
-        , "outputs" Aeson..= map encodeDerivationOutput (Set.toList $ derivOutputs drv)
-        , "env" Aeson..= Map.mapKeys T.unpack (derivEnv drv)
-        , "system" Aeson..= derivSystem drv
-        , "strategy" Aeson..= (case derivStrategy drv of
-                           ApplicativeStrategy -> "applicative" :: Text
-                           MonadicStrategy -> "monadic" :: Text)
-        , "meta" Aeson..= derivMeta drv
-        ]
-  where
-    encodeStorePath :: StorePath -> Aeson.Value
-    encodeStorePath (StorePath hash name) = Aeson.object
-        [ "hash" Aeson..= hash
-        , "name" Aeson..= name
-        ]
-
-    encodeDerivationInput :: DerivationInput -> Aeson.Value
-    encodeDerivationInput (DerivationInput path name) = Aeson.object
-        [ "path" Aeson..= encodeStorePath path
-        , "name" Aeson..= name
-        ]
-
-    encodeDerivationOutput :: DerivationOutput -> Aeson.Value
-    encodeDerivationOutput (DerivationOutput name path) = Aeson.object
-        [ "name" Aeson..= name
-        , "path" Aeson..= encodeStorePath path
-        ]
-
--- | Deserialize a derivation from ByteString format
-deserializeDerivation :: ByteString -> Either Text Derivation
-deserializeDerivation bs =
-    case Aeson.eitherDecode (LBS.fromStrict bs) of
-        Left err -> Left $ T.pack $ "JSON parse error: " <> err
-        Right val -> derivationFromJSON val
-
--- | Convert JSON to Derivation
-derivationFromJSON :: Aeson.Value -> Either Text Derivation
-derivationFromJSON value = case Aeson.parseEither parseDerivation value of
-    Left err -> Left $ T.pack err
-    Right drv -> Right drv
-  where
-    parseDerivation = Aeson.withObject "Derivation" $ \o -> do
-        name <- o Aeson..: "name"
-        hash <- o Aeson..: "hash"
-        builderObj <- o Aeson..: "builder"
-        builder <- parseStorePath' builderObj
-        args <- o Aeson..: "args"
-        inputsArray <- o Aeson..: "inputs"
-        inputs <- parseInputs inputsArray
-        outputsArray <- o Aeson..: "outputs"
-        outputs <- parseOutputs outputsArray
-        envObj <- o Aeson..: "env"
-        env <- parseEnvMap envObj
-        system <- o Aeson..: "system"
-        strategyText <- o Aeson..: "strategy"
-        let strategy = if strategyText == ("monadic" :: Text) then MonadicStrategy else ApplicativeStrategy
-        metaObj <- o Aeson..: "meta"
-        meta <- parseEnvMap metaObj
-
-        return $ Derivation name hash builder args
-                           (Set.fromList inputs) (Set.fromList outputs)
-                           env system strategy meta
-
-    parseStorePath' = Aeson.withObject "StorePath" $ \o -> do
-        hash <- o Aeson..: "hash"
-        name <- o Aeson..: "name"
-        return $ StorePath hash name
-
-    parseInputs = Aeson.withArray "Inputs" $ \arr ->
-        mapM parseInput (Vector.toList arr)
-
-    parseInput = Aeson.withObject "DerivationInput" $ \o -> do
-        pathObj <- o Aeson..: "path"
-        path <- parseStorePath' pathObj
-        name <- o Aeson..: "name"
-        return $ DerivationInput path name
-
-    parseOutputs = Aeson.withArray "Outputs" $ \arr ->
-        mapM parseOutput (Vector.toList arr)
-
-    parseOutput = Aeson.withObject "DerivationOutput" $ \o -> do
-        name <- o Aeson..: "name"
-        pathObj <- o Aeson..: "path"
-        path <- parseStorePath' pathObj
-        return $ DerivationOutput name path
-
-    parseEnvMap :: Aeson.Object -> Aeson.Parser (Map Text Text)
-    parseEnvMap o =
-        return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- KeyMap.toList o]
+            return $ case Deriv.deserializeDerivation content of
+                     Left err -> Left $ "Failed to deserialize derivation: " <> T.pack (show err)
+                     Right drv -> Right drv
