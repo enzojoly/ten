@@ -13,7 +13,6 @@ module Ten.Daemon.Client (
     connectToDaemon,
     disconnectFromDaemon,
     getDefaultSocketPath,
-    withDaemonConnection,
 
     -- Client communication with privilege checks
     sendRequest,
@@ -92,7 +91,6 @@ import Data.Unique (hashUnique)
 import Data.Word (Word8, Word32, Word64)
 import Data.Bits (shiftL, (.|.))
 import Network.Socket (Socket, Family(..), SocketType(..), SockAddr(..), socket, connect, close, socketToHandle)
-import Network.Socket.ByteString (sendAll, recv)
 import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirectory, getXdgDirectory, XdgDirectory(..), findExecutable)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
@@ -100,6 +98,7 @@ import System.FilePath ((</>), takeDirectory)
 import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr, BufferMode(..), hSetBuffering)
 import System.Process (createProcess, proc, waitForProcess, StdStream(..), CreateProcess(..), ProcessHandle)
 import qualified System.Timeout as SystemTimeout
+import Data.Maybe (fromJust, isJust)
 
 -- Import Ten modules
 import Ten.Core hiding (sendRequest, receiveResponse, sendRequestSync, timeout)
@@ -123,8 +122,8 @@ connectToDaemon socketPath credentials = try $ do
                 -- Brief pause to allow daemon to initialize
                 threadDelay 500000 -- 0.5 seconds
 
-    -- Create socket and connect
-    (sock, handle) <- createSocketAndConnect socketPath
+    -- Create socket and connect to get a handle
+    handle <- createSocketAndConnect socketPath
 
     -- Set up proper handle buffering
     hSetBuffering handle (BlockBuffering Nothing)
@@ -141,10 +140,17 @@ connectToDaemon socketPath credentials = try $ do
     let authReq = AuthRequest authContent
     let (reqData, mPayload) = serializeDaemonRequest authReq
     let framedReq = createRequestFrame reqData
-    sendAll sock framedReq
+    BS.hPut handle framedReq
+
+    -- Send payload if needed
+    when (isJust mPayload) $ do
+        let framedPayload = createRequestFrame (fromJust mPayload)
+        BS.hPut handle framedPayload
+
+    hFlush handle
 
     -- Receive and parse authentication response
-    respResult <- try $ receiveFramedResponse sock
+    respResult <- try $ receiveFramedResponse handle
     case respResult of
         Left (e :: SomeException) ->
             throwIO $ AuthError "Connection error during authentication"
@@ -161,10 +167,9 @@ connectToDaemon socketPath credentials = try $ do
                             shutdownFlag <- newTVarIO False
 
                             -- Start background thread to read responses
-                            readerThread <- forkIO $ responseReaderThread sock requestMap shutdownFlag
+                            readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
 
                             return DaemonConnection {
-                                connSocket = sock,
                                 connHandle = handle,
                                 connUserId = userId,
                                 connAuthToken = authToken,
@@ -183,10 +188,9 @@ connectToDaemon socketPath credentials = try $ do
                             shutdownFlag <- newTVarIO False
 
                             -- Start background thread to read responses
-                            readerThread <- forkIO $ responseReaderThread sock requestMap shutdownFlag
+                            readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
 
                             return DaemonConnection {
-                                connSocket = sock,
                                 connHandle = handle,
                                 connUserId = userId,
                                 connAuthToken = authToken,
@@ -200,34 +204,33 @@ connectToDaemon socketPath credentials = try $ do
                     throwIO $ AuthError "Invalid response type for authentication"
 
 -- | Background thread to read and dispatch responses
-responseReaderThread :: Socket -> TVar (Map Int (MVar (Either Text DaemonResponse))) -> TVar Bool -> IO ()
-responseReaderThread sock requestMap shutdownFlag = forever $ do
+responseReaderThread :: Handle -> TVar (Map Int (MVar BS.ByteString)) -> TVar Bool -> IO ()
+responseReaderThread handle requestMap shutdownFlag = forever $ do
     -- Check if we should shut down
     shutdown <- readTVarIO shutdownFlag
     when shutdown $ return ()
 
     -- Try to read a response
-    eResp <- try $ receiveFramedResponse sock
+    eResp <- try $ receiveFramedResponse handle
     case eResp of
         Left (e :: SomeException) ->
             -- Connection error, exit thread
             return ()
         Right (respData, mRespPayload) -> do
-            -- Deserialize the daemon response
-            let eResult = deserializeDaemonResponse respData mRespPayload
+            -- Extract request ID from respData without fully deserializing
+            let mReqId = extractRequestIdFromBytes respData
 
-            -- Extract response ID from the daemon response
-            let mReqId = case eResult of
-                    Right resp -> getResponseId resp
-                    _ -> Nothing
-
-            -- Deliver to waiting client if we have an ID and request
+            -- Store raw response bytes in MVar
             case mReqId of
                 Just reqId -> do
                     reqMap <- readTVarIO requestMap
                     case Map.lookup reqId reqMap of
                         Just respVar -> do
-                            putMVar respVar eResult
+                            -- Concatenate header and payload into a single ByteString for storage
+                            let fullResponse = case mRespPayload of
+                                    Just payload -> BS.concat [respData, payload]
+                                    Nothing -> respData
+                            putMVar respVar fullResponse
                             -- Remove request from tracking map
                             atomically $ modifyTVar' requestMap $ Map.delete reqId
                         Nothing ->
@@ -236,15 +239,6 @@ responseReaderThread sock requestMap shutdownFlag = forever $ do
                 Nothing ->
                     -- Couldn't extract ID, ignore
                     return ()
-  where
-    -- Helper to extract request ID from different response types
-    getResponseId :: DaemonResponse -> Maybe Int
-    getResponseId (BuildStartedResponse (BuildIdFromInt n)) = Just n
-    getResponseId (BuildStatusResponse update) =
-        case buildId update of
-            BuildIdFromInt n -> Just n
-            _ -> Nothing
-    getResponseId _ = Nothing -- For most responses, we'd need metadata
 
 -- | Disconnect from the Ten daemon
 disconnectFromDaemon :: DaemonConnection 'Builder -> IO ()
@@ -252,11 +246,8 @@ disconnectFromDaemon conn = do
     -- Signal reader thread to shut down
     atomically $ writeTVar (connShutdown conn) True
 
-    -- Close socket handle
+    -- Close handle
     hClose (connHandle conn)
-
-    -- Close socket
-    close (connSocket conn)
 
     -- Kill reader thread if it doesn't exit on its own
     killThread (connReaderThread conn)
@@ -271,21 +262,20 @@ isDaemonRunning socketPath = do
         then return False
         else do
             -- Try to connect to the socket
-            result <- try $ createSocketAndConnect socketPath
+            result <- try $ do
+                handle <- createSocketAndConnect socketPath
+                hClose handle
+                return True
             case result of
                 Left (_ :: SomeException) ->
                     -- Connection failed, daemon not running
                     return False
-
-                Right (sock, handle) -> do
+                Right success ->
                     -- Connection succeeded, daemon is running
-                    hClose handle
-                    close sock
-                    return True
-
+                    return success
 
 -- | Create a socket and connect to the daemon
-createSocketAndConnect :: FilePath -> IO (Socket, Handle)
+createSocketAndConnect :: FilePath -> IO Handle
 createSocketAndConnect socketPath = do
     -- Ensure parent directory exists
     createDirectoryIfMissing True (takeDirectory socketPath)
@@ -294,85 +284,68 @@ createSocketAndConnect socketPath = do
     sock <- socket AF_UNIX Stream 0
 
     -- Connect to socket with error handling
-    bracketOnError
+    handle <- bracketOnError
         (return sock)
         close
         (\s -> do
             connect s (SockAddrUnix socketPath)
-            handle <- socketToHandle s ReadWriteMode
-            return (s, handle))
+            socketToHandle s ReadWriteMode)
 
--- | Convert a DaemonConnection to a ProtocolHandle for Protocol functions
-asDaemonProtocolHandle :: DaemonConnection t -> IO ProtocolHandle
-asDaemonProtocolHandle conn = do
-    mvar <- newMVar ()
-    return ProtocolHandle {
-        protocolSocket = connSocket conn,
-        protocolLock = mvar,
-        protocolPrivilegeTier = fromSing (connPrivEvidence conn)
-    }
+    -- Set proper buffering
+    hSetBuffering handle (BlockBuffering Nothing)
+
+    return handle
 
 -- | Send a request to the daemon
-sendRequest :: DaemonConnection 'Builder -> DaemonRequest -> IO (Either BuildError Int)
-sendRequest conn request = do
-    -- Using Protocol's request serialization
-    let (reqData, mPayload) = serializeDaemonRequest request
+sendRequest :: DaemonConnection 'Builder -> Request -> IO (Either BuildError Int)
+sendRequest conn request = try $ do
+    -- Generate request ID
+    reqId <- atomically $ do
+        rid <- readTVar (connNextReqId conn)
+        writeTVar (connNextReqId conn) (rid + 1)
+        return rid
 
-    -- Frame the request
-    let framedReq = createRequestFrame reqData
-    let framedPayload = case mPayload of
-            Just payload -> createRequestFrame payload
-            Nothing -> BS.empty
+    -- Create response variable
+    respVar <- newEmptyMVar
 
-    -- Send the request and optional payload
-    result <- try $ do
-        mvar <- newMVar ()
-        withMVar mvar $ \_ -> do
-            sendAll (connSocket conn) framedReq
+    -- Register the pending request
+    atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
 
-            unless (BS.null framedPayload) $
-                sendAll (connSocket conn) framedPayload
+    -- Update the request with the ID
+    let request' = request { reqId = reqId }
 
-            -- Store request ID for tracking
-            reqId <- atomically $ do
-                rid <- readTVar (connNextReqId conn)
-                writeTVar (connNextReqId conn) (rid + 1)
-                return rid
+    -- Serialize and send the request
+    let encoded = encodeRequest request'
+    BS.hPut (connHandle conn) encoded
+    hFlush (connHandle conn)
 
-            -- Create response variable
-            respVar <- newEmptyMVar
-
-            -- Register the pending request
-            atomically $ modifyTVar' (connRequestMap conn) $ Map.insert reqId respVar
-
-            return reqId
-
-    case result of
-        Left err -> return $ Left $ DaemonError $ T.pack $ show err
-        Right reqId -> return $ Right reqId
+    -- Return the request ID for tracking
+    return reqId
 
 -- | Receive a response for a specific request
 receiveResponse :: DaemonConnection 'Builder -> Int -> Int -> IO (Either BuildError DaemonResponse)
 receiveResponse conn reqId timeoutMicros = do
-    -- Get response MVar
     reqMap <- readTVarIO (connRequestMap conn)
     case Map.lookup reqId reqMap of
         Nothing ->
-            -- No such request ID
             return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
         Just respVar -> do
-            -- Wait for response with timeout
+            -- Get raw bytes from MVar with timeout
             mResult <- SystemTimeout.timeout timeoutMicros $ takeMVar respVar
 
-            -- Return response or error
             case mResult of
                 Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
-                Just eResult -> case eResult of
-                    Left err -> return $ Left $ ProtocolError err
-                    Right daemonResp -> return $ Right daemonResp
+                Just rawBytes -> do
+                    -- Split the raw bytes into header and payload
+                    case splitResponseBytes rawBytes of
+                        (header, mPayload) ->
+                            -- Now deserialize
+                            case deserializeDaemonResponse header mPayload of
+                                Left err -> return $ Left $ ProtocolError err
+                                Right resp -> return $ Right resp
 
 -- | Send a request and wait for response (synchronous)
-sendRequestSync :: DaemonConnection 'Builder -> DaemonRequest -> Int -> IO (Either BuildError DaemonResponse)
+sendRequestSync :: DaemonConnection 'Builder -> Request -> Int -> IO (Either BuildError DaemonResponse)
 sendRequestSync conn request timeoutMicros = do
     -- Send the request
     reqIdResult <- sendRequest conn request
@@ -383,38 +356,23 @@ sendRequestSync conn request timeoutMicros = do
         Right reqId -> receiveResponse conn reqId timeoutMicros
 
 -- | Read a message with timeout
-readResponseWithTimeout :: Handle -> Int -> IO BS.ByteString
+readResponseWithTimeout :: Handle -> Int -> IO Response
 readResponseWithTimeout handle timeoutMicros = do
-    -- Use Protocol's framing to read a response
-    result <- SystemTimeout.timeout timeoutMicros $ do
-        -- Read length prefix (4 bytes)
-        lenBytes <- BS.hGet handle 4
-        when (BS.length lenBytes /= 4) $
-            throwIO $ DaemonError "Disconnected from daemon while reading message length"
+    -- Use Core's receiveFramedResponse to read raw bytes
+    (respData, mRespPayload) <- SystemTimeout.timeout timeoutMicros $ receiveFramedResponse handle >>= \case
+        (respData, mRespPayload) -> return (respData, mRespPayload)
 
-        -- Decode message length - using Word32 consistently for binary protocol
-        let len = fromIntegral $
-                  (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
-                  (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
-                  (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
-                  (fromIntegral (BS.index lenBytes 3) :: Word32)
-
-        -- Sanity check on message length
-        when (len > 100 * 1024 * 1024) $ -- 100 MB limit
-            throwIO $ DaemonError $ "Message too large: " <> T.pack (show len) <> " bytes"
-
-        -- Read message body
-        msgBytes <- BS.hGet handle len
-        when (BS.length msgBytes /= len) $
-            throwIO $ DaemonError "Disconnected from daemon while reading message body"
-
-        -- Return the complete message
-        return $ BS.append lenBytes msgBytes
-
-    case result of
+    case respData of
         Nothing -> throwIO $ DaemonError "Timeout waiting for daemon response"
-        Just msg -> return msg
-
+        Just respData' ->
+            -- Decode the response
+            case mRespPayload of
+                Nothing -> case decodeResponse respData' of
+                    Left err -> throwIO $ DaemonError $ "Failed to decode response: " <> err
+                    Right resp -> return resp
+                Just payload -> case decodeResponse respData' of
+                    Left err -> throwIO $ DaemonError $ "Failed to decode response: " <> err
+                    Right resp -> return resp { respPayload = Just payload }
 
 -- | Start the daemon if it's not running
 startDaemonIfNeeded :: FilePath -> IO (Either BuildError ())
@@ -499,7 +457,15 @@ buildFile conn filePath = do
             content <- BS.readFile filePath
 
             -- Create build request with positional arguments
-            let request = BuildRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
+            let request = Request {
+                reqId = 0,  -- Will be set by sendRequest
+                reqType = "build",
+                reqParams = Map.fromList [
+                    ("path", T.pack filePath),
+                    ("hasContent", "true")
+                ],
+                reqPayload = Just content
+            }
 
             -- Send request and wait for response
             respResult <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
@@ -527,8 +493,16 @@ evalFile conn filePath = do
             -- Read file content
             content <- BS.readFile filePath
 
-            -- Create eval request with positional arguments
-            let request = EvalRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
+            -- Create eval request
+            let request = Request {
+                reqId = 0,  -- Will be set by sendRequest
+                reqType = "eval",
+                reqParams = Map.fromList [
+                    ("path", T.pack filePath),
+                    ("hasContent", "true")
+                ],
+                reqPayload = Just content
+            }
 
             -- Send request and wait for response
             respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
@@ -551,8 +525,18 @@ evalFile conn filePath = do
 -- | Build a derivation using the daemon
 buildDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError BuildResult)
 buildDerivation conn derivation = do
-    -- Create build derivation request with positional arguments
-    let request = BuildDerivationRequest derivation defaultBuildRequestInfo
+    -- Serialize the derivation
+    let serialized = Derivation.serializeDerivation derivation
+
+    -- Create build derivation request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "build-derivation",
+        reqParams = Map.fromList [
+            ("hasDerivation", "true")
+        ],
+        reqPayload = Just serialized
+    }
 
     -- Send request and wait for response (longer timeout for builds)
     respResult <- sendRequestSync conn request (3600 * 1000000) -- 1 hour timeout
@@ -572,8 +556,13 @@ buildDerivation conn derivation = do
 -- | Cancel a build
 cancelBuild :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError ())
 cancelBuild conn buildId = do
-    -- Create cancel build request with positional argument
-    let request = CancelBuildRequest buildId
+    -- Create cancel build request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "cancel-build",
+        reqParams = Map.singleton "buildId" (renderBuildId buildId),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -593,8 +582,13 @@ cancelBuild conn buildId = do
 -- | Get status of a build
 getBuildStatus :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError BuildStatusUpdate)
 getBuildStatus conn buildId = do
-    -- Create build status request with positional argument
-    let request = BuildStatusRequest buildId
+    -- Create build status request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "build-status",
+        reqParams = Map.singleton "buildId" (renderBuildId buildId),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -614,8 +608,13 @@ getBuildStatus conn buildId = do
 -- | Get output of a build
 getBuildOutput :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError Text)
 getBuildOutput conn buildId = do
-    -- Create build output request with positional argument
-    let request = QueryBuildOutputRequest buildId
+    -- Create build output request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "build-output",
+        reqParams = Map.singleton "buildId" (renderBuildId buildId),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -635,8 +634,15 @@ getBuildOutput conn buildId = do
 -- | List all builds
 listBuilds :: DaemonConnection 'Builder -> Maybe Int -> IO (Either BuildError [(BuildId, BuildStatus, Float)])
 listBuilds conn limit = do
-    -- Create list builds request with positional argument
-    let request = ListBuildsRequest limit
+    -- Create list builds request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "list-builds",
+        reqParams = case limit of
+            Just n -> Map.singleton "limit" (T.pack $ show n)
+            Nothing -> Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -664,8 +670,16 @@ addFileToStore conn filePath = do
             -- Read file content
             content <- BS.readFile filePath
 
-            -- Create store add request with positional arguments
-            let request = StoreAddRequest (T.pack filePath) content
+            -- Create store add request
+            let request = Request {
+                reqId = 0,  -- Will be set by sendRequest
+                reqType = "store-add",
+                reqParams = Map.fromList [
+                    ("path", T.pack filePath),
+                    ("hasContent", "true")
+                ],
+                reqPayload = Just content
+            }
 
             -- Send request and wait for response
             respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
@@ -685,8 +699,13 @@ addFileToStore conn filePath = do
 -- | Verify a store path
 verifyStorePath :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
 verifyStorePath conn path = do
-    -- Create verify request with positional argument
-    let request = StoreVerifyRequest path
+    -- Create verify request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "store-verify",
+        reqParams = Map.singleton "path" (storePathToText path),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -714,8 +733,16 @@ getStorePathForFile conn filePath = do
             -- Read file content
             content <- BS.readFile filePath
 
-            -- Create store path request with positional arguments
-            let request = StorePathRequest (T.pack filePath) content
+            -- Create store path request
+            let request = Request {
+                reqId = 0,  -- Will be set by sendRequest
+                reqType = "store-path",
+                reqParams = Map.fromList [
+                    ("path", T.pack filePath),
+                    ("hasContent", "true")
+                ],
+                reqPayload = Just content
+            }
 
             -- Send request and wait for response
             respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -759,7 +786,12 @@ readStoreContent conn path = do
 listStore :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
 listStore conn = do
     -- Create list request
-    let request = StoreListRequest
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "store-list",
+        reqParams = Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
@@ -782,8 +814,13 @@ storeDerivation conn derivation = do
     -- Serialize the derivation
     let serialized = Derivation.serializeDerivation derivation
 
-    -- Create store derivation request with positional argument
-    let request = StoreDerivationRequest serialized
+    -- Create store derivation request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "store-derivation",
+        reqParams = Map.singleton "name" (derivName derivation <> ".drv"),
+        reqPayload = Just serialized
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -803,8 +840,13 @@ storeDerivation conn derivation = do
 -- | Retrieve a derivation from the store
 retrieveDerivation :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
 retrieveDerivation conn path = do
-    -- Create retrieve derivation request with positional argument
-    let request = RetrieveDerivationRequest path
+    -- Create retrieve derivation request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "retrieve-derivation",
+        reqParams = Map.singleton "path" (storePathToText path),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -824,8 +866,13 @@ retrieveDerivation conn path = do
 -- | Query which derivation produced a particular output
 queryDerivationForOutput :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
 queryDerivationForOutput conn outputPath = do
-    -- Create get derivation for output request with positional argument
-    let request = GetDerivationForOutputRequest (storePathToText outputPath)
+    -- Create get derivation for output request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "get-derivation-for-output",
+        reqParams = Map.singleton "path" (storePathToText outputPath),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -848,8 +895,16 @@ queryDerivationForOutput conn outputPath = do
 -- | Query all outputs produced by a derivation
 queryOutputsForDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError (Set StorePath))
 queryOutputsForDerivation conn derivation = do
-    -- Create query derivation outputs request with positional arguments
-    let request = QueryDerivationRequest "outputs" (derivHash derivation) Nothing
+    -- Create query derivation outputs request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "query-derivation",
+        reqParams = Map.fromList [
+            ("queryType", "outputs"),
+            ("queryValue", derivHash derivation)
+        ],
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -869,8 +924,13 @@ queryOutputsForDerivation conn derivation = do
 -- | List all derivations in the store
 listDerivations :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
 listDerivations conn = do
-    -- Create list derivations request with positional argument
-    let request = ListDerivationsRequest Nothing
+    -- Create list derivations request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "list-derivations",
+        reqParams = Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
@@ -890,8 +950,17 @@ listDerivations conn = do
 -- | Get detailed information about a derivation
 getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError DerivationInfo)
 getDerivationInfo conn path = do
-    -- Create query derivation info request with positional arguments
-    let request = QueryDerivationRequest "info" (storePathToText path) (Just 1)
+    -- Create query derivation info request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "query-derivation",
+        reqParams = Map.fromList [
+            ("queryType", "info"),
+            ("queryValue", storePathToText path),
+            ("limit", "1")
+        ],
+        reqPayload = Nothing
+    }
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
     -- Process response
@@ -924,9 +993,13 @@ getDerivationInfo conn path = do
 -- | Run garbage collection (requires daemon privileges via protocol)
 collectGarbage :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
 collectGarbage conn force = do
-    -- Create GC request with positional argument
-    let params = GCRequestParams force
-    let request = GCRequest params
+    -- Create GC request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "gc",
+        reqParams = Map.singleton "force" (if force then "true" else "false"),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (300 * 1000000) -- 5 minutes timeout
@@ -946,9 +1019,13 @@ collectGarbage conn force = do
 -- | Get GC status
 getGCStatus :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStatusInfo)
 getGCStatus conn forceCheck = do
-    -- Create GC status request with positional argument
-    let params = GCStatusRequestParams forceCheck
-    let request = GCStatusRequest params
+    -- Create GC status request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "gc-status",
+        reqParams = Map.singleton "forceCheck" (if forceCheck then "true" else "false"),
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -968,8 +1045,17 @@ getGCStatus conn forceCheck = do
 -- | Add a GC root (requires daemon privileges via protocol)
 addGCRoot :: DaemonConnection 'Builder -> StorePath -> Text -> Bool -> IO (Either BuildError Text)
 addGCRoot conn path name permanent = do
-    -- Create add GC root request with positional arguments
-    let request = AddGCRootRequest path name permanent
+    -- Create add GC root request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "add-gc-root",
+        reqParams = Map.fromList [
+            ("path", storePathToText path),
+            ("name", name),
+            ("permanent", if permanent then "true" else "false")
+        ],
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -989,8 +1075,13 @@ addGCRoot conn path name permanent = do
 -- | Remove a GC root (requires daemon privileges via protocol)
 removeGCRoot :: DaemonConnection 'Builder -> Text -> IO (Either BuildError Text)
 removeGCRoot conn name = do
-    -- Create remove GC root request with positional argument
-    let request = RemoveGCRootRequest name
+    -- Create remove GC root request
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "remove-gc-root",
+        reqParams = Map.singleton "name" name,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -1011,7 +1102,12 @@ removeGCRoot conn name = do
 listGCRoots :: DaemonConnection 'Builder -> IO (Either BuildError [(StorePath, Text, Bool)])
 listGCRoots conn = do
     -- Create list GC roots request
-    let request = ListGCRootsRequest
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "list-gc-roots",
+        reqParams = Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
@@ -1028,19 +1124,16 @@ listGCRoots conn = do
             return $ Left $ DaemonError $
                 "Invalid response type for list GC roots request: " <> T.pack (show resp)
 
--- | Default build request configuration with sensible defaults
-defaultBuildRequestInfo :: BuildRequestInfo
-defaultBuildRequestInfo = BuildRequestInfo {
-    buildTimeout = Nothing,          -- No default timeout
-    buildEnv = Map.empty,            -- No default environment variables
-    buildFlags = []                  -- No default build flags
-}
-
 -- | Shutdown the daemon (requires daemon privileges via protocol)
 shutdownDaemon :: DaemonConnection 'Builder -> IO (Either BuildError ())
 shutdownDaemon conn = do
     -- Create shutdown request
-    let request = ShutdownRequest
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "shutdown",
+        reqParams = Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -1061,7 +1154,12 @@ shutdownDaemon conn = do
 getDaemonStatus :: DaemonConnection 'Builder -> IO (Either BuildError DaemonStatus)
 getDaemonStatus conn = do
     -- Create status request
-    let request = StatusRequest
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "status",
+        reqParams = Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -1082,7 +1180,12 @@ getDaemonStatus conn = do
 getDaemonConfig :: DaemonConnection 'Builder -> IO (Either BuildError DaemonConfig)
 getDaemonConfig conn = do
     -- Create config request
-    let request = ConfigRequest
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "config",
+        reqParams = Map.empty,
+        reqPayload = Nothing
+    }
 
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
@@ -1098,8 +1201,3 @@ getDaemonConfig conn = do
         Right resp ->
             return $ Left $ DaemonError $
                 "Invalid response type for config request: " <> T.pack (show resp)
-
--- | Render BuildId to Text
-renderBuildId :: BuildId -> Text
-renderBuildId (BuildId u) = "build-" <> T.pack (show (hashUnique u))
-renderBuildId (BuildIdFromInt n) = "build-" <> T.pack (show n)

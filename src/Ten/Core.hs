@@ -848,11 +848,10 @@ data DaemonResponse
 -- | Daemon connection type - core implementation for client-server communication
 -- Parameterized by privilege tier for type-level enforcement
 data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
-    connSocket :: Socket,                     -- ^ Socket connected to daemon
-    connHandle :: Handle,                     -- ^ Handle for socket I/O
+    connHandle :: Handle,                     -- ^ Handle for all I/O operations
     connUserId :: UserId,                     -- ^ Authenticated user ID
     connAuthToken :: AuthToken,               -- ^ Authentication token
-    connRequestMap :: TVar (Map Int (MVar BS.ByteString)), -- ^ Map of pending requests
+    connRequestMap :: TVar (Map Int (MVar BS.ByteString)), -- ^ Map of pending requests (raw bytes)
     connNextReqId :: TVar Int,                -- ^ Next request ID
     connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
     connShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
@@ -977,17 +976,16 @@ instance MonadFail (TenM p t) where
     fail msg = throwError $ BuildFailed $ T.pack msg
 
 -- | Create a new daemon connection with privilege tier singleton evidence
-createDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t -> IO (DaemonConnection t)
-createDaemonConnection sock handle userId authToken priEvidence = do
+createDaemonConnection :: Handle -> UserId -> AuthToken -> SPrivilegeTier t -> IO (DaemonConnection t)
+createDaemonConnection handle userId authToken priEvidence = do
     requestMap <- newTVarIO Map.empty
     nextReqId <- newTVarIO 1
     shutdownFlag <- newTVarIO False
 
-    -- Start background thread to read responses
+    -- Start background thread to read responses using handle
     readerThread <- forkIO $ responseReaderThread handle requestMap shutdownFlag
 
     return DaemonConnection {
-        connSocket = sock,
         connHandle = handle,
         connUserId = userId,
         connAuthToken = authToken,
@@ -1004,21 +1002,18 @@ closeDaemonConnection conn = do
     -- Signal reader thread to shut down
     atomically $ writeTVar (connShutdown conn) True
 
-    -- Close socket handle
+    -- Close handle
     hClose (connHandle conn)
-
-    -- Close socket
-    close (connSocket conn)
 
     -- Kill reader thread if it doesn't exit on its own
     killThread (connReaderThread conn)
 
 -- | Execute an action with a daemon connection
-withDaemonConnection :: Socket -> Handle -> UserId -> AuthToken -> SPrivilegeTier t
+withDaemonConnection :: Handle -> UserId -> AuthToken -> SPrivilegeTier t
                      -> (DaemonConnection t -> IO a) -> IO a
-withDaemonConnection sock handle userId authToken priEvidence =
+withDaemonConnection handle userId authToken priEvidence =
     bracket
-        (createDaemonConnection sock handle userId authToken priEvidence)
+        (createDaemonConnection handle userId authToken priEvidence)
         closeDaemonConnection
 
 -- | Send a request to the daemon
@@ -1055,13 +1050,13 @@ receiveResponse conn reqId timeoutMicros = do
         Nothing ->
             return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
         Just respVar -> do
-            -- Get raw bytes from MVar
+            -- Get raw bytes from MVar with timeout
             mResult <- SystemTimeout.timeout timeoutMicros $ takeMVar respVar
 
             case mResult of
                 Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
                 Just rawBytes -> do
-                    -- Split the raw bytes back into header and payload
+                    -- Split the raw bytes into header and payload
                     case splitResponseBytes rawBytes of
                         (header, mPayload) ->
                             -- Now deserialize
@@ -1093,7 +1088,7 @@ responseReaderThread handle requestMap shutdownFlag = forever $ do
             -- Connection error, exit thread
             return ()
         Right (respData, mRespPayload) -> do
-            -- Extract response ID from respData without fully deserializing
+            -- Extract request ID from respData without fully deserializing
             let mReqId = extractRequestIdFromBytes respData
 
             -- Store the raw response bytes in the MVar
@@ -1444,7 +1439,8 @@ readBuildResultBuilder path = do
 
             case response of
                 Left err -> return $ Left err
-                Right (BuildResultResponse result) -> return $ Right result
+                Right (StoreReadResponse content) ->
+                    return $ deserializeBuildResult content
                 Right resp -> return $ Left $ StoreError $ "Unexpected response: " <> T.pack (show resp)
         _ -> return $ Left $ PrivilegeError "Cannot read build result in builder context without daemon connection"
 
@@ -1880,21 +1876,22 @@ readResponseWithTimeout handle timeoutMicros = do
                         return resp { respPayload = Just payload }
                     else return resp
 
--- | Send a message to a socket
-sendMessage :: Socket -> Message -> IO ()
-sendMessage sock msg = do
+-- | Send a message to a handle
+sendMessage :: Handle -> Message -> IO ()
+sendMessage handle msg = do
     -- Encode the message
     let encoded = encodeMessage msg
     -- Send the message
-    sendAll sock encoded
+    BS.hPut handle encoded
+    hFlush handle
 
--- | Receive a message from a socket
-receiveMessage :: Socket -> IO (Either BuildError Message)
-receiveMessage sock = do
+-- | Receive a message from a handle
+receiveMessage :: Handle -> IO (Either BuildError Message)
+receiveMessage handle = do
     -- Try to read the message
     result <- try $ do
         -- Read the length prefix (4 bytes)
-        lenBytes <- recv sock 4
+        lenBytes <- BS.hGet handle 4
         when (BS.length lenBytes /= 4) $
             throwIO $ DaemonError "Incomplete message length"
 
@@ -1911,7 +1908,7 @@ receiveMessage sock = do
             throwIO $ DaemonError $ "Message too large: " <> T.pack (show len) <> " bytes"
 
         -- Read the message body
-        msgBytes <- recv sock len
+        msgBytes <- BS.hGet handle len
         when (BS.length msgBytes /= len) $
             throwIO $ DaemonError "Incomplete message body"
 
@@ -2116,10 +2113,10 @@ decodeMessage bs =
             "config" -> Right $ ConfigError msg
             _ -> Right $ InternalError $ "Unknown error type: " <> errType <> " - " <> msg
 
--- | Receive a request from the socket
-receiveRequest :: Socket -> IO (Either BuildError Request)
-receiveRequest sock = do
-    msgResult <- receiveMessage sock
+-- | Receive a request from the handle
+receiveRequest :: Handle -> IO (Either BuildError Request)
+receiveRequest handle = do
+    msgResult <- receiveMessage handle
     case msgResult of
         Left err -> return $ Left err
         Right (RequestMessage req) -> return $ Right req
@@ -2769,95 +2766,4 @@ instance Aeson.FromJSON BuildResult where
         let outputs = Set.fromList $ catMaybes $ map parseStorePath outputTexts
         let references = Set.fromList $ catMaybes $ map parseStorePath referenceTexts
 
-        return $ BuildResult outputs exitCode log references
-      where
-        parseExitCode = Aeson.withObject "ExitCode" $ \v -> do
-            success <- v Aeson..: "success"
-            code <- v Aeson..: "code"
-            return $ if success then ExitSuccess else ExitFailure code
-
--- JSON instance for GCStats
-instance Aeson.ToJSON GCStats where
-    toJSON GCStats{..} = Aeson.object [
-        "total" Aeson..= gcTotal,
-        "live" Aeson..= gcLive,
-        "collected" Aeson..= gcCollected,
-        "bytes" Aeson..= gcBytes,
-        "elapsedTime" Aeson..= gcElapsedTime
-        ]
-
-instance Aeson.FromJSON GCStats where
-    parseJSON = Aeson.withObject "GCStats" $ \v -> do
-        gcTotal <- v Aeson..: "total"
-        gcLive <- v Aeson..: "live"
-        gcCollected <- v Aeson..: "collected"
-        gcBytes <- v Aeson..: "bytes"
-        gcElapsedTime <- v Aeson..: "elapsedTime"
-        return $ GCStats{..}
-
--- JSON instance for DaemonConfig
-instance Aeson.ToJSON DaemonConfig where
-    toJSON DaemonConfig{..} = Aeson.object [
-        "socketPath" Aeson..= daemonSocketPath,
-        "storePath" Aeson..= daemonStorePath,
-        "stateFile" Aeson..= daemonStateFile,
-        "logFile" Aeson..= daemonLogFile,
-        "logLevel" Aeson..= daemonLogLevel,
-        "gcInterval" Aeson..= daemonGcInterval,
-        "user" Aeson..= daemonUser,
-        "group" Aeson..= daemonGroup,
-        "allowedUsers" Aeson..= Set.toList daemonAllowedUsers,
-        "maxJobs" Aeson..= daemonMaxJobs,
-        "foreground" Aeson..= daemonForeground,
-        "tmpDir" Aeson..= daemonTmpDir
-        ]
-
-instance Aeson.FromJSON DaemonConfig where
-    parseJSON = Aeson.withObject "DaemonConfig" $ \v -> do
-        daemonSocketPath <- v Aeson..: "socketPath"
-        daemonStorePath <- v Aeson..: "storePath"
-        daemonStateFile <- v Aeson..: "stateFile"
-        daemonLogFile <- v Aeson..:? "logFile"
-        daemonLogLevel <- v Aeson..: "logLevel"
-        daemonGcInterval <- v Aeson..:? "gcInterval"
-        daemonUser <- v Aeson..:? "user"
-        daemonGroup <- v Aeson..:? "group"
-        allowedUsersRaw <- v Aeson..:? "allowedUsers" Aeson..!= []
-        daemonMaxJobs <- v Aeson..: "maxJobs"
-        daemonForeground <- v Aeson..: "foreground"
-        daemonTmpDir <- v Aeson..: "tmpDir"
-
-        let daemonAllowedUsers = Set.fromList allowedUsersRaw
-
-        return DaemonConfig{..}
-
--- JSON instance for BuildError
-instance Aeson.FromJSON BuildError where
-    parseJSON = Aeson.withObject "BuildError" $ \v -> do
-        errorType <- v Aeson..: "errorType" :: Parser Text
-        message <- v Aeson..: "message"
-
-        case errorType of
-            "eval" -> return $ EvalError message
-            "build" -> return $ BuildFailed message
-            "store" -> return $ StoreError message
-            "sandbox" -> return $ SandboxError message
-            "input" -> return $ InputNotFound (T.unpack message)
-            "hash" -> return $ HashError message
-            "graph" -> return $ GraphError message
-            "resource" -> return $ ResourceError message
-            "daemon" -> return $ DaemonError message
-            "auth" -> return $ AuthError message
-            "cycle" -> return $ CyclicDependency message
-            "serialization" -> return $ SerializationError message
-            "recursion" -> return $ RecursionLimit message
-            "network" -> return $ NetworkError message
-            "parse" -> return $ ParseError message
-            "db" -> return $ DBError message
-            "gc" -> return $ GCError message
-            "phase" -> return $ PhaseError message
-            "privilege" -> return $ PrivilegeError message
-            "protocol" -> return $ ProtocolError message
-            "internal" -> return $ InternalError message
-            "config" -> return $ ConfigError message
-            _ -> return $ InternalError $ "Unknown error type: " <> errorType <> " - " <> message
+        return $ BuildResult

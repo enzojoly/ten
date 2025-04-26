@@ -406,7 +406,7 @@ shutdownDaemon context logHandle = do
     stopServer (ctxPrivilegeEvidence context) (ctxServer context)
 
     -- Terminate any running builder processes
-    builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
+    builderProcesses <- readTVarIO (ctxBuilderProcesses context)
     forM_ (Map.toList builderProcesses) $ \(buildId, asyncProc) -> do
         logMessage logHandle (daemonLogLevel (ctxConfig context)) LogNormal $
             "Terminating builder process for build: " ++ show buildId
@@ -558,7 +558,7 @@ runDaemonLoop context = do
     -- Set up thread that checks shutdown flag
     let loop = do
             -- Check if we should shut down
-            shouldShutdown <- atomically $ readTVar (ctxShutdownFlag context)
+            shouldShutdown <- readTVarIO (ctxShutdownFlag context)
             if shouldShutdown
                 then return ()  -- Exit loop to start shutdown
                 else do
@@ -583,7 +583,7 @@ runDaemonLoop context = do
 handleCompletedBuilders :: DaemonContext t -> IO ()
 handleCompletedBuilders context = do
     -- Get all running builder processes
-    builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
+    builderProcesses <- atomically $ readTVarIO (ctxBuilderProcesses context)
 
     -- Check for completed processes
     completedBuilds <- forM (Map.toList builderProcesses) $ \(buildId, asyncProc) -> do
@@ -674,7 +674,7 @@ spawnBuilder context derivation buildId = do
             ("TEN_BUILD_DIR", buildDir),
             ("TEN_OUT", buildDir </> "out"),
             ("TEN_TMP", buildDir </> "tmp")
-        ]
+            ]
 
     -- Spawn the builder process as async task with appropriate privilege drop
     asyncProcess <- async $ do
@@ -817,7 +817,7 @@ monitorBuilder context buildId asyncProcess = do
 abortBuilder :: DaemonContext t -> BuildId -> IO ()
 abortBuilder context buildId = do
     -- Get the async process
-    builderProcesses <- atomically $ readTVar (ctxBuilderProcesses context)
+    builderProcesses <- readTVarIO (ctxBuilderProcesses context)
     case Map.lookup buildId builderProcesses of
         Nothing ->
             -- Build not running
@@ -912,7 +912,7 @@ stateSaverWorker context = do
         -- Save every 5 minutes
         loop = do
             -- Check if we should shut down
-            shouldShutdown <- atomically $ readTVar (ctxShutdownFlag context)
+            shouldShutdown <- readTVarIO (ctxShutdownFlag context)
             unless shouldShutdown $ do
                 -- Save state with proper privilege context
                 result <- try $ withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
@@ -946,7 +946,7 @@ gcWorker context interval = do
 
         loop = do
             -- Check if we should shut down
-            shouldShutdown <- atomically $ readTVar (ctxShutdownFlag context)
+            shouldShutdown <- readTVarIO (ctxShutdownFlag context)
             unless shouldShutdown $ do
                 -- Check if we can run GC with proper privilege evidence
                 canGC <- withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->

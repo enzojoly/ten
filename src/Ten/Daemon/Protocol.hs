@@ -114,7 +114,6 @@ import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Word (Word8, Word32, Word64)
 import GHC.Generics (Generic)
 import Network.Socket (Socket, close, socketToHandle)
-import qualified Network.Socket.ByteString as NByte
 import System.IO (Handle, IOMode(..), hClose, hFlush, hSetBuffering, BufferMode(..))
 import System.Exit (ExitCode(ExitSuccess, ExitFailure))
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush)
@@ -355,10 +354,9 @@ data DaemonRequest
 
 -- | Protocol handle type for managing connections
 data ProtocolHandle = ProtocolHandle {
-    protocolSocket :: Socket,
-    protocolHandle :: Handle,  -- Handle converted from socket for I/O operations
-    protocolLock :: MVar (),  -- For thread safety
-    protocolPrivilegeTier :: PrivilegeTier -- Track privilege level of connection
+    protocolHandle :: Handle,  -- ^ Handle for all I/O operations
+    protocolLock :: MVar (),   -- ^ For thread safety
+    protocolPrivilegeTier :: PrivilegeTier -- ^ Track privilege level of connection
 }
 
 -- | Check if a request has the necessary capabilities
@@ -403,20 +401,16 @@ checkPrivilegeRequirement st reqPriv =
 -- | Create a protocol handle from a socket
 createProtocolHandle :: Socket -> PrivilegeTier -> IO ProtocolHandle
 createProtocolHandle sock tier = do
-    lock <- newMVar ()
-    -- Convert socket to handle for higher-level I/O operations
+    -- Socket-to-Handle conversion happens exactly once here
     handle <- socketToHandle sock ReadWriteMode
-    -- Set buffering mode for better performance
     hSetBuffering handle (BlockBuffering Nothing)
-    return $ ProtocolHandle sock handle lock tier
+    lock <- newMVar ()
+    return $ ProtocolHandle handle lock tier
 
 -- | Close a protocol handle
 closeProtocolHandle :: ProtocolHandle -> IO ()
 closeProtocolHandle ph = do
-    -- Close the handle first (this flushes any buffered data)
     hClose (protocolHandle ph)
-    -- Socket is closed automatically when handle is closed, but we do it explicitly for clarity
-    close (protocolSocket ph)
 
 -- | Create a framed request for sending over the wire
 -- Format: [4-byte message length][message data]
@@ -1116,7 +1110,7 @@ serializeDaemonResponse resp =
     errorTypeString (ConfigError _) = "config"
 
 -- | Send a daemon request through a protocol handle
-sendDaemonRequest :: ProtocolHandle -> DaemonRequest -> IO (Either ProtocolError DaemonResponse)
+sendDaemonRequest :: ProtocolHandle -> DaemonRequest -> IO (Either ProtocolError BS.ByteString)
 sendDaemonRequest ph req = do
     -- Take the lock for thread safety
     withMVar (protocolLock ph) $ \_ -> do
@@ -1143,31 +1137,41 @@ sendDaemonRequest ph req = do
             hFlush (protocolHandle ph)
 
             -- Read response using the handle
-            receiveFramedResponse (protocolHandle ph)
+            (respData, mRespPayload) <- receiveFramedResponse (protocolHandle ph)
+
+            -- Return the raw response
+            let rawResponse = case mRespPayload of
+                    Just payload -> BS.concat [respData, payload]
+                    Nothing -> respData
+
+            return rawResponse
 
         case result of
             Left (e :: SomeException) ->
-                return $ Left $ ConnectionClosed
-
-            Right (respData, mRespPayload) -> do
-                -- Deserialize response
-                case deserializeDaemonResponse respData mRespPayload of
-                    Left err -> return $ Left $ ProtocolParseError err
-                    Right resp -> return $ Right resp
+                return $ Left ConnectionClosed
+            Right rawResponse ->
+                return $ Right rawResponse
 
 -- | Receive a daemon response from a handle
-receiveDaemonResponse :: Handle -> IO (Either ProtocolError DaemonResponse)
+receiveDaemonResponse :: Handle -> IO (Either ProtocolError BS.ByteString)
 receiveDaemonResponse handle = do
     -- Try to read the response
-    result <- try $ receiveFramedResponse handle
+    result <- try $ do
+        -- Read response frame
+        (respData, mRespPayload) <- receiveFramedResponse handle
+
+        -- Return the raw response
+        let rawResponse = case mRespPayload of
+                Just payload -> BS.concat [respData, payload]
+                Nothing -> respData
+
+        return rawResponse
+
     case result of
         Left (e :: SomeException) ->
             return $ Left ConnectionClosed
-        Right (respData, mRespPayload) -> do
-            -- Deserialize response
-            case deserializeDaemonResponse respData mRespPayload of
-                Left err -> return $ Left $ ProtocolParseError err
-                Right resp -> return $ Right resp
+        Right rawResponse ->
+            return $ Right rawResponse
 
 -- | Send a daemon response through a protocol handle
 sendDaemonResponse :: ProtocolHandle -> DaemonResponse -> IO ()
@@ -1201,28 +1205,10 @@ receiveDaemonRequest handle = do
     -- Try to read the request
     result <- try $ do
         -- Read request frame
-        requestData <- recvFrame handle
-
-        -- Check if request indicates a payload
-        hasPayload <- case Aeson.decodeStrict requestData of
-            Nothing -> return False
-            Just obj -> return $ case Aeson.fromJSON obj of
-                Aeson.Success (Aeson.Object o) ->
-                    case KeyMap.lookup "hasContent" o of
-                        Just (Aeson.Bool True) -> True
-                        _ -> False
-                _ -> False
-
-        -- Read payload if indicated
-        mPayload <- if hasPayload
-            then do
-                payloadData <- recvFrame handle
-                return $ Just payloadData
-            else
-                return Nothing
+        (reqData, mPayload) <- receiveFramedResponse handle
 
         -- Return request data and optional payload
-        return (requestData, mPayload)
+        return (reqData, mPayload)
 
     case result of
         Left (e :: SomeException) ->
@@ -1233,26 +1219,6 @@ receiveDaemonRequest handle = do
             case deserializeDaemonRequest reqData mPayload of
                 Left err -> return $ Left $ ProtocolParseError err
                 Right req -> return $ Right req
-  where
-    recvFrame :: Handle -> IO BS.ByteString
-    recvFrame h = do
-        -- Read length prefix (4 bytes)
-        lenBytes <- BS.hGet h 4
-        when (BS.length lenBytes /= 4) $
-            throwIO ConnectionClosed
-
-        -- Parse length
-        let len = (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
-                 (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
-                 (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
-                 (fromIntegral (BS.index lenBytes 3) :: Word32)
-
-        -- Check if message is too large
-        when (len > 100 * 1024 * 1024) $ -- 100 MB limit
-            throwIO $ MessageTooLarge len
-
-        -- Read message data
-        BS.hGet h (fromIntegral len)
 
 -- | Convert from Response payload to ResponseData
 responseToResponseData :: Aeson.Value -> Either Text DaemonResponse
