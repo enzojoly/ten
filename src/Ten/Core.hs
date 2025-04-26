@@ -2083,35 +2083,6 @@ decodeMessage bs =
         -- For now, just return a placeholder
         Right $ Response respId respStatus respMessage respData (if hasPayload then Just BS.empty else Nothing)
 
-    parseError :: Aeson.Object -> Either Text BuildError
-    parseError obj = do
-        errType <- maybe (Left "Missing error type") Right $ AKeyMap.lookup "errorType" obj >>= Aeson.parseMaybe Aeson.parseJSON
-        msg <- maybe (Left "Missing error message") Right $ AKeyMap.lookup "message" obj >>= Aeson.parseMaybe Aeson.parseJSON
-
-        case errType of
-            "eval" -> Right $ EvalError msg
-            "build" -> Right $ BuildFailed msg
-            "store" -> Right $ StoreError msg
-            "sandbox" -> Right $ SandboxError msg
-            "input" -> Right $ InputNotFound (T.unpack msg)
-            "hash" -> Right $ HashError msg
-            "graph" -> Right $ GraphError msg
-            "resource" -> Right $ ResourceError msg
-            "daemon" -> Right $ DaemonError msg
-            "auth" -> Right $ AuthError msg
-            "cycle" -> Right $ CyclicDependency msg
-            "serialization" -> Right $ SerializationError msg
-            "recursion" -> Right $ RecursionLimit msg
-            "network" -> Right $ NetworkError msg
-            "parse" -> Right $ ParseError msg
-            "db" -> Right $ DBError msg
-            "gc" -> Right $ GCError msg
-            "phase" -> Right $ PhaseError msg
-            "privilege" -> Right $ PrivilegeError msg
-            "protocol" -> Right $ ProtocolError msg
-            "internal" -> Right $ InternalError msg
-            "config" -> Right $ ConfigError msg
-            _ -> Right $ InternalError $ "Unknown error type: " <> errType <> " - " <> msg
 
 -- | Receive a request from the handle
 receiveRequest :: Handle -> IO (Either BuildError Request)
@@ -2752,7 +2723,65 @@ instance Aeson.ToJSON BuildResult where
             "success" Aeson..= False
             ]
 
+-- Add this after the GCStats definition:
+instance Aeson.FromJSON GCStats where
+    parseJSON = Aeson.withObject "GCStats" $ \v -> do
+        gcTotal <- v Aeson..: "total"
+        gcLive <- v Aeson..: "live"
+        gcCollected <- v Aeson..: "collected"
+        gcBytes <- v Aeson..: "bytes"
+        gcElapsedTime <- v Aeson..: "elapsedTime"
+        return GCStats{..}
 
+-- Add this after the DaemonConfig definition:
+instance Aeson.FromJSON DaemonConfig where
+    parseJSON = Aeson.withObject "DaemonConfig" $ \v -> do
+        daemonSocketPath <- v Aeson..: "socketPath"
+        daemonStorePath <- v Aeson..: "storePath"
+        daemonStateFile <- v Aeson..: "stateFile"
+        daemonLogFile <- v Aeson..:? "logFile"
+        daemonLogLevel <- v Aeson..: "logLevel"
+        daemonGcInterval <- v Aeson..:? "gcInterval"
+        daemonUser <- v Aeson..:? "user"
+        daemonGroup <- v Aeson..:? "group"
+        daemonAllowedUsers <- v Aeson..: "allowedUsers"
+        daemonMaxJobs <- v Aeson..: "maxJobs"
+        daemonForeground <- v Aeson..: "foreground"
+        daemonTmpDir <- v Aeson..: "tmpDir"
+        return DaemonConfig{..}
+
+-- For BuildError, let's implement the parseError function:
+parseError :: Aeson.Value -> Either Text BuildError
+parseError = Aeson.withObject "BuildError" $ \o -> do
+    errType <- maybe (Left "Missing error type") Right $
+               AKeyMap.lookup "type" o >>= Aeson.parseMaybe Aeson.parseJSON
+    msg <- maybe (Left "Missing error message") Right $
+          AKeyMap.lookup "message" o >>= Aeson.parseMaybe Aeson.parseJSON
+
+    case errType of
+        "eval" -> Right $ EvalError msg
+        "build" -> Right $ BuildFailed msg
+        "store" -> Right $ StoreError msg
+        "sandbox" -> Right $ SandboxError msg
+        "input" -> Right $ InputNotFound (T.unpack msg)
+        "hash" -> Right $ HashError msg
+        "graph" -> Right $ GraphError msg
+        "resource" -> Right $ ResourceError msg
+        "daemon" -> Right $ DaemonError msg
+        "auth" -> Right $ AuthError msg
+        "cycle" -> Right $ CyclicDependency msg
+        "serialization" -> Right $ SerializationError msg
+        "recursion" -> Right $ RecursionLimit msg
+        "network" -> Right $ NetworkError msg
+        "parse" -> Right $ ParseError msg
+        "db" -> Right $ DBError msg
+        "gc" -> Right $ GCError msg
+        "phase" -> Right $ PhaseError msg
+        "privilege" -> Right $ PrivilegeError msg
+        "protocol" -> Right $ ProtocolError msg
+        "internal" -> Right $ InternalError msg
+        "config" -> Right $ ConfigError msg
+        _ -> Left $ "Unknown error type: " <> errType
 
 parseExitCode :: Aeson.Value -> Parser ExitCode
 parseExitCode = Aeson.withObject "ExitCode" $ \o -> do
