@@ -34,6 +34,8 @@ import Control.Monad (forM, forM_, when, unless, void, foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.Except (throwError, catchError)
+import Control.Monad (mzero)
+import System.IO (stderr, hPutStrLn)
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe, listToMaybe, catMaybes, isJust)
 import Data.Set (Set)
@@ -163,7 +165,11 @@ parseStorePathField = do
     pathText <- field :: RowParser Text
     case parseStorePath pathText of
         Just path -> return path
-        Nothing -> fail $ "Invalid store path: " ++ T.unpack pathText
+        Nothing -> do
+            -- Use liftIO to log the error with an informative message
+            liftIO $ hPutStrLn stderr $ "Error: Invalid store path: " ++ T.unpack pathText
+            -- Then use mzero to fail the parser
+            mzero
 
 -- | Type class for derivation storage operations
 class CanStoreDerivation (t :: PrivilegeTier) where
