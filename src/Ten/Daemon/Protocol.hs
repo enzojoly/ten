@@ -133,7 +133,7 @@ import Ten.Derivation
 import Ten.Core (
     -- Core types
     Phase(..), SPhase(..), PrivilegeTier(..), SPrivilegeTier(..), TenM(..),
-    BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), storePathToText,
+    BuildId(..), BuildRequestInfo(..), BuildStatus(..), BuildError(..), StorePath(..), storePathToText,
     UserId(..), AuthToken(..), StoreReference(..), ReferenceType(..),
     Derivation(..), DerivationInput(..), DerivationOutput(..),
     BuildResult(..), ProtocolVersion(..), currentProtocolVersion,
@@ -1530,18 +1530,3 @@ instance Aeson.FromJSON Derivation where
                 return $ StorePath hash name') pathObj
 
             return $ DerivationOutput name path
-
--- JSON instance for BuildRequestInfo
-instance Aeson.ToJSON BuildRequestInfo where
-    toJSON BuildRequestInfo{..} = Aeson.object [
-            "timeout" .= buildTimeout,
-            "env" .= buildEnv,
-            "flags" .= buildFlags
-        ]
-
-instance Aeson.FromJSON BuildRequestInfo where
-    parseJSON = Aeson.withObject "BuildRequestInfo" $ \v -> do
-        buildTimeout <- v .: "timeout"
-        buildEnv <- v .: "env"
-        buildFlags <- v .: "flags"
-        return BuildRequestInfo{..}

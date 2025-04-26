@@ -159,7 +159,7 @@ instance CanStoreBuildDerivation 'Core.Builder where
                 let serialized = serializeDerivation drv
                 let request = Core.Request {
                     Core.reqId = 0,
-                    Core.reqType = "store-derivation-build",
+                    Core.reqType = "store-derivation",
                     Core.reqParams = Map.singleton "name" (Core.derivName drv <> ".drv"),
                     Core.reqPayload = Just serialized
                 }
@@ -169,15 +169,9 @@ instance CanStoreBuildDerivation 'Core.Builder where
 
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if Core.respStatus resp == "ok"
-                            then case Map.lookup "path" (Core.respData resp) of
-                                Just pathText ->
-                                    case Core.parseStorePath pathText of
-                                        Just path -> return path
-                                        Nothing -> throwError $ Core.StoreError "Invalid path in response"
-                                Nothing -> throwError $ Core.StoreError "Missing path in response"
-                            else throwError $ Core.StoreError $ Core.respMessage resp
+                    Right (Core.DerivationStoredResponse path) -> return path
+                    Right (Core.ErrorResponse err) -> throwError err
+                    Right resp -> throwError $ Core.StoreError $ "Unexpected response: " <> T.pack (show resp)
 
             _ -> throwError $ Core.PrivilegeError "Cannot store derivation in build phase without daemon connection"
 
@@ -250,7 +244,7 @@ instance CanRetrieveDerivation p 'Core.Builder where
                     -- Create request
                     let request = Core.Request {
                         Core.reqId = 0,
-                        Core.reqType = "get-derivation",
+                        Core.reqType = "retrieve-derivation",
                         Core.reqParams = Map.singleton "path" (Core.storePathToText p),
                         Core.reqPayload = Nothing
                     }
@@ -260,16 +254,8 @@ instance CanRetrieveDerivation p 'Core.Builder where
 
                     case response of
                         Left _ -> return Nothing
-                        Right resp ->
-                            if Core.respStatus resp == "ok"
-                                then case Core.respPayload resp of
-                                    Just content ->
-                                        case deserializeDerivation content of
-                                            Left _ -> return Nothing
-                                            Right drv -> return $ Just drv
-                                    Nothing -> return Nothing
-                                else return Nothing
-
+                        Right (Core.DerivationRetrievedResponse mDeriv) -> return mDeriv
+                        Right _ -> return Nothing
                 _ -> return Nothing  -- Not in client mode
 
 -- | Convenience functions for phase-specific derivation retrieval
@@ -404,12 +390,9 @@ readViaProtocolBuilder path = do
 
             case response of
                 Left err -> throwError err
-                Right resp ->
-                    if Core.respStatus resp == "ok"
-                        then case Core.respPayload resp of
-                            Just content -> return content
-                            Nothing -> throwError $ Core.StoreError "Missing content in response"
-                        else throwError $ Core.StoreError $ Core.respMessage resp
+                Right (Core.StoreReadResponse content) -> return content
+                Right (Core.ErrorResponse err) -> throwError err
+                Right resp -> throwError $ Core.StoreError $ "Unexpected response: " <> T.pack (show resp)
 
         _ -> throwError $ Core.PrivilegeError "Cannot read via protocol without daemon connection"
 
@@ -574,26 +557,26 @@ requestSandboxCreation e i c = do
                             case err of
                                 Core.DaemonError m -> m
                                 _ -> T.pack (show err)
-                Right resp ->
-                    if Core.respStatus resp == "ok"
-                        then case Map.lookup "sandboxPath" (Core.respData resp) of
-                            Just sandboxPath -> do
-                                -- Create inputs directory for builder
-                                let sandboxDir = T.unpack sandboxPath
-                                liftIO $ createDirectoryIfMissing True (sandboxDir </> "inputs")
-                                liftIO $ createDirectoryIfMissing True (sandboxDir </> "work")
-                                liftIO $ createDirectoryIfMissing True (sandboxDir </> "outputs")
+                -- In a Nix-like architecture, there should be a specific response type for sandbox creation
+                -- Something like 'SandboxCreatedResponse Text' for the sandbox path
+                -- For now, we have to use a generic response and extract the path
+                Right (Core.StorePathResponse path) -> do
+                    -- Create inputs directory for builder
+                    let sandboxDir = T.unpack (Core.storePathToText path)
+                    liftIO $ createDirectoryIfMissing True (sandboxDir </> "inputs")
+                    liftIO $ createDirectoryIfMissing True (sandboxDir </> "work")
+                    liftIO $ createDirectoryIfMissing True (sandboxDir </> "outputs")
 
-                                -- Create symlinks to inputs
-                                forM_ (Set.toList i) $ \path -> do
-                                    let storePath = Core.storePathToFilePath path e
-                                    let targetPath = sandboxDir </> "inputs" </> T.unpack (Core.storeName path)
-                                    liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
-                                    liftIO $ Posix.createSymbolicLink storePath targetPath
+                    -- Create symlinks to inputs
+                    forM_ (Set.toList i) $ \path -> do
+                        let storePath = Core.storePathToFilePath path e
+                        let targetPath = sandboxDir </> "inputs" </> T.unpack (Core.storeName path)
+                        liftIO $ createDirectoryIfMissing True (takeDirectory targetPath)
+                        liftIO $ Posix.createSymbolicLink storePath targetPath
 
-                                return sandboxDir
-                            Nothing -> throwError $ Core.SandboxError "Missing sandbox path in response"
-                        else throwError $ Core.SandboxError $ Core.respMessage resp
+                    return sandboxDir
+                Right (Core.ErrorResponse err) -> throwError $ Core.SandboxError $ Core.buildErrorToText err
+                Right resp -> throwError $ Core.SandboxError $ "Unexpected response: " <> T.pack (show resp)
 
         _ -> throwError $ Core.PrivilegeError "Cannot request sandbox creation without daemon connection"
   where

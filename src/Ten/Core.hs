@@ -30,6 +30,7 @@ module Ten.Core (
     BuildState(..),
     BuildError(..),
     BuildId(..),
+    BuildRequestInfo(..),
     BuildStatus(..),
     BuildStrategy(..),
     RunMode(..),
@@ -737,6 +738,13 @@ data Response = Response {
     respMessage :: Text,                  -- ^ Response message
     respData :: Map Text Text,            -- ^ Response data
     respPayload :: Maybe ByteString       -- ^ Optional binary payload
+} deriving (Show, Eq)
+
+-- | Build request information for protocol communication
+data BuildRequestInfo = BuildRequestInfo {
+    buildTimeout :: Maybe Int,      -- ^ Optional timeout in seconds
+    buildEnv :: Map Text Text,      -- ^ Additional environment variables
+    buildFlags :: [Text]            -- ^ Build flags
 } deriving (Show, Eq)
 
 -- | Full derivation information (Moved from Protocol.hs)
@@ -2497,6 +2505,20 @@ instance Aeson.FromJSON Response where
       respData = respData,
       respPayload = if hasPayload then Just BS.empty else Nothing
     }
+
+instance Aeson.ToJSON BuildRequestInfo where
+    toJSON BuildRequestInfo{..} = Aeson.object [
+            "timeout" Aeson..= buildTimeout,
+            "env" Aeson..= buildEnv,
+            "flags" Aeson..= buildFlags
+        ]
+
+instance Aeson.FromJSON BuildRequestInfo where
+    parseJSON = Aeson.withObject "BuildRequestInfo" $ \v -> do
+        buildTimeout <- v Aeson..: "timeout"
+        buildEnv <- v Aeson..: "env"
+        buildFlags <- v Aeson..: "flags"
+        return BuildRequestInfo{..}
 
 instance Aeson.ToJSON Response where
   toJSON resp = Aeson.object [
