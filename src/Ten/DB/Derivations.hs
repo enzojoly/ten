@@ -421,10 +421,10 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
 
         -- Now load each derivation
         derivations <- forM derivInfos $ \derivInfo -> do
-            mDrv <- retrieveDerivation (derivInfoHash derivInfo)
+            mDrv <- retrieveDerivation (derivationHash derivInfo)
             case mDrv of
                 Nothing -> return Nothing
-                Just drv -> return $ Just (T.unpack (derivInfoHash derivInfo), drv)
+                Just drv -> return $ Just (T.unpack (derivationHash derivInfo), drv)
 
         -- Filter out Nothings and convert to Map
         return $ Map.fromList $ catMaybes derivations
@@ -506,10 +506,10 @@ instance CanRetrieveDerivation 'Build 'Daemon where
 
         -- Now load each derivation
         derivations <- forM derivInfos $ \derivInfo -> do
-            mDrv <- retrieveDerivation (derivInfoHash derivInfo)
+            mDrv <- retrieveDerivation (derivationHash derivInfo)
             case mDrv of
                 Nothing -> return Nothing
-                Just drv -> return $ Just (T.unpack (derivInfoHash derivInfo), drv)
+                Just drv -> return $ Just (T.unpack (derivationHash derivInfo), drv)
 
         -- Filter out Nothings and convert to Map
         return $ Map.fromList $ catMaybes derivations
@@ -1307,7 +1307,7 @@ readDerivationFromStore path = do
                 do
                     mDerivInfo <- getDerivationForOutput sp
                     case mDerivInfo of
-                        Just info -> retrieveDerivation (derivInfoHash info)
+                        Just info -> retrieveDerivation (derivationHash info)
                         Nothing -> return Nothing
 
 -- | Read and deserialize a derivation file
