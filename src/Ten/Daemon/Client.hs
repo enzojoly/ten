@@ -279,7 +279,9 @@ receiveResponse conn reqId timeoutMicros = do
             -- Return response or error
             case mResult of
                 Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
-                Just resp -> return $ Right resp
+                Just resp -> case deserializeDaemonResponse (respData resp) (respPayload resp) of
+                    Left err -> return $ Left $ ProtocolError err
+                    Right daemonResp -> return $ Right daemonResp
 
 -- | Send a request and wait for response (synchronous)
 sendRequestSync :: DaemonConnection 'Builder -> DaemonRequest -> Int -> IO (Either BuildError DaemonResponse)
