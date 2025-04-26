@@ -270,7 +270,7 @@ import System.Environment (lookupEnv, getEnvironment)
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
 import qualified System.Posix.IO as PosixIO
 import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
-import Text.Read (readPrec)
+import Text.Read (readPrec, readMaybe)
 import qualified Text.Read as Read
 import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, myThreadId)
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
