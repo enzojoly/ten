@@ -37,6 +37,7 @@ module Ten.Daemon.Client (
     addFileToStore,
     verifyStorePath,
     getStorePathForFile,
+    readStoreContent,
     listStore,
 
     -- Derivation operations
@@ -784,6 +785,29 @@ getStorePathForFile conn filePath = do
                 Right resp ->
                     return $ Left $ DaemonError $
                         "Invalid response type for store path request: " <> T.pack (show resp)
+
+-- | Read from the store via daemon
+readStoreContent :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError ByteString)
+readStoreContent conn path = do
+    -- Create request for store content
+    let request = Request {
+        reqId = 0,  -- Will be set by sendRequest
+        reqType = "store-read",
+        reqParams = Map.singleton "path" (storePathToText path),
+        reqPayload = Nothing
+    }
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request 30000000  -- 30 second timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+        Right (StoreReadResponse content) ->
+            return $ Right content
+        Right resp ->
+            return $ Left $ DaemonError $ "Invalid response type for store read request: " <> T.pack (show resp)
 
 -- | List store contents
 listStore :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
