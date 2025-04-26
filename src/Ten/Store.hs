@@ -1136,7 +1136,7 @@ requestVerifyPath path = do
                     return False  -- Any error means verification failed
                 Right resp ->
                     if isDaemonResponseOk resp
-                        then getExistsFromDaemonResponse resp
+                        then return $ getExistsFromDaemonResponse resp
                         else return False
 
 -- | Request references from a path via protocol
@@ -1161,7 +1161,7 @@ requestReferencesFromPath path = do
             return Set.empty  -- Return empty set on error
         Right resp ->
             if isDaemonResponseOk resp
-                then getReferencesFromDaemonResponse resp
+                then return $ getReferencesFromDaemonResponse resp
                 else return Set.empty
 
 -- | Request referrers to a path via protocol
@@ -1186,7 +1186,7 @@ requestReferrersToPath path = do
             return Set.empty  -- Return empty set on error
         Right resp ->
             if isDaemonResponseOk resp
-                then getReferencesFromDaemonResponse resp
+                then return $ getReferencesFromDaemonResponse resp
                 else return Set.empty
 
 -- | Scan a file for references to store paths
