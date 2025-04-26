@@ -16,7 +16,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 module Ten.Daemon.Auth (
-    -- Core authentication types
+    -- Core authentication types from Protocol
     UserCredentials(..),
     AuthToken(..),
 
@@ -38,17 +38,12 @@ module Ten.Daemon.Auth (
     hashPassword,
     verifyPassword,
 
-    -- Permission types and functions
-    Permission(..),
-    UserPermissionLevel(..),
-    PrivilegeRequirement(..),
-    permissionToText,
-    textToPermission,
-    permissionLevelToText,
-    textToPermissionLevel,
-    defaultPermissions,
-    permissionRequiresDaemon,
-    filterPermissionsForTier,
+    -- Permission types and functions (using Protocol's DaemonCapability)
+    permissionToCapability,
+    capabilityToPermission,
+    defaultCapabilities,
+    capabilityRequiresDaemon,
+    filterCapabilitiesForTier,
 
     -- System user integration
     getSystemUserInfo,
@@ -71,7 +66,7 @@ module Ten.Daemon.Auth (
 
     -- Privilege transitions
     dropTokenPrivileges,
-    hasPrivilegeForPermission,
+    hasPrivilegeForCapability,
 
     -- Auth file management
     loadAuthFile,
@@ -131,8 +126,11 @@ import System.Posix.Types (UserID, GroupID)
 import qualified System.Posix.User as PosixUser
 import System.Random (randomRIO)
 
--- Import Ten modules
+-- Import Ten.Core for basic types
 import Ten.Core
+
+-- Import Protocol for authentication and security model
+import Ten.Daemon.Protocol
 
 -- | Authentication errors
 data AuthError
@@ -150,40 +148,14 @@ data AuthError
 
 instance Exception AuthError
 
--- | User credentials for authentication with privilege tier request
-data UserCredentials = UserCredentials {
-    ucUsername :: Text,
-    ucToken :: Text,
-    ucRequestedTier :: PrivilegeTier  -- Requested privilege tier
+-- | Stored password hash
+data PasswordHash = PasswordHash {
+    phAlgorithm :: Text,      -- Hash algorithm (e.g., "pbkdf2-sha512")
+    phSalt :: BS.ByteString,  -- Salt value
+    phHash :: BS.ByteString,  -- Actual hash value
+    phIterations :: Int,      -- Number of iterations
+    phCreated :: UTCTime      -- When this hash was created
 } deriving (Show, Eq)
-
--- | User permission levels
-data UserPermissionLevel
-    = UserLevelNone       -- No access
-    | UserLevelBasic      -- Basic access (read-only)
-    | UserLevelStandard   -- Standard user (can build)
-    | UserLevelAdvanced   -- Advanced user (can manage own builds)
-    | UserLevelAdmin      -- Administrator (full access)
-    deriving (Show, Eq, Ord, Enum, Bounded)
-
--- | Privilege requirement for operations
-data PrivilegeRequirement
-    = DaemonRequired      -- Requires daemon privileges
-    | BuilderSufficient   -- Can be done with builder privileges
-    deriving (Show, Eq)
-
--- | Specific permissions
-data Permission
-    = PermBuild              -- Can build derivations
-    | PermCancelBuild        -- Can cancel builds
-    | PermQueryBuild         -- Can query build status
-    | PermQueryStore         -- Can query store contents
-    | PermModifyStore        -- Can add to store
-    | PermRunGC              -- Can run garbage collection
-    | PermShutdown           -- Can shut down daemon
-    | PermManageUsers        -- Can manage users
-    | PermAdmin              -- Administrative access
-    deriving (Show, Eq, Ord, Enum, Bounded)
 
 -- | Token information with privilege tier tracking
 data TokenInfo (t :: PrivilegeTier) = TokenInfo {
@@ -192,7 +164,7 @@ data TokenInfo (t :: PrivilegeTier) = TokenInfo {
     tiExpires :: Maybe UTCTime, -- When the token expires (Nothing = no expiry)
     tiClientInfo :: Text,      -- Information about the client
     tiLastUsed :: UTCTime,     -- When the token was last used
-    tiPermissions :: Set Permission, -- Specific permissions for this token
+    tiCapabilities :: Set DaemonCapability, -- Specific capabilities for this token
     tiPrivilegeEvidence :: SPrivilegeTier t  -- Runtime evidence of privilege tier
 } deriving (Eq)
 
@@ -203,17 +175,8 @@ instance Show (TokenInfo t) where
                          ", expires = " ++ show tiExpires ++
                          ", clientInfo = " ++ show tiClientInfo ++
                          ", lastUsed = " ++ show tiLastUsed ++
-                         ", permissions = " ++ show tiPermissions ++
+                         ", capabilities = " ++ show tiCapabilities ++
                          ", privilegeTier = " ++ show (fromSing tiPrivilegeEvidence) ++ " }"
-
--- | Helper functions to filter permissions based on privilege tier
-filterPermissionsForTier :: SPrivilegeTier t -> Set Permission -> Set Permission
-filterPermissionsForTier SDaemon = id  -- Daemon can use all permissions
-filterPermissionsForTier SBuilder = Set.filter (not . permissionRequiresDaemon)  -- Filter daemon-only permissions
-
--- | Get the evidence value for a privilege tier
-privilegeEvidence :: SPrivilegeTier t -> SPrivilegeTier t
-privilegeEvidence = id
 
 -- | Token wrapper that erases the phantom type
 data SomeTokenInfo = forall t. SomeTokenInfo (TokenInfo t)
@@ -224,22 +187,13 @@ instance Show SomeTokenInfo where
 instance Eq SomeTokenInfo where
     (SomeTokenInfo t1) == (SomeTokenInfo t2) = tiToken t1 == tiToken t2
 
--- | Stored password hash
-data PasswordHash = PasswordHash {
-    phAlgorithm :: Text,      -- Hash algorithm (e.g., "pbkdf2-sha512")
-    phSalt :: BS.ByteString,  -- Salt value
-    phHash :: BS.ByteString,  -- Actual hash value
-    phIterations :: Int,      -- Number of iterations
-    phCreated :: UTCTime      -- When this hash was created
-} deriving (Show, Eq)
-
 -- | User information with allowed privilege tiers
 data UserInfo = UserInfo {
     uiUserId :: UserId,
     uiUsername :: Text,
     uiPasswordHash :: Maybe PasswordHash,
-    uiPermissionLevel :: UserPermissionLevel,
-    uiSpecificPermissions :: Set Permission,
+    uiCapabilityLevel :: UserCapabilityLevel,
+    uiSpecificCapabilities :: Set DaemonCapability,
     uiAllowedPrivilegeTiers :: Set PrivilegeTier, -- Which privilege tiers are allowed
     uiSystemUser :: Maybe Text,  -- Associated system user, if any
     uiTokens :: Map Text SomeTokenInfo,  -- Store tokens with erased types
@@ -256,96 +210,86 @@ data AuthDb = AuthDb {
     adAllowPrivilegeEscalation :: Bool  -- Whether to allow privilege escalation
 } deriving (Show, Eq)
 
--- | Get permission requirement for a specific permission
-getPermissionRequirement :: Permission -> PrivilegeRequirement
-getPermissionRequirement PermModifyStore = DaemonRequired
-getPermissionRequirement PermRunGC = DaemonRequired
-getPermissionRequirement PermShutdown = DaemonRequired
-getPermissionRequirement PermManageUsers = DaemonRequired
-getPermissionRequirement PermAdmin = DaemonRequired
-getPermissionRequirement _ = BuilderSufficient
+-- | User capability levels - aligned with Protocol's security model
+data UserCapabilityLevel
+    = UserLevelNone       -- No access
+    | UserLevelBasic      -- Basic access (read-only)
+    | UserLevelStandard   -- Standard user (can build)
+    | UserLevelAdvanced   -- Advanced user (can manage own builds)
+    | UserLevelAdmin      -- Administrator (full access)
+    deriving (Show, Eq, Ord, Enum, Bounded)
 
--- | Check if a permission requires daemon privileges
-permissionRequiresDaemon :: Permission -> Bool
-permissionRequiresDaemon perm = getPermissionRequirement perm == DaemonRequired
+-- | Helper functions to filter capabilities based on privilege tier
+filterCapabilitiesForTier :: SPrivilegeTier t -> Set DaemonCapability -> Set DaemonCapability
+filterCapabilitiesForTier SDaemon = id  -- Daemon can use all capabilities
+filterCapabilitiesForTier SBuilder = Set.filter (not . capabilityRequiresDaemon)  -- Filter daemon-only capabilities
 
--- | Convert permission level to text
-permissionLevelToText :: UserPermissionLevel -> Text
-permissionLevelToText UserLevelNone = "none"
-permissionLevelToText UserLevelBasic = "basic"
-permissionLevelToText UserLevelStandard = "standard"
-permissionLevelToText UserLevelAdvanced = "advanced"
-permissionLevelToText UserLevelAdmin = "admin"
+-- | Get the evidence value for a privilege tier
+privilegeEvidence :: SPrivilegeTier t -> SPrivilegeTier t
+privilegeEvidence = id
 
--- | Parse permission level from text
-textToPermissionLevel :: Text -> Maybe UserPermissionLevel
-textToPermissionLevel "none" = Just UserLevelNone
-textToPermissionLevel "basic" = Just UserLevelBasic
-textToPermissionLevel "standard" = Just UserLevelStandard
-textToPermissionLevel "advanced" = Just UserLevelAdvanced
-textToPermissionLevel "admin" = Just UserLevelAdmin
-textToPermissionLevel _ = Nothing
+-- | Check if a capability requires daemon privileges (using Protocol's model)
+capabilityRequiresDaemon :: DaemonCapability -> Bool
+capabilityRequiresDaemon StoreAccess = True
+capabilityRequiresDaemon SandboxCreation = True
+capabilityRequiresDaemon GarbageCollection = True
+capabilityRequiresDaemon DerivationRegistration = True
+capabilityRequiresDaemon _ = False
 
--- | Convert permission to text
-permissionToText :: Permission -> Text
-permissionToText PermBuild = "build"
-permissionToText PermCancelBuild = "cancel-build"
-permissionToText PermQueryBuild = "query-build"
-permissionToText PermQueryStore = "query-store"
-permissionToText PermModifyStore = "modify-store"
-permissionToText PermRunGC = "run-gc"
-permissionToText PermShutdown = "shutdown"
-permissionToText PermManageUsers = "manage-users"
-permissionToText PermAdmin = "admin"
+-- | Map old-style Permission to new Protocol DaemonCapability
+permissionToCapability :: Text -> Maybe DaemonCapability
+permissionToCapability "build" = Just DerivationBuild
+permissionToCapability "cancel-build" = Just DerivationBuild
+permissionToCapability "query-build" = Just BuildQuery
+permissionToCapability "query-store" = Just StoreQuery
+permissionToCapability "modify-store" = Just StoreAccess
+permissionToCapability "run-gc" = Just GarbageCollection
+permissionToCapability "manage-users" = Just StoreAccess  -- Admin capability
+permissionToCapability "admin" = Just StoreAccess         -- Admin capability
+permissionToCapability _ = Nothing
 
--- | Parse permission from text
-textToPermission :: Text -> Maybe Permission
-textToPermission "build" = Just PermBuild
-textToPermission "cancel-build" = Just PermCancelBuild
-textToPermission "query-build" = Just PermQueryBuild
-textToPermission "query-store" = Just PermQueryStore
-textToPermission "modify-store" = Just PermModifyStore
-textToPermission "run-gc" = Just PermRunGC
-textToPermission "shutdown" = Just PermShutdown
-textToPermission "manage-users" = Just PermManageUsers
-textToPermission "admin" = Just PermAdmin
-textToPermission _ = Nothing
+-- | Map a capability back to permission name (for backwards compatibility)
+capabilityToPermission :: DaemonCapability -> Text
+capabilityToPermission StoreAccess = "modify-store"
+capabilityToPermission SandboxCreation = "sandbox-creation"
+capabilityToPermission GarbageCollection = "run-gc"
+capabilityToPermission DerivationRegistration = "register-derivation"
+capabilityToPermission DerivationBuild = "build"
+capabilityToPermission StoreQuery = "query-store"
+capabilityToPermission BuildQuery = "query-build"
 
--- | Default permissions for permission levels
-defaultPermissions :: UserPermissionLevel -> Set Permission
-defaultPermissions UserLevelNone = Set.empty
-defaultPermissions UserLevelBasic = Set.fromList [
-    PermQueryBuild,
-    PermQueryStore
+-- | Default capabilities for capability levels - aligned with Protocol
+defaultCapabilities :: UserCapabilityLevel -> Set DaemonCapability
+defaultCapabilities UserLevelNone = Set.empty
+defaultCapabilities UserLevelBasic = Set.fromList [
+    StoreQuery,
+    BuildQuery
     ]
-defaultPermissions UserLevelStandard = Set.fromList [
-    PermBuild,
-    PermCancelBuild,
-    PermQueryBuild,
-    PermQueryStore
+defaultCapabilities UserLevelStandard = Set.fromList [
+    DerivationBuild,
+    StoreQuery,
+    BuildQuery
     ]
-defaultPermissions UserLevelAdvanced = Set.fromList [
-    PermBuild,
-    PermCancelBuild,
-    PermQueryBuild,
-    PermQueryStore,
-    PermModifyStore,
-    PermRunGC
+defaultCapabilities UserLevelAdvanced = Set.fromList [
+    DerivationBuild,
+    DerivationRegistration,
+    StoreQuery,
+    BuildQuery,
+    StoreAccess,
+    GarbageCollection
     ]
-defaultPermissions UserLevelAdmin = Set.fromList [
-    PermBuild,
-    PermCancelBuild,
-    PermQueryBuild,
-    PermQueryStore,
-    PermModifyStore,
-    PermRunGC,
-    PermShutdown,
-    PermManageUsers,
-    PermAdmin
+defaultCapabilities UserLevelAdmin = Set.fromList [
+    StoreAccess,
+    SandboxCreation,
+    GarbageCollection,
+    DerivationRegistration,
+    DerivationBuild,
+    StoreQuery,
+    BuildQuery
     ]
 
--- | Default allowed privilege tiers for permission levels
-defaultAllowedTiers :: UserPermissionLevel -> Set PrivilegeTier
+-- | Default allowed privilege tiers for capability levels
+defaultAllowedTiers :: UserCapabilityLevel -> Set PrivilegeTier
 defaultAllowedTiers UserLevelNone = Set.singleton Builder
 defaultAllowedTiers UserLevelBasic = Set.singleton Builder
 defaultAllowedTiers UserLevelStandard = Set.singleton Builder
@@ -389,7 +333,7 @@ pbkdf2Hash password salt iterations keyLen =
         password
         salt
 
--- | Generate a random token with high entropy
+-- | Generate a random token with high entropy (using Protocol's security model)
 generateToken :: IO Text
 generateToken = do
     -- Generate UUIDs for randomness
@@ -426,8 +370,8 @@ decodeBase64 text =
         Right bs -> Just bs
 
 -- | Create a token with the specified privilege tier
-createTokenForTier :: SPrivilegeTier t -> UserInfo -> Text -> Maybe Int -> Set Permission -> IO (TokenInfo t)
-createTokenForTier evidence user clientInfo expirySeconds permissions = do
+createTokenForTier :: SPrivilegeTier t -> UserInfo -> Text -> Maybe Int -> Set DaemonCapability -> IO (TokenInfo t)
+createTokenForTier evidence user clientInfo expirySeconds capabilities = do
     token <- generateToken
     now <- getCurrentTime
 
@@ -436,8 +380,8 @@ createTokenForTier evidence user clientInfo expirySeconds permissions = do
             Just seconds -> Just $ addUTCTime (fromIntegral seconds) now
             Nothing -> Nothing
 
-    -- Filter permissions based on privilege tier
-    let filteredPermissions = filterPermissionsForTier evidence permissions
+    -- Filter capabilities based on privilege tier
+    let filteredCapabilities = filterCapabilitiesForTier evidence capabilities
 
     -- Create token info with the appropriate privilege evidence
     return TokenInfo {
@@ -446,16 +390,16 @@ createTokenForTier evidence user clientInfo expirySeconds permissions = do
         tiExpires = expires,
         tiClientInfo = clientInfo,
         tiLastUsed = now,
-        tiPermissions = filteredPermissions,
+        tiCapabilities = filteredCapabilities,
         tiPrivilegeEvidence = evidence
     }
 
 -- | Create a new daemon token for a user
-createDaemonToken :: UserInfo -> Text -> Maybe Int -> Set Permission -> IO (TokenInfo 'Daemon)
+createDaemonToken :: UserInfo -> Text -> Maybe Int -> Set DaemonCapability -> IO (TokenInfo 'Daemon)
 createDaemonToken = createTokenForTier SDaemon
 
 -- | Create a new builder token for a user
-createBuilderToken :: UserInfo -> Text -> Maybe Int -> Set Permission -> IO (TokenInfo 'Builder)
+createBuilderToken :: UserInfo -> Text -> Maybe Int -> Set DaemonCapability -> IO (TokenInfo 'Builder)
 createBuilderToken = createTokenForTier SBuilder
 
 -- | Create a builder token from a daemon token (privilege downgrade only)
@@ -468,7 +412,7 @@ dropTokenPrivileges token =
         tiExpires = tiExpires token,
         tiClientInfo = tiClientInfo token,
         tiLastUsed = tiLastUsed token,
-        tiPermissions = Set.filter (not . permissionRequiresDaemon) (tiPermissions token),
+        tiCapabilities = Set.filter (not . capabilityRequiresDaemon) (tiCapabilities token),
         tiPrivilegeEvidence = SBuilder
     }
 
@@ -534,15 +478,15 @@ integrateWithSystemUser db tenUsername sysUsername = do
                 adLastModified = now
             }
 
--- | Check if a user has permission for a specific privilege tier
-hasPrivilegeForPermission :: UserInfo -> Permission -> PrivilegeTier -> Bool
-hasPrivilegeForPermission user permission requestedTier =
-    -- Check if user has the permission
-    permission `Set.member` uiSpecificPermissions user &&
+-- | Check if a user has permission for a specific capability + privilege tier
+hasPrivilegeForCapability :: UserInfo -> DaemonCapability -> PrivilegeTier -> Bool
+hasPrivilegeForCapability user capability requestedTier =
+    -- Check if user has the capability
+    capability `Set.member` uiSpecificCapabilities user &&
     -- Check if user is allowed to use the requested tier
     requestedTier `Set.member` uiAllowedPrivilegeTiers user &&
-    -- Check if permission is compatible with requested tier
-    (requestedTier == Daemon || not (permissionRequiresDaemon permission))
+    -- Check if capability is compatible with requested tier
+    (requestedTier == Daemon || not (capabilityRequiresDaemon capability))
 
 -- | Load the authentication database
 loadAuthFile :: FilePath -> IO AuthDb
@@ -610,7 +554,7 @@ authenticateUser ::
     Text ->
     Text ->
     PrivilegeTier ->
-    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier))
+    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier, Set DaemonCapability))
 authenticateUser db username password clientInfo requestedTier = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
@@ -651,12 +595,12 @@ proceedWithAuthentication ::
     Text ->
     UTCTime ->
     PrivilegeTier ->
-    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier))
+    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier, Set DaemonCapability))
 proceedWithAuthentication db username user clientInfo now requestedTier =
     case requestedTier of
         Daemon -> do
             let expirySeconds = Just 86400 -- 24 hours
-            tokenInfo <- createDaemonToken user clientInfo expirySeconds (uiSpecificPermissions user)
+            tokenInfo <- createDaemonToken user clientInfo expirySeconds (uiSpecificCapabilities user)
             let someToken = SomeTokenInfo tokenInfo
 
             -- Update user with new token
@@ -672,14 +616,14 @@ proceedWithAuthentication db username user clientInfo now requestedTier =
                     adLastModified = now
                 }
 
-            return $ Right (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo), Daemon)
+            return $ Right (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo), Daemon, tiCapabilities tokenInfo)
 
         Builder -> do
             let expirySeconds = Just 86400 -- 24 hours
 
-            -- For Builder tier, filter out daemon-only permissions
-            let builderPermissions = Set.filter (not . permissionRequiresDaemon) (uiSpecificPermissions user)
-            tokenInfo <- createBuilderToken user clientInfo expirySeconds builderPermissions
+            -- For Builder tier, filter out daemon-only capabilities
+            let builderCapabilities = Set.filter (not . capabilityRequiresDaemon) (uiSpecificCapabilities user)
+            tokenInfo <- createBuilderToken user clientInfo expirySeconds builderCapabilities
             let someToken = SomeTokenInfo tokenInfo
 
             -- Update user with new token
@@ -695,13 +639,13 @@ proceedWithAuthentication db username user clientInfo now requestedTier =
                     adLastModified = now
                 }
 
-            return $ Right (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo), Builder)
+            return $ Right (updatedDb, uiUserId user, AuthToken (tiToken tokenInfo), Builder, tiCapabilities tokenInfo)
 
 -- | Validate a token for daemon privileges
 validateDaemonToken ::
     AuthDb ->
     AuthToken ->
-    IO (Maybe (UserId, Set Permission))
+    IO (Maybe (UserId, Set DaemonCapability))
 validateDaemonToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -721,16 +665,16 @@ validateDaemonToken db (AuthToken token) = do
                                 then return Nothing
                                 else do
                                     -- Check if token has daemon privileges
-                                    let (_, _, _, _, _, perms, tier) = unwrapTokenInfo someToken
+                                    let (_, _, _, _, _, caps, tier) = unwrapTokenInfo someToken
                                     case tier of
-                                        Daemon -> return $ Just (uiUserId user, perms)
+                                        Daemon -> return $ Just (uiUserId user, caps)
                                         _ -> return Nothing
 
 -- | Validate a token for builder privileges
 validateBuilderToken ::
     AuthDb ->
     AuthToken ->
-    IO (Maybe (UserId, Set Permission))
+    IO (Maybe (UserId, Set DaemonCapability))
 validateBuilderToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -749,16 +693,16 @@ validateBuilderToken db (AuthToken token) = do
                             if expired
                                 then return Nothing
                                 else do
-                                    -- Return the permissions (any token works for builder ops)
-                                    let (_, _, _, _, _, perms, _) = unwrapTokenInfo someToken
-                                    return $ Just (uiUserId user, perms)
+                                    -- Return the capabilities (any token works for builder ops)
+                                    let (_, _, _, _, _, caps, _) = unwrapTokenInfo someToken
+                                    return $ Just (uiUserId user, caps)
 
 -- | Token validation at process boundaries
 validateTokenAtProcessBoundary ::
     AuthDb ->
     AuthToken ->
     PrivilegeTier ->  -- Requested privilege tier
-    IO (Maybe (UserId, Set Permission))
+    IO (Maybe (UserId, Set DaemonCapability))
 validateTokenAtProcessBoundary db token requestedTier =
     case requestedTier of
         Daemon -> validateDaemonToken db token
@@ -769,7 +713,7 @@ validateToken :: forall t.
     AuthDb ->
     AuthToken ->
     SPrivilegeTier t ->
-    IO (Maybe (UserId, Set Permission, SPrivilegeTier t))
+    IO (Maybe (UserId, Set DaemonCapability, SPrivilegeTier t))
 validateToken db token evidence =
     -- Simply wrap the appropriate validation function based on privilege tier
     case fromSing evidence of
@@ -777,32 +721,32 @@ validateToken db token evidence =
             -- Validate for daemon privileges
             result <- validateDaemonToken db token
             case result of
-                Just (userId, permissions) -> return $ Just (userId, permissions, evidence)
+                Just (userId, capabilities) -> return $ Just (userId, capabilities, evidence)
                 Nothing -> return Nothing
         Builder -> do
             -- Validate for builder privileges (any token is acceptable for builder ops)
             result <- validateBuilderToken db token
             case result of
-                Just (userId, permissions) -> return $ Just (userId, permissions, evidence)
+                Just (userId, capabilities) -> return $ Just (userId, capabilities, evidence)
                 Nothing -> return Nothing
 
 -- | Helper to extract privilege evidence from TokenInfo
 extractPrivilegeEvidence :: forall t. TokenInfo t -> SPrivilegeTier t
 extractPrivilegeEvidence = tiPrivilegeEvidence
 
--- | Helper to extract permissions from TokenInfo
-extractPermissions :: forall t. TokenInfo t -> Set Permission
-extractPermissions = tiPermissions
+-- | Helper to extract capabilities from TokenInfo
+extractCapabilities :: forall t. TokenInfo t -> Set DaemonCapability
+extractCapabilities = tiCapabilities
 
 -- | Helper to convert SomeTokenInfo to its components for validation
-unwrapTokenInfo :: SomeTokenInfo -> (Text, UTCTime, Maybe UTCTime, Text, UTCTime, Set Permission, PrivilegeTier)
+unwrapTokenInfo :: SomeTokenInfo -> (Text, UTCTime, Maybe UTCTime, Text, UTCTime, Set DaemonCapability, PrivilegeTier)
 unwrapTokenInfo (SomeTokenInfo token) =
     (tiToken token,
      tiCreated token,
      tiExpires token,
      tiClientInfo token,
      tiLastUsed token,
-     tiPermissions token,
+     tiCapabilities token,
      fromSing (tiPrivilegeEvidence token))
 
 -- | Data type to erase the phantom type from SPrivilegeTier
@@ -863,7 +807,7 @@ refreshWithTier db username user oldTokenStr someToken tier = do
     newTokenStr <- generateToken
 
     -- Extract token info
-    let (_, created, oldExpiry, clientInfo, _, perms, _) = unwrapTokenInfo someToken
+    let (_, created, oldExpiry, clientInfo, _, caps, _) = unwrapTokenInfo someToken
 
     -- Calculate new expiry in seconds
     let expirySeconds = case oldExpiry of
@@ -878,15 +822,15 @@ refreshWithTier db username user oldTokenStr someToken tier = do
     newDb <- case tier of
         Daemon -> do
             -- Create new daemon token
-            newTokenInfo <- createDaemonToken user clientInfo expirySeconds perms
+            newTokenInfo <- createDaemonToken user clientInfo expirySeconds caps
             updateDbWithNewToken db username user oldTokenStr newTokenStr newTokenInfo
 
         Builder -> do
-            -- Filter permissions for builder
-            let builderPermissions = Set.filter (not . permissionRequiresDaemon) perms
+            -- Filter capabilities for builder
+            let builderCapabilities = Set.filter (not . capabilityRequiresDaemon) caps
 
             -- Create new builder token
-            newTokenInfo <- createBuilderToken user clientInfo expirySeconds builderPermissions
+            newTokenInfo <- createBuilderToken user clientInfo expirySeconds builderCapabilities
             updateDbWithNewToken db username user oldTokenStr newTokenStr newTokenInfo
 
     return $ Right (newDb, AuthToken newTokenStr)
@@ -982,8 +926,8 @@ getUserInfo db username = do
         Just user -> return user
 
 -- | Add a new user
-addUser :: AuthDb -> Text -> Text -> UserPermissionLevel -> IO AuthDb
-addUser db username password permLevel = do
+addUser :: AuthDb -> Text -> Text -> UserCapabilityLevel -> IO AuthDb
+addUser db username password capabilityLevel = do
     -- Check if the user already exists
     when (Map.member username (adUsers db)) $
         throwIO $ AuthFileError $ "User already exists: " <> username
@@ -997,9 +941,9 @@ addUser db username password permLevel = do
             uiUserId = userId,
             uiUsername = username,
             uiPasswordHash = Just passwordHash,
-            uiPermissionLevel = permLevel,
-            uiSpecificPermissions = defaultPermissions permLevel,
-            uiAllowedPrivilegeTiers = defaultAllowedTiers permLevel,
+            uiCapabilityLevel = capabilityLevel,
+            uiSpecificCapabilities = defaultCapabilities capabilityLevel,
+            uiAllowedPrivilegeTiers = defaultAllowedTiers capabilityLevel,
             uiSystemUser = Nothing,
             uiTokens = Map.empty,
             uiLastLogin = Nothing,
@@ -1076,16 +1020,16 @@ changeUserPrivilegeTiers db username newTiers = do
                 adLastModified = now
             }
 
--- | Check if a user has a specific permission
-checkUserPermission :: AuthDb -> UserId -> Permission -> PrivilegeTier -> IO Bool
-checkUserPermission db userId permission requestedTier = do
+-- | Check if a user has a specific capability
+checkUserPermission :: AuthDb -> UserId -> DaemonCapability -> PrivilegeTier -> IO Bool
+checkUserPermission db userId capability requestedTier = do
     -- Find the user by ID
     let mUser = findUserById db userId
     case mUser of
         Nothing -> return False
         Just user -> do
-            -- Check if the user has the permission in the requested tier
-            return $ hasPrivilegeForPermission user permission requestedTier
+            -- Check if the user has the capability in the requested tier
+            return $ hasPrivilegeForCapability user capability requestedTier
 
 -- | Find a user by ID
 findUserById :: AuthDb -> UserId -> Maybe UserInfo
@@ -1133,7 +1077,7 @@ instance Aeson.ToJSON SomeTokenInfo where
             "expires" .= tiExpires token,
             "clientInfo" .= tiClientInfo token,
             "lastUsed" .= tiLastUsed token,
-            "permissions" .= (map permissionToText (Set.toList (tiPermissions token)) :: [Text]),
+            "capabilities" .= (map capabilityToPermission (Set.toList (tiCapabilities token)) :: [Text]),
             "privilegeTier" .= (case fromSing (tiPrivilegeEvidence token) of
                                  Daemon -> ("daemon" :: Text)
                                  Builder -> ("builder" :: Text))
@@ -1146,14 +1090,12 @@ instance Aeson.FromJSON SomeTokenInfo where
         expires <- v .: "expires"
         clientInfo <- v .: "clientInfo"
         lastUsed <- v .: "lastUsed"
-        permissionTexts <- v .: "permissions" :: Aeson.Parser [Text]
+        capabilityTexts <- v .: "capabilities" :: Aeson.Parser [Text]
         tierText <- v .: "privilegeTier" :: Aeson.Parser Text
 
-        -- Parse permissions
-        let mPermissions = mapM textToPermission permissionTexts
-        permissions <- case mPermissions of
-            Just perms -> return $ Set.fromList perms
-            Nothing -> fail "Invalid permission in token"
+        -- Parse capabilities
+        let capabilityList = catMaybes $ map permissionToCapability capabilityTexts
+        let capabilities = Set.fromList capabilityList
 
         -- Create token with appropriate privilege tier
         case tierText of
@@ -1164,7 +1106,7 @@ instance Aeson.FromJSON SomeTokenInfo where
                         tiExpires = expires,
                         tiClientInfo = clientInfo,
                         tiLastUsed = lastUsed,
-                        tiPermissions = permissions,
+                        tiCapabilities = capabilities,
                         tiPrivilegeEvidence = SDaemon
                     }
                 return $ SomeTokenInfo tokenInfo
@@ -1175,7 +1117,7 @@ instance Aeson.FromJSON SomeTokenInfo where
                         tiExpires = expires,
                         tiClientInfo = clientInfo,
                         tiLastUsed = lastUsed,
-                        tiPermissions = permissions,
+                        tiCapabilities = capabilities,
                         tiPrivilegeEvidence = SBuilder
                     }
                 return $ SomeTokenInfo tokenInfo
@@ -1186,8 +1128,8 @@ instance Aeson.ToJSON UserInfo where
             "userId" .= case uiUserId of UserId uid -> uid,
             "username" .= uiUsername,
             "passwordHash" .= uiPasswordHash,
-            "permissionLevel" .= permissionLevelToText uiPermissionLevel,
-            "specificPermissions" .= (map permissionToText (Set.toList uiSpecificPermissions) :: [Text]),
+            "capabilityLevel" .= show uiCapabilityLevel,
+            "specificCapabilities" .= (map capabilityToPermission (Set.toList uiSpecificCapabilities) :: [Text]),
             "allowedPrivilegeTiers" .= (map showTier (Set.toList uiAllowedPrivilegeTiers) :: [Text]),
             "systemUser" .= uiSystemUser,
             "tokens" .= uiTokens,
@@ -1204,8 +1146,8 @@ instance Aeson.FromJSON UserInfo where
         userId <- v .: "userId"
         uiUsername <- v .: "username"
         uiPasswordHash <- v .: "passwordHash"
-        permLevelText <- v .: "permissionLevel"
-        permissionTexts <- v .: "specificPermissions" :: Aeson.Parser [Text]
+        capabilityLevelText <- v .: "capabilityLevel"
+        capabilityTexts <- v .: "specificCapabilities" :: Aeson.Parser [Text]
         tierTexts <- v .: "allowedPrivilegeTiers" :: Aeson.Parser [Text]
         uiSystemUser <- v .: "systemUser"
         uiTokens <- v .: "tokens"
@@ -1214,15 +1156,17 @@ instance Aeson.FromJSON UserInfo where
 
         let uiUserId = UserId userId
 
-        let mPermLevel = textToPermissionLevel permLevelText
-        uiPermissionLevel <- case mPermLevel of
-            Just level -> return level
-            Nothing -> fail $ "Invalid permission level: " ++ T.unpack permLevelText
+        let uiCapabilityLevel = case capabilityLevelText of
+                "UserLevelNone" -> UserLevelNone
+                "UserLevelBasic" -> UserLevelBasic
+                "UserLevelStandard" -> UserLevelStandard
+                "UserLevelAdvanced" -> UserLevelAdvanced
+                "UserLevelAdmin" -> UserLevelAdmin
+                _ -> UserLevelNone  -- Default to lowest level for safety
 
-        let mPermissions = mapM textToPermission permissionTexts
-        uiSpecificPermissions <- case mPermissions of
-            Just perms -> return $ Set.fromList perms
-            Nothing -> fail "Invalid permission in user"
+        -- Parse capabilities
+        let capabilityList = catMaybes $ map permissionToCapability capabilityTexts
+        let uiSpecificCapabilities = Set.fromList capabilityList
 
         -- Parse privilege tiers
         let parseTier :: Text -> Maybe PrivilegeTier
