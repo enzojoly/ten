@@ -122,6 +122,34 @@ import qualified Database.SQLite.Simple as SQL
 
 import Ten.Core
 
+-- | Helper functions for DaemonResponse
+isDaemonResponseOk :: DaemonResponse -> Bool
+isDaemonResponseOk (ErrorResponse _) = False
+isDaemonResponseOk _ = True
+
+getDaemonResponseMessage :: DaemonResponse -> Text
+getDaemonResponseMessage (ErrorResponse err) = buildErrorToText err
+getDaemonResponseMessage SuccessResponse = "Success"
+getDaemonResponseMessage _ = "Unknown response"
+
+getPathFromDaemonResponse :: DaemonResponse -> Maybe Text
+getPathFromDaemonResponse (StoreAddResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (StorePathResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (DerivationStoredResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse _ = Nothing
+
+getBytesFromDaemonResponse :: DaemonResponse -> Maybe ByteString
+getBytesFromDaemonResponse (StoreReadResponse content) = Just content
+getBytesFromDaemonResponse _ = Nothing
+
+getReferencesFromDaemonResponse :: DaemonResponse -> Set StorePath
+getReferencesFromDaemonResponse (DerivationOutputResponse paths) = paths
+getReferencesFromDaemonResponse _ = Set.empty
+
+getExistsFromDaemonResponse :: DaemonResponse -> Bool
+getExistsFromDaemonResponse (StoreVerifyResponse exists) = exists
+getExistsFromDaemonResponse _ = False
+
 -- | Store request message types for protocol communication
 data StoreRequest
     = StoreAddRequest Text ByteString       -- Name hint and content to store
@@ -1012,14 +1040,14 @@ requestAddToStore nameHint content = do
                 DaemonError m -> m
                 _ -> T.pack (show err)
         Right resp ->
-            if respStatus resp == "ok"
-                then case Map.lookup "path" (respData resp) of
+            if isDaemonResponseOk resp
+                then case getPathFromDaemonResponse resp of
                     Just pathText ->
                         case parseStorePath pathText of
                             Just path -> return path
                             Nothing -> throwError $ StoreError $ "Invalid path in response: " <> pathText
                     Nothing -> throwError $ StoreError "Missing path in response"
-                else throwError $ StoreError $ respMessage resp
+                else throwError $ StoreError $ getDaemonResponseMessage resp
 
 -- | Request to read from the store via daemon protocol
 -- For use in builder tier when direct read is not possible
@@ -1067,11 +1095,11 @@ requestReadViaProtocol path = do
                 DaemonError m -> m
                 _ -> T.pack (show err)
         Right resp ->
-            if respStatus resp == "ok"
-                then case respPayload resp of
+            if isDaemonResponseOk resp
+                then case getBytesFromDaemonResponse resp of
                     Just content -> return content
                     Nothing -> throwError $ StoreError "Missing content in response"
-                else throwError $ StoreError $ respMessage resp
+                else throwError $ StoreError $ getDaemonResponseMessage resp
 
 -- | Request to verify a path via daemon protocol
 -- For use in builder tier
@@ -1104,10 +1132,8 @@ requestVerifyPath path = do
                 Left _ ->
                     return False  -- Any error means verification failed
                 Right resp ->
-                    if respStatus resp == "ok"
-                        then case Map.lookup "exists" (respData resp) of
-                            Just "true" -> return True
-                            _ -> return False
+                    if isDaemonResponseOk resp
+                        then getExistsFromDaemonResponse resp
                         else return False
 
 -- | Request references from a path via protocol
@@ -1131,13 +1157,8 @@ requestReferencesFromPath path = do
         Left _ ->
             return Set.empty  -- Return empty set on error
         Right resp ->
-            if respStatus resp == "ok"
-                then case Map.lookup "refs" (respData resp) of
-                    Just refsText -> do
-                        let refsList = T.splitOn "," refsText
-                        let paths = catMaybes $ map parseStorePath refsList
-                        return $ Set.fromList paths
-                    Nothing -> return Set.empty
+            if isDaemonResponseOk resp
+                then getReferencesFromDaemonResponse resp
                 else return Set.empty
 
 -- | Request referrers to a path via protocol
@@ -1161,13 +1182,8 @@ requestReferrersToPath path = do
         Left _ ->
             return Set.empty  -- Return empty set on error
         Right resp ->
-            if respStatus resp == "ok"
-                then case Map.lookup "refs" (respData resp) of
-                    Just refsText -> do
-                        let refsList = T.splitOn "," refsText
-                        let paths = catMaybes $ map parseStorePath refsList
-                        return $ Set.fromList paths
-                    Nothing -> return Set.empty
+            if isDaemonResponseOk resp
+                then getReferencesFromDaemonResponse resp
                 else return Set.empty
 
 -- | Scan a file for references to store paths
