@@ -912,6 +912,12 @@ serializeDaemonResponse resp =
                 "paths" .= map storePathToText paths
             ], Nothing)
 
+        StoreReadResponse content ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("store-read" :: Text),
+                "hasContent" .= True
+            ], Just content)
+
         DerivationResponse deriv ->
             let derivContent = Ten.Derivation.serializeDerivation deriv
             in (LBS.toStrict $ Aeson.encode $ Aeson.object [

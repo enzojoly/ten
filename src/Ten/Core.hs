@@ -815,6 +815,7 @@ data DaemonResponse
     | StoreVerifyResponse Bool
     | StorePathResponse StorePath
     | StoreListResponse [StorePath]
+    | StoreReadResponse ByteString
     | DerivationResponse Derivation
     | DerivationStoredResponse StorePath
     | DerivationRetrievedResponse (Maybe Derivation)
@@ -1633,6 +1634,11 @@ deserializeDaemonResponse bs mPayload =
                             AKeyMap.lookup "paths" obj >>= Aeson.parseMaybe Aeson.parseJSON
                         let paths = catMaybes $ map parseStorePath pathTexts
                         Right $ StoreListResponse paths
+
+                    Just (Aeson.String "store-read") -> do
+                        case mPayload of
+                            Nothing -> Left "Missing store content payload"
+                            Just content -> Right $ StoreReadResponse content
 
                     Just (Aeson.String "derivation") -> do
                         case mPayload of
