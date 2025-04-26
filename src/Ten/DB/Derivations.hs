@@ -95,15 +95,6 @@ parseStorePathField = do
     let name = T.drop 1 namePart
     return $ StorePath hash name
 
--- Validate a collection of StorePath objects after extraction
-validateAndLogPaths :: [StorePath] -> TenM p t [StorePath]
-validateAndLogPaths paths = do
-    forM paths $ \path -> do
-        valid <- liftIO $ validateStorePathWithContext path "database-extraction"
-        unless valid $
-            logMsg 1 $ "Warning: Invalid store path from database: " <> storePathToText path
-        return path
-
 -- Validate a single StorePath after extraction
 validateAndLogPath :: StorePath -> TenM p t StorePath
 validateAndLogPath path = do
@@ -111,6 +102,25 @@ validateAndLogPath path = do
     unless valid $
         logMsg 1 $ "Warning: Invalid store path from database: " <> storePathToText path
     return path
+
+-- Validate a collection of StorePath objects after extraction
+validateAndLogPaths :: [StorePath] -> TenM p t [StorePath]
+validateAndLogPaths paths = do
+    forM paths $ \path -> validateAndLogPath path
+
+-- Validate DerivationInfo objects, focusing on their contained StorePath
+validateAndLogDerivationInfos :: [DerivationInfo] -> TenM p t [DerivationInfo]
+validateAndLogDerivationInfos derivInfos = do
+    forM derivInfos $ \info -> do
+        _ <- validateAndLogPath (derivationStorePath info)
+        return info
+
+-- Validate OutputInfo objects, focusing on their contained StorePath
+validateAndLogOutputInfos :: [OutputInfo] -> TenM p t [OutputInfo]
+validateAndLogOutputInfos outputInfos = do
+    forM outputInfos $ \info -> do
+        _ <- validateAndLogPath (outputInfoPath info)
+        return info
 
 -- Make DerivationInfo an instance of FromRow
 instance FromRow DerivationInfo where
@@ -407,10 +417,7 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
             (Only hash) :: TenM 'Eval 'Daemon [DerivationInfo]
 
         -- Validate returned paths
-        validatedRows <- forM derivRows $ \info -> do
-            -- Validate the store path
-            _ <- validateAndLogPath (derivationStorePath info)
-            return info
+        validatedRows <- validateAndLogDerivationInfos derivRows
 
         case validatedRows of
             [] -> return Nothing
@@ -465,7 +472,7 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
             (Only (storePathToText outputPath)) :: TenM 'Eval 'Daemon [DerivationInfo]
 
         -- Validate returned paths
-        validatedResults <- validateAndLogPaths results
+        validatedResults <- validateAndLogDerivationInfos results
 
         return $ listToMaybe validatedResults
 
@@ -486,7 +493,7 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
         derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts :: TenM 'Eval 'Daemon [DerivationInfo]
 
         -- Validate store paths
-        validatedDerivInfos <- validateAndLogPaths derivInfos
+        validatedDerivInfos <- validateAndLogDerivationInfos derivInfos
 
         -- Now load each derivation
         derivations <- forM validatedDerivInfos $ \derivInfo -> do
@@ -510,10 +517,7 @@ instance CanRetrieveDerivation 'Build 'Daemon where
             (Only hash) :: TenM 'Build 'Daemon [DerivationInfo]
 
         -- Validate returned paths
-        validatedRows <- forM derivRows $ \info -> do
-            -- Validate the store path
-            _ <- validateAndLogPath (derivationStorePath info)
-            return info
+        validatedRows <- validateAndLogDerivationInfos derivRows
 
         case validatedRows of
             [] -> return Nothing
@@ -568,7 +572,7 @@ instance CanRetrieveDerivation 'Build 'Daemon where
             (Only (storePathToText outputPath)) :: TenM 'Build 'Daemon [DerivationInfo]
 
         -- Validate returned paths
-        validatedResults <- validateAndLogPaths results
+        validatedResults <- validateAndLogDerivationInfos results
 
         return $ listToMaybe validatedResults
 
@@ -589,7 +593,7 @@ instance CanRetrieveDerivation 'Build 'Daemon where
         derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts :: TenM 'Build 'Daemon [DerivationInfo]
 
         -- Validate store paths
-        validatedDerivInfos <- validateAndLogPaths derivInfos
+        validatedDerivInfos <- validateAndLogDerivationInfos derivInfos
 
         -- Now load each derivation
         derivations <- forM validatedDerivInfos $ \derivInfo -> do
@@ -780,7 +784,7 @@ instance CanManageOutputs 'Daemon where
             (Only derivId)
 
         -- Validate all paths after extraction
-        validateAndLogPaths outputs
+        validateAndLogOutputInfos outputs
 
 -- Builder implementation of CanManageOutputs (via protocol)
 instance CanManageOutputs 'Builder where
@@ -829,7 +833,7 @@ instance CanManageOutputs 'Builder where
                     Right (DerivationOutputResponse paths) ->
                         -- Convert output paths to OutputInfo objects and validate
                         let outputs = map (\p -> OutputInfo derivId "" p) (Set.toList paths)
-                        in validateAndLogPaths outputs
+                        in validateAndLogOutputInfos outputs
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return []  -- Default fallback for unexpected responses
 
@@ -1134,7 +1138,7 @@ instance CanQueryDerivations 'Daemon where
         derivInfos <- tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
 
         -- Validate paths
-        validateAndLogPaths derivInfos
+        validateAndLogDerivationInfos derivInfos
 
     getDerivationPath hash = do
         db <- getDatabaseConn
@@ -1199,7 +1203,7 @@ instance CanQueryDerivations 'Builder where
                     Right (DerivationListResponse paths) -> do
                         -- Convert to DerivationInfo objects with minimal data
                         let derivInfos = map (\p -> DerivationInfo 0 "" p 0) paths
-                        validateAndLogPaths derivInfos
+                        validateAndLogDerivationInfos derivInfos
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return []  -- Default fallback for unexpected responses
 
