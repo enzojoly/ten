@@ -88,7 +88,7 @@ module Ten.Daemon.Protocol (
 import Control.Concurrent (forkIO, killThread, threadDelay, myThreadId)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (Exception, throwIO, bracket, try, SomeException, IOException)
+import Control.Exception (Exception, throwIO, bracket, try, finally, catch, SomeException, IOException)
 import Control.Monad (unless, when, foldM, forM)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
@@ -113,8 +113,9 @@ import qualified Data.Text.IO as TIO
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Word (Word8, Word32, Word64)
 import GHC.Generics (Generic)
-import Network.Socket (Socket, close)
+import Network.Socket (Socket, close, socketToHandle)
 import qualified Network.Socket.ByteString as NByte
+import System.IO (Handle, IOMode(..), hClose, hFlush, hSetBuffering, BufferMode(..))
 import System.Exit (ExitCode(ExitSuccess, ExitFailure))
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush)
 import System.IO.Error (isEOFError)
@@ -126,6 +127,8 @@ import Data.Proxy (Proxy(..))
 import Data.Binary (Binary(..), Get, put, get, encode, decode)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Unique (Unique, hashUnique)
+import qualified Data.ByteString.Lazy.Char8 as LC8
+import qualified Data.ByteString.Char8 as C8
 
 import Ten.Derivation
 
@@ -353,6 +356,7 @@ data DaemonRequest
 -- | Protocol handle type for managing connections
 data ProtocolHandle = ProtocolHandle {
     protocolSocket :: Socket,
+    protocolHandle :: Handle,  -- Handle converted from socket for I/O operations
     protocolLock :: MVar (),  -- For thread safety
     protocolPrivilegeTier :: PrivilegeTier -- Track privilege level of connection
 }
@@ -400,12 +404,19 @@ checkPrivilegeRequirement st reqPriv =
 createProtocolHandle :: Socket -> PrivilegeTier -> IO ProtocolHandle
 createProtocolHandle sock tier = do
     lock <- newMVar ()
-    return $ ProtocolHandle sock lock tier
+    -- Convert socket to handle for higher-level I/O operations
+    handle <- socketToHandle sock ReadWriteMode
+    -- Set buffering mode for better performance
+    hSetBuffering handle (BlockBuffering Nothing)
+    return $ ProtocolHandle sock handle lock tier
 
 -- | Close a protocol handle
 closeProtocolHandle :: ProtocolHandle -> IO ()
-closeProtocolHandle handle = do
-    close (protocolSocket handle)
+closeProtocolHandle ph = do
+    -- Close the handle first (this flushes any buffered data)
+    hClose (protocolHandle ph)
+    -- Socket is closed automatically when handle is closed, but we do it explicitly for clarity
+    close (protocolSocket ph)
 
 -- | Create a framed request for sending over the wire
 -- Format: [4-byte message length][message data]
@@ -621,7 +632,7 @@ serializeDaemonRequest req =
 
 -- | Deserialize a daemon request from ByteString
 deserializeDaemonRequest :: BS.ByteString -> Maybe BS.ByteString -> Either Text DaemonRequest
-deserializeDaemonRequest bs payload =
+deserializeDaemonRequest bs mPayload =
     case Aeson.eitherDecodeStrict bs of
         Left err -> Left $ "JSON parse error: " <> T.pack err
         Right val -> case Aeson.fromJSON val of
@@ -647,7 +658,7 @@ deserializeDaemonRequest bs payload =
                                 Aeson.Error err -> Left $ "Invalid build info: " <> T.pack err
                             Nothing -> Right BuildRequestInfo { buildTimeout = Nothing, buildEnv = Map.empty, buildFlags = [] }
 
-                        Right $ BuildRequest path payload info
+                        Right $ BuildRequest path mPayload info
 
                     Just (Aeson.String "eval") -> do
                         path <- case KeyMap.lookup "path" obj of
@@ -660,11 +671,11 @@ deserializeDaemonRequest bs payload =
                                 Aeson.Error err -> Left $ "Invalid eval info: " <> T.pack err
                             Nothing -> Right BuildRequestInfo { buildTimeout = Nothing, buildEnv = Map.empty, buildFlags = [] }
 
-                        Right $ EvalRequest path payload info
+                        Right $ EvalRequest path mPayload info
 
                     Just (Aeson.String "build-derivation") -> do
                         -- Derivation content is in payload
-                        case payload of
+                        case mPayload of
                             Nothing -> Left "Missing derivation content"
                             Just derivContent ->
                                 case Ten.Derivation.deserializeDerivation derivContent of
@@ -719,7 +730,7 @@ deserializeDaemonRequest bs payload =
                             Just (Aeson.String p) -> Right p
                             _ -> Left "Missing or invalid path"
 
-                        case payload of
+                        case mPayload of
                             Nothing -> Left "Missing content payload"
                             Just content -> Right $ StoreAddRequest path content
 
@@ -737,19 +748,23 @@ deserializeDaemonRequest bs payload =
                             Just (Aeson.String p) -> Right p
                             _ -> Left "Missing or invalid path"
 
-                        case payload of
+                        case mPayload of
                             Nothing -> Left "Missing content payload"
                             Just content -> Right $ StorePathRequest path content
 
                     Just (Aeson.String "store-list") -> Right StoreListRequest
 
                     Just (Aeson.String "store-read") -> do
-                        case mPayload of
-                            Nothing -> Left "Missing store content payload"
-                            Just content -> Right $ StoreReadResponse content
+                        pathText <- case KeyMap.lookup "path" obj of
+                            Just (Aeson.String p) -> Right p
+                            _ -> Left "Missing or invalid path"
+
+                        case parseStorePath pathText of
+                            Nothing -> Left $ "Invalid store path format: " <> pathText
+                            Just path -> Right $ RetrieveDerivationRequest path
 
                     Just (Aeson.String "store-derivation") -> do
-                        case payload of
+                        case mPayload of
                             Nothing -> Left "Missing derivation content"
                             Just content -> Right $ StoreDerivationRequest content
 
@@ -1102,9 +1117,9 @@ serializeDaemonResponse resp =
 
 -- | Send a daemon request through a protocol handle
 sendDaemonRequest :: ProtocolHandle -> DaemonRequest -> IO (Either ProtocolError DaemonResponse)
-sendDaemonRequest handle req = do
+sendDaemonRequest ph req = do
     -- Take the lock for thread safety
-    withMVar (protocolLock handle) $ \_ -> do
+    withMVar (protocolLock ph) $ \_ -> do
         -- Serialize the request and any payload
         let (reqData, mPayload) = serializeDaemonRequest req
 
@@ -1116,16 +1131,19 @@ sendDaemonRequest handle req = do
                 Just payload -> createRequestFrame payload
                 Nothing -> BS.empty
 
-        -- Send the request frame
+        -- Send the request frame using the handle
         result <- try $ do
-            NByte.sendAll (protocolSocket handle) framedReq
+            BS.hPut (protocolHandle ph) framedReq
 
             -- Send payload if any
             unless (BS.null framedPayload) $
-                NByte.sendAll (protocolSocket handle) framedPayload
+                BS.hPut (protocolHandle ph) framedPayload
 
-            -- Read response
-            receiveFramedResponse (protocolSocket handle)
+            -- Flush to ensure data is sent immediately
+            hFlush (protocolHandle ph)
+
+            -- Read response using the handle
+            receiveFramedResponse (protocolHandle ph)
 
         case result of
             Left (e :: SomeException) ->
@@ -1137,11 +1155,11 @@ sendDaemonRequest handle req = do
                     Left err -> return $ Left $ ProtocolParseError err
                     Right resp -> return $ Right resp
 
--- | Receive a daemon response from a socket
-receiveDaemonResponse :: Socket -> IO (Either ProtocolError DaemonResponse)
-receiveDaemonResponse sock = do
+-- | Receive a daemon response from a handle
+receiveDaemonResponse :: Handle -> IO (Either ProtocolError DaemonResponse)
+receiveDaemonResponse handle = do
     -- Try to read the response
-    result <- try $ receiveFramedResponse sock
+    result <- try $ receiveFramedResponse handle
     case result of
         Left (e :: SomeException) ->
             return $ Left ConnectionClosed
@@ -1153,9 +1171,9 @@ receiveDaemonResponse sock = do
 
 -- | Send a daemon response through a protocol handle
 sendDaemonResponse :: ProtocolHandle -> DaemonResponse -> IO ()
-sendDaemonResponse handle resp = do
+sendDaemonResponse ph resp = do
     -- Take the lock for thread safety
-    withMVar (protocolLock handle) $ \_ -> do
+    withMVar (protocolLock ph) $ \_ -> do
         -- Serialize the response and any payload
         let (respData, mPayload) = serializeDaemonResponse resp
 
@@ -1167,20 +1185,23 @@ sendDaemonResponse handle resp = do
                 Just payload -> createResponseFrame payload
                 Nothing -> BS.empty
 
-        -- Send the response frame
-        NByte.sendAll (protocolSocket handle) framedResp
+        -- Send the response frame using the handle
+        BS.hPut (protocolHandle ph) framedResp
 
         -- Send payload if any
         unless (BS.null framedPayload) $
-            NByte.sendAll (protocolSocket handle) framedPayload
+            BS.hPut (protocolHandle ph) framedPayload
 
--- | Receive a daemon request from a socket
-receiveDaemonRequest :: Socket -> IO (Either ProtocolError DaemonRequest)
-receiveDaemonRequest sock = do
+        -- Flush to ensure data is sent immediately
+        hFlush (protocolHandle ph)
+
+-- | Receive a daemon request from a handle
+receiveDaemonRequest :: Handle -> IO (Either ProtocolError DaemonRequest)
+receiveDaemonRequest handle = do
     -- Try to read the request
     result <- try $ do
         -- Read request frame
-        requestData <- recvFrame sock
+        requestData <- recvFrame handle
 
         -- Check if request indicates a payload
         hasPayload <- case Aeson.decodeStrict requestData of
@@ -1195,7 +1216,7 @@ receiveDaemonRequest sock = do
         -- Read payload if indicated
         mPayload <- if hasPayload
             then do
-                payloadData <- recvFrame sock
+                payloadData <- recvFrame handle
                 return $ Just payloadData
             else
                 return Nothing
@@ -1213,10 +1234,10 @@ receiveDaemonRequest sock = do
                 Left err -> return $ Left $ ProtocolParseError err
                 Right req -> return $ Right req
   where
-    recvFrame :: Socket -> IO BS.ByteString
-    recvFrame s = do
+    recvFrame :: Handle -> IO BS.ByteString
+    recvFrame h = do
         -- Read length prefix (4 bytes)
-        lenBytes <- NByte.recv s 4
+        lenBytes <- BS.hGet h 4
         when (BS.length lenBytes /= 4) $
             throwIO ConnectionClosed
 
@@ -1231,25 +1252,44 @@ receiveDaemonRequest sock = do
             throwIO $ MessageTooLarge len
 
         -- Read message data
-        recvExactly s (fromIntegral len)
+        BS.hGet h (fromIntegral len)
 
-    recvExactly :: Socket -> Int -> IO BS.ByteString
-    recvExactly s len = go len []
-      where
-        go 0 chunks = return $ BS.concat $ reverse chunks
-        go n chunks = do
-            chunk <- NByte.recv s n
-            let chunkLen = BS.length chunk
-            if chunkLen == 0
-                then throwIO ConnectionClosed
-                else go (n - chunkLen) (chunk : chunks)
-
--- | Convert from Response payload to ResponseContent
+-- | Convert from Response payload to ResponseData
 responseToResponseData :: Aeson.Value -> Either Text DaemonResponse
 responseToResponseData payload =
-    case Aeson.fromJSON payload of
-        Aeson.Success respData -> Right respData
-        Aeson.Error err -> Left $ "Failed to decode response payload: " <> T.pack err
+    case payload of
+        Aeson.Object obj -> do
+            -- Extract the message type
+            case KeyMap.lookup "type" obj of
+                Just (Aeson.String typeStr) ->
+                    -- Parse based on the message type
+                    parseResponseByType typeStr obj
+                _ -> Left "Missing or invalid response type"
+        _ -> Left "Response payload is not a JSON object"
+    where
+        parseResponseByType :: Text -> Aeson.Object -> Either Text DaemonResponse
+        parseResponseByType "auth" obj = do
+            -- Parse auth response
+            case KeyMap.lookup "result" obj of
+                Just resultVal -> case Aeson.fromJSON resultVal of
+                    Aeson.Success authResult -> Right $ AuthResponse authResult
+                    Aeson.Error err -> Left $ "Invalid auth result: " <> T.pack err
+                _ -> Left "Missing auth result"
+
+        parseResponseByType "success" _ = Right SuccessResponse
+
+        parseResponseByType "error" obj = do
+            -- Parse error response
+            case KeyMap.lookup "error" obj of
+                Just errorVal -> case Aeson.fromJSON errorVal of
+                    Aeson.Success err -> Right $ ErrorResponse err
+                    Aeson.Error convErr -> Left $ "Invalid error format: " <> T.pack convErr
+                _ -> Left "Missing error details"
+
+        -- Add other response types as needed...
+
+        parseResponseByType typ _ =
+            Left $ "Unsupported response type: " <> typ
 
 -- | Execute an action with a protocol handle and clean up after
 withProtocolHandle :: Socket -> PrivilegeTier -> (ProtocolHandle -> IO a) -> IO a
