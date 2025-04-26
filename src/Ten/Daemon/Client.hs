@@ -88,6 +88,7 @@ import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime, diffUTCTime)
 import Data.Unique (hashUnique)
 import Data.Word (Word8, Word32, Word64)
+import Data.Bits (shiftL, (.|.))
 import Network.Socket (Socket, Family(..), SocketType(..), SockAddr(..), socket, connect, close, socketToHandle)
 import Network.Socket.ByteString (sendAll, recv)
 import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirectory, getXdgDirectory, XdgDirectory(..), findExecutable)
@@ -190,21 +191,6 @@ isDaemonRunning socketPath = do
                     close sock
                     return True
 
--- | Execute an action with a daemon connection
-withDaemonConnection :: FilePath -> UserCredentials -> (DaemonConnection 'Builder -> IO a) -> IO (Either BuildError a)
-withDaemonConnection socketPath credentials action = try $
-    bracket
-        (do
-            connResult <- connectToDaemon socketPath credentials
-            case connResult of
-                Left err -> throwIO err
-                Right conn -> return conn)
-        disconnectFromDaemon
-        (\conn -> do
-            result <- try (action conn)
-            case result of
-                Left err -> throwIO err
-                Right value -> return value)
 
 -- | Create a socket and connect to the daemon
 createSocketAndConnect :: FilePath -> IO (Socket, Handle)
@@ -285,15 +271,15 @@ receiveResponse conn reqId timeoutMicros = do
 
         Just respVar -> do
             -- Wait for response with timeout
-            result <- SystemTimeout.timeout timeoutMicros $ takeMVar respVar
+            mResult <- SystemTimeout.timeout timeoutMicros $ takeMVar respVar
 
             -- Clean up request map
             atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
 
             -- Return response or error
-            case result of
+            case mResult of
                 Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
-                Right resp -> return $ Right resp
+                Just resp -> return $ Right resp
 
 -- | Send a request and wait for response (synchronous)
 sendRequestSync :: DaemonConnection 'Builder -> DaemonRequest -> Int -> IO (Either BuildError DaemonResponse)
@@ -316,12 +302,12 @@ readResponseWithTimeout handle timeoutMicros = do
         when (BS.length lenBytes /= 4) $
             throwIO $ DaemonError "Disconnected from daemon while reading message length"
 
-        -- Decode message length
+        -- Decode message length - using Word32 consistently for binary protocol
         let len = fromIntegral $
-                  (fromIntegral (BS.index lenBytes 0) `shiftL` 24) .|.
-                  (fromIntegral (BS.index lenBytes 1) `shiftL` 16) .|.
-                  (fromIntegral (BS.index lenBytes 2) `shiftL` 8) .|.
-                  (fromIntegral (BS.index lenBytes 3))
+                  (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+                  (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+                  (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+                  (fromIntegral (BS.index lenBytes 3) :: Word32)
 
         -- Sanity check on message length
         when (len > 100 * 1024 * 1024) $ -- 100 MB limit
@@ -371,7 +357,7 @@ receiveFramedResponse sock = do
         when (BS.length lenBytes /= 4) $
             throwIO ConnectionClosed
 
-        -- Parse length
+        -- Parse length - using Word32 consistently for binary protocol
         let len = (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
                  (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
                  (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
@@ -418,10 +404,11 @@ startDaemonIfNeeded socketPath = try $ do
                         }
 
                 -- Wait for daemon to start with timeout
-                let maxWaitTime = 15 -- 15 seconds
+                let maxWaitTime = 15.0 -- 15 seconds
 
                 -- Check with retries
-                let checkWithRetry retries timeElapsed = do
+                let checkWithRetry :: Int -> Double -> IO ()
+                    checkWithRetry retries timeElapsed = do
                         if timeElapsed >= maxWaitTime
                             then throwIO $ DaemonError "Timeout waiting for daemon to start"
                             else do
@@ -433,7 +420,7 @@ startDaemonIfNeeded socketPath = try $ do
                                         -- Check if process has exited
                                         exitCode <- getProcessExitCode processHandle
                                         case exitCode of
-                                            Just ExitSuccess ->
+                                            Just ExitSuccess -> do
                                                 -- Process exited successfully but daemon not running yet
                                                 -- Wait and retry
                                                 threadDelay 500000 -- 0.5 seconds
@@ -443,7 +430,7 @@ startDaemonIfNeeded socketPath = try $ do
                                                 -- Process failed
                                                 throwIO $ DaemonError $ "Daemon process exited with error code: " <> T.pack (show code)
 
-                                            Nothing ->
+                                            Nothing -> do
                                                 -- Process still running
                                                 threadDelay 500000 -- 0.5 seconds
                                                 checkWithRetry (retries-1) (timeElapsed + 0.5)
@@ -468,63 +455,63 @@ getProcessExitCode ph = do
 -- | Build a file using the daemon
 buildFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError BuildResult)
 buildFile conn filePath = do
-    -- Check file existence
+    -- Check file existence first and return early if it doesn't exist
     fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+    if not fileExists
+        then return $ Left $ InputNotFound filePath
+        else do
+            -- Read file content
+            content <- BS.readFile filePath
 
-    -- Read file content
-    content <- BS.readFile filePath
+            -- Create build request with positional arguments
+            let request = BuildRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
 
-    -- Create build request with positional arguments
-    let request = BuildRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
+            -- Send request and wait for response
+            respResult <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
 
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
+            -- Process response
+            case respResult of
+                Left err ->
+                    return $ Left err
 
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
+                Right (BuildResultResponse result) ->
+                    return $ Right result
 
-        Right (BuildResultResponse result) ->
-            return $ Right result
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for build request: " <> T.pack (show resp)
+                Right resp ->
+                    return $ Left $ DaemonError $
+                        "Invalid response type for build request: " <> T.pack (show resp)
 
 -- | Evaluate a file using the daemon
 evalFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError Derivation)
 evalFile conn filePath = do
-    -- Check file existence
+    -- Check file existence first and return early if it doesn't exist
     fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+    if not fileExists
+        then return $ Left $ InputNotFound filePath
+        else do
+            -- Read file content
+            content <- BS.readFile filePath
 
-    -- Read file content
-    content <- BS.readFile filePath
+            -- Create eval request with positional arguments
+            let request = EvalRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
 
-    -- Create eval request with positional arguments
-    let request = EvalRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
+            -- Send request and wait for response
+            respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
 
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
+            -- Process response
+            case respResult of
+                Left err ->
+                    return $ Left err
 
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
+                Right (DerivationResponse derivation) ->
+                    return $ Right derivation
 
-        Right (DerivationResponse derivation) ->
-            return $ Right derivation
+                Right (EvalResponse derivation) ->
+                    return $ Right derivation
 
-        Right (EvalResponse derivation) ->
-            return $ Right derivation
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for eval request: " <> T.pack (show resp)
+                Right resp ->
+                    return $ Left $ DaemonError $
+                        "Invalid response type for eval request: " <> T.pack (show resp)
 
 -- | Build a derivation using the daemon
 buildDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError BuildResult)
@@ -634,31 +621,31 @@ listBuilds conn limit = do
 -- | Add a file to the store (requires daemon privileges via protocol)
 addFileToStore :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
 addFileToStore conn filePath = do
-    -- Check file existence
+    -- Check file existence first and return early if it doesn't exist
     fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+    if not fileExists
+        then return $ Left $ InputNotFound filePath
+        else do
+            -- Read file content
+            content <- BS.readFile filePath
 
-    -- Read file content
-    content <- BS.readFile filePath
+            -- Create store add request with positional arguments
+            let request = StoreAddRequest (T.pack filePath) content
 
-    -- Create store add request with positional arguments
-    let request = StoreAddRequest (T.pack filePath) content
+            -- Send request and wait for response
+            respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
 
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
+            -- Process response
+            case respResult of
+                Left err ->
+                    return $ Left err
 
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
+                Right (StoreAddResponse path) ->
+                    return $ Right path
 
-        Right (StoreAddResponse path) ->
-            return $ Right path
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store add request: " <> T.pack (show resp)
+                Right resp ->
+                    return $ Left $ DaemonError $
+                        "Invalid response type for store add request: " <> T.pack (show resp)
 
 -- | Verify a store path
 verifyStorePath :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
@@ -684,31 +671,31 @@ verifyStorePath conn path = do
 -- | Get store path for a file
 getStorePathForFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
 getStorePathForFile conn filePath = do
-    -- Check file existence
+    -- Check file existence first and return early if it doesn't exist
     fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+    if not fileExists
+        then return $ Left $ InputNotFound filePath
+        else do
+            -- Read file content
+            content <- BS.readFile filePath
 
-    -- Read file content
-    content <- BS.readFile filePath
+            -- Create store path request with positional arguments
+            let request = StorePathRequest (T.pack filePath) content
 
-    -- Create store path request with positional arguments
-    let request = StorePathRequest (T.pack filePath) content
+            -- Send request and wait for response
+            respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
 
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+            -- Process response
+            case respResult of
+                Left err ->
+                    return $ Left err
 
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
+                Right (StorePathResponse path) ->
+                    return $ Right path
 
-        Right (StorePathResponse path) ->
-            return $ Right path
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store path request: " <> T.pack (show resp)
+                Right resp ->
+                    return $ Left $ DaemonError $
+                        "Invalid response type for store path request: " <> T.pack (show resp)
 
 -- | List store contents
 listStore :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
@@ -843,7 +830,7 @@ listDerivations conn = do
                 "Invalid response type for list derivations request: " <> T.pack (show resp)
 
 -- | Get detailed information about a derivation
-getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError DerivationInfoResponse)
+getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError DerivationInfo)
 getDerivationInfo conn path = do
     -- Create query derivation info request with positional arguments
     let request = QueryDerivationRequest "info" (storePathToText path) (Just 1)
@@ -856,12 +843,19 @@ getDerivationInfo conn path = do
         Left err ->
             return $ Left err
 
-        Right (DerivationInfoResponse info) ->
-            return $ Right info
-
         Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for get derivation info request: " <> T.pack (show resp)
+            -- Extract DerivationInfo from response type
+            case resp of
+                DerivationInfoResponse drv outputs inputs storePath metadata ->
+                    return $ Right $ DerivationInfo {
+                        derivationId = 0,  -- ID is assigned by database
+                        derivationHash = derivHash drv,
+                        derivationStorePath = storePath,
+                        derivationTimestamp = 0  -- Timestamp from database
+                    }
+
+                _ -> return $ Left $ DaemonError $
+                    "Invalid response type for get derivation info request: " <> T.pack (show resp)
 
 -- | Run garbage collection (requires daemon privileges via protocol)
 collectGarbage :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
@@ -1032,13 +1026,6 @@ getDaemonConfig conn = do
         Right resp ->
             return $ Left $ DaemonError $
                 "Invalid response type for config request: " <> T.pack (show resp)
-
--- | Bitwise operations for message length encoding/decoding
-shiftL :: Int -> Int -> Int
-shiftL x n = x * (2 ^ n)
-
-(.|.) :: Int -> Int -> Int
-a .|. b = a + b
 
 -- | Render BuildId to Text
 renderBuildId :: BuildId -> Text
