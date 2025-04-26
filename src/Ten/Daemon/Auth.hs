@@ -130,7 +130,7 @@ import System.Random (randomRIO)
 import Ten.Core (PrivilegeTier(..), SPrivilegeTier(..), UserId(..), AuthToken(..))
 
 -- Import Protocol for authentication and security model
-import Ten.Daemon.Protocol (PrivilegeError(..), PrivilegeRequirement(..), DaemonCapability(..))
+import Ten.Daemon.Protocol (PrivilegeError(..), PrivilegeRequirement(..), DaemonCapability(..), UserCredentials(..))
 
 -- | Authentication errors
 data AuthError
@@ -146,6 +146,18 @@ data AuthError
     deriving (Show, Eq)
 
 instance Exception AuthError
+
+-- | Helper functions for auth privilege error handling with clear error messages
+-- These align with Nix's security model where privilege boundaries are explicitly enforced
+createPrivilegeError :: PrivilegeTier -> PrivilegeRequirement -> AuthError
+createPrivilegeError tier DaemonRequired =
+    PrivilegeEscalationDenied $ "Operation requires daemon privileges but requested tier is " <> T.pack (show tier)
+createPrivilegeError _ BuilderSufficient =
+    PrivilegeEscalationDenied "Insufficient privileges for this operation"
+
+createPrivilegeEscalationError :: PrivilegeTier -> PrivilegeTier -> AuthError
+createPrivilegeEscalationError from to =
+    PrivilegeEscalationDenied $ "Cannot escalate privileges from " <> T.pack (show from) <> " to " <> T.pack (show to)
 
 -- | Stored password hash
 data PasswordHash = PasswordHash {
@@ -584,7 +596,7 @@ authenticateUser db username password clientInfo requestedTier = do
                                     if verifyPassword password passwordHash
                                         then proceedWithAuthentication db username user clientInfo now requestedTier
                                         else return $ Left InvalidCredentials
-                else return $ Left $ InsufficientPrivileges requestedTier DaemonRequired
+                else return $ Left $ createPrivilegeError requestedTier DaemonRequired
 
 -- | Process authenticated user and create appropriate token
 proceedWithAuthentication ::
@@ -789,7 +801,7 @@ refreshToken db (AuthToken token) requestedTier = do
 
                                         -- Privilege escalation - denied
                                         (Builder, Daemon) ->
-                                            return $ Left $ InsufficientPrivileges Builder DaemonRequired
+                                            return $ Left $ createPrivilegeEscalationError Builder Daemon
 
 -- | Helper function to refresh token with specific privilege tier
 refreshWithTier ::
