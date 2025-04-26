@@ -66,9 +66,12 @@ import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Vector as Vector
 
-import Ten.Core
+import Ten.Core (
+            DaemonResponse(..), StorePath, StorePathReference, Derivation,
+            BuildEnv, TenM, PrivilegeTier(..), RunMode(..), Request, Phase(..)
+            )
 import Ten.DB.Core
-import Ten.Daemon.Protocol (DaemonRequest(..), DaemonResponse(..))
+import Ten.Daemon.Protocol (DaemonRequest(..))
 import qualified Ten.Derivation as Deriv
 
 -- | Information about a stored derivation
