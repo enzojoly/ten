@@ -99,11 +99,42 @@ import System.IO (Handle, IOMode(..), hClose, hFlush, hPutStrLn, stderr, hPutStr
 import System.Process (createProcess, proc, waitForProcess, StdStream(..), CreateProcess(..))
 import System.Timeout (timeout)
 
-import Ten.Core
-import Ten.Daemon.Protocol
+import Ten.Core (
+    DaemonConnection(..),
+    Request(..),
+    Response(..),
+    PrivilegeTier(..),
+    SPrivilegeTier(..),
+    Phase(..),
+    BuildError(..),
+    BuildId(..),
+    BuildStatus(..),
+    StorePath(..),
+    storePathToText,
+    createDaemonConnection,
+    closeDaemonConnection,
+    AuthToken(..),
+    UserId(..),
+    AuthResult(..),
+    Derivation(..),
+    parseStorePath,
+    BuildResult(..),
+    GCStats(..),
+    GCRoot(..),
+    DaemonConfig(..),
+    sBuilder,
+    ProtocolVersion(..),
+    currentProtocolVersion)
+import qualified Ten.Core as Core
+
+import Ten.Daemon.Protocol (DaemonRequest(..), DaemonResponse(..))
+import qualified Ten.Daemon.Protocol as Protocol
+
 import Ten.Daemon.Auth (UserCredentials(..))
 import Ten.Daemon.Config (getDefaultSocketPath)
+
 import Ten.Derivation (serializeDerivation, deserializeDerivation)
+import qualified Ten.Derivation as Derivation
 
 -- | Connect to the Ten daemon - always in Builder context
 connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError (DaemonConnection 'Builder))
@@ -128,14 +159,19 @@ connectToDaemon socketPath credentials = try $ do
 
     -- Authenticate with the daemon
     let authReq = AuthRequest {
-            authVersion = currentProtocolVersion,
-            authUser = username credentials,
-            authToken = token credentials,
-            authRequestedTier = Builder -- Always request Builder tier
+            reqType = "auth",
+            reqParams = Map.fromList [
+                ("version", T.pack $ show currentProtocolVersion),
+                ("username", username credentials),
+                ("token", token credentials),
+                ("requestedTier", "Builder")
+            ],
+            reqPayload = Nothing,
+            reqId = 0
         }
 
     -- Encode auth request
-    let reqBS = serializeMessage (AuthRequestMsg authReq)
+    let reqBS = Core.encodeRequest authReq
 
     -- Send auth request
     BS.hPut handle reqBS
@@ -144,25 +180,58 @@ connectToDaemon socketPath credentials = try $ do
     -- Read auth response
     respBS <- readMessageWithTimeout handle 5000000 -- 5 seconds timeout
 
-    -- Parse and handle the response
-    case deserializeMessage respBS of
+    -- Parse auth response
+    case Core.decodeResponse respBS of
         Left err ->
             throwIO $ AuthError $ "Authentication failed: " <> err
 
-        Right (AuthResponseMsg (AuthAccepted userId authToken capabilities)) -> do
-            -- Create daemon connection with proper privilege tier evidence
-            conn <- createDaemonConnection sock handle userId authToken sBuilder
+        Right resp ->
+            if respStatus resp == "ok" then
+                case parseAuthResult (respData resp) of
+                    AuthAccepted userId authToken capabilities -> do
+                        -- Create daemon connection with proper privilege tier evidence
+                        conn <- Core.createDaemonConnection sock handle userId authToken sBuilder
+                        return conn
+                    AuthRejected reason ->
+                        throwIO $ AuthError $ "Authentication rejected: " <> reason
+                    _ ->
+                        throwIO $ AuthError "Unexpected authentication response"
+            else
+                throwIO $ AuthError $ respMessage resp
 
-            return conn
+-- | Parse authentication result from response data
+parseAuthResult :: Map Text Text -> AuthResult
+parseAuthResult data_ =
+    let status = Map.findWithDefault "rejected" "status" data_
+    in case status of
+        "accepted" ->
+            let userId = UserId $ Map.findWithDefault "" "userId" data_
+                token = AuthToken $ Map.findWithDefault "" "token" data_
+                capStrs = T.splitOn "," $ Map.findWithDefault "" "capabilities" data_
+                caps = Set.fromList $ map parseCapability capStrs
+            in AuthAccepted userId token caps
+        "success" ->
+            let userId = UserId $ Map.findWithDefault "" "userId" data_
+                token = AuthToken $ Map.findWithDefault "" "token" data_
+            in AuthSuccess userId token
+        _ -> AuthRejected $ Map.findWithDefault "Authentication rejected" "reason" data_
 
-        Right (AuthResponseMsg (AuthRejected reason)) ->
-            throwIO $ AuthError $ "Authentication rejected: " <> reason
+-- | Parse a capability from text
+parseCapability :: Text -> Protocol.DaemonCapability
+parseCapability "StoreAccess" = Protocol.StoreAccess
+parseCapability "SandboxCreation" = Protocol.SandboxCreation
+parseCapability "GarbageCollection" = Protocol.GarbageCollection
+parseCapability "DerivationRegistration" = Protocol.DerivationRegistration
+parseCapability "DerivationBuild" = Protocol.DerivationBuild
+parseCapability "StoreQuery" = Protocol.StoreQuery
+parseCapability "BuildQuery" = Protocol.BuildQuery
+parseCapability _ = Protocol.BuildQuery  -- Default to safe capability
 
 -- | Disconnect from the Ten daemon
 disconnectFromDaemon :: DaemonConnection 'Builder -> IO ()
 disconnectFromDaemon conn = do
     -- Use the closeDaemonConnection function from Ten.Core
-    closeDaemonConnection conn
+    Core.closeDaemonConnection conn
 
 -- | Check if the daemon is running
 isDaemonRunning :: FilePath -> IO Bool
@@ -232,14 +301,147 @@ sendRequest conn request = do
         }
 
     -- Send request to daemon using Core implementation
-    reqId <- Ten.Core.sendRequest conn req
+    reqId <- Core.sendRequest conn req
     return $ Right reqId
+
+-- | Convert request type to string
+requestTypeToString :: DaemonRequest -> Text
+requestTypeToString = \case
+    Protocol.AuthRequest {} -> "auth"
+    Protocol.BuildRequest {} -> "build"
+    Protocol.EvalRequest {} -> "eval"
+    Protocol.BuildDerivationRequest {} -> "build-derivation"
+    Protocol.BuildStatusRequest {} -> "build-status"
+    Protocol.CancelBuildRequest {} -> "cancel-build"
+    Protocol.QueryBuildOutputRequest {} -> "build-output"
+    Protocol.ListBuildsRequest {} -> "list-builds"
+    Protocol.StoreAddRequest {} -> "store-add"
+    Protocol.StoreVerifyRequest {} -> "store-verify"
+    Protocol.StorePathRequest {} -> "store-path"
+    Protocol.StoreListRequest -> "store-list"
+    Protocol.StoreDerivationRequest {} -> "store-derivation"
+    Protocol.RetrieveDerivationRequest {} -> "retrieve-derivation"
+    Protocol.QueryDerivationRequest {} -> "query-derivation"
+    Protocol.GetDerivationForOutputRequest {} -> "get-derivation-for-output"
+    Protocol.ListDerivationsRequest {} -> "list-derivations"
+    Protocol.GCRequest {} -> "gc"
+    Protocol.GCStatusRequest {} -> "gc-status"
+    Protocol.AddGCRootRequest {} -> "add-gc-root"
+    Protocol.RemoveGCRootRequest {} -> "remove-gc-root"
+    Protocol.ListGCRootsRequest -> "list-gc-roots"
+    Protocol.PingRequest -> "ping"
+    Protocol.ShutdownRequest -> "shutdown"
+    Protocol.StatusRequest -> "status"
+    Protocol.ConfigRequest -> "config"
+
+-- | Convert request to parameters map
+requestToParams :: DaemonRequest -> Map Text Text
+requestToParams = \case
+    Protocol.AuthRequest {} -> Map.empty  -- Handled specially in connectToDaemon
+    Protocol.BuildRequest path contentMaybe info -> Map.fromList [
+        ("path", path),
+        ("hasContent", if isJust contentMaybe then "true" else "false"),
+        ("timeout", maybe "" (T.pack . show) (buildTimeout info)),
+        ("flags", T.intercalate "," (buildFlags info))
+        ]
+    Protocol.EvalRequest path contentMaybe info -> Map.fromList [
+        ("path", path),
+        ("hasContent", if isJust contentMaybe then "true" else "false"),
+        ("timeout", maybe "" (T.pack . show) (buildTimeout info)),
+        ("flags", T.intercalate "," (buildFlags info))
+        ]
+    Protocol.BuildDerivationRequest _ info -> Map.fromList [
+        ("hasDerivation", "true"),
+        ("timeout", maybe "" (T.pack . show) (buildTimeout info)),
+        ("flags", T.intercalate "," (buildFlags info))
+        ]
+    Protocol.BuildStatusRequest buildId -> Map.fromList [
+        ("buildId", renderBuildId buildId)
+        ]
+    Protocol.CancelBuildRequest buildId -> Map.fromList [
+        ("buildId", renderBuildId buildId)
+        ]
+    Protocol.QueryBuildOutputRequest buildId -> Map.fromList [
+        ("buildId", renderBuildId buildId)
+        ]
+    Protocol.ListBuildsRequest limit -> Map.fromList [
+        ("limit", maybe "" (T.pack . show) limit)
+        ]
+    Protocol.StoreAddRequest path _ -> Map.fromList [
+        ("path", path),
+        ("hasContent", "true")
+        ]
+    Protocol.StoreVerifyRequest path -> Map.fromList [
+        ("path", storePathToText path)
+        ]
+    Protocol.StorePathRequest path _ -> Map.fromList [
+        ("path", path),
+        ("hasContent", "true")
+        ]
+    Protocol.StoreListRequest -> Map.empty
+    Protocol.StoreDerivationRequest _ -> Map.singleton "hasContent" "true"
+    Protocol.RetrieveDerivationRequest path -> Map.singleton "path" (storePathToText path)
+    Protocol.QueryDerivationRequest qType qValue qLimit -> Map.fromList [
+        ("queryType", qType),
+        ("queryValue", qValue),
+        ("limit", maybe "" (T.pack . show) qLimit)
+        ]
+    Protocol.GetDerivationForOutputRequest path -> Map.singleton "path" path
+    Protocol.ListDerivationsRequest limit -> Map.singleton "limit" (maybe "" (T.pack . show) limit)
+    Protocol.GCRequest force -> Map.singleton "force" (if force then "true" else "false")
+    Protocol.GCStatusRequest forceCheck -> Map.singleton "forceCheck" (if forceCheck then "true" else "false")
+    Protocol.AddGCRootRequest path name permanent -> Map.fromList [
+        ("path", storePathToText path),
+        ("name", name),
+        ("permanent", if permanent then "true" else "false")
+        ]
+    Protocol.RemoveGCRootRequest name -> Map.singleton "name" name
+    Protocol.ListGCRootsRequest -> Map.empty
+    Protocol.PingRequest -> Map.empty
+    Protocol.ShutdownRequest -> Map.empty
+    Protocol.StatusRequest -> Map.empty
+    Protocol.ConfigRequest -> Map.empty
+
+-- | Convert request to payload
+requestToPayload :: DaemonRequest -> Maybe BS.ByteString
+requestToPayload = \case
+    Protocol.BuildRequest _ (Just content) _ -> Just content
+    Protocol.EvalRequest _ (Just content) _ -> Just content
+    Protocol.BuildDerivationRequest drv _ -> Just (serializeDerivation drv)
+    Protocol.StoreAddRequest _ content -> Just content
+    Protocol.StorePathRequest _ content -> Just content
+    Protocol.StoreDerivationRequest content -> Just content
+    _ -> Nothing
+
+-- | Render a BuildId to Text
+renderBuildId :: BuildId -> Text
+renderBuildId (BuildId u) = "build-" <> T.pack (show (Core.hashUnique u))
+renderBuildId (BuildIdFromInt n) = "build-" <> T.pack (show n)
+
+-- | Parse a BuildId from Text
+parseBuildId :: Text -> BuildId
+parseBuildId txt =
+    case T.stripPrefix "build-" txt of
+        Just numStr ->
+            case readMaybe (T.unpack numStr) of
+                Just n -> BuildIdFromInt n
+                Nothing -> BuildIdFromInt 0  -- Default if invalid
+        Nothing ->
+            case readMaybe (T.unpack txt) of
+                Just n -> BuildIdFromInt n
+                Nothing -> BuildIdFromInt 0  -- Default if invalid
+
+-- Helper function for readMaybe
+readMaybe :: Read a => String -> Maybe a
+readMaybe s = case reads s of
+    [(x, "")] -> Just x
+    _ -> Nothing
 
 -- | Receive a response for a specific request
 receiveResponse :: DaemonConnection 'Builder -> Int -> Int -> IO (Either BuildError DaemonResponse)
 receiveResponse conn reqId timeoutMicros = do
     -- Use the core receiveResponse function
-    result <- Ten.Core.receiveResponse conn reqId timeoutMicros
+    result <- Core.receiveResponse conn reqId timeoutMicros
 
     -- Convert from core Response to domain DaemonResponse
     case result of
@@ -259,125 +461,11 @@ sendRequestSync conn request timeoutMicros = do
         Right reqId ->
             receiveResponse conn reqId timeoutMicros
 
--- | Convert request type to string
-requestTypeToString :: DaemonRequest -> Text
-requestTypeToString = \case
-    AuthRequest {} -> "auth"
-    BuildRequest {} -> "build"
-    EvalRequest {} -> "eval"
-    BuildDerivationRequest {} -> "build-derivation"
-    BuildStatusRequest {} -> "build-status"
-    CancelBuildRequest {} -> "cancel-build"
-    QueryBuildOutputRequest {} -> "build-output"
-    ListBuildsRequest {} -> "list-builds"
-    StoreAddRequest {} -> "store-add"
-    StoreVerifyRequest {} -> "store-verify"
-    StorePathRequest {} -> "store-path"
-    StoreListRequest -> "store-list"
-    StoreDerivationRequest {} -> "store-derivation"
-    RetrieveDerivationRequest {} -> "retrieve-derivation"
-    QueryDerivationRequest {} -> "query-derivation"
-    GetDerivationForOutputRequest {} -> "get-derivation-for-output"
-    ListDerivationsRequest {} -> "list-derivations"
-    GCRequest {} -> "gc"
-    GCStatusRequest {} -> "gc-status"
-    AddGCRootRequest {} -> "add-gc-root"
-    RemoveGCRootRequest {} -> "remove-gc-root"
-    ListGCRootsRequest -> "list-gc-roots"
-    PingRequest -> "ping"
-    ShutdownRequest -> "shutdown"
-    StatusRequest -> "status"
-    ConfigRequest -> "config"
-
--- | Convert request to parameters map
-requestToParams :: DaemonRequest -> Map Text Text
-requestToParams = \case
-    AuthRequest version creds -> Map.fromList [
-        ("version", T.pack $ show version),
-        ("username", username creds),
-        ("token", token creds),
-        ("requestedTier", "Builder")
-        ]
-    BuildRequest path _ options -> Map.fromList [
-        ("path", path),
-        ("hasContent", if isJust _ then "true" else "false"),
-        ("timeout", maybe "" (T.pack . show) (buildTimeout options)),
-        ("flags", T.intercalate "," (buildFlags options))
-        ]
-    EvalRequest path _ options -> Map.fromList [
-        ("path", path),
-        ("hasContent", if isJust _ then "true" else "false"),
-        ("timeout", maybe "" (T.pack . show) (buildTimeout options)),
-        ("flags", T.intercalate "," (buildFlags options))
-        ]
-    BuildDerivationRequest _ options -> Map.fromList [
-        ("hasDerivation", "true"),
-        ("timeout", maybe "" (T.pack . show) (buildTimeout options)),
-        ("flags", T.intercalate "," (buildFlags options))
-        ]
-    BuildStatusRequest buildId -> Map.fromList [
-        ("buildId", T.pack $ show buildId)
-        ]
-    CancelBuildRequest buildId -> Map.fromList [
-        ("buildId", T.pack $ show buildId)
-        ]
-    QueryBuildOutputRequest buildId -> Map.fromList [
-        ("buildId", T.pack $ show buildId)
-        ]
-    ListBuildsRequest limit -> Map.fromList [
-        ("limit", maybe "" (T.pack . show) limit)
-        ]
-    StoreAddRequest path _ -> Map.fromList [
-        ("path", path),
-        ("hasContent", "true")
-        ]
-    StoreVerifyRequest path -> Map.fromList [
-        ("path", path)
-        ]
-    StorePathRequest path _ -> Map.fromList [
-        ("path", path),
-        ("hasContent", "true")
-        ]
-    StoreListRequest -> Map.empty
-    StoreDerivationRequest {} -> Map.singleton "hasDerivation" "true"
-    RetrieveDerivationRequest path -> Map.singleton "path" (storePathToText path)
-    QueryDerivationRequest qType qValue qLimit -> Map.fromList [
-        ("queryType", qType),
-        ("queryValue", qValue),
-        ("limit", maybe "" (T.pack . show) qLimit)
-        ]
-    GetDerivationForOutputRequest path -> Map.singleton "path" path
-    ListDerivationsRequest limit -> Map.singleton "limit" (maybe "" (T.pack . show) limit)
-    GCRequest force -> Map.singleton "force" (if force then "true" else "false")
-    GCStatusRequest forceCheck -> Map.singleton "forceCheck" (if forceCheck then "true" else "false")
-    AddGCRootRequest path name permanent -> Map.fromList [
-        ("path", storePathToText path),
-        ("name", name),
-        ("permanent", if permanent then "true" else "false")
-        ]
-    RemoveGCRootRequest name -> Map.singleton "name" name
-    ListGCRootsRequest -> Map.empty
-    PingRequest -> Map.empty
-    ShutdownRequest -> Map.empty
-    StatusRequest -> Map.empty
-    ConfigRequest -> Map.empty
-
--- | Convert request to payload
-requestToPayload :: DaemonRequest -> Maybe BS.ByteString
-requestToPayload = \case
-    BuildRequest _ (Just content) _ -> Just content
-    EvalRequest _ (Just content) _ -> Just content
-    BuildDerivationRequest drv _ -> Just (serializeDerivation drv)
-    StoreAddRequest _ content -> Just content
-    StorePathRequest _ content -> Just content
-    StoreDerivationRequest content -> Just content
-    _ -> Nothing
-
 -- | Parse a response from core Response to domain DaemonResponse
 parseResponse :: Response -> Either BuildError DaemonResponse
 parseResponse resp
     | respStatus resp == "error" =
-        Left $ BuildError $ parseErrorType (Map.findWithDefault "unknown" "type" (respData resp)) (respMessage resp)
+        Left $ parseErrorType (Map.findWithDefault "unknown" "type" (respData resp)) (respMessage resp)
     | otherwise = parseSuccessResponse resp
 
 -- | Parse error type from response
@@ -407,92 +495,111 @@ parseErrorType _ = InternalError
 -- | Parse successful response based on type
 parseSuccessResponse :: Response -> Either BuildError DaemonResponse
 parseSuccessResponse resp =
-    case respType resp of
-        "auth" -> Right $ AuthResponse $ parseAuthResult (respData resp) (respPayload resp)
-        "build-started" -> Right $ BuildStartedResponse $ parseBuildId (Map.findWithDefault "" "buildId" (respData resp))
-        "build-result" -> Right $ BuildResponse $ parseBuildResult (respData resp) (respPayload resp)
-        "build-status" -> Right $ BuildStatusResponse $ parseBuildStatus (respData resp)
-        "build-output" -> Right $ BuildOutputResponse $ Map.findWithDefault "" "output" (respData resp)
-        "build-list" -> Right $ BuildListResponse $ parseBuildList (respData resp)
-        "build-cancelled" -> Right $ CancelBuildResponse $ Map.findWithDefault "false" "success" (respData resp) == "true"
-        "store-add" -> Right $ StoreAddResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
-        "store-verify" -> Right $ StoreVerifyResponse $ Map.findWithDefault "false" "valid" (respData resp) == "true"
-        "store-path" -> Right $ StorePathResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
-        "store-list" -> Right $ StoreListResponse $ parseStorePaths (Map.findWithDefault "" "paths" (respData resp))
-        "derivation" ->
+    case Map.lookup "type" (respData resp) of
+        Just "auth" -> Right $ Protocol.AuthResponse $ parseAuthResult (respData resp)
+        Just "build-started" -> Right $ Protocol.BuildStartedResponse $ parseBuildId (Map.findWithDefault "" "buildId" (respData resp))
+        Just "build-result" -> Right $ Protocol.BuildResultResponse $ parseBuildResult (respData resp) (respPayload resp)
+        Just "build-status" -> Right $ Protocol.BuildStatusResponse $ parseBuildStatus (respData resp)
+        Just "build-output" -> Right $ Protocol.BuildOutputResponse $ Map.findWithDefault "" "output" (respData resp)
+        Just "build-list" -> Right $ Protocol.BuildListResponse $ parseBuildList (respData resp)
+        Just "build-cancelled" -> Right $ Protocol.CancelBuildResponse $ Map.findWithDefault "false" "success" (respData resp) == "true"
+        Just "store-add" -> Right $ Protocol.StoreAddResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
+        Just "store-verify" -> Right $ Protocol.StoreVerifyResponse $ Map.findWithDefault "false" "valid" (respData resp) == "true"
+        Just "store-path" -> Right $ Protocol.StorePathResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
+        Just "store-list" -> Right $ Protocol.StoreListResponse $ parseStorePaths (Map.findWithDefault "" "paths" (respData resp))
+        Just "derivation" ->
             case respPayload resp of
                 Just content ->
                     case deserializeDerivation content of
-                        Left err -> Left $ SerializationError err
-                        Right drv -> Right $ DerivationResponse drv
+                        Left err -> Left $ SerializationError $ buildErrorToText err
+                        Right drv -> Right $ Protocol.DerivationResponse drv
                 Nothing -> Left $ SerializationError "Missing derivation content"
-        "derivation-stored" -> Right $ DerivationStoredResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
-        "derivation-retrieved" ->
+        Just "derivation-stored" -> Right $ Protocol.DerivationStoredResponse $ parseStorePath (Map.findWithDefault "" "path" (respData resp))
+        Just "derivation-retrieved" ->
             case respPayload resp of
                 Just content ->
                     case deserializeDerivation content of
-                        Left err -> Left $ SerializationError err
-                        Right drv -> Right $ DerivationRetrievedResponse (Just drv)
-                Nothing -> Right $ DerivationRetrievedResponse Nothing
-        "derivation-query" ->
+                        Left err -> Left $ SerializationError $ buildErrorToText err
+                        Right drv -> Right $ Protocol.DerivationRetrievedResponse (Just drv)
+                Nothing -> Right $ Protocol.DerivationRetrievedResponse Nothing
+        Just "derivation-query" ->
             case respPayload resp of
                 Just content -> parseDerivationList content
-                Nothing -> Right $ DerivationQueryResponse []
-        "derivation-outputs" -> Right $ DerivationOutputResponse $ parseStorePathSet (Map.findWithDefault "" "outputs" (respData resp))
-        "derivation-list" -> Right $ DerivationListResponse $ parseStorePaths (Map.findWithDefault "" "paths" (respData resp))
-        "gc-result" -> Right $ GCResponse $ parseGCStats (respData resp)
-        "gc-started" -> Right GCStartedResponse
-        "gc-status" -> Right $ GCStatusResponse $ parseGCStatus (respData resp)
-        "gc-root-added" -> Right $ GCRootAddedResponse $ Map.findWithDefault "" "name" (respData resp)
-        "gc-root-removed" -> Right $ GCRootRemovedResponse $ Map.findWithDefault "" "name" (respData resp)
-        "gc-roots-list" -> Right $ GCRootsListResponse $ parseGCRoots (respData resp)
-        "pong" -> Right PongResponse
-        "shutdown" -> Right ShutdownResponse
-        "status" -> Right $ StatusResponse $ parseDaemonStatus (respData resp)
-        "config" -> Right $ ConfigResponse $ parseDaemonConfig (respData resp)
-        "eval" ->
+                Nothing -> Right $ Protocol.DerivationQueryResponse []
+        Just "derivation-outputs" -> Right $ Protocol.DerivationOutputResponse $ parseStorePathSet (Map.findWithDefault "" "outputs" (respData resp))
+        Just "derivation-list" -> Right $ Protocol.DerivationListResponse $ parseStorePaths (Map.findWithDefault "" "paths" (respData resp))
+        Just "gc-result" -> Right $ Protocol.GCResultResponse $ parseGCStats (respData resp)
+        Just "gc-started" -> Right Protocol.GCStartedResponse
+        Just "gc-status" -> Right $ Protocol.GCStatusResponse $ parseGCStatus (respData resp)
+        Just "gc-root-added" -> Right $ Protocol.GCRootAddedResponse $ Map.findWithDefault "" "name" (respData resp)
+        Just "gc-root-removed" -> Right $ Protocol.GCRootRemovedResponse $ Map.findWithDefault "" "name" (respData resp)
+        Just "gc-roots-list" -> Right $ Protocol.GCRootListResponse $ parseGCRoots (respData resp)
+        Just "pong" -> Right Protocol.PongResponse
+        Just "shutdown" -> Right Protocol.ShutdownResponse
+        Just "status" -> Right $ Protocol.StatusResponse $ parseDaemonStatus (respData resp)
+        Just "config" -> Right $ Protocol.ConfigResponse $ parseDaemonConfig (respData resp)
+        Just "eval" ->
             case respPayload resp of
                 Just content ->
                     case deserializeDerivation content of
-                        Left err -> Left $ SerializationError err
-                        Right drv -> Right $ EvalResponse drv
+                        Left err -> Left $ SerializationError $ buildErrorToText err
+                        Right drv -> Right $ Protocol.EvalResponse drv
                 Nothing -> Left $ SerializationError "Missing derivation content"
-        _ -> Left $ ProtocolError $ "Unknown response type: " <> respType resp
+        Just respType -> Left $ ProtocolError $ "Unknown response type: " <> respType
+        Nothing -> Left $ ProtocolError "Missing response type"
 
--- | Parse auth result from response data
-parseAuthResult :: Map Text Text -> Maybe BS.ByteString -> AuthResult
-parseAuthResult data_ _ =
-    let status = Map.findWithDefault "rejected" "status" data_
-    in case status of
-        "accepted" ->
-            let userId = UserId $ Map.findWithDefault "" "userId" data_
-                token = AuthToken $ Map.findWithDefault "" "token" data_
-                capStrs = T.splitOn "," $ Map.findWithDefault "" "capabilities" data_
-                caps = Set.fromList $ map parseCapability capStrs
-            in AuthAccepted userId token caps
-        "success" ->
-            let userId = UserId $ Map.findWithDefault "" "userId" data_
-                token = AuthToken $ Map.findWithDefault "" "token" data_
-            in AuthSuccess userId token
-        _ -> AuthRejected $ Map.findWithDefault "Authentication rejected" "reason" data_
+-- | BuildRequestInfo with standard fields
+data BuildRequestInfo = BuildRequestInfo {
+    buildTimeout :: Maybe Int,    -- Build timeout in seconds
+    buildEnv :: Map Text Text,    -- Extra environment variables
+    buildFlags :: [Text]          -- Build flags (e.g., --keep-failed, --no-out-link)
+} deriving (Show, Eq)
 
--- | Parse a capability from text
-parseCapability :: Text -> DaemonCapability
-parseCapability "StoreAccess" = StoreAccess
-parseCapability "SandboxCreation" = SandboxCreation
-parseCapability "GarbageCollection" = GarbageCollection
-parseCapability "DerivationRegistration" = DerivationRegistration
-parseCapability "DerivationBuild" = DerivationBuild
-parseCapability "StoreQuery" = StoreQuery
-parseCapability "BuildQuery" = BuildQuery
-parseCapability _ = BuildQuery  -- Default to safe capability
+-- | Default build request info
+defaultBuildRequestInfo :: BuildRequestInfo
+defaultBuildRequestInfo = BuildRequestInfo {
+    buildTimeout = Nothing,
+    buildEnv = Map.empty,
+    buildFlags = []
+}
 
--- | Parse a BuildId from text
-parseBuildId :: Text -> BuildId
-parseBuildId str =
-    case reads (T.unpack str) of
-        [(n, "")] -> BuildIdFromInt n
-        _ -> BuildIdFromInt 0  -- Default to zero if parsing fails
+-- | Build status update info
+data BuildStatusUpdate = BuildStatusUpdate {
+    buildId :: BuildId,
+    buildStatus :: BuildStatus,
+    buildTimeElapsed :: Double,   -- Time elapsed in seconds
+    buildTimeRemaining :: Maybe Double,  -- Estimated time remaining (if available)
+    buildLogUpdate :: Maybe Text,  -- New log messages since last update
+    buildResourceUsage :: Map Text Double  -- Resource usage metrics
+} deriving (Show, Eq)
+
+-- | GC status information
+data GCStatusInfo = GCStatusInfo {
+    gcRunning :: Bool,           -- Whether GC is currently running
+    gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
+    gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
+} deriving (Show, Eq)
+
+-- | Daemon status information
+data DaemonStatus = DaemonStatus {
+    daemonStatus :: Text,           -- "running", "starting", etc.
+    daemonUptime :: Double,         -- Uptime in seconds
+    daemonActiveBuilds :: Int,      -- Number of active builds
+    daemonCompletedBuilds :: Int,   -- Number of completed builds since startup
+    daemonFailedBuilds :: Int,      -- Number of failed builds since startup
+    daemonGcRoots :: Int,           -- Number of GC roots
+    daemonStoreSize :: Integer,     -- Store size in bytes
+    daemonStorePaths :: Int         -- Number of paths in store
+} deriving (Show, Eq)
+
+-- | Derivation information type
+data DerivationInfo = DerivationInfo {
+    derivationResponseDrv :: Derivation,
+    derivationResponseOutputs :: Set StorePath,
+    derivationResponseInputs :: Set StorePath,
+    derivationResponseStorePath :: StorePath,
+    derivationResponseMetadata :: Map Text Text
+} deriving (Show, Eq)
 
 -- | Parse a BuildResult from response data and payload
 parseBuildResult :: Map Text Text -> Maybe BS.ByteString -> BuildResult
@@ -553,13 +660,6 @@ parseBuildList data_ =
     parseStatus "failed" _ = BuildFailed'
     parseStatus _ _ = BuildPending
 
--- | Parse a StorePath from text
-parseStorePath :: Text -> StorePath
-parseStorePath text =
-    case Ten.Core.parseStorePath text of
-        Just path -> path
-        Nothing -> StorePath "invalid" "invalid"  -- Fallback for invalid paths
-
 -- | Parse a list of StorePaths from comma-separated text
 parseStorePaths :: Text -> [StorePath]
 parseStorePaths text =
@@ -572,12 +672,12 @@ parseStorePathSet :: Text -> Set StorePath
 parseStorePathSet text = Set.fromList $ parseStorePaths text
 
 -- | Parse a list of derivations from binary content
-parseDerivationList :: BS.ByteString -> Either BuildError (DaemonResponse)
+parseDerivationList :: BS.ByteString -> Either BuildError DaemonResponse
 parseDerivationList content =
     -- For simplicity, assume we're parsing a single derivation for now
     case deserializeDerivation content of
-        Left err -> Left $ SerializationError err
-        Right drv -> Right $ DerivationQueryResponse [drv]
+        Left err -> Left $ SerializationError $ buildErrorToText err
+        Right drv -> Right $ Protocol.DerivationQueryResponse [drv]
 
 -- | Parse GC stats from response data
 parseGCStats :: Map Text Text -> GCStats
@@ -591,9 +691,9 @@ parseGCStats data_ =
     }
 
 -- | Parse GC status from response data
-parseGCStatus :: Map Text Text -> GCStatusResponse
+parseGCStatus :: Map Text Text -> GCStatusInfo
 parseGCStatus data_ =
-    GCStatusResponse {
+    GCStatusInfo {
         gcRunning = Map.findWithDefault "false" "running" data_ == "true",
         gcOwner = if Map.member "owner" data_ then Just $ Map.findWithDefault "" "owner" data_ else Nothing,
         gcLockTime = Nothing  -- Not parsed for simplicity
@@ -635,6 +735,7 @@ parseDaemonConfig data_ =
         daemonSocketPath = T.unpack $ Map.findWithDefault "/var/run/ten/daemon.sock" "socketPath" data_,
         daemonStorePath = T.unpack $ Map.findWithDefault "/var/lib/ten/store" "storePath" data_,
         daemonStateFile = T.unpack $ Map.findWithDefault "/var/lib/ten/state.json" "stateFile" data_,
+        daemonLogFile = if Map.member "logFile" data_ then Just $ T.unpack $ Map.findWithDefault "" "logFile" data_ else Nothing,
         daemonLogLevel = read $ T.unpack $ Map.findWithDefault "1" "logLevel" data_,
         daemonGcInterval = if Map.member "gcInterval" data_
                            then Just $ read $ T.unpack $ Map.findWithDefault "0" "gcInterval" data_
@@ -686,27 +787,603 @@ readMessage handle = do
 -- | Encode a request for transmission
 encodeRequest :: DaemonRequest -> BS.ByteString
 encodeRequest req =
-    -- Convert to core Request and use its serialization
+    -- Convert to core Request and use Core implementation
     let coreReq = Request {
             reqId = 0,  -- Will be set later
             reqType = requestTypeToString req,
             reqParams = requestToParams req,
             reqPayload = requestToPayload req
         }
-        encoded = Ten.Core.encodeRequest coreReq
-    in encoded
+    in Core.encodeRequest coreReq
 
 -- | Decode a response from bytes
 decodeResponse :: BS.ByteString -> Either Text DaemonResponse
 decodeResponse bs =
     -- First decode to core Response
-    case Ten.Core.decodeResponse bs of
+    case Core.decodeResponse bs of
         Left err -> Left err
         Right coreResp ->
             -- Then convert to domain response
             case parseResponse coreResp of
-                Left err -> Left $ T.pack $ show err
+                Left err -> Left $ buildErrorToText err
                 Right resp -> Right resp
+
+-- | Bitwise operations for message length encoding/decoding
+shiftL :: Int -> Int -> Int
+shiftL x n = x * (2 ^ n)
+
+(.|.) :: Int -> Int -> Int
+a .|. b = a + b
+
+-- The rest of the module implementation (buildFile, evalFile, etc.)
+-- follows the same pattern as in the previous version but using
+-- the local helper functions defined above
+
+-- | Build a file using the daemon
+buildFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError BuildResult)
+buildFile conn filePath = do
+    -- Check file existence
+    fileExists <- doesFileExist filePath
+    unless fileExists $
+        return $ Left $ InputNotFound filePath
+
+    -- Read file content
+    content <- BS.readFile filePath
+
+    -- Create build request
+    let request = Protocol.BuildRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.BuildResultResponse result) ->
+            return $ Right result
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for build request: " <> T.pack (show resp)
+
+-- | Evaluate a file using the daemon
+evalFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError Derivation)
+evalFile conn filePath = do
+    -- Check file existence
+    fileExists <- doesFileExist filePath
+    unless fileExists $
+        return $ Left $ InputNotFound filePath
+
+    -- Read file content
+    content <- BS.readFile filePath
+
+    -- Create eval request
+    let request = Protocol.EvalRequest (T.pack filePath) (Just content) defaultBuildRequestInfo
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationResponse derivation) ->
+            return $ Right derivation
+
+        Right (Protocol.EvalResponse derivation) ->
+            return $ Right derivation
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for eval request: " <> T.pack (show resp)
+
+-- | Build a derivation using the daemon
+buildDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError BuildResult)
+buildDerivation conn derivation = do
+    -- Create build derivation request
+    let request = Protocol.BuildDerivationRequest derivation defaultBuildRequestInfo
+
+    -- Send request and wait for response (longer timeout for builds)
+    respResult <- sendRequestSync conn request (3600 * 1000000) -- 1 hour timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.BuildResultResponse result) ->
+            return $ Right result
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for build derivation request: " <> T.pack (show resp)
+
+-- | Cancel a build
+cancelBuild :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError ())
+cancelBuild conn buildId = do
+    -- Create cancel build request
+    let request = Protocol.CancelBuildRequest buildId
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.CancelBuildResponse _) ->
+            return $ Right ()
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for cancel build request: " <> T.pack (show resp)
+
+-- | Get status of a build
+getBuildStatus :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError BuildStatusUpdate)
+getBuildStatus conn buildId = do
+    -- Create build status request
+    let request = Protocol.BuildStatusRequest buildId
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.BuildStatusResponse status) ->
+            return $ Right status
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for build status request: " <> T.pack (show resp)
+
+-- | Get output of a build
+getBuildOutput :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError Text)
+getBuildOutput conn buildId = do
+    -- Create build output request
+    let request = Protocol.QueryBuildOutputRequest buildId
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.BuildOutputResponse output) ->
+            return $ Right output
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for build output request: " <> T.pack (show resp)
+
+-- | List all builds
+listBuilds :: DaemonConnection 'Builder -> Maybe Int -> IO (Either BuildError [(BuildId, BuildStatus, Float)])
+listBuilds conn limit = do
+    -- Create list builds request
+    let request = Protocol.ListBuildsRequest limit
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.BuildListResponse builds) ->
+            return $ Right builds
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for list builds request: " <> T.pack (show resp)
+
+-- | Add a file to the store (requires daemon privileges via protocol)
+addFileToStore :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
+addFileToStore conn filePath = do
+    -- Check file existence
+    fileExists <- doesFileExist filePath
+    unless fileExists $
+        return $ Left $ InputNotFound filePath
+
+    -- Read file content
+    content <- BS.readFile filePath
+
+    -- Create store add request
+    let request = Protocol.StoreAddRequest (T.pack filePath) content
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.StoreAddResponse path) ->
+            return $ Right path
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for store add request: " <> T.pack (show resp)
+
+-- | Verify a store path
+verifyStorePath :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
+verifyStorePath conn path = do
+    -- Create verify request
+    let request = Protocol.StoreVerifyRequest path
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.StoreVerifyResponse valid) ->
+            return $ Right valid
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for store verify request: " <> T.pack (show resp)
+
+-- | Get store path for a file
+getStorePathForFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
+getStorePathForFile conn filePath = do
+    -- Check file existence
+    fileExists <- doesFileExist filePath
+    unless fileExists $
+        return $ Left $ InputNotFound filePath
+
+    -- Read file content
+    content <- BS.readFile filePath
+
+    -- Create store path request
+    let request = Protocol.StorePathRequest (T.pack filePath) content
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.StorePathResponse path) ->
+            return $ Right path
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for store path request: " <> T.pack (show resp)
+
+-- | List store contents
+listStore :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
+listStore conn = do
+    -- Create list request
+    let request = Protocol.StoreListRequest
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.StoreListResponse paths) ->
+            return $ Right paths
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for store list request: " <> T.pack (show resp)
+
+-- | Store a derivation in the daemon store (requires daemon privileges via protocol)
+storeDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError StorePath)
+storeDerivation conn derivation = do
+    -- Serialize the derivation
+    let serialized = serializeDerivation derivation
+
+    -- Create store derivation request
+    let request = Protocol.StoreDerivationRequest serialized
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationStoredResponse path) ->
+            return $ Right path
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for store derivation request: " <> T.pack (show resp)
+
+-- | Retrieve a derivation from the store
+retrieveDerivation :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
+retrieveDerivation conn path = do
+    -- Create retrieve derivation request
+    let request = Protocol.RetrieveDerivationRequest path
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationRetrievedResponse mDrv) ->
+            return $ Right mDrv
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for retrieve derivation request: " <> T.pack (show resp)
+
+-- | Query which derivation produced a particular output
+queryDerivationForOutput :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
+queryDerivationForOutput conn outputPath = do
+    -- Create get derivation for output request
+    let request = Protocol.GetDerivationForOutputRequest (storePathToText outputPath)
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationResponse derivation) ->
+            return $ Right $ Just derivation
+
+        Right (Protocol.DerivationRetrievedResponse mDrv) ->
+            return $ Right mDrv
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for query derivation for output request: " <> T.pack (show resp)
+
+-- | Query all outputs produced by a derivation
+queryOutputsForDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError (Set StorePath))
+queryOutputsForDerivation conn derivation = do
+    -- Create query derivation outputs request
+    let request = Protocol.QueryDerivationRequest "outputs" (derivHash derivation) Nothing
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationOutputResponse outputs) ->
+            return $ Right outputs
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for query outputs for derivation request: " <> T.pack (show resp)
+
+-- | List all derivations in the store
+listDerivations :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
+listDerivations conn = do
+    -- Create list derivations request
+    let request = Protocol.ListDerivationsRequest Nothing
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationListResponse paths) ->
+            return $ Right paths
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for list derivations request: " <> T.pack (show resp)
+
+-- | Get detailed information about a derivation
+getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError DerivationInfo)
+getDerivationInfo conn path = do
+    -- Create query derivation info request
+    let request = Protocol.QueryDerivationRequest "info" (storePathToText path) (Just 1)
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.DerivationInfoResponse info) ->
+            return $ Right info
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for get derivation info request: " <> T.pack (show resp)
+
+-- | Run garbage collection (requires daemon privileges via protocol)
+collectGarbage :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
+collectGarbage conn force = do
+    -- Create GC request
+    let request = Protocol.GCRequest force
+
+    -- Send request and wait for response (longer timeout for GC)
+    respResult <- sendRequestSync conn request (300 * 1000000) -- 5 minutes timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.GCResultResponse stats) ->
+            return $ Right stats
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for GC request: " <> T.pack (show resp)
+
+-- | Get GC status
+getGCStatus :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStatusInfo)
+getGCStatus conn forceCheck = do
+    -- Create GC status request
+    let request = Protocol.GCStatusRequest forceCheck
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.GCStatusResponse status) ->
+            return $ Right status
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for GC status request: " <> T.pack (show resp)
+
+-- | Add a GC root (requires daemon privileges via protocol)
+addGCRoot :: DaemonConnection 'Builder -> StorePath -> Text -> Bool -> IO (Either BuildError Text)
+addGCRoot conn path name permanent = do
+    -- Create add GC root request
+    let request = Protocol.AddGCRootRequest path name permanent
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.GCRootAddedResponse rootName) ->
+            return $ Right rootName
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for add GC root request: " <> T.pack (show resp)
+
+-- | Remove a GC root (requires daemon privileges via protocol)
+removeGCRoot :: DaemonConnection 'Builder -> Text -> IO (Either BuildError Text)
+removeGCRoot conn name = do
+    -- Create remove GC root request
+    let request = Protocol.RemoveGCRootRequest name
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.GCRootRemovedResponse rootName) ->
+            return $ Right rootName
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for remove GC root request: " <> T.pack (show resp)
+
+-- | List all GC roots
+listGCRoots :: DaemonConnection 'Builder -> IO (Either BuildError [(StorePath, Text, Bool)])
+listGCRoots conn = do
+    -- Create list GC roots request
+    let request = Protocol.ListGCRootsRequest
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.GCRootListResponse roots) ->
+            return $ Right roots
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for list GC roots request: " <> T.pack (show resp)
+
+-- | Shutdown the daemon (requires daemon privileges via protocol)
+shutdownDaemon :: DaemonConnection 'Builder -> IO (Either BuildError ())
+shutdownDaemon conn = do
+    -- Create shutdown request
+    let request = Protocol.ShutdownRequest
+
+    -- Send request and expect connection to close
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right Protocol.ShutdownResponse ->
+            return $ Right ()
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for shutdown request: " <> T.pack (show resp)
+
+-- | Get daemon status
+getDaemonStatus :: DaemonConnection 'Builder -> IO (Either BuildError DaemonStatus)
+getDaemonStatus conn = do
+    -- Create status request
+    let request = Protocol.StatusRequest
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.StatusResponse status) ->
+            return $ Right status
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for status request: " <> T.pack (show resp)
+
+-- | Get daemon configuration
+getDaemonConfig :: DaemonConnection 'Builder -> IO (Either BuildError DaemonConfig)
+getDaemonConfig conn = do
+    -- Create config request
+    let request = Protocol.ConfigRequest
+
+    -- Send request and wait for response
+    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
+
+    -- Process response
+    case respResult of
+        Left err ->
+            return $ Left err
+
+        Right (Protocol.ConfigResponse config) ->
+            return $ Right config
+
+        Right resp ->
+            return $ Left $ DaemonError $
+                "Invalid response type for config request: " <> T.pack (show resp)
 
 -- | Start the daemon if it's not running
 startDaemonIfNeeded :: FilePath -> IO (Either BuildError ())
@@ -778,628 +1455,5 @@ getProcessExitCode ph = do
         Left (_ :: SomeException) -> return Nothing
         Right exitCode -> return $ Just exitCode
 
--- | Build a file using the daemon
-buildFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError BuildResult)
-buildFile conn filePath = do
-    -- Check file existence
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
-
-    -- Read file content
-    content <- BS.readFile filePath
-
-    -- Create build request
-    let request = BuildRequest
-            { buildFilePath = T.pack filePath
-            , buildFileContent = Just content
-            , buildOptions = defaultBuildRequestInfo
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (120 * 1000000) -- 120 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (BuildResponse result) ->
-            return $ Right result
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for build request: " <> T.pack (show resp)
-
--- | Evaluate a file using the daemon
-evalFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError Derivation)
-evalFile conn filePath = do
-    -- Check file existence
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
-
-    -- Read file content
-    content <- BS.readFile filePath
-
-    -- Create eval request
-    let request = EvalRequest
-            { evalFilePath = T.pack filePath
-            , evalFileContent = Just content
-            , evalOptions = defaultBuildRequestInfo
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationResponse derivation) ->
-            return $ Right derivation
-
-        Right (EvalResponse derivation) ->
-            return $ Right derivation
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for eval request: " <> T.pack (show resp)
-
--- | Build a derivation using the daemon
-buildDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError BuildResult)
-buildDerivation conn derivation = do
-    -- Create build derivation request
-    let request = BuildDerivationRequest
-            { buildDerivation = derivation
-            , buildDerivOptions = defaultBuildRequestInfo
-            }
-
-    -- Send request and wait for response (longer timeout for builds)
-    respResult <- sendRequestSync conn request (3600 * 1000000) -- 1 hour timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (BuildResponse result) ->
-            return $ Right result
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for build derivation request: " <> T.pack (show resp)
-
--- | Cancel a build
-cancelBuild :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError ())
-cancelBuild conn buildId = do
-    -- Create cancel build request
-    let request = CancelBuildRequest
-            { cancelBuildId = buildId
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right CancelBuildResponse {} ->
-            return $ Right ()
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for cancel build request: " <> T.pack (show resp)
-
--- | Get status of a build
-getBuildStatus :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError BuildStatusUpdate)
-getBuildStatus conn buildId = do
-    -- Create build status request
-    let request = BuildStatusRequest
-            { statusBuildId = buildId
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (BuildStatusResponse status) ->
-            return $ Right status
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for build status request: " <> T.pack (show resp)
-
--- | Get output of a build
-getBuildOutput :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError Text)
-getBuildOutput conn buildId = do
-    -- Create build output request
-    let request = QueryBuildOutputRequest
-            { outputBuildId = buildId
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (BuildOutputResponse output) ->
-            return $ Right output
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for build output request: " <> T.pack (show resp)
-
--- | List all builds
-listBuilds :: DaemonConnection 'Builder -> Maybe Int -> IO (Either BuildError [(BuildId, BuildStatus, Float)])
-listBuilds conn limit = do
-    -- Create list builds request
-    let request = ListBuildsRequest
-            { listLimit = limit
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (BuildListResponse builds) ->
-            return $ Right builds
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for list builds request: " <> T.pack (show resp)
-
--- | Add a file to the store (requires daemon privileges via protocol)
-addFileToStore :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
-addFileToStore conn filePath = do
-    -- Check file existence
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
-
-    -- Read file content
-    content <- BS.readFile filePath
-
-    -- Create store add request
-    let request = StoreAddRequest
-            { storeAddPath = T.pack filePath
-            , storeAddContent = content
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (StoreAddResponse path) ->
-            return $ Right path
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store add request: " <> T.pack (show resp)
-
--- | Verify a store path
-verifyStorePath :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
-verifyStorePath conn path = do
-    -- Create verify request
-    let request = StoreVerifyRequest
-            { storeVerifyPath = storePathToText path
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (StoreVerifyResponse valid) ->
-            return $ Right valid
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store verify request: " <> T.pack (show resp)
-
--- | Get store path for a file
-getStorePathForFile :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
-getStorePathForFile conn filePath = do
-    -- Check file existence
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
-
-    -- Read file content
-    content <- BS.readFile filePath
-
-    -- Create store path request
-    let request = StorePathRequest
-            { storePathForFile = T.pack filePath
-            , storePathContent = content
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (StorePathResponse path) ->
-            return $ Right path
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store path request: " <> T.pack (show resp)
-
--- | List store contents
-listStore :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
-listStore conn = do
-    -- Create list request
-    let request = StoreListRequest
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (StoreListResponse paths) ->
-            return $ Right paths
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store list request: " <> T.pack (show resp)
-
--- | Store a derivation in the daemon store (requires daemon privileges via protocol)
-storeDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError StorePath)
-storeDerivation conn derivation = do
-    -- Serialize the derivation
-    let serialized = serializeDerivation derivation
-
-    -- Create store derivation request
-    let request = StoreDerivationRequest
-            { derivationContent = serialized
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationStoredResponse path) ->
-            return $ Right path
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for store derivation request: " <> T.pack (show resp)
-
--- | Retrieve a derivation from the store
-retrieveDerivation :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
-retrieveDerivation conn path = do
-    -- Create retrieve derivation request
-    let request = RetrieveDerivationRequest
-            { derivationPath = path
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationRetrievedResponse mDrv) ->
-            return $ Right mDrv
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for retrieve derivation request: " <> T.pack (show resp)
-
--- | Query which derivation produced a particular output
-queryDerivationForOutput :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError (Maybe Derivation))
-queryDerivationForOutput conn outputPath = do
-    -- Create get derivation for output request
-    let request = GetDerivationForOutputRequest
-            { getDerivationForPath = storePathToText outputPath
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationResponse derivation) ->
-            return $ Right $ Just derivation
-
-        Right (DerivationRetrievedResponse mDrv) ->
-            return $ Right mDrv
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for query derivation for output request: " <> T.pack (show resp)
-
--- | Query all outputs produced by a derivation
-queryOutputsForDerivation :: DaemonConnection 'Builder -> Derivation -> IO (Either BuildError (Set StorePath))
-queryOutputsForDerivation conn derivation = do
-    -- Create query derivation outputs request
-    let request = QueryDerivationRequest
-            { queryType = "outputs"
-            , queryValue = derivHash derivation
-            , queryLimit = Nothing
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationOutputResponse outputs) ->
-            return $ Right outputs
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for query outputs for derivation request: " <> T.pack (show resp)
-
--- | List all derivations in the store
-listDerivations :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
-listDerivations conn = do
-    -- Create list derivations request
-    let request = ListDerivationsRequest
-            { listDerivLimit = Nothing
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (60 * 1000000) -- 60 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationListResponse paths) ->
-            return $ Right paths
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for list derivations request: " <> T.pack (show resp)
-
--- | Get detailed information about a derivation
-getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError DerivationInfo)
-getDerivationInfo conn path = do
-    -- Create query derivation info request
-    let request = QueryDerivationRequest
-            { queryType = "info"
-            , queryValue = storePathToText path
-            , queryLimit = Just 1
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (DerivationInfoResponse info) ->
-            return $ Right info
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for get derivation info request: " <> T.pack (show resp)
-
--- | Run garbage collection (requires daemon privileges via protocol)
-collectGarbage :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
-collectGarbage conn force = do
-    -- Create GC request
-    let request = GCRequest
-            { gcForce = force
-            }
-
-    -- Send request and wait for response (longer timeout for GC)
-    respResult <- sendRequestSync conn request (300 * 1000000) -- 5 minutes timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (GCResponse stats) ->
-            return $ Right stats
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for GC request: " <> T.pack (show resp)
-
--- | Get GC status
-getGCStatus :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStatusResponse)
-getGCStatus conn forceCheck = do
-    -- Create GC status request
-    let request = GCStatusRequest
-            { gcForceCheck = forceCheck
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (GCStatusResponse status) ->
-            return $ Right status
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for GC status request: " <> T.pack (show resp)
-
--- | Add a GC root (requires daemon privileges via protocol)
-addGCRoot :: DaemonConnection 'Builder -> StorePath -> Text -> Bool -> IO (Either BuildError Text)
-addGCRoot conn path name permanent = do
-    -- Create add GC root request
-    let request = AddGCRootRequest
-            { rootPath = path
-            , rootName = name
-            , rootPermanent = permanent
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (GCRootAddedResponse rootName) ->
-            return $ Right rootName
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for add GC root request: " <> T.pack (show resp)
-
--- | Remove a GC root (requires daemon privileges via protocol)
-removeGCRoot :: DaemonConnection 'Builder -> Text -> IO (Either BuildError Text)
-removeGCRoot conn name = do
-    -- Create remove GC root request
-    let request = RemoveGCRootRequest
-            { rootNameToRemove = name
-            }
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (GCRootRemovedResponse rootName) ->
-            return $ Right rootName
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for remove GC root request: " <> T.pack (show resp)
-
--- | List all GC roots
-listGCRoots :: DaemonConnection 'Builder -> IO (Either BuildError [(StorePath, Text, Bool)])
-listGCRoots conn = do
-    -- Create list GC roots request
-    let request = ListGCRootsRequest
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (GCRootsListResponse roots) ->
-            return $ Right roots
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for list GC roots request: " <> T.pack (show resp)
-
--- | Shutdown the daemon (requires daemon privileges via protocol)
-shutdownDaemon :: DaemonConnection 'Builder -> IO (Either BuildError ())
-shutdownDaemon conn = do
-    -- Create shutdown request
-    let request = ShutdownRequest
-
-    -- Send request and expect connection to close
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right ShutdownResponse ->
-            return $ Right ()
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for shutdown request: " <> T.pack (show resp)
-
--- | Get daemon status
-getDaemonStatus :: DaemonConnection 'Builder -> IO (Either BuildError DaemonStatus)
-getDaemonStatus conn = do
-    -- Create status request
-    let request = StatusRequest
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (StatusResponse status) ->
-            return $ Right status
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for status request: " <> T.pack (show resp)
-
--- | Get daemon configuration
-getDaemonConfig :: DaemonConnection 'Builder -> IO (Either BuildError DaemonConfig)
-getDaemonConfig conn = do
-    -- Create config request
-    let request = ConfigRequest
-
-    -- Send request and wait for response
-    respResult <- sendRequestSync conn request (10 * 1000000) -- 10 seconds timeout
-
-    -- Process response
-    case respResult of
-        Left err ->
-            return $ Left err
-
-        Right (ConfigResponse config) ->
-            return $ Right config
-
-        Right resp ->
-            return $ Left $ DaemonError $
-                "Invalid response type for config request: " <> T.pack (show resp)
-
--- | Bitwise operations for message length encoding/decoding
-shiftL :: Int -> Int -> Int
-shiftL x n = x * (2 ^ n)
-
-(.|.) :: Int -> Int -> Int
-a .|. b = a + b
+-- Handle type to satisfy the signature in getProcessExitCode
+type ProcessHandle = System.Process.ProcessHandle
