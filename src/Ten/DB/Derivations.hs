@@ -36,7 +36,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.Except (throwError, catchError)
 import Data.Int (Int64)
-import Data.Maybe (fromMaybe, listToMaybe, catMaybes)
+import Data.Maybe (fromMaybe, listToMaybe, catMaybes, isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
