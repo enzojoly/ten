@@ -137,7 +137,7 @@ connectToDaemon socketPath credentials = try $ do
 
     -- Create the auth request and serialize it
     let authReq = AuthRequest authContent
-    let (reqData, _) = serializeDaemonRequest authReq
+    let (reqData, mPayload) = serializeDaemonRequest authReq
     let framedReq = createRequestFrame reqData
     sendAll sock framedReq
 
@@ -154,20 +154,110 @@ connectToDaemon socketPath credentials = try $ do
                     case authResult of
                         AuthAccepted userId authToken _ -> do
                             -- Create daemon connection with proper privilege tier evidence
-                            conn <- createDaemonConnection sock handle userId authToken sBuilder
-                            return conn
+                            requestMap <- newTVarIO Map.empty
+                            nextReqId <- newTVarIO 1
+                            shutdownFlag <- newTVarIO False
+
+                            -- Start background thread to read responses
+                            readerThread <- forkIO $ responseReaderThread sock requestMap shutdownFlag
+
+                            return DaemonConnection {
+                                connSocket = sock,
+                                connHandle = handle,
+                                connUserId = userId,
+                                connAuthToken = authToken,
+                                connRequestMap = requestMap,
+                                connNextReqId = nextReqId,
+                                connReaderThread = readerThread,
+                                connShutdown = shutdownFlag,
+                                connPrivEvidence = sBuilder
+                            }
                         AuthRejected reason ->
                             throwIO $ AuthError $ "Authentication rejected: " <> reason
                         AuthSuccess userId authToken -> do
                             -- Legacy format support
-                            conn <- createDaemonConnection sock handle userId authToken sBuilder
-                            return conn
+                            requestMap <- newTVarIO Map.empty
+                            nextReqId <- newTVarIO 1
+                            shutdownFlag <- newTVarIO False
+
+                            -- Start background thread to read responses
+                            readerThread <- forkIO $ responseReaderThread sock requestMap shutdownFlag
+
+                            return DaemonConnection {
+                                connSocket = sock,
+                                connHandle = handle,
+                                connUserId = userId,
+                                connAuthToken = authToken,
+                                connRequestMap = requestMap,
+                                connNextReqId = nextReqId,
+                                connReaderThread = readerThread,
+                                connShutdown = shutdownFlag,
+                                connPrivEvidence = sBuilder
+                            }
                 Right _ ->
                     throwIO $ AuthError "Invalid response type for authentication"
 
+-- | Background thread to read and dispatch responses
+responseReaderThread :: Socket -> TVar (Map Int (MVar (Either Text DaemonResponse))) -> TVar Bool -> IO ()
+responseReaderThread sock requestMap shutdownFlag = forever $ do
+    -- Check if we should shut down
+    shutdown <- readTVarIO shutdownFlag
+    when shutdown $ return ()
+
+    -- Try to read a response
+    eResp <- try $ receiveFramedResponse sock
+    case eResp of
+        Left (e :: SomeException) ->
+            -- Connection error, exit thread
+            return ()
+        Right (respData, mRespPayload) -> do
+            -- Deserialize the daemon response
+            let eResult = deserializeDaemonResponse respData mRespPayload
+
+            -- Extract response ID from the daemon response
+            let mReqId = case eResult of
+                    Right resp -> getResponseId resp
+                    _ -> Nothing
+
+            -- Deliver to waiting client if we have an ID and request
+            case mReqId of
+                Just reqId -> do
+                    reqMap <- readTVarIO requestMap
+                    case Map.lookup reqId reqMap of
+                        Just respVar -> do
+                            putMVar respVar eResult
+                            -- Remove request from tracking map
+                            atomically $ modifyTVar' requestMap $ Map.delete reqId
+                        Nothing ->
+                            -- Untracked response, ignore
+                            return ()
+                Nothing ->
+                    -- Couldn't extract ID, ignore
+                    return ()
+  where
+    -- Helper to extract request ID from different response types
+    getResponseId :: DaemonResponse -> Maybe Int
+    getResponseId (BuildStartedResponse (BuildIdFromInt n)) = Just n
+    getResponseId (BuildStatusResponse update) =
+        case buildId update of
+            BuildIdFromInt n -> Just n
+            _ -> Nothing
+    getResponseId _ = Nothing -- For most responses, we'd need metadata
+
 -- | Disconnect from the Ten daemon
 disconnectFromDaemon :: DaemonConnection 'Builder -> IO ()
-disconnectFromDaemon = Core.closeDaemonConnection
+disconnectFromDaemon conn = do
+    -- Signal reader thread to shut down
+    atomically $ writeTVar (connShutdown conn) True
+
+    -- Close socket handle
+    hClose (connHandle conn)
+
+    -- Close socket
+    close (connSocket conn)
+
+    -- Kill reader thread if it doesn't exit on its own
+    killThread (connReaderThread conn)
 
 -- | Check if the daemon is running
 isDaemonRunning :: FilePath -> IO Bool
@@ -268,18 +358,14 @@ receiveResponse conn reqId timeoutMicros = do
         Nothing ->
             -- No such request ID
             return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
-
         Just respVar -> do
             -- Wait for response with timeout
             mResult <- SystemTimeout.timeout timeoutMicros $ takeMVar respVar
 
-            -- Clean up request map
-            atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
-
             -- Return response or error
             case mResult of
                 Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
-                Just resp -> case deserializeDaemonResponse (respData resp) (respPayload resp) of
+                Just eResult -> case eResult of
                     Left err -> return $ Left $ ProtocolError err
                     Right daemonResp -> return $ Right daemonResp
 
@@ -836,24 +922,30 @@ getDerivationInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildE
 getDerivationInfo conn path = do
     -- Create query derivation info request with positional arguments
     let request = QueryDerivationRequest "info" (storePathToText path) (Just 1)
-
     -- Send request and wait for response
     respResult <- sendRequestSync conn request (30 * 1000000) -- 30 seconds timeout
-
     -- Process response
     case respResult of
         Left err ->
             return $ Left err
-
         Right resp ->
             -- Extract DerivationInfo from response type
             case resp of
-                DerivationInfoResponse drv outputs inputs storePath metadata ->
+                -- Try different potential response formats
+                DerivationQueryResponse [drv] ->
                     return $ Right $ DerivationInfo {
-                        derivationId = 0,  -- ID is assigned by database
+                        derivationId = 0,
                         derivationHash = derivHash drv,
-                        derivationStorePath = storePath,
-                        derivationTimestamp = 0  -- Timestamp from database
+                        derivationStorePath = path,
+                        derivationTimestamp = 0
+                    }
+
+                DerivationResponse drv ->
+                    return $ Right $ DerivationInfo {
+                        derivationId = 0,
+                        derivationHash = derivHash drv,
+                        derivationStorePath = path,
+                        derivationTimestamp = 0
                     }
 
                 _ -> return $ Left $ DaemonError $
