@@ -124,6 +124,39 @@ instance FromRow PathInfo where
 
         return $ PathInfo path hash deriver regTime (isValid == 1)
 
+-- | Extract metadata from daemon responses
+daemonResponseMeta :: Either BuildError DaemonResponse -> Map Text Text
+daemonResponseMeta (Left _) = Map.empty  -- No metadata for error responses
+daemonResponseMeta (Right response) =
+    case response of
+        DerivationStoredResponse path ->
+            Map.fromList [
+                -- Use the existing storeHash function to get the hash part
+                ("derivationId", storeHash path),
+                ("path", storePathToText path)
+            ]
+        SuccessResponse ->
+            Map.empty
+        StoreAddResponse path ->
+            Map.singleton "path" (storePathToText path)
+        DerivationQueryResponse derivs ->
+            Map.singleton "count" (T.pack $ show $ length derivs)
+        DerivationRetrievedResponse mDrv ->
+            let hash = maybe "" derivHash mDrv
+                deriver = maybe "" (storePathToText . derivBuilder) mDrv
+            in Map.fromList [
+                ("hash", hash),
+                ("deriver", deriver),
+                ("found", T.pack $ show $ isJust mDrv)
+            ]
+        StoreVerifyResponse valid ->
+            Map.fromList [
+                ("valid", if valid then "true" else "false"),
+                ("hash", "")  -- Placeholder for hash if needed
+            ]
+        -- Add additional response types as needed
+        _ -> Map.empty  -- Default empty metadata for other responses
+
 -- Helper function to parse StorePath from a database field
 parseStorePathField :: RowParser StorePath
 parseStorePathField = do
@@ -359,7 +392,7 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
             [] -> return Nothing
             [derivInfo] -> do
                 -- Get the derivation store path
-                let storePath = derivInfoStorePath derivInfo
+                let storePath = derivationStorePath derivInfo
 
                 -- Read and deserialize the derivation file
                 derivContent <- liftIO $ readDerivationFile env storePath
@@ -444,7 +477,7 @@ instance CanRetrieveDerivation 'Build 'Daemon where
             [] -> return Nothing
             [derivInfo] -> do
                 -- Get the derivation store path
-                let storePath = derivInfoStorePath derivInfo
+                let storePath = derivationStorePath derivInfo
 
                 -- Read and deserialize the derivation file
                 derivContent <- liftIO $ readDerivationFile env storePath
