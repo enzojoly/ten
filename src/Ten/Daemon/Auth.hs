@@ -127,10 +127,10 @@ import qualified System.Posix.User as PosixUser
 import System.Random (randomRIO)
 
 -- Import Ten.Core for basic types
-import Ten.Core (PrivilegeTier(..), SPrivilegeTier(..), UserId, AuthToken)
+import Ten.Core (PrivilegeTier(..), SPrivilegeTier(..), UserId(..), AuthToken(..))
 
 -- Import Protocol for authentication and security model
-import Ten.Daemon.Protocol (PrivilegeError(..), PrivilegeRequirement, DaemonCapability(..))
+import Ten.Daemon.Protocol (PrivilegeError(..), PrivilegeRequirement(..), DaemonCapability(..))
 
 -- | Authentication errors
 data AuthError
