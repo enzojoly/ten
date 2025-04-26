@@ -743,6 +743,11 @@ deserializeDaemonRequest bs payload =
 
                     Just (Aeson.String "store-list") -> Right StoreListRequest
 
+                    Just (Aeson.String "store-read") -> do
+                        case mPayload of
+                            Nothing -> Left "Missing store content payload"
+                            Just content -> Right $ StoreReadResponse content
+
                     Just (Aeson.String "store-derivation") -> do
                         case payload of
                             Nothing -> Left "Missing derivation content"

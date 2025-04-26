@@ -133,21 +133,21 @@ getDaemonResponseMessage SuccessResponse = "Success"
 getDaemonResponseMessage _ = "Unknown response"
 
 getPathFromDaemonResponse :: DaemonResponse -> Maybe Text
-getPathFromDaemonResponse (Ten.Core.StoreAddResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse (Ten.Core.StorePathResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse (Ten.Core.DerivationStoredResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (StoreAddResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (StorePathResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (DerivationStoredResponse path) = Just $ storePathToText path
 getPathFromDaemonResponse _ = Nothing
 
 getBytesFromDaemonResponse :: DaemonResponse -> Maybe ByteString
-getBytesFromDaemonResponse (Ten.Core.StoreReadResponse content) = Just content
+getBytesFromDaemonResponse (StoreReadResponse content) = Just content
 getBytesFromDaemonResponse _ = Nothing
 
 getReferencesFromDaemonResponse :: DaemonResponse -> Set StorePath
-getReferencesFromDaemonResponse (Ten.Core.DerivationOutputResponse paths) = paths
+getReferencesFromDaemonResponse (DerivationOutputResponse paths) = paths
 getReferencesFromDaemonResponse _ = Set.empty
 
 getExistsFromDaemonResponse :: DaemonResponse -> Bool
-getExistsFromDaemonResponse (Ten.Core.StoreVerifyResponse exists) = exists
+getExistsFromDaemonResponse (StoreVerifyResponse exists) = exists
 getExistsFromDaemonResponse _ = False
 
 -- | Store request message types for protocol communication
@@ -303,7 +303,7 @@ addToStore _ nameHint content = do
     let storeDir = storeLocation env
 
     -- Calculate hash of content
-    let contentHashDigest = Ten.Core.hashByteString content
+    let contentHashDigest = hashByteString content
     let contentHash = T.pack $ show contentHashDigest
 
     -- Sanitize name hint (remove special characters, etc.)
@@ -321,7 +321,7 @@ addToStore _ nameHint content = do
         then do
             -- Verify hash of existing file matches
             existingContent <- liftIO $ BS.readFile filePath
-            let existingHashDigest = Ten.Core.hashByteString existingContent
+            let existingHashDigest = hashByteString existingContent
             let existingHash = T.pack $ show existingHashDigest
             if existingHash == contentHash
                 then do
@@ -425,7 +425,7 @@ verifyStorePath path = do
             content <- readFromStore path
 
             -- Calculate hash of the content
-            let contentHashDigest = Ten.Core.hashByteString content
+            let contentHashDigest = hashByteString content
             let contentHash = T.pack $ show contentHashDigest
 
             -- Compare with the expected hash from the path
@@ -1008,7 +1008,7 @@ hashPath path = do
     -- Read file content
     content <- liftIO $ BS.readFile path
     -- Calculate hash
-    let hashDigest = Ten.Core.hashByteString content
+    let hashDigest = hashByteString content
     return $ T.pack $ show hashDigest
 
 -- | Get the hash part of a store path
@@ -1095,12 +1095,14 @@ requestReadViaProtocol path = do
             throwError $ StoreError $ "Failed to read from store: " <> case err of
                 DaemonError m -> m
                 _ -> T.pack (show err)
+
+        -- Direct pattern matching on the expected response type
+        Right (StoreReadResponse content) ->
+            return content
+
+        -- Handle unexpected response types with a clear error
         Right resp ->
-            if isDaemonResponseOk resp
-                then case getBytesFromDaemonResponse resp of
-                    Just content -> return content
-                    Nothing -> throwError $ StoreError "Missing content in response"
-                else throwError $ StoreError $ getDaemonResponseMessage resp
+            throwError $ StoreError $ "Unexpected response type: " <> T.pack (show resp)
 
 -- | Request to verify a path via daemon protocol
 -- For use in builder tier
