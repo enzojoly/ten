@@ -1061,7 +1061,8 @@ receiveResponse conn reqId timeoutMicros = do
                                 Right resp -> return $ Right resp
 
 -- | Send a request and wait for response (synchronous)
-sendRequestSync :: DaemonConnection t -> Request -> Int -> IO (Either BuildError Response)
+-- Always uses Builder privilege tier to enforce Nix-like privilege model
+sendRequestSync :: DaemonConnection 'Builder -> Request -> Int -> IO (Either BuildError DaemonResponse)
 sendRequestSync conn request timeoutMicros = do
     -- Send the request
     reqId <- sendRequest conn request
@@ -1322,16 +1323,8 @@ storeDerivationBuilder deriv = do
 
             case response of
                 Left err -> throwError err
-                Right resp ->
-                    if respStatus resp == "ok"
-                        then case Map.lookup "path" (respData resp) of
-                            Just pathText ->
-                                case parseStorePath pathText of
-                                    Just path -> return path
-                                    Nothing -> throwError $ StoreError "Invalid path in response"
-                            Nothing -> throwError $ StoreError "Missing path in response"
-                        else throwError $ StoreError $ respMessage resp
-
+                Right (DerivationStoredResponse path) -> return path
+                Right resp -> throwError $ StoreError $ "Unexpected response: " <> T.pack (show resp)
         _ -> throwError $ PrivilegeError "Cannot store derivation in builder context without daemon connection"
 
 -- | Read a derivation from the store (Daemon context with direct store access)
@@ -1359,7 +1352,7 @@ readDerivationBuilder path = do
             -- Create request for derivation content
             let request = Request {
                 reqId = 0,  -- Will be set by sendRequest
-                reqType = "store-read",
+                reqType = "retrieve-derivation",
                 reqParams = Map.singleton "path" (storePathToText path),
                 reqPayload = Nothing
             }
@@ -1369,15 +1362,11 @@ readDerivationBuilder path = do
 
             case response of
                 Left err -> return $ Left err
-                Right resp ->
-                    if respStatus resp == "ok"
-                        then case respPayload resp of
-                            Just content ->
-                                -- Deserialize using proper format
-                                return $ deserializeDerivation content
-                            Nothing -> return $ Left $ StoreError "Received empty response"
-                        else return $ Left $ StoreError $ respMessage resp
-
+                Right (DerivationRetrievedResponse mDeriv) ->
+                    case mDeriv of
+                        Just drv -> return $ Right drv
+                        Nothing -> return $ Left $ StoreError $ "Derivation not found: " <> storePathToText path
+                Right resp -> return $ Left $ StoreError $ "Unexpected response: " <> T.pack (show resp)
         _ -> return $ Left $ PrivilegeError "Cannot read derivation in builder context without daemon connection"
 
 -- | Store a build result (Daemon context with direct store access)
@@ -1446,15 +1435,8 @@ readBuildResultBuilder path = do
 
             case response of
                 Left err -> return $ Left err
-                Right resp ->
-                    if respStatus resp == "ok"
-                        then case respPayload resp of
-                            Just content ->
-                                -- Deserialize with proper format
-                                return $ deserializeBuildResult content
-                            Nothing -> return $ Left $ StoreError "Received empty response"
-                        else return $ Left $ StoreError $ respMessage resp
-
+                Right (BuildResultResponse result) -> return $ Right result
+                Right resp -> return $ Left $ StoreError $ "Unexpected response: " <> T.pack (show resp)
         _ -> return $ Left $ PrivilegeError "Cannot read build result in builder context without daemon connection"
 
 -- | Encode a request for transmission
@@ -1680,17 +1662,19 @@ deserializeDaemonResponse bs mPayload =
                             else Right $ DerivationRetrievedResponse Nothing
 
                     Just (Aeson.String "derivation-query") -> do
-                        count <- maybe (Left "Missing count") Right $
+                        countVal <- maybe (Left "Missing count") Right $
                             AKeyMap.lookup "count" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        let count = countVal :: Int  -- Explicit type annotation
                         case mPayload of
                             Nothing ->
                                 if count == 0
                                     then Right $ DerivationQueryResponse []
                                     else Left "Missing derivation content"
                             Just content ->
-                                -- This would need special handling for multiple derivations
-                                -- For simplicity, just returning a placeholder or empty list
-                                Right $ DerivationQueryResponse []
+                                -- Parse multiple derivations from the content
+                                -- In a real implementation, this would properly deserialize
+                                -- a list of derivations from the binary content
+                                parseDerivationsFromContent content
 
                     Just (Aeson.String "derivation-outputs") -> do
                         outputTexts <- maybe (Left "Missing outputs") Right $
@@ -1764,15 +1748,55 @@ deserializeDaemonResponse bs mPayload =
                     Just (Aeson.String typ) -> Left $ "Unknown response type: " <> typ
                     _ -> Left "Invalid response type"
   where
+    parseBuilds :: Aeson.Value -> Either Text [(BuildId, BuildStatus, Float)]
     parseBuilds builds = do
-        case Aeson.fromJSON builds of
-            Aeson.Success builds' -> Right builds'
-            Aeson.Error err -> Left $ "Invalid builds format: " <> T.pack err
+        case Aeson.parseEither parseBuildsArray builds of
+            Left err -> Left $ "Invalid builds format: " <> T.pack err
+            Right builds' -> Right builds'
+
+    parseBuildsArray :: Aeson.Value -> Parser [(BuildId, BuildStatus, Float)]
+    parseBuildsArray = Aeson.withArray "Builds" $ \arr ->
+        mapM parseBuildEntry (Vector.toList arr)
+
+    parseBuildEntry :: Aeson.Value -> Parser (BuildId, BuildStatus, Float)
+    parseBuildEntry = Aeson.withObject "BuildEntry" $ \o -> do
+        idText <- o Aeson..: "id"
+        statusText <- o Aeson..: "status" :: Parser Text
+        progress <- o Aeson..: "progress"
+
+        buildId <- case parseBuildId idText of
+            Left err -> fail $ T.unpack err
+            Right bid -> return bid
+
+        status <- case statusText of
+            "pending" -> return BuildPending
+            "running" -> return $ BuildRunning progress
+            "completed" -> return BuildCompleted
+            "failed" -> return BuildFailed'
+            "recursing" -> do
+                childId <- o Aeson..: "childId"
+                case parseBuildId childId of
+                    Left err -> fail $ T.unpack err
+                    Right cid -> return $ BuildRecursing cid
+            _ -> fail $ "Unknown build status: " ++ T.unpack statusText
+
+        return (buildId, status, progress)
+
+    parseDerivationsFromContent :: BS.ByteString -> Either Text DaemonResponse
+    parseDerivationsFromContent content = do
+        -- In a real implementation, this would deserialize a list of derivations
+        -- For now, we'll just return an empty list
+        Right $ DerivationQueryResponse []
 
     parseError errObj = do
         case Aeson.fromJSON errObj of
             Aeson.Success err -> Right err
             Aeson.Error err -> Left $ "Invalid error format: " <> T.pack err
+
+-- | Convert a BuildId to Text representation for serialization
+renderBuildId :: BuildId -> Text
+renderBuildId (BuildId u) = "build-" <> T.pack (show (hashUnique u))
+renderBuildId (BuildIdFromInt n) = "build-" <> T.pack (show n)
 
 -- | Parse a BuildId from Text
 parseBuildId :: Text -> Either Text BuildId
@@ -2576,6 +2600,114 @@ instance Aeson.FromJSON AuthResult where
         parseCapability "StoreQuery" = Just StoreQuery
         parseCapability "BuildQuery" = Just BuildQuery
         parseCapability _ = Nothing
+
+-- JSON instances for BuildStatusUpdate
+instance Aeson.ToJSON BuildStatusUpdate where
+    toJSON BuildStatusUpdate{..} = Aeson.object [
+        "buildId" Aeson..= renderBuildId buildId,
+        "status" Aeson..= encodeStatus buildStatus,
+        "timeElapsed" Aeson..= buildTimeElapsed,
+        "timeRemaining" Aeson..= buildTimeRemaining,
+        "logUpdate" Aeson..= buildLogUpdate,
+        "resourceUsage" Aeson..= buildResourceUsage
+        ]
+      where
+        encodeStatus :: BuildStatus -> Aeson.Value
+        encodeStatus BuildPending = Aeson.object [
+            "state" Aeson..= ("pending" :: Text),
+            "progress" Aeson..= (0 :: Float)
+            ]
+        encodeStatus (BuildRunning progress) = Aeson.object [
+            "state" Aeson..= ("running" :: Text),
+            "progress" Aeson..= progress
+            ]
+        encodeStatus (BuildRecursing bid) = Aeson.object [
+            "state" Aeson..= ("recursing" :: Text),
+            "childId" Aeson..= renderBuildId bid
+            ]
+        encodeStatus BuildCompleted = Aeson.object [
+            "state" Aeson..= ("completed" :: Text),
+            "progress" Aeson..= (1.0 :: Float)
+            ]
+        encodeStatus BuildFailed' = Aeson.object [
+            "state" Aeson..= ("failed" :: Text),
+            "progress" Aeson..= (0 :: Float)
+            ]
+
+instance Aeson.FromJSON BuildStatusUpdate where
+    parseJSON = Aeson.withObject "BuildStatusUpdate" $ \v -> do
+        buildIdText <- v Aeson..: "buildId"
+        buildId <- case parseBuildId buildIdText of
+            Left err -> fail $ T.unpack err
+            Right bid -> return bid
+
+        statusObj <- v Aeson..: "status"
+        buildStatus <- parseStatus statusObj
+
+        buildTimeElapsed <- v Aeson..: "timeElapsed"
+        buildTimeRemaining <- v Aeson..:? "timeRemaining"
+        buildLogUpdate <- v Aeson..:? "logUpdate"
+        buildResourceUsage <- v Aeson..:? "resourceUsage" Aeson..!= Map.empty
+
+        return BuildStatusUpdate{..}
+      where
+        parseStatus :: Aeson.Value -> Parser BuildStatus
+        parseStatus = Aeson.withObject "BuildStatus" $ \s -> do
+            state <- s Aeson..: "state" :: Parser Text
+            case state of
+                "pending" -> return BuildPending
+                "running" -> do
+                    progress <- s Aeson..: "progress"
+                    return $ BuildRunning progress
+                "recursing" -> do
+                    childId <- s Aeson..: "childId"
+                    buildId <- case parseBuildId childId of
+                        Left err -> fail $ T.unpack err
+                        Right bid -> return bid
+                    return $ BuildRecursing buildId
+                "completed" -> return BuildCompleted
+                "failed" -> return BuildFailed'
+                _ -> fail $ "Unknown build status: " ++ T.unpack state
+
+-- JSON instances for GCStatusInfo
+instance Aeson.ToJSON GCStatusInfo where
+    toJSON GCStatusInfo{..} = Aeson.object [
+        "running" Aeson..= gcRunning,
+        "owner" Aeson..= gcOwner,
+        "lockTime" Aeson..= gcLockTime
+        ]
+
+instance Aeson.FromJSON GCStatusInfo where
+    parseJSON = Aeson.withObject "GCStatusInfo" $ \v -> do
+        gcRunning <- v Aeson..: "running"
+        gcOwner <- v Aeson..:? "owner"
+        gcLockTime <- v Aeson..:? "lockTime"
+        return GCStatusInfo{..}
+
+-- JSON instances for DaemonStatus
+instance Aeson.ToJSON DaemonStatus where
+    toJSON DaemonStatus{..} = Aeson.object [
+        "status" Aeson..= daemonStatus,
+        "uptime" Aeson..= daemonUptime,
+        "activeBuilds" Aeson..= daemonActiveBuilds,
+        "completedBuilds" Aeson..= daemonCompletedBuilds,
+        "failedBuilds" Aeson..= daemonFailedBuilds,
+        "gcRoots" Aeson..= daemonGcRoots,
+        "storeSize" Aeson..= daemonStoreSize,
+        "storePaths" Aeson..= daemonStorePaths
+        ]
+
+instance Aeson.FromJSON DaemonStatus where
+    parseJSON = Aeson.withObject "DaemonStatus" $ \v -> do
+        daemonStatus <- v Aeson..: "status"
+        daemonUptime <- v Aeson..: "uptime"
+        daemonActiveBuilds <- v Aeson..: "activeBuilds"
+        daemonCompletedBuilds <- v Aeson..: "completedBuilds"
+        daemonFailedBuilds <- v Aeson..: "failedBuilds"
+        daemonGcRoots <- v Aeson..: "gcRoots"
+        daemonStoreSize <- v Aeson..: "storeSize"
+        daemonStorePaths <- v Aeson..: "storePaths"
+        return DaemonStatus{..}
 
 -- JSON instances for BuildResult
 instance Aeson.ToJSON BuildResult where
