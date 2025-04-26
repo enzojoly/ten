@@ -48,7 +48,7 @@ module Ten.Store
 
     -- Store protocol message types
     , StoreRequest(..)
-    , StoreResponse(..)
+    , StoreOperationResult(..)
 
     -- Protocol operations (for builder tier)
     , requestAddToStore
@@ -133,21 +133,21 @@ getDaemonResponseMessage SuccessResponse = "Success"
 getDaemonResponseMessage _ = "Unknown response"
 
 getPathFromDaemonResponse :: DaemonResponse -> Maybe Text
-getPathFromDaemonResponse (StoreAddResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse (StorePathResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse (DerivationStoredResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (Ten.Core.StoreAddResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (Ten.Core.StorePathResponse path) = Just $ storePathToText path
+getPathFromDaemonResponse (Ten.Core.DerivationStoredResponse path) = Just $ storePathToText path
 getPathFromDaemonResponse _ = Nothing
 
 getBytesFromDaemonResponse :: DaemonResponse -> Maybe ByteString
-getBytesFromDaemonResponse (StoreReadResponse content) = Just content
+getBytesFromDaemonResponse (Ten.Core.StoreReadResponse content) = Just content
 getBytesFromDaemonResponse _ = Nothing
 
 getReferencesFromDaemonResponse :: DaemonResponse -> Set StorePath
-getReferencesFromDaemonResponse (DerivationOutputResponse paths) = paths
+getReferencesFromDaemonResponse (Ten.Core.DerivationOutputResponse paths) = paths
 getReferencesFromDaemonResponse _ = Set.empty
 
 getExistsFromDaemonResponse :: DaemonResponse -> Bool
-getExistsFromDaemonResponse (StoreVerifyResponse exists) = exists
+getExistsFromDaemonResponse (Ten.Core.StoreVerifyResponse exists) = exists
 getExistsFromDaemonResponse _ = False
 
 -- | Store request message types for protocol communication
@@ -161,16 +161,17 @@ data StoreRequest
     | StoreGCRequest Bool                   -- Request garbage collection (force flag)
     deriving (Show, Eq)
 
--- | Store response message types for protocol communication
-data StoreResponse
-    = StoreAddResponse StorePath            -- Path where content was stored
-    | StoreReadResponse ByteString          -- Content read from store
-    | StoreVerifyResponse Bool              -- Whether path exists and is valid
-    | StoreListResponse [StorePath]         -- List of paths in store
-    | StoreDerivationResponse StorePath     -- Path where derivation was stored
-    | StoreReferenceResponse (Set StorePath) -- Set of references for a path
-    | StoreGCResponse Int Int Integer       -- GC stats: collected, remaining, bytes freed
-    | StoreErrorResponse Text               -- Error response
+-- | Store response message types for internal operations
+-- These are distinct from the protocol-level responses in Ten.Core
+data StoreOperationResult
+    = StoreAddResult StorePath             -- Path where content was stored
+    | StoreReadResult ByteString           -- Content read from store
+    | StoreVerifyResult Bool               -- Whether path exists and is valid
+    | StoreListResult [StorePath]          -- List of paths in store
+    | StoreDerivationResult StorePath      -- Path where derivation was stored
+    | StoreReferenceResult (Set StorePath) -- Set of references for a path
+    | StoreGCResult Int Int Integer        -- GC stats: collected, remaining, bytes freed
+    | StoreErrorResult Text                -- Error response
     deriving (Show, Eq)
 
 -- | Initialize the content-addressable store
@@ -493,7 +494,7 @@ removeFromStore _ path = do
         throwError $ StoreError $ "Path does not exist: " <> storePathToText path
 
     -- Check if path has any referrers
-    refs <- getReferencesToPath path  -- Changed from getReferencesToPathDaemon
+    refs <- getReferencesToPath path
     unless (Set.null refs) $
         throwError $ StoreError $ "Cannot remove path with referrers: " <> storePathToText path
 
@@ -641,7 +642,7 @@ collectGarbageCandidate st path = do
         then return False
         else do
             -- Check if path has any referrers
-            refs <- getReferencesToPath path  -- Changed from getReferencesToPathDaemon
+            refs <- getReferencesToPath path
             return $ Set.null refs
 
 -- | Garbage collection
