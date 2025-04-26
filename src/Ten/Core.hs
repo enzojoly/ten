@@ -17,6 +17,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Ten.Core (
     -- Core types
@@ -47,6 +48,17 @@ module Ten.Core (
     Capability(..),
     ProtocolVersion(..),
     currentProtocolVersion,
+
+    -- Added Daemon Response types
+    DaemonResponse(..),
+    DerivationInfo(..),
+    BuildStatusUpdate(..),
+    GCStatusInfo(..),
+    GCRequestParams(..),
+    GCStatusRequestParams(..),
+    DaemonStatus(..),
+    DerivationInfoResponse(..),
+    DerivationOutputMappingResponse(..),
 
     -- Protocol actions
     createDaemonConnection,
@@ -206,6 +218,13 @@ module Ten.Core (
     currentBuildId,
     verbosity,
 
+    -- Protocol utilities
+    parseRequestFrame,
+    receiveFramedResponse,
+    deserializeDaemonResponse,
+    splitResponseBytes,
+    extractRequestIdFromBytes,
+
     hashByteString
 ) where
 
@@ -231,6 +250,7 @@ import qualified Data.Text as T
 import Data.Word (Word8, Word32)
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
+import qualified System.Timeout as SystemTimeout
 import System.Directory
 import System.FilePath
 import qualified System.Process as Process
@@ -271,6 +291,7 @@ import System.Random (randomRIO)
 import qualified Data.Binary as Binary
 import qualified Data.Binary.Put as Binary
 import qualified Data.Binary.Get as Binary
+import qualified Data.Vector as Vector
 
 -- | Build phases for type-level separation between evaluation and execution
 data Phase = Eval | Build
@@ -718,6 +739,103 @@ data Response = Response {
     respPayload :: Maybe ByteString       -- ^ Optional binary payload
 } deriving (Show, Eq)
 
+-- | Full derivation information (Moved from Protocol.hs)
+data DerivationInfo = DerivationInfo {
+    derivationId :: Int,
+    derivationHash :: Text,
+    derivationStorePath :: StorePath,
+    derivationTimestamp :: Int
+} deriving (Show, Eq)
+
+-- | Response with derivation information (Moved from Protocol.hs)
+data DerivationInfoResponse = DerivationInfoResponse {
+    derivationResponseDrv :: Derivation,
+    derivationResponseOutputs :: Set StorePath,
+    derivationResponseInputs :: Set StorePath,
+    derivationResponseStorePath :: StorePath,
+    derivationResponseMetadata :: Map Text Text
+} deriving (Show, Eq)
+
+-- | Response with derivation-output mappings (Moved from Protocol.hs)
+data DerivationOutputMappingResponse = DerivationOutputMappingResponse {
+    outputMappings :: [(StorePath, StorePath)],  -- [(derivation path, output path)]
+    outputMappingCount :: Int,
+    outputMappingComplete :: Bool   -- Whether all mappings were included
+} deriving (Show, Eq)
+
+-- | Build status update (Moved from Protocol.hs)
+data BuildStatusUpdate = BuildStatusUpdate {
+    buildId :: BuildId,
+    buildStatus :: BuildStatus,
+    buildTimeElapsed :: Double,   -- Time elapsed in seconds
+    buildTimeRemaining :: Maybe Double,  -- Estimated time remaining (if available)
+    buildLogUpdate :: Maybe Text,  -- New log messages since last update
+    buildResourceUsage :: Map Text Double  -- Resource usage metrics
+} deriving (Show, Eq)
+
+-- | GC Request parameters (Moved from Protocol.hs)
+data GCRequestParams = GCRequestParams {
+    gcForce :: Bool  -- Force GC (run even if unsafe)
+} deriving (Show, Eq)
+
+-- | GC Status Request parameters (Moved from Protocol.hs)
+data GCStatusRequestParams = GCStatusRequestParams {
+    gcForceCheck :: Bool  -- Whether to force recheck the lock file
+} deriving (Show, Eq)
+
+-- | GC Status Response content (Moved from Protocol.hs)
+data GCStatusInfo = GCStatusInfo {
+    gcRunning :: Bool,           -- Whether GC is currently running
+    gcOwner :: Maybe Text,       -- Process/username owning the GC lock (if running)
+    gcLockTime :: Maybe UTCTime  -- When the GC lock was acquired (if running)
+} deriving (Show, Eq)
+
+-- | Daemon status information (Moved from Protocol.hs)
+data DaemonStatus = DaemonStatus {
+    daemonStatus :: Text,           -- "running", "starting", etc.
+    daemonUptime :: Double,         -- Uptime in seconds
+    daemonActiveBuilds :: Int,      -- Number of active builds
+    daemonCompletedBuilds :: Int,   -- Number of completed builds since startup
+    daemonFailedBuilds :: Int,      -- Number of failed builds since startup
+    daemonGcRoots :: Int,           -- Number of GC roots
+    daemonStoreSize :: Integer,     -- Store size in bytes
+    daemonStorePaths :: Int         -- Number of paths in store
+} deriving (Show, Eq)
+
+-- | Daemon response types for protocol communication (Moved from Protocol.hs)
+data DaemonResponse
+    = AuthResponse AuthResult
+    | BuildStartedResponse BuildId
+    | BuildResultResponse BuildResult
+    | BuildStatusResponse BuildStatusUpdate
+    | BuildOutputResponse Text
+    | BuildListResponse [(BuildId, BuildStatus, Float)]
+    | CancelBuildResponse Bool
+    | StoreAddResponse StorePath
+    | StoreVerifyResponse Bool
+    | StorePathResponse StorePath
+    | StoreListResponse [StorePath]
+    | DerivationResponse Derivation
+    | DerivationStoredResponse StorePath
+    | DerivationRetrievedResponse (Maybe Derivation)
+    | DerivationQueryResponse [Derivation]
+    | DerivationOutputResponse (Set StorePath)
+    | DerivationListResponse [StorePath]
+    | GCResultResponse GCStats
+    | GCStartedResponse
+    | GCStatusResponse GCStatusInfo
+    | GCRootAddedResponse Text
+    | GCRootRemovedResponse Text
+    | GCRootListResponse [GCRoot]
+    | PongResponse
+    | ShutdownResponse
+    | StatusResponse DaemonStatus
+    | ConfigResponse DaemonConfig
+    | EvalResponse Derivation
+    | ErrorResponse BuildError
+    | SuccessResponse
+    deriving (Show, Eq)
+
 -- | Daemon connection type - core implementation for client-server communication
 -- Parameterized by privilege tier for type-level enforcement
 data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
@@ -725,7 +843,7 @@ data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
     connHandle :: Handle,                     -- ^ Handle for socket I/O
     connUserId :: UserId,                     -- ^ Authenticated user ID
     connAuthToken :: AuthToken,               -- ^ Authentication token
-    connRequestMap :: TVar (Map Int (MVar BS.ByteString)),
+    connRequestMap :: TVar (Map Int (MVar BS.ByteString)), -- ^ Map of pending requests
     connNextReqId :: TVar Int,                -- ^ Next request ID
     connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
     connShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
@@ -952,14 +1070,14 @@ sendRequestSync conn request timeoutMicros = do
     receiveResponse conn reqId timeoutMicros
 
 -- | Background thread to read and dispatch responses
-responseReaderThread :: Socket -> TVar (Map Int (MVar BS.ByteString)) -> TVar Bool -> IO ()
-responseReaderThread sock requestMap shutdownFlag = forever $ do
+responseReaderThread :: Handle -> TVar (Map Int (MVar BS.ByteString)) -> TVar Bool -> IO ()
+responseReaderThread handle requestMap shutdownFlag = forever $ do
     -- Check if we should shut down
     shutdown <- readTVarIO shutdownFlag
     when shutdown $ return ()
 
     -- Try to read a response as raw bytes
-    eResp <- try $ receiveFramedResponse sock
+    eResp <- try $ receiveFramedResponse handle
     case eResp of
         Left (e :: SomeException) ->
             -- Connection error, exit thread
@@ -990,7 +1108,7 @@ extractRequestIdFromBytes bytes = do
     case Aeson.decodeStrict bytes of
         Just obj -> case Aeson.fromJSON obj of
             Aeson.Success (Aeson.Object o) ->
-                case KeyMap.lookup "id" o of
+                case AKeyMap.lookup "id" o of
                     Just (Aeson.Number n) -> Just (round n)
                     _ -> Nothing
             _ -> Nothing
@@ -1377,6 +1495,297 @@ decodeResponse bs =
         Right val -> case Aeson.fromJSON val of
             Aeson.Error err -> Left $ "JSON conversion error: " <> T.pack err
             Aeson.Success resp -> Right resp
+
+-- | Parse a framed request from the wire
+parseRequestFrame :: BS.ByteString -> Either Text (BS.ByteString, BS.ByteString)
+parseRequestFrame bs
+    | BS.length bs < 4 = Left "Message too short to contain length"
+    | otherwise = do
+        let (lenBytes, rest) = BS.splitAt 4 bs
+        let len = (fromIntegral :: Word32 -> Int) $
+              (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+              (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+              (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+              (fromIntegral (BS.index lenBytes 3) :: Word32)
+
+        if len > 100 * 1024 * 1024  -- 100 MB limit
+            then Left $ T.pack $ "Message too large (" ++ show len ++ " bytes)"
+            else if BS.length rest < len
+                then Left "Incomplete message"
+                else do
+                    let (content, remaining) = BS.splitAt len rest
+                    Right (content, remaining)
+
+-- | Receive a framed response from a handle
+receiveFramedResponse :: Handle -> IO (BS.ByteString, Maybe BS.ByteString)
+receiveFramedResponse handle = do
+    -- Read the length prefix (4 bytes)
+    lenBytes <- BS.hGet handle 4
+    when (BS.length lenBytes /= 4) $
+        throwIO $ DaemonError "Incomplete message length"
+
+    -- Parse message length
+    let len = fromIntegral $
+             (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+             (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+             (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+             (fromIntegral (BS.index lenBytes 3) :: Word32)
+
+    -- Check message size
+    when (len > 100 * 1024 * 1024) $ -- 100 MB limit
+        throwIO $ DaemonError $ "Message too large: " <> T.pack (show len)
+
+    -- Read message body
+    respJson <- BS.hGet handle len
+    when (BS.length respJson /= len) $
+        throwIO $ DaemonError "Incomplete message body"
+
+    -- Check if there's a payload by parsing the JSON and looking for hasContent flag
+    let hasPayload = case Aeson.decodeStrict respJson of
+            Just obj -> case Aeson.fromJSON obj of
+                Aeson.Success (Aeson.Object o) ->
+                    case AKeyMap.lookup "hasContent" o of
+                        Just (Aeson.Bool True) -> True
+                        _ -> False
+                _ -> False
+            _ -> False
+
+    if hasPayload
+        then do
+            -- Read payload frame (same format - 4 byte length followed by content)
+            payloadLenBytes <- BS.hGet handle 4
+            when (BS.length payloadLenBytes /= 4) $
+                throwIO $ DaemonError "Incomplete payload length"
+
+            let payloadLen = fromIntegral $
+                          (fromIntegral (BS.index payloadLenBytes 0) :: Word32) `shiftL` 24 .|.
+                          (fromIntegral (BS.index payloadLenBytes 1) :: Word32) `shiftL` 16 .|.
+                          (fromIntegral (BS.index payloadLenBytes 2) :: Word32) `shiftL` 8 .|.
+                          (fromIntegral (BS.index payloadLenBytes 3) :: Word32)
+
+            -- Check payload size
+            when (payloadLen > 100 * 1024 * 1024) $ -- 100 MB limit
+                throwIO $ DaemonError $ "Payload too large: " <> T.pack (show payloadLen)
+
+            -- Read payload
+            payload <- BS.hGet handle payloadLen
+            when (BS.length payload /= payloadLen) $
+                throwIO $ DaemonError "Incomplete payload"
+
+            return (respJson, Just payload)
+        else
+            return (respJson, Nothing)
+
+-- | Deserialize a daemon response
+deserializeDaemonResponse :: BS.ByteString -> Maybe BS.ByteString -> Either Text DaemonResponse
+deserializeDaemonResponse bs mPayload =
+    case Aeson.eitherDecodeStrict bs of
+        Left err -> Left $ "JSON parse error: " <> T.pack err
+        Right val -> case Aeson.fromJSON val of
+            Aeson.Error err -> Left $ "JSON conversion error: " <> T.pack err
+            Aeson.Success obj -> do
+                -- Get the message type
+                case AKeyMap.lookup "type" obj of
+                    Nothing -> Left "Missing message type"
+                    Just (Aeson.String "auth") -> do
+                        case AKeyMap.lookup "result" obj of
+                            Just result -> case Aeson.fromJSON result of
+                                Aeson.Success authResult -> Right $ AuthResponse authResult
+                                Aeson.Error err -> Left $ "Invalid auth result: " <> T.pack err
+                            Nothing -> Left "Missing auth result"
+
+                    Just (Aeson.String "build-started") -> do
+                        buildIdText <- maybe (Left "Missing buildId") Right $
+                            AKeyMap.lookup "buildId" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        case parseBuildId buildIdText of
+                            Left err -> Left err
+                            Right bid -> Right $ BuildStartedResponse bid
+
+                    Just (Aeson.String "build-result") -> do
+                        result <- maybe (Left "Missing build result") Right $
+                            AKeyMap.lookup "result" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ BuildResultResponse result
+
+                    Just (Aeson.String "build-status") -> do
+                        update <- maybe (Left "Missing build status update") Right $
+                            AKeyMap.lookup "update" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ BuildStatusResponse update
+
+                    Just (Aeson.String "build-output") -> do
+                        output <- maybe (Left "Missing output") Right $
+                            AKeyMap.lookup "output" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ BuildOutputResponse output
+
+                    Just (Aeson.String "build-list") -> do
+                        builds <- maybe (Left "Missing builds") Right $
+                            AKeyMap.lookup "builds" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        buildsList <- parseBuilds builds
+                        Right $ BuildListResponse buildsList
+
+                    Just (Aeson.String "cancel-build") -> do
+                        success <- maybe (Left "Missing success") Right $
+                            AKeyMap.lookup "success" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ CancelBuildResponse success
+
+                    Just (Aeson.String "store-add") -> do
+                        pathText <- maybe (Left "Missing path") Right $
+                            AKeyMap.lookup "path" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        case parseStorePath pathText of
+                            Just path -> Right $ StoreAddResponse path
+                            Nothing -> Left $ "Invalid store path: " <> pathText
+
+                    Just (Aeson.String "store-verify") -> do
+                        valid <- maybe (Left "Missing valid") Right $
+                            AKeyMap.lookup "valid" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ StoreVerifyResponse valid
+
+                    Just (Aeson.String "store-path") -> do
+                        pathText <- maybe (Left "Missing path") Right $
+                            AKeyMap.lookup "path" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        case parseStorePath pathText of
+                            Just path -> Right $ StorePathResponse path
+                            Nothing -> Left $ "Invalid store path: " <> pathText
+
+                    Just (Aeson.String "store-list") -> do
+                        pathTexts <- maybe (Left "Missing paths") Right $
+                            AKeyMap.lookup "paths" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        let paths = catMaybes $ map parseStorePath pathTexts
+                        Right $ StoreListResponse paths
+
+                    Just (Aeson.String "derivation") -> do
+                        case mPayload of
+                            Nothing -> Left "Missing derivation content"
+                            Just content ->
+                                case deserializeDerivation content of
+                                    Left err -> Left $ "Invalid derivation: " <> buildErrorToText err
+                                    Right drv -> Right $ DerivationResponse drv
+
+                    Just (Aeson.String "derivation-stored") -> do
+                        pathText <- maybe (Left "Missing path") Right $
+                            AKeyMap.lookup "path" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        case parseStorePath pathText of
+                            Just path -> Right $ DerivationStoredResponse path
+                            Nothing -> Left $ "Invalid store path: " <> pathText
+
+                    Just (Aeson.String "derivation-retrieved") -> do
+                        found <- maybe (Left "Missing found flag") Right $
+                            AKeyMap.lookup "found" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        if found
+                            then case mPayload of
+                                Nothing -> Left "Missing derivation content"
+                                Just content ->
+                                    case deserializeDerivation content of
+                                        Left err -> Left $ "Invalid derivation: " <> buildErrorToText err
+                                        Right drv -> Right $ DerivationRetrievedResponse (Just drv)
+                            else Right $ DerivationRetrievedResponse Nothing
+
+                    Just (Aeson.String "derivation-query") -> do
+                        count <- maybe (Left "Missing count") Right $
+                            AKeyMap.lookup "count" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        case mPayload of
+                            Nothing ->
+                                if count == 0
+                                    then Right $ DerivationQueryResponse []
+                                    else Left "Missing derivation content"
+                            Just content ->
+                                -- This would need special handling for multiple derivations
+                                -- For simplicity, just returning a placeholder or empty list
+                                Right $ DerivationQueryResponse []
+
+                    Just (Aeson.String "derivation-outputs") -> do
+                        outputTexts <- maybe (Left "Missing outputs") Right $
+                            AKeyMap.lookup "outputs" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        let outputs = Set.fromList $ catMaybes $ map parseStorePath outputTexts
+                        Right $ DerivationOutputResponse outputs
+
+                    Just (Aeson.String "derivation-list") -> do
+                        pathTexts <- maybe (Left "Missing paths") Right $
+                            AKeyMap.lookup "paths" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        let paths = catMaybes $ map parseStorePath pathTexts
+                        Right $ DerivationListResponse paths
+
+                    Just (Aeson.String "gc-result") -> do
+                        stats <- maybe (Left "Missing stats") Right $
+                            AKeyMap.lookup "stats" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ GCResultResponse stats
+
+                    Just (Aeson.String "gc-started") -> Right GCStartedResponse
+
+                    Just (Aeson.String "gc-status") -> do
+                        status <- maybe (Left "Missing status") Right $
+                            AKeyMap.lookup "status" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ GCStatusResponse status
+
+                    Just (Aeson.String "gc-root-added") -> do
+                        name <- maybe (Left "Missing name") Right $
+                            AKeyMap.lookup "name" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ GCRootAddedResponse name
+
+                    Just (Aeson.String "gc-root-removed") -> do
+                        name <- maybe (Left "Missing name") Right $
+                            AKeyMap.lookup "name" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ GCRootRemovedResponse name
+
+                    Just (Aeson.String "gc-roots-list") -> do
+                        -- Simple implementation returning empty list
+                        Right $ GCRootListResponse []
+
+                    Just (Aeson.String "pong") -> Right PongResponse
+
+                    Just (Aeson.String "shutdown") -> Right ShutdownResponse
+
+                    Just (Aeson.String "status") -> do
+                        status <- maybe (Left "Missing status") Right $
+                            AKeyMap.lookup "status" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ StatusResponse status
+
+                    Just (Aeson.String "config") -> do
+                        config <- maybe (Left "Missing config") Right $
+                            AKeyMap.lookup "config" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        Right $ ConfigResponse config
+
+                    Just (Aeson.String "eval") -> do
+                        case mPayload of
+                            Nothing -> Left "Missing derivation content"
+                            Just content ->
+                                case deserializeDerivation content of
+                                    Left err -> Left $ "Invalid derivation: " <> buildErrorToText err
+                                    Right drv -> Right $ EvalResponse drv
+
+                    Just (Aeson.String "error") -> do
+                        errObj <- maybe (Left "Missing error") Right $
+                            AKeyMap.lookup "error" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                        case parseError errObj of
+                            Left err -> Left $ "Invalid error: " <> err
+                            Right err -> Right $ ErrorResponse err
+
+                    Just (Aeson.String "success") -> Right SuccessResponse
+
+                    Just (Aeson.String typ) -> Left $ "Unknown response type: " <> typ
+                    _ -> Left "Invalid response type"
+  where
+    parseBuilds builds = do
+        case Aeson.fromJSON builds of
+            Aeson.Success builds' -> Right builds'
+            Aeson.Error err -> Left $ "Invalid builds format: " <> T.pack err
+
+    parseError errObj = do
+        case Aeson.fromJSON errObj of
+            Aeson.Success err -> Right err
+            Aeson.Error err -> Left $ "Invalid error format: " <> T.pack err
+
+-- | Parse a BuildId from Text
+parseBuildId :: Text -> Either Text BuildId
+parseBuildId txt =
+    case T.stripPrefix "build-" txt of
+        Just numStr ->
+            case readMaybe (T.unpack numStr) of
+                Just n -> Right $ BuildIdFromInt n
+                Nothing -> Left $ "Invalid BuildId number format: " <> numStr
+        Nothing ->
+            case readMaybe (T.unpack txt) of
+                Just n -> Right $ BuildIdFromInt n
+                Nothing -> Left $ "Invalid BuildId format: " <> txt
 
 -- | Read a message with timeout
 readResponseWithTimeout :: Handle -> Int -> IO Response
