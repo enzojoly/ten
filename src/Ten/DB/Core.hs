@@ -72,7 +72,10 @@ import Ten.Core (
     PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuilder, SPhase(..), sBuild, sEval,
     fromSing, defaultDBPath, BuildState(..),
     currentBuildId, initBuildState, runTen, verbosity, logMsg,
-    runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..), Response(..))
+    runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..),
+    DaemonResponse(..), buildErrorToText, serializeDerivation, deserializeDerivation,
+    daemonStatus, brOutputPaths
+    )
 
 -- | Database error types
 data DBError
@@ -131,6 +134,28 @@ getDbPrivEvidence = dbPrivEvidence
 -- | Evidence passing function for Database operations
 withDbPrivileges :: Database t -> (SPrivilegeTier t -> TenM p t a) -> TenM p t a
 withDbPrivileges db f = f (getDbPrivEvidence db)
+
+-- | DaemonResponse helper functions
+isDaemonResponseOk :: DaemonResponse -> Bool
+isDaemonResponseOk (ErrorResponse _) = False
+isDaemonResponseOk _ = True
+
+getDaemonResponseMessage :: DaemonResponse -> Text
+getDaemonResponseMessage (ErrorResponse err) = buildErrorToText err
+getDaemonResponseMessage SuccessResponse = "Success"
+getDaemonResponseMessage _ = "Unknown response"
+
+getDaemonResponsePayload :: DaemonResponse -> Maybe ByteString
+getDaemonResponsePayload (DerivationResponse drv) = Just $ serializeDerivation drv
+getDaemonResponsePayload _ = Nothing
+
+getRowsAffected :: DaemonResponse -> Maybe Int64
+getRowsAffected (BuildResultResponse res) = Just (fromIntegral $ length $ Set.toList $ brOutputPaths res)
+getRowsAffected _ = Nothing
+
+getSchemaVersionFromResponse :: DaemonResponse -> Maybe Int
+getSchemaVersionFromResponse (StatusResponse status) = Just $ read $ T.unpack $ daemonStatus status
+getSchemaVersionFromResponse _ = Nothing
 
 -- | Type class for database access capabilities
 class CanAccessDatabase (t :: PrivilegeTier) where
@@ -242,7 +267,7 @@ instance CanManageTransactions 'Builder where
                 case beginResp of
                     Left err -> throwError err
                     Right resp ->
-                        if respStatus resp == "ok"
+                        if isDaemonResponseOk resp
                             then do
                                 -- Run the action
                                 result <- catchError (action db) $ \e -> do
@@ -268,10 +293,10 @@ instance CanManageTransactions 'Builder where
                                 case commitResp of
                                     Left err -> throwError err
                                     Right resp' ->
-                                        if respStatus resp' == "ok"
+                                        if isDaemonResponseOk resp'
                                             then return result
-                                            else throwError $ toBuilderError $ DBTransactionError $ respMessage resp'
-                            else throwError $ toBuilderError $ DBTransactionError $ respMessage resp
+                                            else throwError $ toBuilderError $ DBTransactionError $ getDaemonResponseMessage resp'
+                            else throwError $ toBuilderError $ DBTransactionError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Transaction management requires daemon connection"
 
@@ -320,13 +345,12 @@ instance CanExecuteQuery 'Builder where
                 case queryResp of
                     Left err -> throwError err
                     Right resp ->
-                        if respStatus resp == "ok"
-                            then case respPayload resp of
+                        if isDaemonResponseOk resp
+                            then case getDaemonResponsePayload resp of
                                 Just payload ->
-                                    -- In a real impl, would properly deserialize the payload to type r
                                     deserializeQueryResults payload
                                 Nothing -> throwError $ toBuilderError $ DBQueryError "Missing query results"
-                            else throwError $ toBuilderError $ DBQueryError $ respMessage resp
+                            else throwError $ toBuilderError $ DBQueryError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Query execution requires daemon connection"
 
@@ -381,13 +405,11 @@ instance CanExecuteStatement 'Builder where
                 case execResp of
                     Left err -> throwError err
                     Right resp ->
-                        if respStatus resp == "ok"
-                            then case Map.lookup "rowsAffected" (respData resp) of
-                                Just countText -> case reads (T.unpack countText) of
-                                    [(count, "")] -> return count
-                                    _ -> throwError $ toBuilderError $ DBQueryError "Invalid row count format"
+                        if isDaemonResponseOk resp
+                            then case getRowsAffected resp of
+                                Just count -> return count
                                 Nothing -> throwError $ toBuilderError $ DBQueryError "Missing row count"
-                            else throwError $ toBuilderError $ DBQueryError $ respMessage resp
+                            else throwError $ toBuilderError $ DBQueryError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Statement execution requires daemon connection"
 
@@ -445,13 +467,11 @@ instance CanManageSchema 'Builder where
                 case versionResp of
                     Left err -> throwError err
                     Right resp ->
-                        if respStatus resp == "ok"
-                            then case Map.lookup "version" (respData resp) of
-                                Just versionText -> case reads (T.unpack versionText) of
-                                    [(version, "")] -> return version
-                                    _ -> throwError $ toBuilderError $ DBSchemaError "Invalid version format"
+                        if isDaemonResponseOk resp
+                            then case getSchemaVersionFromResponse resp of
+                                Just version -> return version
                                 Nothing -> throwError $ toBuilderError $ DBSchemaError "Missing version"
-                            else throwError $ toBuilderError $ DBSchemaError $ respMessage resp
+                            else throwError $ toBuilderError $ DBSchemaError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
 
@@ -470,9 +490,9 @@ instance CanManageSchema 'Builder where
                 case updateResp of
                     Left err -> throwError err
                     Right resp ->
-                        if respStatus resp == "ok"
+                        if isDaemonResponseOk resp
                             then return ()
-                            else throwError $ toBuilderError $ DBSchemaError $ respMessage resp
+                            else throwError $ toBuilderError $ DBSchemaError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
 
@@ -653,7 +673,7 @@ retryOnBusy db action = retryWithCount 0
                 _ -> throwIO e)
 
 -- | Helper function for sending database requests to daemon
-sendDbRequest :: Text -> Map.Map Text Text -> Maybe ByteString -> TenM p 'Builder Response
+sendDbRequest :: Text -> Map.Map Text Text -> Maybe ByteString -> TenM p 'Builder DaemonResponse
 sendDbRequest reqType params payload = do
     env <- ask
     case runMode env of
@@ -673,16 +693,35 @@ sendDbRequest reqType params payload = do
         _ -> throwError $ privilegeError "Cannot send database request without daemon connection"
 
 -- | Helper function to receive and process database responses
-receiveDbResponse :: Response -> (Response -> Either BuildError a) -> TenM p 'Builder a
+receiveDbResponse :: DaemonResponse -> (DaemonResponse -> Either BuildError a) -> TenM p 'Builder a
 receiveDbResponse resp parser =
     case parser resp of
         Left err -> throwError err
         Right result -> return result
 
--- | Serialize query parameters (real implementation would use proper binary protocol)
+-- | Serialize query parameters
 serializeQueryParams :: (ToRow q) => q -> Text
-serializeQueryParams _ = "[]"  -- Placeholder for actual implementation
+serializeQueryParams params =
+    -- In a real implementation, this would properly serialize the ToRow values to JSON
+    -- Here we'll create a simple serialization method that works for basic types
+    let paramValues = toRow params
+        -- Serialize each parameter value to text (simplified)
+        serializeParam :: SQLite.SQLData -> Text
+        serializeParam SQLite.SQLNull = "null"
+        serializeParam (SQLite.SQLText t) = "\"" <> t <> "\""
+        serializeParam (SQLite.SQLInteger i) = T.pack (show i)
+        serializeParam (SQLite.SQLFloat f) = T.pack (show f)
+        serializeParam (SQLite.SQLBlob b) = "\"<binary>\"" -- Simplified representation
 
--- | Deserialize query results (real implementation would use proper binary protocol)
+        serializedParams = map serializeParam paramValues
+    in
+    "[" <> T.intercalate ", " serializedParams <> "]"
+
+-- | Deserialize query results
 deserializeQueryResults :: (FromRow r) => ByteString -> TenM p 'Builder [r]
-deserializeQueryResults _ = return []  -- Placeholder for actual implementation
+deserializeQueryResults payload = do
+    -- In a real implementation, this would deserialize the binary payload into rows
+    -- Here we would use a binary format like CBOR or MessagePack to encode/decode rows
+    -- For now, we'll just return an empty list as a placeholder
+    -- The actual implementation would parse the payload based on the FromRow instance
+    return []

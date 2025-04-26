@@ -116,16 +116,87 @@ import Ten.Core (
     TenM(..), Phase(..), PrivilegeTier(..), BuildEnv(..), BuildError(..), BuildId(..),
     StorePath(..), storeHash, storeName, storePathToText, storePathToFilePath,
     GCStats(..), GCRoot(..), rootPath, rootName, rootType, rootTime,
-    Request(..), Response(..), RootType(..), SPhase(..), SPrivilegeTier(..),
+    Request(..), DaemonResponse(..), RootType(..), SPhase(..), SPrivilegeTier(..),
     sDaemon, sBuilder, sBuild,
-    RunMode(..),
-    ensureLockDirExists, hashByteString,
+    RunMode(..), daemonStatus,
+    ensureLockDirExists, hashByteString, buildErrorToText,
     -- Functions
     parseStorePath, sendRequest, sendRequestSync, receiveResponse,
     currentBuildId, logMsg, defaultDBPath, filePathToStorePath, gcLockPath,
     -- Error handling
     throwError, catchError
     )
+
+-- | DaemonResponse helper functions
+isDaemonResponseOk :: DaemonResponse -> Bool
+isDaemonResponseOk (ErrorResponse _) = False
+isDaemonResponseOk _ = True
+
+getDaemonResponseMessage :: DaemonResponse -> Text
+getDaemonResponseMessage (ErrorResponse err) = buildErrorToText err
+getDaemonResponseMessage (SuccessResponse) = "Success"
+getDaemonResponseMessage _ = "Unknown response"
+
+getGCStatsFromResponse :: DaemonResponse -> GCStats
+getGCStatsFromResponse (GCResultResponse stats) = stats
+getGCStatsFromResponse _ = GCStats 0 0 0 0 0.0
+
+extractRootsFromResponse :: DaemonResponse -> [GCRoot]
+extractRootsFromResponse (GCRootListResponse roots) = roots
+extractRootsFromResponse _ = []
+
+getReachabilityFromResponse :: DaemonResponse -> Bool
+getReachabilityFromResponse (StatusResponse status) =
+    T.pack (show $ daemonStatus status) == "true"
+getReachabilityFromResponse _ = False
+
+getDaemonResponseMetadata :: DaemonResponse -> Map Text Text
+getDaemonResponseMetadata (GCResultResponse stats) =
+    Map.fromList [
+        ("total", T.pack $ show $ gcTotal stats),
+        ("live", T.pack $ show $ gcLive stats),
+        ("collected", T.pack $ show $ gcCollected stats),
+        ("bytes", T.pack $ show $ gcBytes stats),
+        ("elapsedTime", T.pack $ show $ gcElapsedTime stats)
+    ]
+getDaemonResponseMetadata _ = Map.empty
+
+getRootCountFromResponse :: DaemonResponse -> Int
+getRootCountFromResponse (GCRootListResponse roots) = length roots
+getRootCountFromResponse _ = 0
+
+getRootPathFromResponse :: DaemonResponse -> Int -> Maybe Text
+getRootPathFromResponse (GCRootListResponse roots) idx =
+    if idx >= 0 && idx < length roots
+    then Just $ storePathToText $ rootPath $ roots !! idx
+    else Nothing
+getRootPathFromResponse _ _ = Nothing
+
+getRootNameFromResponse :: DaemonResponse -> Int -> Maybe Text
+getRootNameFromResponse (GCRootListResponse roots) idx =
+    if idx >= 0 && idx < length roots
+    then Just $ rootName $ roots !! idx
+    else Nothing
+getRootNameFromResponse _ _ = Nothing
+
+getRootTypeFromResponse :: DaemonResponse -> Int -> Maybe Text
+getRootTypeFromResponse (GCRootListResponse roots) idx =
+    if idx >= 0 && idx < length roots
+    then Just $ case rootType (roots !! idx) of
+        Ten.Core.PermanentRoot -> "permanent"
+        Ten.Core.ProfileRoot -> "profile"
+        Ten.Core.RuntimeRoot -> "runtime"
+        Ten.Core.RegistryRoot -> "registry"
+        _ -> "symlink"
+    else Nothing
+getRootTypeFromResponse _ _ = Nothing
+
+getRootTimeFromResponse :: DaemonResponse -> Int -> Maybe Text
+getRootTimeFromResponse (GCRootListResponse roots) idx =
+    if idx >= 0 && idx < length roots
+    then Just $ T.pack $ show $ rootTime $ roots !! idx
+    else Nothing
+getRootTimeFromResponse _ _ = Nothing
 
 -- | Database helper functions for daemon context
 
@@ -263,13 +334,13 @@ requestAddRoot path name permanent = do
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if Ten.Core.respStatus response == "ok"
+                    if isDaemonResponseOk response
                         then do
                             -- Construct a GC root from the response
                             now <- liftIO getCurrentTime
                             let rootType = if permanent then Ten.Core.PermanentRoot else Ten.Core.SymlinkRoot
                             return $ Ten.Core.GCRoot path name rootType now
-                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
+                        else throwError $ Ten.Core.DaemonError $ getDaemonResponseMessage response
 
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
@@ -322,8 +393,8 @@ requestRemoveRoot root = do
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    unless (Ten.Core.respStatus response == "ok") $
-                        throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
+                    unless (isDaemonResponseOk response) $
+                        throwError $ Ten.Core.DaemonError $ getDaemonResponseMessage response
 
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
@@ -450,36 +521,11 @@ requestListRoots = do
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if Ten.Core.respStatus response == "ok"
+                    if isDaemonResponseOk response
                         then do
-                            -- Parse roots from response data
-                            let rootCount = read $ T.unpack $ Map.findWithDefault "0" "count" (Ten.Core.respData response)
-                                roots = [0..(rootCount-1)]
-                                parseRoot i = do
-                                    let prefix = "root." <> T.pack (show i) <> "."
-                                        pathText = Map.findWithDefault "" (prefix <> "path") (Ten.Core.respData response)
-                                        name = Map.findWithDefault "" (prefix <> "name") (Ten.Core.respData response)
-                                        typeText = Map.findWithDefault "symlink" (prefix <> "type") (Ten.Core.respData response)
-                                        timeText = Map.findWithDefault "" (prefix <> "time") (Ten.Core.respData response)
-
-                                    case Ten.Core.parseStorePath pathText of
-                                        Nothing -> return Nothing
-                                        Just path -> do
-                                            let rootType = case typeText of
-                                                    "permanent" -> Ten.Core.PermanentRoot
-                                                    "profile" -> Ten.Core.ProfileRoot
-                                                    "runtime" -> Ten.Core.RuntimeRoot
-                                                    "registry" -> Ten.Core.RegistryRoot
-                                                    _ -> Ten.Core.SymlinkRoot
-                                                time = case reads (T.unpack timeText) of
-                                                    [(t, "")] -> t
-                                                    _ -> posixSecondsToUTCTime 0
-
-                                            return $ Just $ Ten.Core.GCRoot path name rootType time
-
-                            roots <- mapM parseRoot roots
-                            return $ catMaybes roots
-                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
+                            -- Get roots directly from response
+                            return $ extractRootsFromResponse response
+                        else throwError $ Ten.Core.DaemonError $ getDaemonResponseMessage response
 
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
@@ -541,17 +587,9 @@ requestGarbageCollection force = do
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if Ten.Core.respStatus response == "ok"
-                        then do
-                            -- Parse GC stats from response data
-                            let total = read $ T.unpack $ Map.findWithDefault "0" "total" (Ten.Core.respData response)
-                                live = read $ T.unpack $ Map.findWithDefault "0" "live" (Ten.Core.respData response)
-                                collected = read $ T.unpack $ Map.findWithDefault "0" "collected" (Ten.Core.respData response)
-                                bytes = read $ T.unpack $ Map.findWithDefault "0" "bytes" (Ten.Core.respData response)
-                                time = read $ T.unpack $ Map.findWithDefault "0" "elapsedTime" (Ten.Core.respData response)
-
-                            return $ Ten.Core.GCStats total live collected bytes time
-                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
+                    if isDaemonResponseOk response
+                        then return $ getGCStatsFromResponse response
+                        else throwError $ Ten.Core.DaemonError $ getDaemonResponseMessage response
 
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
@@ -865,10 +903,10 @@ requestPathReachability path = do
             case responseResult of
                 Left err -> throwError err
                 Right response ->
-                    if Ten.Core.respStatus response == "ok"
+                    if isDaemonResponseOk response
                         then
-                            return $ Map.findWithDefault "false" "reachable" (Ten.Core.respData response) == "true"
-                        else throwError $ Ten.Core.DaemonError $ Ten.Core.respMessage response
+                            return $ getReachabilityFromResponse response
+                        else throwError $ Ten.Core.DaemonError $ getDaemonResponseMessage response
 
         _ -> throwError $ Ten.Core.DaemonError "Not connected to daemon"
 
