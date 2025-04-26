@@ -66,12 +66,9 @@ import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.Vector as Vector
 
-import Ten.Core (
-            DaemonResponse(..), StorePath, StorePathReference, Derivation,
-            BuildEnv, TenM, PrivilegeTier(..), RunMode(..), Request, Phase(..)
-            )
+import Ten.Core
 import Ten.DB.Core
-import Ten.Daemon.Protocol (DaemonRequest(..))
+import Ten.Daemon.Protocol
 import qualified Ten.Derivation as Deriv
 
 -- | Information about a stored derivation
@@ -258,8 +255,7 @@ instance CanStoreDerivation 'Builder where
             ClientMode conn -> do
                 -- Create store request with derivation payload
                 let serialized = Deriv.serializeDerivation derivation
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "store-derivation",
                     reqParams = Map.fromList [
                         ("name", derivName derivation <> ".drv"),
@@ -269,17 +265,19 @@ instance CanStoreDerivation 'Builder where
                 }
 
                 -- Send request and wait for response
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case Map.lookup "derivationId" (respData resp) of
+                    Right resp -> case resp of
+                        DerivationStoredResponse path ->
+                            -- Extract derivation ID from response metadata
+                            case Map.lookup "derivationId" (daemonResponseMeta resp) of
                                 Just idText -> case reads (T.unpack idText) of
                                     [(derivId, "")] -> return derivId
                                     _ -> throwError $ DBError "Invalid derivation ID format"
-                                Nothing -> throwError $ DBError "Missing derivation ID"
-                            else throwError $ DBError $ respMessage resp
+                                Nothing -> throwError $ DBError "Missing derivation ID in response"
+                        ErrorResponse err -> throwError err
+                        _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot store derivation without daemon connection"
 
@@ -289,25 +287,26 @@ instance CanStoreDerivation 'Builder where
             ClientMode conn -> do
                 -- Serialize and prepare request
                 let serialized = Deriv.serializeDerivation derivation
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "register-derivation-file",
                     reqParams = Map.singleton "storePath" (storePathToText storePath),
                     reqPayload = Just serialized
                 }
 
                 -- Send request and wait for response
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case Map.lookup "derivationId" (respData resp) of
+                    Right resp -> case resp of
+                        SuccessResponse ->
+                            -- Extract derivation ID from response metadata
+                            case Map.lookup "derivationId" (daemonResponseMeta resp) of
                                 Just idText -> case reads (T.unpack idText) of
                                     [(derivId, "")] -> return derivId
                                     _ -> throwError $ DBError "Invalid derivation ID format"
-                                Nothing -> throwError $ DBError "Missing derivation ID"
-                            else throwError $ DBError $ respMessage resp
+                                Nothing -> throwError $ DBError "Missing derivation ID in response"
+                        ErrorResponse err -> throwError err
+                        _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot register derivation file without daemon connection"
 
@@ -317,25 +316,26 @@ instance CanStoreDerivation 'Builder where
             ClientMode conn -> do
                 -- Serialize and prepare request
                 let serialized = Deriv.serializeDerivation derivation
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "register-derivation-with-outputs",
                     reqParams = Map.singleton "storePath" (storePathToText storePath),
                     reqPayload = Just serialized
                 }
 
                 -- Send request and wait for response
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case Map.lookup "derivationId" (respData resp) of
+                    Right resp -> case resp of
+                        SuccessResponse ->
+                            -- Extract derivation ID from response metadata
+                            case Map.lookup "derivationId" (daemonResponseMeta resp) of
                                 Just idText -> case reads (T.unpack idText) of
                                     [(derivId, "")] -> return derivId
                                     _ -> throwError $ DBError "Invalid derivation ID format"
-                                Nothing -> throwError $ DBError "Missing derivation ID"
-                            else throwError $ DBError $ respMessage resp
+                                Nothing -> throwError $ DBError "Missing derivation ID in response"
+                        ErrorResponse err -> throwError err
+                        _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot register derivation with outputs without daemon connection"
 
@@ -530,25 +530,19 @@ instance CanRetrieveDerivation 'Eval 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Send request through daemon protocol
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "retrieve-derivation",
                     reqParams = Map.singleton "hash" hash,
                     reqPayload = Nothing
                 }
 
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case respPayload resp of
-                                Just serialized ->
-                                    case Deriv.deserializeDerivation serialized of
-                                        Left err -> return Nothing
-                                        Right drv -> return $ Just drv
-                                Nothing -> return Nothing
-                            else return Nothing
+                    Right resp -> case resp of
+                        DerivationRetrievedResponse mDrv -> return mDrv
+                        ErrorResponse err -> throwError err
+                        _ -> return Nothing  -- Unexpected response
 
             _ -> throwError $ privilegeError "Cannot retrieve derivation without daemon connection"
 
@@ -559,40 +553,24 @@ instance CanRetrieveDerivation 'Eval 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Send request through daemon protocol
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-derivation-for-output",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then do
-                                -- Deserialize DerivationInfo from payload
-                                case respPayload resp of
-                                    Just serialized ->
-                                        -- In a real implementation would properly deserialize the DerivationInfo
-                                        -- Here we create a minimal version for simplicity
-                                        case Map.lookup "derivId" (respData resp) of
-                                            Just idText -> case reads (T.unpack idText) of
-                                                [(derivId, "")] -> do
-                                                    case Map.lookup "hash" (respData resp) of
-                                                        Just hash ->
-                                                            case Map.lookup "storePath" (respData resp) of
-                                                                Just pathText ->
-                                                                    case parseStorePath pathText of
-                                                                        Just sp -> return $ Just $ DerivationInfo derivId hash sp 0
-                                                                        Nothing -> return Nothing
-                                                                Nothing -> return Nothing
-                                                        Nothing -> return Nothing
-                                                _ -> return Nothing
-                                            Nothing -> return Nothing
-                                    Nothing -> return Nothing
-                            else return Nothing
+                    Right resp -> case resp of
+                        DerivationStoredResponse storePath ->
+                            -- Construct a basic DerivationInfo from response
+                            case Map.lookup "hash" (daemonResponseMeta resp) of
+                                Just hash ->
+                                    return $ Just $ DerivationInfo 0 hash storePath 0
+                                Nothing -> return Nothing
+                        ErrorResponse _ -> return Nothing
+                        _ -> return Nothing  -- Unexpected response
 
             _ -> throwError $ privilegeError "Cannot get derivation for output without daemon connection"
 
@@ -602,25 +580,22 @@ instance CanRetrieveDerivation 'Eval 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Request derivations for outputs through protocol
-                let pathTexts = map storePathToText outputPaths
-                let pathsParam = T.intercalate "," pathTexts
-
-                let request = Request {
-                    reqId = 0,
+                let pathsParam = T.intercalate "," (map storePathToText outputPaths)
+                let request = DaemonRequest {
                     reqType = "find-derivations-by-outputs",
                     reqParams = Map.singleton "paths" pathsParam,
                     reqPayload = Nothing
                 }
 
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then
-                                -- In a real implementation, would deserialize a Map from payload
-                                return Map.empty -- Placeholder
-                            else return Map.empty
+                    Right resp -> case resp of
+                        DerivationQueryResponse drvs ->
+                            -- Construct a map from the derivations
+                            return $ Map.fromList $ map (\d -> (T.unpack (derivHash d), d)) drvs
+                        ErrorResponse _ -> return Map.empty
+                        _ -> return Map.empty  -- Unexpected response
 
             _ -> throwError $ privilegeError "Cannot find derivations by outputs without daemon connection"
 
@@ -631,25 +606,19 @@ instance CanRetrieveDerivation 'Build 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Send request through daemon protocol
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "retrieve-derivation",
                     reqParams = Map.singleton "hash" hash,
                     reqPayload = Nothing
                 }
 
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case respPayload resp of
-                                Just serialized ->
-                                    case Deriv.deserializeDerivation serialized of
-                                        Left err -> return Nothing
-                                        Right drv -> return $ Just drv
-                                Nothing -> return Nothing
-                            else return Nothing
+                    Right resp -> case resp of
+                        DerivationRetrievedResponse mDrv -> return mDrv
+                        ErrorResponse err -> throwError err
+                        _ -> return Nothing  -- Unexpected response
 
             _ -> throwError $ privilegeError "Cannot retrieve derivation without daemon connection"
 
@@ -660,40 +629,24 @@ instance CanRetrieveDerivation 'Build 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Send request through daemon protocol
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-derivation-for-output",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then do
-                                -- Deserialize DerivationInfo from payload
-                                case respPayload resp of
-                                    Just serialized ->
-                                        -- In a real implementation would properly deserialize the DerivationInfo
-                                        -- Here we create a minimal version for simplicity
-                                        case Map.lookup "derivId" (respData resp) of
-                                            Just idText -> case reads (T.unpack idText) of
-                                                [(derivId, "")] -> do
-                                                    case Map.lookup "hash" (respData resp) of
-                                                        Just hash ->
-                                                            case Map.lookup "storePath" (respData resp) of
-                                                                Just pathText ->
-                                                                    case parseStorePath pathText of
-                                                                        Just sp -> return $ Just $ DerivationInfo derivId hash sp 0
-                                                                        Nothing -> return Nothing
-                                                                Nothing -> return Nothing
-                                                        Nothing -> return Nothing
-                                                _ -> return Nothing
-                                            Nothing -> return Nothing
-                                    Nothing -> return Nothing
-                            else return Nothing
+                    Right resp -> case resp of
+                        DerivationStoredResponse storePath ->
+                            -- Construct a basic DerivationInfo from response
+                            case Map.lookup "hash" (daemonResponseMeta resp) of
+                                Just hash ->
+                                    return $ Just $ DerivationInfo 0 hash storePath 0
+                                Nothing -> return Nothing
+                        ErrorResponse _ -> return Nothing
+                        _ -> return Nothing  -- Unexpected response
 
             _ -> throwError $ privilegeError "Cannot get derivation for output without daemon connection"
 
@@ -703,25 +656,22 @@ instance CanRetrieveDerivation 'Build 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Request derivations for outputs through protocol
-                let pathTexts = map storePathToText outputPaths
-                let pathsParam = T.intercalate "," pathTexts
-
-                let request = Request {
-                    reqId = 0,
+                let pathsParam = T.intercalate "," (map storePathToText outputPaths)
+                let request = DaemonRequest {
                     reqType = "find-derivations-by-outputs",
                     reqParams = Map.singleton "paths" pathsParam,
                     reqPayload = Nothing
                 }
 
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then
-                                -- In a real implementation, would deserialize a Map from payload
-                                return Map.empty -- Placeholder
-                            else return Map.empty
+                    Right resp -> case resp of
+                        DerivationQueryResponse drvs ->
+                            -- Construct a map from the derivations
+                            return $ Map.fromList $ map (\d -> (T.unpack (derivHash d), d)) drvs
+                        ErrorResponse _ -> return Map.empty
+                        _ -> return Map.empty  -- Unexpected response
 
             _ -> throwError $ privilegeError "Cannot find derivations by outputs without daemon connection"
 
@@ -757,8 +707,7 @@ instance CanManageOutputs 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "register-derivation-output",
                     reqParams = Map.fromList [
                         ("derivId", T.pack $ show derivId),
@@ -769,13 +718,13 @@ instance CanManageOutputs 'Builder where
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then return ()
-                            else throwError $ DBError $ respMessage resp
+                    Right resp -> case resp of
+                        SuccessResponse -> return ()
+                        ErrorResponse err -> throwError err
+                        _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot register derivation output without daemon connection"
 
@@ -784,23 +733,23 @@ instance CanManageOutputs 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-outputs-for-derivation",
                     reqParams = Map.singleton "derivId" (T.pack $ show derivId),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then
-                                -- In a real implementation, would deserialize OutputInfo list from payload
-                                return [] -- Placeholder
-                            else return []
+                    Right resp -> case resp of
+                        DerivationOutputResponse paths ->
+                            -- Convert output paths to OutputInfo objects
+                            -- Using a simple approach since we don't have the names
+                            return $ map (\p -> OutputInfo derivId "" p) (Set.toList paths)
+                        ErrorResponse err -> throwError err
+                        _ -> return []  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get outputs without daemon connection"
 
@@ -914,8 +863,7 @@ instance CanManageReferences 'Builder where
             case runMode env of
                 ClientMode conn -> do
                     -- Create request
-                    let request = Request {
-                        reqId = 0,
+                    let request = DaemonRequest {
                         reqType = "add-derivation-reference",
                         reqParams = Map.fromList [
                             ("referrer", storePathToText referrer),
@@ -925,13 +873,13 @@ instance CanManageReferences 'Builder where
                     }
 
                     -- Send request
-                    response <- liftIO $ sendRequestSync conn request 30000000
+                    response <- liftIO $ sendDaemonRequest conn request 30000000
                     case response of
                         Left err -> throwError err
-                        Right resp ->
-                            if respStatus resp == "ok"
-                                then return ()
-                                else throwError $ DBError $ respMessage resp
+                        Right resp -> case resp of
+                            SuccessResponse -> return ()
+                            ErrorResponse err -> throwError err
+                            _ -> throwError $ DBError "Unexpected response from daemon"
 
                 _ -> throwError $ privilegeError "Cannot add reference without daemon connection"
 
@@ -940,26 +888,20 @@ instance CanManageReferences 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-derivation-references",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "references" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return []
-                            else return []
+                    Right resp -> case resp of
+                        StoreListResponse paths -> return $ Set.toList paths
+                        ErrorResponse err -> throwError err
+                        _ -> return []  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get references without daemon connection"
 
@@ -968,26 +910,20 @@ instance CanManageReferences 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-referrers",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "referrers" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return []
-                            else return []
+                    Right resp -> case resp of
+                        StoreListResponse paths -> return $ Set.toList paths
+                        ErrorResponse err -> throwError err
+                        _ -> return []  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get referrers without daemon connection"
 
@@ -996,26 +932,20 @@ instance CanManageReferences 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-transitive-references",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "references" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return Set.empty
-                            else return Set.empty
+                    Right resp -> case resp of
+                        StoreListResponse paths -> return $ Set.fromList paths
+                        ErrorResponse err -> throwError err
+                        _ -> return Set.empty  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get transitive references without daemon connection"
 
@@ -1024,26 +954,20 @@ instance CanManageReferences 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-transitive-referrers",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "referrers" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return Set.empty
-                            else return Set.empty
+                    Right resp -> case resp of
+                        StoreListResponse paths -> return $ Set.fromList paths
+                        ErrorResponse err -> throwError err
+                        _ -> return Set.empty  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get transitive referrers without daemon connection"
 
@@ -1059,26 +983,26 @@ instance CanManageReferences 'Builder where
                       (\(from, to) -> storePathToText from <> "," <> storePathToText to) validRefs
 
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "bulk-register-references",
                     reqParams = Map.singleton "references" refsText,
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "count" (respData resp) of
-                                    Just countText -> case reads (T.unpack countText) of
-                                        [(count, "")] -> return count
-                                        _ -> return 0
-                                    Nothing -> return 0
-                            else return 0
+                    Right resp -> case resp of
+                        SuccessResponse ->
+                            -- The count should be in the metadata
+                            case Map.lookup "count" (daemonResponseMeta resp) of
+                                Just countText -> case reads (T.unpack countText) of
+                                    [(count, "")] -> return count
+                                    _ -> return (length validRefs)  -- Return the number we sent
+                                Nothing -> return (length validRefs)  -- Return the number we sent
+                        ErrorResponse err -> throwError err
+                        _ -> return 0  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot bulk register references without daemon connection"
 
@@ -1127,24 +1051,20 @@ instance CanQueryDerivations 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "is-derivation-registered",
                     reqParams = Map.singleton "hash" hash,
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "exists" (respData resp) of
-                                    Just "true" -> return True
-                                    _ -> return False
-                            else return False
+                    Right resp -> case resp of
+                        SuccessResponse -> return True
+                        ErrorResponse _ -> return False
+                        _ -> return False  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot check derivation registration without daemon connection"
 
@@ -1153,23 +1073,22 @@ instance CanQueryDerivations 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "list-registered-derivations",
                     reqParams = Map.empty,
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then
-                                -- In a real implementation, would deserialize DerivationInfo list from payload
-                                return [] -- Placeholder
-                            else return []
+                    Right resp -> case resp of
+                        DerivationListResponse paths ->
+                            -- Convert to DerivationInfo objects with minimal data
+                            return $ map (\p -> DerivationInfo 0 "" p 0) paths
+                        ErrorResponse err -> throwError err
+                        _ -> return []  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot list derivations without daemon connection"
 
@@ -1178,24 +1097,20 @@ instance CanQueryDerivations 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-derivation-path",
                     reqParams = Map.singleton "hash" hash,
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "path" (respData resp) of
-                                    Just pathText -> return $ parseStorePath pathText
-                                    Nothing -> return Nothing
-                            else return Nothing
+                    Right resp -> case resp of
+                        StorePathResponse path -> return $ Just path
+                        ErrorResponse _ -> return Nothing
+                        _ -> return Nothing  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get derivation path without daemon connection"
 
@@ -1265,21 +1180,20 @@ instance CanManagePathValidity 'Builder where
                         Just deriver -> Map.singleton "deriver" (storePathToText deriver)
                         Nothing -> Map.empty
 
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "register-valid-path",
                     reqParams = Map.insert "path" (storePathToText path) deriverParam,
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then return ()
-                            else throwError $ DBError $ respMessage resp
+                    Right resp -> case resp of
+                        SuccessResponse -> return ()
+                        ErrorResponse err -> throwError err
+                        _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot register valid path without daemon connection"
 
@@ -1288,21 +1202,20 @@ instance CanManagePathValidity 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "invalidate-path",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then return ()
-                            else throwError $ DBError $ respMessage resp
+                    Right resp -> case resp of
+                        SuccessResponse -> return ()
+                        ErrorResponse err -> throwError err
+                        _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot invalidate path without daemon connection"
 
@@ -1311,24 +1224,20 @@ instance CanManagePathValidity 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "is-path-valid",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "valid" (respData resp) of
-                                    Just "true" -> return True
-                                    _ -> return False
-                            else return False
+                    Right resp -> case resp of
+                        SuccessResponse -> return True
+                        ErrorResponse _ -> return False
+                        _ -> return False  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot check path validity without daemon connection"
 
@@ -1337,23 +1246,30 @@ instance CanManagePathValidity 'Builder where
         case runMode env of
             ClientMode conn -> do
                 -- Create request
-                let request = Request {
-                    reqId = 0,
+                let request = DaemonRequest {
                     reqType = "get-path-info",
                     reqParams = Map.singleton "path" (storePathToText path),
                     reqPayload = Nothing
                 }
 
                 -- Send request
-                response <- liftIO $ sendRequestSync conn request 30000000
+                response <- liftIO $ sendDaemonRequest conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok" && isJust (respPayload resp)
-                            then
-                                -- In a real implementation, would deserialize PathInfo from payload
-                                return Nothing -- Placeholder
-                            else return Nothing
+                    Right resp -> case resp of
+                        -- For a general response that conveys path info, construct a basic PathInfo
+                        -- from the metadata we get back in the response
+                        SuccessResponse ->
+                            case (Map.lookup "hash" (daemonResponseMeta resp),
+                                  Map.lookup "valid" (daemonResponseMeta resp)) of
+                                (Just hash, Just valid) ->
+                                    let deriver = Map.lookup "deriver" (daemonResponseMeta resp) >>= parseStorePath
+                                        isValid = valid == "true"
+                                        time = posixSecondsToUTCTime 0 -- Default time
+                                    in return $ Just $ PathInfo path hash deriver time isValid
+                                _ -> return Nothing
+                        ErrorResponse _ -> return Nothing
+                        _ -> return Nothing  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get path info without daemon connection"
 

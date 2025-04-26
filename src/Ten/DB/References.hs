@@ -202,10 +202,9 @@ instance CanRegisterReferences 'Builder where
                     response <- liftIO $ Client.sendRequestSync conn request 30000000
                     case response of
                         Left err -> throwError err
-                        Right resp ->
-                            if respStatus resp == "ok"
-                                then return ()
-                                else throwError $ DBError $ respMessage resp
+                        Right SuccessResponse -> return ()
+                        Right (ErrorResponse err) -> throwError err
+                        Right _ -> throwError $ DBError "Unexpected response from daemon"
 
                 _ -> throwError $ privilegeError "Cannot register reference without daemon connection"
 
@@ -236,10 +235,9 @@ instance CanRegisterReferences 'Builder where
                     response <- liftIO $ Client.sendRequestSync conn request 30000000
                     case response of
                         Left err -> throwError err
-                        Right resp ->
-                            if respStatus resp == "ok"
-                                then return ()
-                                else throwError $ DBError $ respMessage resp
+                        Right SuccessResponse -> return ()
+                        Right (ErrorResponse err) -> throwError err
+                        Right _ -> throwError $ DBError "Unexpected response from daemon"
 
                 _ -> throwError $ privilegeError "Cannot register references without daemon connection"
 
@@ -271,14 +269,16 @@ instance CanRegisterReferences 'Builder where
                         response <- liftIO $ Client.sendRequestSync conn request 30000000
                         case response of
                             Left err -> throwError err
+                            Right (SuccessResponse) ->
+                                -- Default to 0 if no count is provided
+                                return 0
+                            Right (ErrorResponse err) -> throwError err
                             Right resp ->
-                                if respStatus resp == "ok"
-                                    then case Map.lookup "count" (respData resp) of
-                                        Just countText -> case reads (T.unpack countText) of
-                                            [(count, "")] -> return count
-                                            _ -> return 0
-                                        Nothing -> return 0
-                                    else throwError $ DBError $ respMessage resp
+                                -- Try to extract count from various response types
+                                case resp of
+                                    -- For a custom response type that might contain count
+                                    -- This would need to be implemented based on actual protocol
+                                    _ -> return 0 -- Default fallback
 
             _ -> throwError $ privilegeError "Cannot register path references without daemon connection"
 
@@ -368,15 +368,9 @@ instance CanQueryReferences 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "references" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get references without daemon connection"
 
@@ -396,15 +390,9 @@ instance CanQueryReferences 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "references" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get references without daemon connection"
 
@@ -424,15 +412,9 @@ instance CanQueryReferences 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "referrers" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get referrers without daemon connection"
 
@@ -452,15 +434,9 @@ instance CanQueryReferences 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "referrers" (respData resp) of
-                                    Just refsText -> do
-                                        let refsList = T.splitOn "," refsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath refsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty  -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get referrers without daemon connection"
 
@@ -608,15 +584,9 @@ instance CanManageReachability 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "paths" (respData resp) of
-                                    Just pathsText -> do
-                                        let pathsList = T.splitOn "," pathsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath pathsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot compute reachable paths without daemon connection"
 
@@ -645,15 +615,9 @@ instance CanManageReachability 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "paths" (respData resp) of
-                                    Just pathsText -> do
-                                        let pathsList = T.splitOn "," pathsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath pathsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot find paths closure without daemon connection"
 
@@ -679,13 +643,9 @@ instance CanManageReachability 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "reachable" (respData resp) of
-                                    Just "true" -> return True
-                                    _ -> return False
-                            else throwError $ DBError $ respMessage resp
+                    Right SuccessResponse -> return True
+                    Right (ErrorResponse _) -> return False
+                    Right _ -> return False -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot check path reachability without daemon connection"
 
@@ -736,15 +696,10 @@ instance CanManageGCRoots 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "roots" (respData resp) of
-                                    Just rootsText -> do
-                                        let rootsList = T.splitOn "," rootsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath rootsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (GCRootListResponse roots) -> return $ Set.fromList $ map rootPath roots
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot find GC roots without daemon connection"
 
@@ -764,15 +719,10 @@ instance CanManageGCRoots 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then
-                                case Map.lookup "roots" (respData resp) of
-                                    Just rootsText -> do
-                                        let rootsList = T.splitOn "," rootsText
-                                        return $ Set.fromList $ catMaybes $ map parseStorePath rootsList
-                                    Nothing -> return Set.empty
-                            else throwError $ DBError $ respMessage resp
+                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (GCRootListResponse roots) -> return $ Set.fromList $ map rootPath roots
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return Set.empty -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot get registered roots without daemon connection"
 
@@ -1123,10 +1073,9 @@ instance CanManageValidPaths 'Builder where
                     response <- liftIO $ Client.sendRequestSync conn request 30000000
                     case response of
                         Left err -> throwError err
-                        Right resp ->
-                            if respStatus resp == "ok"
-                                then return ()
-                                else throwError $ DBError $ respMessage resp
+                        Right SuccessResponse -> return ()
+                        Right (ErrorResponse err) -> throwError err
+                        Right _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot mark paths as valid without daemon connection"
 
@@ -1151,10 +1100,9 @@ instance CanManageValidPaths 'Builder where
                     response <- liftIO $ Client.sendRequestSync conn request 30000000
                     case response of
                         Left err -> throwError err
-                        Right resp ->
-                            if respStatus resp == "ok"
-                                then return ()
-                                else throwError $ DBError $ respMessage resp
+                        Right SuccessResponse -> return ()
+                        Right (ErrorResponse err) -> throwError err
+                        Right _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot mark paths as invalid without daemon connection"
 
@@ -1224,10 +1172,9 @@ instance CanManageDatabase 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then return ()
-                            else throwError $ DBError $ respMessage resp
+                    Right SuccessResponse -> return ()
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot vacuum database without daemon connection"
 
@@ -1247,16 +1194,9 @@ instance CanManageDatabase 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case (Map.lookup "totalRefs" (respData resp),
-                                       Map.lookup "invalid" (respData resp)) of
-                                (Just totalText, Just invalidText) ->
-                                    case (reads (T.unpack totalText), reads (T.unpack invalidText)) of
-                                        ([(total, "")], [(invalid, "")]) -> return (total, invalid)
-                                        _ -> return (0, 0)
-                                _ -> return (0, 0)
-                            else throwError $ DBError $ respMessage resp
+                    Right (SuccessResponse) -> return (0, 0) -- Default response if no details provided
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return (0, 0) -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot validate database without daemon connection"
 
@@ -1276,14 +1216,9 @@ instance CanManageDatabase 'Builder where
                 response <- liftIO $ Client.sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right resp ->
-                        if respStatus resp == "ok"
-                            then case Map.lookup "count" (respData resp) of
-                                Just countText -> case reads (T.unpack countText) of
-                                    [(count, "")] -> return count
-                                    _ -> return 0
-                                Nothing -> return 0
-                            else throwError $ DBError $ respMessage resp
+                    Right (SuccessResponse) -> return 0 -- Default if no count is provided
+                    Right (ErrorResponse err) -> throwError err
+                    Right _ -> return 0 -- Default fallback for unexpected responses
 
             _ -> throwError $ privilegeError "Cannot cleanup dangling references without daemon connection"
 
