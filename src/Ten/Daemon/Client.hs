@@ -1028,6 +1028,14 @@ listGCRoots conn = do
             return $ Left $ DaemonError $
                 "Invalid response type for list GC roots request: " <> T.pack (show resp)
 
+-- | Default build request configuration with sensible defaults
+defaultBuildRequestInfo :: BuildRequestInfo
+defaultBuildRequestInfo = BuildRequestInfo {
+    buildTimeout = Nothing,          -- No default timeout
+    buildEnv = Map.empty,            -- No default environment variables
+    buildFlags = []                  -- No default build flags
+}
+
 -- | Shutdown the daemon (requires daemon privileges via protocol)
 shutdownDaemon :: DaemonConnection 'Builder -> IO (Either BuildError ())
 shutdownDaemon conn = do
