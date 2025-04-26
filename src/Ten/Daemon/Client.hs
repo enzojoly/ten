@@ -359,18 +359,17 @@ sendRequestSync conn request timeoutMicros = do
 readResponseWithTimeout :: Handle -> Int -> IO Response
 readResponseWithTimeout handle timeoutMicros = do
     -- Use Core's receiveFramedResponse to read raw bytes
-    (respData, mRespPayload) <- SystemTimeout.timeout timeoutMicros $ receiveFramedResponse handle >>= \case
-        (respData, mRespPayload) -> return (respData, mRespPayload)
+    result <- SystemTimeout.timeout timeoutMicros $ receiveFramedResponse handle
 
-    case respData of
+    case result of
         Nothing -> throwIO $ DaemonError "Timeout waiting for daemon response"
-        Just respData' ->
+        Just (respData, mRespPayload) ->
             -- Decode the response
             case mRespPayload of
-                Nothing -> case decodeResponse respData' of
+                Nothing -> case decodeResponse respData of
                     Left err -> throwIO $ DaemonError $ "Failed to decode response: " <> err
                     Right resp -> return resp
-                Just payload -> case decodeResponse respData' of
+                Just payload -> case decodeResponse respData of
                     Left err -> throwIO $ DaemonError $ "Failed to decode response: " <> err
                     Right resp -> return resp { respPayload = Just payload }
 

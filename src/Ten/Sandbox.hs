@@ -136,7 +136,7 @@ import qualified Ten.Daemon.Protocol as Protocol
 
 -- | Sandbox connection type for proper process separation
 data SandboxConnection = SandboxConnection {
-    sandboxConnSocket :: Socket,         -- Socket for communicating with daemon
+    sandboxConnHandle :: Handle,
     sandboxConnAuthToken :: AuthToken,   -- Authentication token
     sandboxConnUserId :: UserId,         -- User ID
     sandboxConnRequestCounter :: TVar Int, -- Request counter
@@ -144,12 +144,12 @@ data SandboxConnection = SandboxConnection {
 }
 
 -- | Create a sandbox connection from socket information
-createSandboxConnection :: Socket -> AuthToken -> UserId -> IO SandboxConnection
-createSandboxConnection sock authToken userId = do
+createSandboxConnection :: Handle -> AuthToken -> UserId -> IO SandboxConnection
+createSandboxConnection handle authToken userId = do
     requestCounter <- newTVarIO 0
     responses <- newTVarIO Map.empty
     return SandboxConnection {
-        sandboxConnSocket = sock,
+        sandboxConnHandle = handle,
         sandboxConnAuthToken = authToken,
         sandboxConnUserId = userId,
         sandboxConnRequestCounter = requestCounter,
@@ -159,7 +159,7 @@ createSandboxConnection sock authToken userId = do
 -- | Close a sandbox connection
 closeSandboxConnection :: SandboxConnection -> IO ()
 closeSandboxConnection conn = do
-    Network.close (sandboxConnSocket conn)
+    hClose (sandboxConnHandle conn)
 
 -- | Sandbox request message types for daemon-builder communication
 data SandboxRequest
@@ -1485,7 +1485,7 @@ getSandboxConnection conn = do
 
     -- Create the sandbox connection
     return SandboxConnection {
-        sandboxConnSocket = connSocket conn,
+        sandboxConnHandle = connHandle conn,
         sandboxConnAuthToken = connAuthToken conn,
         sandboxConnUserId = connUserId conn,
         sandboxConnRequestCounter = requestCounter,
@@ -1528,8 +1528,8 @@ requestSandbox conn buildId inputs config = do
         let header = LBS.toStrict $ Binary.encode (reqId, LBS.length requestData)
 
         -- Send header followed by request data through the socket
-        NetworkBS.sendAll (sandboxConnSocket conn) header
-        NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+        BS.hPut (sandboxConnHandle conn) header
+        BS.hPut (sandboxConnHandle conn) (LBS.toStrict requestData)
 
         -- Wait for response with a reasonable timeout (30 seconds)
         response <- timeout 30000000 $ takeMVar responseMVar
@@ -1572,8 +1572,8 @@ releaseSandbox conn sandboxId = do
     let header = LBS.toStrict $ Binary.encode (reqId, LBS.length requestData)
 
     -- Send header followed by request data through the socket
-    NetworkBS.sendAll (sandboxConnSocket conn) header
-    NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+    BS.hPut (sandboxConnHandle conn) header
+    BS.hPut (sandboxConnHandle conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (10 seconds)
     _ <- timeout 10000000 $ takeMVar responseMVar
@@ -1614,8 +1614,8 @@ notifySandboxError conn sandboxId err = do
     let header = LBS.toStrict $ Binary.encode (reqId, LBS.length requestData)
 
     -- Send header followed by request data through the socket
-    NetworkBS.sendAll (sandboxConnSocket conn) header
-    NetworkBS.sendAll (sandboxConnSocket conn) (LBS.toStrict requestData)
+    BS.hPut (sandboxConnHandle conn) header
+    BS.hPut (sandboxConnHandle conn) (LBS.toStrict requestData)
 
     -- Wait for response with a timeout (5 seconds)
     _ <- timeout 5000000 $ takeMVar responseMVar

@@ -435,6 +435,35 @@ data BuildError
     | ConfigError Text                   -- Configuration error
     deriving (Show, Eq)
 
+instance Aeson.FromJSON BuildError where
+    parseJSON = Aeson.withObject "BuildError" $ \o -> do
+        errType <- o Aeson..: "type"
+        msg <- o Aeson..: "message"
+        case errType of
+            "eval" -> return $ EvalError msg
+            "build" -> return $ BuildFailed msg
+            "store" -> return $ StoreError msg
+            "sandbox" -> return $ SandboxError msg
+            "input" -> return $ InputNotFound (T.unpack msg)
+            "hash" -> return $ HashError msg
+            "graph" -> return $ GraphError msg
+            "resource" -> return $ ResourceError msg
+            "daemon" -> return $ DaemonError msg
+            "auth" -> return $ AuthError msg
+            "cycle" -> return $ CyclicDependency msg
+            "serialization" -> return $ SerializationError msg
+            "recursion" -> return $ RecursionLimit msg
+            "network" -> return $ NetworkError msg
+            "parse" -> return $ ParseError msg
+            "db" -> return $ DBError msg
+            "gc" -> return $ GCError msg
+            "phase" -> return $ PhaseError msg
+            "privilege" -> return $ PrivilegeError msg
+            "protocol" -> return $ ProtocolError msg
+            "internal" -> return $ InternalError msg
+            "config" -> return $ ConfigError msg
+            _ -> fail $ "Unknown error type: " <> T.unpack errType
+
 instance Exception BuildError
 
 -- | Convert BuildError to Text for easier handling across module boundaries
@@ -1748,7 +1777,7 @@ deserializeDaemonResponse bs mPayload =
 
                     Just (Aeson.String "error") -> do
                         errObj <- maybe (Left "Missing error") Right $
-                            AKeyMap.lookup "error" obj >>= Aeson.parseMaybe Aeson.parseJSON
+                            AKeyMap.lookup "error" obj
                         case parseError errObj of
                             Left err -> Left $ "Invalid error: " <> err
                             Right err -> Right $ ErrorResponse err
@@ -2053,7 +2082,7 @@ decodeMessage bs =
 
                     Just (Aeson.String "error") -> do
                         -- This is an error message
-                        case parseError obj of
+                        case parseError (Aeson.Object obj) of
                             Left err -> Left $ "Failed to parse error: " <> err
                             Right err -> Right $ ErrorMessage err
 
@@ -2752,7 +2781,7 @@ instance Aeson.FromJSON DaemonConfig where
 
 -- For BuildError, let's implement the parseError function:
 parseError :: Aeson.Value -> Either Text BuildError
-parseError = Aeson.withObject "BuildError" $ \o -> do
+parseError (Aeson.Object o) = do
     errType <- maybe (Left "Missing error type") Right $
                AKeyMap.lookup "type" o >>= Aeson.parseMaybe Aeson.parseJSON
     msg <- maybe (Left "Missing error message") Right $
@@ -2782,6 +2811,8 @@ parseError = Aeson.withObject "BuildError" $ \o -> do
         "internal" -> Right $ InternalError msg
         "config" -> Right $ ConfigError msg
         _ -> Left $ "Unknown error type: " <> errType
+
+parseError _ = Left "Error value is not an object"
 
 parseExitCode :: Aeson.Value -> Parser ExitCode
 parseExitCode = Aeson.withObject "ExitCode" $ \o -> do

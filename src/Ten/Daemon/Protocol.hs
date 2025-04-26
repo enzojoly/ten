@@ -1460,6 +1460,31 @@ responseToText = \case
 -- Type alias for consistency
 type Int64 = Int
 
+instance Aeson.ToJSON GCStats where
+    toJSON GCStats{..} = Aeson.object [
+        "total" .= gcTotal,
+        "live" .= gcLive,
+        "collected" .= gcCollected,
+        "bytes" .= gcBytes,
+        "elapsedTime" .= gcElapsedTime
+        ]
+
+instance Aeson.ToJSON DaemonConfig where
+    toJSON DaemonConfig{..} = Aeson.object [
+        "socketPath" .= daemonSocketPath,
+        "storePath" .= daemonStorePath,
+        "stateFile" .= daemonStateFile,
+        "logFile" .= daemonLogFile,
+        "logLevel" .= daemonLogLevel,
+        "gcInterval" .= daemonGcInterval,
+        "user" .= daemonUser,
+        "group" .= daemonGroup,
+        "allowedUsers" .= daemonAllowedUsers,
+        "maxJobs" .= daemonMaxJobs,
+        "foreground" .= daemonForeground,
+        "tmpDir" .= daemonTmpDir
+        ]
+
 -- JSON instance for Derivation
 instance Aeson.ToJSON Derivation where
     toJSON drv = Aeson.object [
