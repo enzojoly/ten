@@ -2752,6 +2752,17 @@ instance Aeson.ToJSON BuildResult where
             "success" Aeson..= False
             ]
 
+
+
+parseExitCode :: Aeson.Value -> Parser ExitCode
+parseExitCode = Aeson.withObject "ExitCode" $ \o -> do
+    codeType <- o Aeson..: "type" :: Parser Text
+    if codeType == "success"
+        then return ExitSuccess
+        else do
+            code <- o Aeson..: "code"
+            return $ ExitFailure code
+
 instance Aeson.FromJSON BuildResult where
     parseJSON = Aeson.withObject "BuildResult" $ \v -> do
         outputTexts <- v Aeson..: "outputs" :: Parser [Text]
@@ -2767,3 +2778,8 @@ instance Aeson.FromJSON BuildResult where
         let references = Set.fromList $ catMaybes $ map parseStorePath referenceTexts
 
         return $ BuildResult
+            { brOutputPaths = outputs
+            , brExitCode = exitCode
+            , brLog = log
+            , brReferences = references
+            }
