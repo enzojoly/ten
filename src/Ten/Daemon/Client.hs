@@ -68,7 +68,7 @@ module Ten.Daemon.Client (
 ) where
 
 import Control.Concurrent (forkIO, ThreadId, threadDelay, myThreadId, killThread)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, newMVar, readMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, newMVar, readMVar, withMVar)
 import Control.Concurrent.STM
 import Control.Exception (catch, finally, bracketOnError, bracket, throwIO, SomeException, try, IOException)
 import Control.Monad (void, when, forever, unless)
@@ -225,12 +225,14 @@ createSocketAndConnect socketPath = do
             return (s, handle))
 
 -- | Convert a DaemonConnection to a ProtocolHandle for Protocol functions
-asDaemonProtocolHandle :: DaemonConnection t -> ProtocolHandle
-asDaemonProtocolHandle conn = ProtocolHandle {
-    protocolSocket = connSocket conn,
-    protocolLock = newMVar (), -- Create a new lock for thread safety
-    protocolPrivilegeTier = fromSing (connPrivEvidence conn)
-}
+asDaemonProtocolHandle :: DaemonConnection t -> IO ProtocolHandle
+asDaemonProtocolHandle conn = do
+    mvar <- newMVar ()
+    return ProtocolHandle {
+        protocolSocket = connSocket conn,
+        protocolLock = mvar,
+        protocolPrivilegeTier = fromSing (connPrivEvidence conn)
+    }
 
 -- | Send a request to the daemon
 sendRequest :: DaemonConnection 'Builder -> DaemonRequest -> IO (Either BuildError Int)

@@ -130,7 +130,7 @@ import System.Random (randomRIO)
 import Ten.Core
 
 -- Import Protocol for authentication and security model
-import Ten.Daemon.Protocol
+import qualified Ten.Daemon.Protocol as Protocol
 
 -- | Authentication errors
 data AuthError
@@ -138,7 +138,7 @@ data AuthError
     | UserNotFound
     | TokenNotFound
     | TokenExpired
-    | InsufficientPrivileges PrivilegeTier PrivilegeRequirement
+    | InsufficientPrivileges PrivilegeTier Protocol.PrivilegeRequirement
     | AuthFileError Text
     | InvalidPassphrase
     | CryptoError Text
@@ -164,7 +164,7 @@ data TokenInfo (t :: PrivilegeTier) = TokenInfo {
     tiExpires :: Maybe UTCTime, -- When the token expires (Nothing = no expiry)
     tiClientInfo :: Text,      -- Information about the client
     tiLastUsed :: UTCTime,     -- When the token was last used
-    tiCapabilities :: Set DaemonCapability, -- Specific capabilities for this token
+    tiCapabilities :: Set Protocol.DaemonCapability, -- Specific capabilities for this token
     tiPrivilegeEvidence :: SPrivilegeTier t  -- Runtime evidence of privilege tier
 } deriving (Eq)
 
@@ -193,7 +193,7 @@ data UserInfo = UserInfo {
     uiUsername :: Text,
     uiPasswordHash :: Maybe PasswordHash,
     uiCapabilityLevel :: UserCapabilityLevel,
-    uiSpecificCapabilities :: Set DaemonCapability,
+    uiSpecificCapabilities :: Set Protocol.DaemonCapability,
     uiAllowedPrivilegeTiers :: Set PrivilegeTier, -- Which privilege tiers are allowed
     uiSystemUser :: Maybe Text,  -- Associated system user, if any
     uiTokens :: Map Text SomeTokenInfo,  -- Store tokens with erased types
@@ -220,7 +220,7 @@ data UserCapabilityLevel
     deriving (Show, Eq, Ord, Enum, Bounded)
 
 -- | Helper functions to filter capabilities based on privilege tier
-filterCapabilitiesForTier :: SPrivilegeTier t -> Set DaemonCapability -> Set DaemonCapability
+filterCapabilitiesForTier :: SPrivilegeTier t -> Set Protocol.DaemonCapability -> Set Protocol.DaemonCapability
 filterCapabilitiesForTier SDaemon = id  -- Daemon can use all capabilities
 filterCapabilitiesForTier SBuilder = Set.filter (not . capabilityRequiresDaemon)  -- Filter daemon-only capabilities
 
@@ -229,63 +229,63 @@ privilegeEvidence :: SPrivilegeTier t -> SPrivilegeTier t
 privilegeEvidence = id
 
 -- | Check if a capability requires daemon privileges (using Protocol's model)
-capabilityRequiresDaemon :: DaemonCapability -> Bool
-capabilityRequiresDaemon StoreAccess = True
-capabilityRequiresDaemon SandboxCreation = True
-capabilityRequiresDaemon GarbageCollection = True
-capabilityRequiresDaemon DerivationRegistration = True
+capabilityRequiresDaemon :: Protocol.DaemonCapability -> Bool
+capabilityRequiresDaemon Protocol.StoreAccess = True
+capabilityRequiresDaemon Protocol.SandboxCreation = True
+capabilityRequiresDaemon Protocol.GarbageCollection = True
+capabilityRequiresDaemon Protocol.DerivationRegistration = True
 capabilityRequiresDaemon _ = False
 
 -- | Map old-style Permission to new Protocol DaemonCapability
-permissionToCapability :: Text -> Maybe DaemonCapability
-permissionToCapability "build" = Just DerivationBuild
-permissionToCapability "cancel-build" = Just DerivationBuild
-permissionToCapability "query-build" = Just BuildQuery
-permissionToCapability "query-store" = Just StoreQuery
-permissionToCapability "modify-store" = Just StoreAccess
-permissionToCapability "run-gc" = Just GarbageCollection
-permissionToCapability "manage-users" = Just StoreAccess  -- Admin capability
-permissionToCapability "admin" = Just StoreAccess         -- Admin capability
+permissionToCapability :: Text -> Maybe Protocol.DaemonCapability
+permissionToCapability "build" = Just Protocol.DerivationBuild
+permissionToCapability "cancel-build" = Just Protocol.DerivationBuild
+permissionToCapability "query-build" = Just Protocol.BuildQuery
+permissionToCapability "query-store" = Just Protocol.StoreQuery
+permissionToCapability "modify-store" = Just Protocol.StoreAccess
+permissionToCapability "run-gc" = Just Protocol.GarbageCollection
+permissionToCapability "manage-users" = Just Protocol.StoreAccess  -- Admin capability
+permissionToCapability "admin" = Just Protocol.StoreAccess         -- Admin capability
 permissionToCapability _ = Nothing
 
 -- | Map a capability back to permission name (for backwards compatibility)
-capabilityToPermission :: DaemonCapability -> Text
-capabilityToPermission StoreAccess = "modify-store"
-capabilityToPermission SandboxCreation = "sandbox-creation"
-capabilityToPermission GarbageCollection = "run-gc"
-capabilityToPermission DerivationRegistration = "register-derivation"
-capabilityToPermission DerivationBuild = "build"
-capabilityToPermission StoreQuery = "query-store"
-capabilityToPermission BuildQuery = "query-build"
+capabilityToPermission :: Protocol.DaemonCapability -> Text
+capabilityToPermission Protocol.StoreAccess = "modify-store"
+capabilityToPermission Protocol.SandboxCreation = "sandbox-creation"
+capabilityToPermission Protocol.GarbageCollection = "run-gc"
+capabilityToPermission Protocol.DerivationRegistration = "register-derivation"
+capabilityToPermission Protocol.DerivationBuild = "build"
+capabilityToPermission Protocol.StoreQuery = "query-store"
+capabilityToPermission Protocol.BuildQuery = "query-build"
 
 -- | Default capabilities for capability levels - aligned with Protocol
-defaultCapabilities :: UserCapabilityLevel -> Set DaemonCapability
+defaultCapabilities :: UserCapabilityLevel -> Set Protocol.DaemonCapability
 defaultCapabilities UserLevelNone = Set.empty
 defaultCapabilities UserLevelBasic = Set.fromList [
-    StoreQuery,
-    BuildQuery
+    Protocol.StoreQuery,
+    Protocol.BuildQuery
     ]
 defaultCapabilities UserLevelStandard = Set.fromList [
-    DerivationBuild,
-    StoreQuery,
-    BuildQuery
+    Protocol.DerivationBuild,
+    Protocol.StoreQuery,
+    Protocol.BuildQuery
     ]
 defaultCapabilities UserLevelAdvanced = Set.fromList [
-    DerivationBuild,
-    DerivationRegistration,
-    StoreQuery,
-    BuildQuery,
-    StoreAccess,
-    GarbageCollection
+    Protocol.DerivationBuild,
+    Protocol.DerivationRegistration,
+    Protocol.StoreQuery,
+    Protocol.BuildQuery,
+    Protocol.StoreAccess,
+    Protocol.GarbageCollection
     ]
 defaultCapabilities UserLevelAdmin = Set.fromList [
-    StoreAccess,
-    SandboxCreation,
-    GarbageCollection,
-    DerivationRegistration,
-    DerivationBuild,
-    StoreQuery,
-    BuildQuery
+    Protocol.StoreAccess,
+    Protocol.SandboxCreation,
+    Protocol.GarbageCollection,
+    Protocol.DerivationRegistration,
+    Protocol.DerivationBuild,
+    Protocol.StoreQuery,
+    Protocol.BuildQuery
     ]
 
 -- | Default allowed privilege tiers for capability levels
@@ -370,7 +370,7 @@ decodeBase64 text =
         Right bs -> Just bs
 
 -- | Create a token with the specified privilege tier
-createTokenForTier :: SPrivilegeTier t -> UserInfo -> Text -> Maybe Int -> Set DaemonCapability -> IO (TokenInfo t)
+createTokenForTier :: SPrivilegeTier t -> UserInfo -> Text -> Maybe Int -> Set Protocol.DaemonCapability -> IO (TokenInfo t)
 createTokenForTier evidence user clientInfo expirySeconds capabilities = do
     token <- generateToken
     now <- getCurrentTime
@@ -395,11 +395,11 @@ createTokenForTier evidence user clientInfo expirySeconds capabilities = do
     }
 
 -- | Create a new daemon token for a user
-createDaemonToken :: UserInfo -> Text -> Maybe Int -> Set DaemonCapability -> IO (TokenInfo 'Daemon)
+createDaemonToken :: UserInfo -> Text -> Maybe Int -> Set Protocol.DaemonCapability -> IO (TokenInfo 'Daemon)
 createDaemonToken = createTokenForTier SDaemon
 
 -- | Create a new builder token for a user
-createBuilderToken :: UserInfo -> Text -> Maybe Int -> Set DaemonCapability -> IO (TokenInfo 'Builder)
+createBuilderToken :: UserInfo -> Text -> Maybe Int -> Set Protocol.DaemonCapability -> IO (TokenInfo 'Builder)
 createBuilderToken = createTokenForTier SBuilder
 
 -- | Create a builder token from a daemon token (privilege downgrade only)
@@ -479,7 +479,7 @@ integrateWithSystemUser db tenUsername sysUsername = do
             }
 
 -- | Check if a user has permission for a specific capability + privilege tier
-hasPrivilegeForCapability :: UserInfo -> DaemonCapability -> PrivilegeTier -> Bool
+hasPrivilegeForCapability :: UserInfo -> Protocol.DaemonCapability -> PrivilegeTier -> Bool
 hasPrivilegeForCapability user capability requestedTier =
     -- Check if user has the capability
     capability `Set.member` uiSpecificCapabilities user &&
@@ -554,7 +554,7 @@ authenticateUser ::
     Text ->
     Text ->
     PrivilegeTier ->
-    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier, Set DaemonCapability))
+    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier, Set Protocol.DaemonCapability))
 authenticateUser db username password clientInfo requestedTier = do
     -- Check if the user exists
     case Map.lookup username (adUsers db) of
@@ -585,7 +585,7 @@ authenticateUser db username password clientInfo requestedTier = do
                                     if verifyPassword password passwordHash
                                         then proceedWithAuthentication db username user clientInfo now requestedTier
                                         else return $ Left InvalidCredentials
-                else return $ Left $ InsufficientPrivileges requestedTier DaemonRequired
+                else return $ Left $ InsufficientPrivileges requestedTier Protocol.DaemonRequired
 
 -- | Process authenticated user and create appropriate token
 proceedWithAuthentication ::
@@ -595,7 +595,7 @@ proceedWithAuthentication ::
     Text ->
     UTCTime ->
     PrivilegeTier ->
-    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier, Set DaemonCapability))
+    IO (Either AuthError (AuthDb, UserId, AuthToken, PrivilegeTier, Set Protocol.DaemonCapability))
 proceedWithAuthentication db username user clientInfo now requestedTier =
     case requestedTier of
         Daemon -> do
@@ -645,7 +645,7 @@ proceedWithAuthentication db username user clientInfo now requestedTier =
 validateDaemonToken ::
     AuthDb ->
     AuthToken ->
-    IO (Maybe (UserId, Set DaemonCapability))
+    IO (Maybe (UserId, Set Protocol.DaemonCapability))
 validateDaemonToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -674,7 +674,7 @@ validateDaemonToken db (AuthToken token) = do
 validateBuilderToken ::
     AuthDb ->
     AuthToken ->
-    IO (Maybe (UserId, Set DaemonCapability))
+    IO (Maybe (UserId, Set Protocol.DaemonCapability))
 validateBuilderToken db (AuthToken token) = do
     -- Check if the token exists
     case Map.lookup token (adTokenMap db) of
@@ -702,7 +702,7 @@ validateTokenAtProcessBoundary ::
     AuthDb ->
     AuthToken ->
     PrivilegeTier ->  -- Requested privilege tier
-    IO (Maybe (UserId, Set DaemonCapability))
+    IO (Maybe (UserId, Set Protocol.DaemonCapability))
 validateTokenAtProcessBoundary db token requestedTier =
     case requestedTier of
         Daemon -> validateDaemonToken db token
@@ -713,7 +713,7 @@ validateToken :: forall t.
     AuthDb ->
     AuthToken ->
     SPrivilegeTier t ->
-    IO (Maybe (UserId, Set DaemonCapability, SPrivilegeTier t))
+    IO (Maybe (UserId, Set Protocol.DaemonCapability, SPrivilegeTier t))
 validateToken db token evidence =
     -- Simply wrap the appropriate validation function based on privilege tier
     case fromSing evidence of
@@ -735,11 +735,11 @@ extractPrivilegeEvidence :: forall t. TokenInfo t -> SPrivilegeTier t
 extractPrivilegeEvidence = tiPrivilegeEvidence
 
 -- | Helper to extract capabilities from TokenInfo
-extractCapabilities :: forall t. TokenInfo t -> Set DaemonCapability
+extractCapabilities :: forall t. TokenInfo t -> Set Protocol.DaemonCapability
 extractCapabilities = tiCapabilities
 
 -- | Helper to convert SomeTokenInfo to its components for validation
-unwrapTokenInfo :: SomeTokenInfo -> (Text, UTCTime, Maybe UTCTime, Text, UTCTime, Set DaemonCapability, PrivilegeTier)
+unwrapTokenInfo :: SomeTokenInfo -> (Text, UTCTime, Maybe UTCTime, Text, UTCTime, Set Protocol.DaemonCapability, PrivilegeTier)
 unwrapTokenInfo (SomeTokenInfo token) =
     (tiToken token,
      tiCreated token,
@@ -790,7 +790,7 @@ refreshToken db (AuthToken token) requestedTier = do
 
                                         -- Privilege escalation - denied
                                         (Builder, Daemon) ->
-                                            return $ Left $ InsufficientPrivileges Builder DaemonRequired
+                                            return $ Left $ InsufficientPrivileges Builder Protocol.DaemonRequired
 
 -- | Helper function to refresh token with specific privilege tier
 refreshWithTier ::
@@ -1021,7 +1021,7 @@ changeUserPrivilegeTiers db username newTiers = do
             }
 
 -- | Check if a user has a specific capability
-checkUserPermission :: AuthDb -> UserId -> DaemonCapability -> PrivilegeTier -> IO Bool
+checkUserPermission :: AuthDb -> UserId -> Protocol.DaemonCapability -> PrivilegeTier -> IO Bool
 checkUserPermission db userId capability requestedTier = do
     -- Find the user by ID
     let mUser = findUserById db userId
