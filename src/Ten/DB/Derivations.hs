@@ -34,8 +34,6 @@ import Control.Monad (forM, forM_, when, unless, void, foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.Except (throwError, catchError)
-import Control.Monad (mzero)
-import System.IO (stderr, hPutStrLn)
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe, listToMaybe, catMaybes, isJust)
 import Data.Set (Set)
@@ -87,6 +85,32 @@ data PathInfo = PathInfo {
     pathInfoRegistrationTime :: UTCTime, -- ^ When it was registered
     pathInfoIsValid :: Bool             -- ^ Whether path is still valid
 } deriving (Show, Eq)
+
+-- Helper function to parse StorePath from a database field without validation
+parseStorePathField :: RowParser StorePath
+parseStorePathField = do
+    pathText <- field :: RowParser Text
+    -- Extract components without validation - pure data extraction following Nix pattern
+    let (hash, namePart) = T.breakOn "-" pathText
+    let name = T.drop 1 namePart
+    return $ StorePath hash name
+
+-- Validate a collection of StorePath objects after extraction
+validateAndLogPaths :: [StorePath] -> TenM p t [StorePath]
+validateAndLogPaths paths = do
+    forM paths $ \path -> do
+        valid <- liftIO $ validateStorePathWithContext path "database-extraction"
+        unless valid $
+            logMsg 1 $ "Warning: Invalid store path from database: " <> storePathToText path
+        return path
+
+-- Validate a single StorePath after extraction
+validateAndLogPath :: StorePath -> TenM p t StorePath
+validateAndLogPath path = do
+    valid <- liftIO $ validateStorePathWithContext path "database-extraction"
+    unless valid $
+        logMsg 1 $ "Warning: Invalid store path from database: " <> storePathToText path
+    return path
 
 -- Make DerivationInfo an instance of FromRow
 instance FromRow DerivationInfo where
@@ -158,18 +182,6 @@ daemonResponseMeta (Right response) =
             ]
         -- Add additional response types as needed
         _ -> Map.empty  -- Default empty metadata for other responses
-
--- Helper function to parse StorePath from a database field
-parseStorePathField :: RowParser StorePath
-parseStorePathField = do
-    pathText <- field :: RowParser Text
-    case parseStorePath pathText of
-        Just path -> return path
-        Nothing -> do
-            -- Use liftIO to log the error with an informative message
-            liftIO $ hPutStrLn stderr $ "Error: Invalid store path: " ++ T.unpack pathText
-            -- Then use mzero to fail the parser
-            mzero
 
 -- | Type class for derivation storage operations
 class CanStoreDerivation (t :: PrivilegeTier) where
@@ -394,7 +406,13 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
             "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d WHERE d.hash = ?"
             (Only hash) :: TenM 'Eval 'Daemon [DerivationInfo]
 
-        case derivRows of
+        -- Validate returned paths
+        validatedRows <- forM derivRows $ \info -> do
+            -- Validate the store path
+            _ <- validateAndLogPath (derivationStorePath info)
+            return info
+
+        case validatedRows of
             [] -> return Nothing
             [derivInfo] -> do
                 -- Get the derivation store path
@@ -427,8 +445,14 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
         case storePaths of
             [Only pathText] ->
                 case parseStorePath pathText of
-                    Just sp -> readDerivationFromStore sp
-                    Nothing -> return Nothing
+                    Just sp -> do
+                        -- Validate the path after extraction
+                        validatedPath <- validateAndLogPath sp
+                        readDerivationFromStore validatedPath
+                    Nothing -> do
+                        -- Log invalid path
+                        logMsg 1 $ "Invalid store path in database: " <> pathText
+                        return Nothing
             _ -> return Nothing
 
     getDerivationForOutput outputPath = do
@@ -440,7 +464,10 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
             \WHERE o.path = ?"
             (Only (storePathToText outputPath)) :: TenM 'Eval 'Daemon [DerivationInfo]
 
-        return $ listToMaybe results
+        -- Validate returned paths
+        validatedResults <- validateAndLogPaths results
+
+        return $ listToMaybe validatedResults
 
     findDerivationsByOutputs [] = return Map.empty
     findDerivationsByOutputs outputPaths = do
@@ -458,8 +485,11 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
 
         derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts :: TenM 'Eval 'Daemon [DerivationInfo]
 
+        -- Validate store paths
+        validatedDerivInfos <- validateAndLogPaths derivInfos
+
         -- Now load each derivation
-        derivations <- forM derivInfos $ \derivInfo -> do
+        derivations <- forM validatedDerivInfos $ \derivInfo -> do
             mDrv <- retrieveDerivation (derivationHash derivInfo)
             case mDrv of
                 Nothing -> return Nothing
@@ -479,7 +509,13 @@ instance CanRetrieveDerivation 'Build 'Daemon where
             "SELECT d.id, d.hash, d.store_path, d.timestamp FROM Derivations d WHERE d.hash = ?"
             (Only hash) :: TenM 'Build 'Daemon [DerivationInfo]
 
-        case derivRows of
+        -- Validate returned paths
+        validatedRows <- forM derivRows $ \info -> do
+            -- Validate the store path
+            _ <- validateAndLogPath (derivationStorePath info)
+            return info
+
+        case validatedRows of
             [] -> return Nothing
             [derivInfo] -> do
                 -- Get the derivation store path
@@ -512,8 +548,14 @@ instance CanRetrieveDerivation 'Build 'Daemon where
         case storePaths of
             [Only pathText] ->
                 case parseStorePath pathText of
-                    Just sp -> readDerivationFromStore sp
-                    Nothing -> return Nothing
+                    Just sp -> do
+                        -- Validate the path after extraction
+                        validatedPath <- validateAndLogPath sp
+                        readDerivationFromStore validatedPath
+                    Nothing -> do
+                        -- Log invalid path
+                        logMsg 1 $ "Invalid store path in database: " <> pathText
+                        return Nothing
             _ -> return Nothing
 
     getDerivationForOutput outputPath = do
@@ -525,7 +567,10 @@ instance CanRetrieveDerivation 'Build 'Daemon where
             \WHERE o.path = ?"
             (Only (storePathToText outputPath)) :: TenM 'Build 'Daemon [DerivationInfo]
 
-        return $ listToMaybe results
+        -- Validate returned paths
+        validatedResults <- validateAndLogPaths results
+
+        return $ listToMaybe validatedResults
 
     findDerivationsByOutputs [] = return Map.empty
     findDerivationsByOutputs outputPaths = do
@@ -543,8 +588,11 @@ instance CanRetrieveDerivation 'Build 'Daemon where
 
         derivInfos <- tenQuery db (Query $ T.pack queryStr) pathTexts :: TenM 'Build 'Daemon [DerivationInfo]
 
+        -- Validate store paths
+        validatedDerivInfos <- validateAndLogPaths derivInfos
+
         -- Now load each derivation
-        derivations <- forM derivInfos $ \derivInfo -> do
+        derivations <- forM validatedDerivInfos $ \derivInfo -> do
             mDrv <- retrieveDerivation (derivationHash derivInfo)
             case mDrv of
                 Nothing -> return Nothing
@@ -726,9 +774,13 @@ instance CanManageOutputs 'Daemon where
     getOutputsForDerivation derivId = do
         db <- getDatabaseConn
 
-        tenQuery db
+        -- Query outputs
+        outputs <- tenQuery db
             "SELECT derivation_id, output_name, path FROM Outputs WHERE derivation_id = ?"
             (Only derivId)
+
+        -- Validate all paths after extraction
+        validateAndLogPaths outputs
 
 -- Builder implementation of CanManageOutputs (via protocol)
 instance CanManageOutputs 'Builder where
@@ -775,9 +827,9 @@ instance CanManageOutputs 'Builder where
                 case response of
                     Left err -> throwError err
                     Right (DerivationOutputResponse paths) ->
-                        -- Convert output paths to OutputInfo objects
-                        -- Using a simple approach since we don't have the names
-                        return $ map (\p -> OutputInfo derivId "" p) (Set.toList paths)
+                        -- Convert output paths to OutputInfo objects and validate
+                        let outputs = map (\p -> OutputInfo derivId "" p) (Set.toList paths)
+                        in validateAndLogPaths outputs
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return []  -- Default fallback for unexpected responses
 
@@ -822,7 +874,10 @@ instance CanManageReferences 'Daemon where
             (Only (storePathToText path)) :: TenM p 'Daemon [Only Text]
 
         -- Parse each path
-        return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+        let parsedPaths = catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        -- Validate parsed paths
+        validateAndLogPaths parsedPaths
 
     getReferrers path = do
         db <- getDatabaseConn
@@ -832,7 +887,10 @@ instance CanManageReferences 'Daemon where
             (Only (storePathToText path)) :: TenM p 'Daemon [Only Text]
 
         -- Parse each path
-        return $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+        let parsedPaths = catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        -- Validate parsed paths
+        validateAndLogPaths parsedPaths
 
     getTransitiveReferences path = do
         db <- getDatabaseConn
@@ -848,8 +906,12 @@ instance CanManageReferences 'Daemon where
 
         results <- tenQuery db query (storePathToText path, storePathToText path) :: TenM p 'Daemon [Only Text]
 
-        -- Parse paths and return as set
-        return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+        -- Parse paths
+        let parsedPaths = catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        -- Validate parsed paths and convert to set
+        validatedPaths <- validateAndLogPaths parsedPaths
+        return $ Set.fromList validatedPaths
 
     getTransitiveReferrers path = do
         db <- getDatabaseConn
@@ -865,8 +927,12 @@ instance CanManageReferences 'Daemon where
 
         results <- tenQuery db query (storePathToText path, storePathToText path) :: TenM p 'Daemon [Only Text]
 
-        -- Parse paths and return as set
-        return $ Set.fromList $ catMaybes $ map (\(Only text) -> parseStorePath text) results
+        -- Parse paths
+        let parsedPaths = catMaybes $ map (\(Only text) -> parseStorePath text) results
+
+        -- Validate parsed paths and convert to set
+        validatedPaths <- validateAndLogPaths parsedPaths
+        return $ Set.fromList validatedPaths
 
     bulkRegisterReferences [] = return 0
     bulkRegisterReferences references = do
@@ -929,7 +995,7 @@ instance CanManageReferences 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (StoreListResponse paths) -> return paths
+                    Right (StoreListResponse paths) -> validateAndLogPaths paths
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return []  -- Default fallback for unexpected responses
 
@@ -951,7 +1017,7 @@ instance CanManageReferences 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (StoreListResponse paths) -> return paths
+                    Right (StoreListResponse paths) -> validateAndLogPaths paths
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return []  -- Default fallback for unexpected responses
 
@@ -973,7 +1039,9 @@ instance CanManageReferences 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (StoreListResponse paths) -> do
+                        validatedPaths <- validateAndLogPaths paths
+                        return $ Set.fromList validatedPaths
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return Set.empty  -- Default fallback for unexpected responses
 
@@ -995,7 +1063,9 @@ instance CanManageReferences 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (StoreListResponse paths) -> return $ Set.fromList paths
+                    Right (StoreListResponse paths) -> do
+                        validatedPaths <- validateAndLogPaths paths
+                        return $ Set.fromList validatedPaths
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return Set.empty  -- Default fallback for unexpected responses
 
@@ -1061,7 +1131,10 @@ instance CanQueryDerivations 'Daemon where
     listRegisteredDerivations = do
         db <- getDatabaseConn
 
-        tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+        derivInfos <- tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+
+        -- Validate paths
+        validateAndLogPaths derivInfos
 
     getDerivationPath hash = do
         db <- getDatabaseConn
@@ -1071,7 +1144,16 @@ instance CanQueryDerivations 'Daemon where
             (Only hash) :: TenM p 'Daemon [Only Text]
 
         case results of
-            [Only path] -> return $ parseStorePath path
+            [Only path] ->
+                case parseStorePath path of
+                    Just sp -> do
+                        -- Validate after parsing
+                        validatedPath <- validateAndLogPath sp
+                        return $ Just validatedPath
+                    Nothing -> do
+                        -- Log invalid path
+                        logMsg 1 $ "Invalid store path in database: " <> path
+                        return Nothing
             _ -> return Nothing
 
 -- Builder implementation of CanQueryDerivations (via protocol)
@@ -1114,9 +1196,10 @@ instance CanQueryDerivations 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (DerivationListResponse paths) ->
+                    Right (DerivationListResponse paths) -> do
                         -- Convert to DerivationInfo objects with minimal data
-                        return $ map (\p -> DerivationInfo 0 "" p 0) paths
+                        let derivInfos = map (\p -> DerivationInfo 0 "" p 0) paths
+                        validateAndLogPaths derivInfos
                     Right (ErrorResponse err) -> throwError err
                     Right _ -> return []  -- Default fallback for unexpected responses
 
@@ -1138,7 +1221,9 @@ instance CanQueryDerivations 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (StorePathResponse path) -> return $ Just path
+                    Right (StorePathResponse path) -> do
+                        validatedPath <- validateAndLogPath path
+                        return $ Just validatedPath
                     Right (ErrorResponse _) -> return Nothing
                     Right _ -> return Nothing  -- Default fallback for unexpected responses
 
@@ -1193,11 +1278,20 @@ instance CanManagePathValidity 'Daemon where
     getPathInfo path = do
         db <- getDatabaseConn
 
-        results <- tenQuery db
+        pathInfos <- tenQuery db
             "SELECT path, hash, deriver, registration_time, is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
             (Only (storePathToText path)) :: TenM p 'Daemon [PathInfo]
 
-        return $ listToMaybe results
+        -- Validate the returned paths
+        validatedPathInfos <- forM pathInfos $ \info -> do
+            _ <- validateAndLogPath (pathInfoPath info)
+            case pathInfoDeriver info of
+                Just deriver -> do
+                    _ <- validateAndLogPath deriver
+                    return info
+                Nothing -> return info
+
+        return $ listToMaybe validatedPathInfos
 
 -- Builder implementation of CanManagePathValidity (via protocol)
 instance CanManagePathValidity 'Builder where
@@ -1290,11 +1384,17 @@ instance CanManagePathValidity 'Builder where
                     Right (SuccessResponse) ->
                         case (Map.lookup "hash" (daemonResponseMeta response),
                               Map.lookup "valid" (daemonResponseMeta response)) of
-                            (Just hash, Just valid) ->
+                            (Just hash, Just valid) -> do
                                 let deriver = Map.lookup "deriver" (daemonResponseMeta response) >>= parseStorePath
                                     isValid = valid == "true"
                                     time = posixSecondsToUTCTime 0 -- Default time
-                                in return $ Just $ PathInfo path hash deriver time isValid
+                                pathInfo <- validateAndLogPath path
+                                case deriver of
+                                    Just d -> do
+                                        _ <- validateAndLogPath d
+                                        return $ Just $ PathInfo pathInfo hash deriver time isValid
+                                    Nothing ->
+                                        return $ Just $ PathInfo pathInfo hash deriver time isValid
                             _ -> return Nothing
                     Right (ErrorResponse _) -> return Nothing
                     Right _ -> return Nothing  -- Default fallback for unexpected responses
