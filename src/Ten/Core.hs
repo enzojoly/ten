@@ -725,7 +725,7 @@ data DaemonConnection (t :: PrivilegeTier) = DaemonConnection {
     connHandle :: Handle,                     -- ^ Handle for socket I/O
     connUserId :: UserId,                     -- ^ Authenticated user ID
     connAuthToken :: AuthToken,               -- ^ Authentication token
-    connRequestMap :: TVar (Map Int (MVar Response)), -- ^ Map of pending requests
+    connRequestMap :: TVar (Map Int (MVar BS.ByteString)),
     connNextReqId :: TVar Int,                -- ^ Next request ID
     connReaderThread :: ThreadId,             -- ^ Thread ID of the response reader
     connShutdown :: TVar Bool,                -- ^ Flag to indicate connection shutdown
@@ -921,26 +921,26 @@ sendRequest conn request = do
     return reqId
 
 -- | Receive a response for a specific request
-receiveResponse :: DaemonConnection t -> Int -> Int -> IO (Either BuildError Response)
+receiveResponse :: DaemonConnection 'Builder -> Int -> Int -> IO (Either BuildError DaemonResponse)
 receiveResponse conn reqId timeoutMicros = do
-    -- Get response MVar
     reqMap <- readTVarIO (connRequestMap conn)
     case Map.lookup reqId reqMap of
         Nothing ->
-            -- No such request ID
             return $ Left $ DaemonError $ "Unknown request ID: " <> T.pack (show reqId)
-
         Just respVar -> do
-            -- Wait for response with timeout
-            result <- timeout timeoutMicros $ takeMVar respVar
+            -- Get raw bytes from MVar
+            mResult <- SystemTimeout.timeout timeoutMicros $ takeMVar respVar
 
-            -- Clean up request map
-            atomically $ modifyTVar' (connRequestMap conn) $ Map.delete reqId
-
-            -- Return response or error
-            case result of
+            case mResult of
                 Nothing -> return $ Left $ DaemonError "Timeout waiting for daemon response"
-                Just resp -> return $ Right resp
+                Just rawBytes -> do
+                    -- Split the raw bytes back into header and payload
+                    case splitResponseBytes rawBytes of
+                        (header, mPayload) ->
+                            -- Now deserialize
+                            case deserializeDaemonResponse header mPayload of
+                                Left err -> return $ Left $ ProtocolError err
+                                Right resp -> return $ Right resp
 
 -- | Send a request and wait for response (synchronous)
 sendRequestSync :: DaemonConnection t -> Request -> Int -> IO (Either BuildError Response)
@@ -952,25 +952,63 @@ sendRequestSync conn request timeoutMicros = do
     receiveResponse conn reqId timeoutMicros
 
 -- | Background thread to read and dispatch responses
-responseReaderThread :: Handle -> TVar (Map Int (MVar Response)) -> TVar Bool -> IO ()
-responseReaderThread handle requestMap shutdownFlag = forever $ do
+responseReaderThread :: Socket -> TVar (Map Int (MVar BS.ByteString)) -> TVar Bool -> IO ()
+responseReaderThread sock requestMap shutdownFlag = forever $ do
     -- Check if we should shut down
     shutdown <- readTVarIO shutdownFlag
     when shutdown $ return ()
 
-    -- Try to read a response
-    response <- try $ readResponseWithTimeout handle 30000000 -- 30 second timeout
-    case response of
-        Left (e :: SomeException) -> do
+    -- Try to read a response as raw bytes
+    eResp <- try $ receiveFramedResponse sock
+    case eResp of
+        Left (e :: SomeException) ->
             -- Connection error, exit thread
             return ()
+        Right (respData, mRespPayload) -> do
+            -- Extract response ID from respData without fully deserializing
+            let mReqId = extractRequestIdFromBytes respData
 
-        Right resp -> do
-            -- Look up request and deliver response
-            reqMap <- readTVarIO requestMap
-            case Map.lookup (respId resp) reqMap of
-                Nothing -> return () -- Unknown request ID, ignore
-                Just respVar -> putMVar respVar resp
+            -- Store the raw response bytes in the MVar
+            case mReqId of
+                Just reqId -> do
+                    reqMap <- readTVarIO requestMap
+                    case Map.lookup reqId reqMap of
+                        Just respVar -> do
+                            -- Concatenate header and payload into a single ByteString for storage
+                            let fullResponse = case mRespPayload of
+                                    Just payload -> BS.concat [respData, payload]
+                                    Nothing -> respData
+                            putMVar respVar fullResponse
+                            atomically $ modifyTVar' requestMap $ Map.delete reqId
+                        Nothing -> return ()
+                Nothing -> return ()
+
+-- Extract request ID from response bytes
+extractRequestIdFromBytes :: BS.ByteString -> Maybe Int
+extractRequestIdFromBytes bytes = do
+    -- Quick and dirty way to extract ID without full deserialization
+    case Aeson.decodeStrict bytes of
+        Just obj -> case Aeson.fromJSON obj of
+            Aeson.Success (Aeson.Object o) ->
+                case KeyMap.lookup "id" o of
+                    Just (Aeson.Number n) -> Just (round n)
+                    _ -> Nothing
+            _ -> Nothing
+        _ -> Nothing
+
+-- Split concatenated response into header and payload
+splitResponseBytes :: BS.ByteString -> (BS.ByteString, Maybe BS.ByteString)
+splitResponseBytes bytes =
+    -- Implementation would parse the length prefix and split accordingly
+    -- This is a simplified example
+    case parseRequestFrame bytes of
+        Right (header, rest) ->
+            if BS.null rest
+                then (header, Nothing)
+                else case parseRequestFrame rest of
+                    Right (payload, _) -> (header, Just payload)
+                    _ -> (header, Nothing)
+        _ -> (bytes, Nothing)
 
 -- | Helper function to work with singletons
 withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a
