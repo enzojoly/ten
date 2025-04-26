@@ -75,6 +75,7 @@ import Control.Exception (catch, finally, bracketOnError, bracket, throwIO, Some
 import Control.Monad (void, when, forever, unless)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KeyMap
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Char8 as BC
@@ -414,61 +415,6 @@ readResponseWithTimeout handle timeoutMicros = do
         Nothing -> throwIO $ DaemonError "Timeout waiting for daemon response"
         Just msg -> return msg
 
--- | Receive a framed response from socket
-receiveFramedResponse :: Socket -> IO (BS.ByteString, Maybe BS.ByteString)
-receiveFramedResponse sock = do
-    -- Read response frame using Protocol's framing
-    responseData <- recvFrame sock
-
-    -- Check if response indicates a payload using Protocol's logic
-    case Aeson.decodeStrict responseData of
-        Nothing -> return (responseData, Nothing)
-        Just obj -> do
-            let hasPayload = case Aeson.fromJSON obj of
-                    Aeson.Success (Aeson.Object o) ->
-                        case KeyMap.lookup "hasContent" o of
-                            Just (Aeson.Bool True) -> True
-                            _ -> False
-                    _ -> False
-
-            if hasPayload
-                then do
-                    -- Read payload frame
-                    payloadData <- recvFrame sock
-                    return (responseData, Just payloadData)
-                else
-                    return (responseData, Nothing)
-  where
-    recvFrame :: Socket -> IO BS.ByteString
-    recvFrame s = do
-        -- Read length prefix (4 bytes)
-        lenBytes <- recv s 4
-        when (BS.length lenBytes /= 4) $
-            throwIO ConnectionClosed
-
-        -- Parse length - using Word32 consistently for binary protocol
-        let len = (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
-                 (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
-                 (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
-                 (fromIntegral (BS.index lenBytes 3) :: Word32)
-
-        -- Check if message is too large
-        when (len > 100 * 1024 * 1024) $ -- 100 MB limit
-            throwIO $ MessageTooLarge len
-
-        -- Read message data
-        recvExactly s (fromIntegral len)
-
-    recvExactly :: Socket -> Int -> IO BS.ByteString
-    recvExactly s len = go len []
-      where
-        go 0 chunks = return $ BS.concat $ reverse chunks
-        go n chunks = do
-            chunk <- recv s n
-            let chunkLen = BS.length chunk
-            if chunkLen == 0
-                then throwIO ConnectionClosed
-                else go (n - chunkLen) (chunk : chunks)
 
 -- | Start the daemon if it's not running
 startDaemonIfNeeded :: FilePath -> IO (Either BuildError ())
