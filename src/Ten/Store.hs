@@ -858,18 +858,8 @@ requestAddToStore nameHint content = do
                 "Unexpected response type for store-add request: " <> T.pack (show resp)
 
 -- | Store a file in the store
-storeFile :: forall p t. (StoreAccessOps t, CanAccessStore t ~ 'True) => FilePath -> TenM p t StorePath
-storeFile filePath = do
-    env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> storeFileToStore filePath
-        Builder -> do
-            -- Protocol communication for builder tier
-            exists <- liftIO $ doesFileExist filePath
-            unless exists $ throwError $ InputNotFound filePath
-            content <- liftIO $ BS.readFile filePath
-            let nameHint = T.pack $ takeFileName filePath
-            requestAddToStore nameHint content
+storeFile :: forall p t. (StoreContentOps t) => FilePath -> TenM p t StorePath
+storeFile = storeFile_impl
 
 -- | Store a directory in the store - Builder implementation via protocol
 storeDirectory_builder :: FilePath -> TenM p 'Builder StorePath
