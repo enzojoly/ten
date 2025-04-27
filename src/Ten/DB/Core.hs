@@ -20,7 +20,7 @@ module Ten.DB.Core (
     Only(..),  -- Re-export the Only type needed by modules like Ten.GC
 
     -- Type classes for database capabilities
-    CanAccessDatabase(..),
+    CanAccessDatabaseConn(..),
     CanManageTransactions(..),
     CanExecuteQuery(..),
     CanExecuteStatement(..),
@@ -66,12 +66,17 @@ import qualified Data.Text as T
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as Map
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), Only(..))
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import System.Posix.Files (setFileMode)
 import System.IO (withFile, IOMode(..), hPutStrLn, stderr)
+import Data.Aeson ((.:), (.=))
+import qualified Data.Aeson as Aeson
+
+import qualified Data.Binary as Binary
 
 -- Import from Ten.Core, including all necessary items for database operations
 import Ten.Core (
@@ -79,11 +84,12 @@ import Ten.Core (
     PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuilder, SPhase(..), sBuild, sEval,
     fromSing, defaultDBPath, BuildState(..),
     Database(..), TransactionMode(..),
-    CanAccessDatabase,
+    CanAccessDatabase, -- Not using direct methods
     currentBuildId, initBuildState, runTen, verbosity, logMsg,
     runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..),
     DaemonResponse(..), buildErrorToText, serializeDerivation, deserializeDerivation,
-    daemonStatus, brOutputPaths, dbInitialized -- Add record field
+    daemonStatus, brOutputPaths, dbInitialized, -- Add record field
+    liftTenIO
     )
 
 -- | Database error types
@@ -142,15 +148,56 @@ getDaemonResponsePayload (StoreReadResponse content) = Just content
 getDaemonResponsePayload _ = Nothing
 
 getRowsAffected :: DaemonResponse -> Maybe Int64
-getRowsAffected (SuccessResponse) = Just 0  -- Default to 0 affected rows
+getRowsAffected SuccessResponse = Just 0  -- Default to 0 affected rows
 getRowsAffected _ = Nothing
 
 getSchemaVersionFromResponse :: DaemonResponse -> Maybe Int
 getSchemaVersionFromResponse (StatusResponse status) = Just (read (T.unpack (daemonStatus status)))
 getSchemaVersionFromResponse _ = Nothing
 
+-- | Type class for database connection operations
+class CanAccessDatabaseConn (t :: PrivilegeTier) where
+    getDatabaseConn :: TenM p t (Database t)
+    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
+
+-- | Type class for transaction management
+class CanManageTransactions (t :: PrivilegeTier) where
+    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+
+-- | Type class for query execution
+class CanExecuteQuery (t :: PrivilegeTier) where
+    query :: (ToRow q, FromRow r, Aeson.FromJSON r) => Database t -> Query -> q -> TenM p t [r]
+    query_ :: (FromRow r, Aeson.FromJSON r) => Database t -> Query -> TenM p t [r]
+
+-- | Type class for statement execution
+class CanExecuteStatement (t :: PrivilegeTier) where
+    execute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+    execute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+    executeSimple_ :: Database t -> Query -> TenM p t ()
+
+-- | Type class for schema management
+class CanManageSchema (t :: PrivilegeTier) where
+    -- | Get the current schema version
+    getSchemaVersion :: Database t -> TenM p t Int
+
+    -- | Update the schema version
+    updateSchemaVersion :: Database t -> Int -> TenM p t ()
+
+-- | Bracket-like function that works in the TenM monad
+bracketTenM :: TenM p t a -> (a -> TenM p t b) -> (a -> TenM p t c) -> TenM p t c
+bracketTenM acquire release action = do
+    resource <- acquire
+    result <- catchError (action resource) $ \e -> do
+        -- On error, still release the resource, then rethrow
+        _ <- release resource
+        throwError e
+    _ <- release resource
+    return result
+
 -- | Instance for Daemon (direct database access)
-instance CanAccessDatabase 'Daemon where
+instance CanAccessDatabaseConn 'Daemon where
     getDatabaseConn = do
         env <- ask
         let dbPath = defaultDBPath (storeLocation env)
@@ -161,14 +208,14 @@ instance CanAccessDatabase 'Daemon where
         env <- ask
         let dbPath = defaultDBPath (storeLocation env)
 
-        -- Use bracket to ensure proper cleanup
-        bracket
-            (liftIO $ initDatabaseDaemon sDaemon dbPath 5000)
-            (\db -> liftIO $ closeDatabaseDaemon db)
-            action
+        -- Use bracketTenM instead of bracket
+        bracketTenM
+            (liftIO $ initDatabaseDaemon sDaemon dbPath 5000)  -- acquire
+            (\db -> liftIO $ closeDatabaseDaemon db)          -- release
+            action                                            -- action
 
 -- | Instance for Builder (protocol-based access)
-instance CanAccessDatabase 'Builder where
+instance CanAccessDatabaseConn 'Builder where
     getDatabaseConn = do
         env <- ask
         case runMode env of
@@ -276,22 +323,22 @@ instance CanManageTransactions 'Builder where
 
             _ -> throwError $ privilegeError "Transaction management requires daemon connection"
 
-    withTenReadTransaction db = withTenTransaction db ReadOnly
-    withTenWriteTransaction db = withTenTransaction db ReadWrite
+    withReadTransaction db = withTransaction db ReadOnly
+    withWriteTransaction db = withTransaction db ReadWrite
 
 -- | Daemon instance for direct query execution
 instance CanExecuteQuery 'Daemon where
-    tenQuery db q params = do
+    query db q params = do
         -- Execute query with retry
         liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
 
-    tenQuery_ db q = do
+    query_ db q = do
         -- Execute simple query with retry
         liftIO $ retryOnBusy db $ SQLite.query_ (dbConn db) q
 
 -- | Builder instance for query execution via protocol
 instance CanExecuteQuery 'Builder where
-    tenQuery db q params = do
+    query db q params = do
         env <- ask
         case runMode env of
             ClientMode conn -> do
@@ -299,7 +346,7 @@ instance CanExecuteQuery 'Builder where
                 let queryStr = case q of
                         Query qs -> qs
 
-                -- Convert params to JSON (in real impl would use proper serialization)
+                -- Convert params to JSON
                 let serializedParams = serializeQueryParams params
 
                 let queryReq = Request {
@@ -325,11 +372,11 @@ instance CanExecuteQuery 'Builder where
 
             _ -> throwError $ privilegeError "Query execution requires daemon connection"
 
-    tenQuery_ db q = tenQuery db q ()
+    query_ db q = query db q ()
 
 -- | Daemon instance for direct statement execution
 instance CanExecuteStatement 'Daemon where
-    tenExecute db query params = do
+    execute db query params = do
         -- Execute the query with retry on busy
         liftIO $ retryOnBusy db $ do
             -- Execute the query
@@ -337,15 +384,15 @@ instance CanExecuteStatement 'Daemon where
             -- Get the number of changes (rows affected) and convert from Int to Int64
             fromIntegral <$> SQLite.changes (dbConn db)
 
-    tenExecute_ db query params = void $ tenExecute db query params
+    execute_ db query params = void $ execute db query params
 
-    tenExecuteSimple_ db query = do
+    executeSimple_ db query = do
         -- Execute simple query
         liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) query
 
 -- | Builder instance for statement execution via protocol
 instance CanExecuteStatement 'Builder where
-    tenExecute db query params = do
+    execute db query params = do
         env <- ask
         case runMode env of
             ClientMode conn -> do
@@ -353,7 +400,7 @@ instance CanExecuteStatement 'Builder where
                 let queryStr = case query of
                         Query qs -> qs
 
-                -- Convert params to JSON (in real impl would use proper serialization)
+                -- Convert params to JSON
                 let serializedParams = serializeQueryParams params
 
                 let execReq = Request {
@@ -378,53 +425,28 @@ instance CanExecuteStatement 'Builder where
 
             _ -> throwError $ privilegeError "Statement execution requires daemon connection"
 
-    tenExecute_ db query params = void $ tenExecute db query params
+    execute_ db query params = void $ execute db query params
 
-    tenExecuteSimple_ db query = tenExecute_ db query ()
+    executeSimple_ db query = execute_ db query ()
 
--- | Type class for database capabilities
-class CanAccessDatabase (t :: PrivilegeTier) where
-    getDatabaseConn :: TenM p t (Database t)
-    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
-
--- | Type class for transaction management
-class CanManageTransactions (t :: PrivilegeTier) where
-    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
-    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withTenReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withTenWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withTenTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
-
--- | Type class for query execution
-class CanExecuteQuery (t :: PrivilegeTier) where
-    tenQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
-    tenQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
-
--- | Type class for statement execution
-class CanExecuteStatement (t :: PrivilegeTier) where
-    tenExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
-    tenExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
-    tenExecuteSimple_ :: Database t -> Query -> TenM p t ()
-
--- | Type class for schema management
-class CanManageSchema (t :: PrivilegeTier) where
-    -- | Get the current schema version
-    getSchemaVersion :: Database t -> TenM p t Int
-
-    -- | Update the schema version
-    updateSchemaVersion :: Database t -> Int -> TenM p t ()
+instance Aeson.FromJSON (Only Int) where
+    parseJSON = Aeson.withArray "Only Int" $ \arr ->
+        if length arr == 1
+            then do
+                val <- Aeson.parseJSON (arr Aeson.! 0)
+                return (Only val)
+            else fail "Expected array of length 1 for Only Int"
 
 -- | Daemon instance for direct schema management
 instance CanManageSchema 'Daemon where
     getSchemaVersion db = do
         -- Check if the version table exists
-        hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
+        hasVersionTable <- query_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
 
         case hasVersionTable of
             [Only count] | count > 0 -> do
                 -- Table exists, get the version
-                results <- tenQuery_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM p 'Daemon [Only Int]
+                results <- query_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM p 'Daemon [Only Int]
                 case results of
                     [Only version] -> return version
                     _ -> return 0  -- No version record found
@@ -432,34 +454,16 @@ instance CanManageSchema 'Daemon where
 
     updateSchemaVersion db version = do
         -- Check if the version table exists
-        hasVersionTable <- tenQuery_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
+        hasVersionTable <- query_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
 
         case hasVersionTable of
             [Only count] | count > 0 -> do
                 -- Table exists, update the version
-                tenExecute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
+                execute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
             _ -> do
                 -- Table doesn't exist, create it
-                tenExecuteSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
-                tenExecute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
-
-
--- | Type class for transaction management
-class CanManageTransactions (t :: PrivilegeTier) where
-    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
-    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-
--- | Type class for query execution
-class CanExecuteQuery (t :: PrivilegeTier) where
-    dbQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
-    dbQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
-
--- | Type class for statement execution
-class CanExecuteStatement (t :: PrivilegeTier) where
-    dbExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
-    dbExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
-    dbExecuteSimple_ :: Database t -> Query -> TenM p t ()
+                executeSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+                execute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
 
 -- | Builder instance for schema management via protocol
 instance CanManageSchema 'Builder where
@@ -506,7 +510,6 @@ instance CanManageSchema 'Builder where
                             else throwError $ toBuilderError $ DBSchemaError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
-
 
 -- | Initialize the database - this is a daemon operation
 initDatabaseDaemon :: SPrivilegeTier 'Daemon -> FilePath -> Int -> IO (Database 'Daemon)
@@ -561,7 +564,7 @@ closeDatabaseDaemon db = catch
         hPutStrLn stderr $ "Warning: Error closing database: " ++ show e)
 
 -- | Get the database from environment
-getDatabaseFromEnv :: (CanAccessDatabase t) => TenM p t (Database t)
+getDatabaseFromEnv :: (CanAccessDatabaseConn t) => TenM p t (Database t)
 getDatabaseFromEnv = getDatabaseConn
 
 -- | Roll back transaction on error
@@ -714,33 +717,29 @@ receiveDbResponse resp parser =
 -- | Serialize query parameters
 serializeQueryParams :: (ToRow q) => q -> Text
 serializeQueryParams params =
-    -- In a real implementation, this would properly serialize the ToRow values to JSON
-    -- Here we'll create a simple serialization method that works for basic types
+    -- Convert the parameters to SQLite data and manually serialize them
     let paramValues = toRow params
-        -- Serialize each parameter value to text (simplified)
-        serializeParam :: SQLite.SQLData -> Text
-        serializeParam SQLite.SQLNull = "null"
-        serializeParam (SQLite.SQLText t) = "\"" <> t <> "\""
-        serializeParam (SQLite.SQLInteger i) = T.pack (show i)
-        serializeParam (SQLite.SQLFloat f) = T.pack (show f)
-        serializeParam (SQLite.SQLBlob b) = "\"<binary>\""  -- Simplified representation
+        -- Custom serialization for each SQLite data type
+        serializeSQLData :: SQLite.SQLData -> Text
+        serializeSQLData SQLite.SQLNull = "null"
+        serializeSQLData (SQLite.SQLText txt) = "\"" <> T.replace "\"" "\\\"" txt <> "\""
+        serializeSQLData (SQLite.SQLInteger i) = T.pack (show i)
+        serializeSQLData (SQLite.SQLFloat f) = T.pack (show f)
+        serializeSQLData (SQLite.SQLBlob b) = "\"" <> T.pack (show b) <> "\"" -- Base64 would be better
 
-        serializedParams = map serializeParam paramValues
-    in
-    "[" <> T.intercalate ", " serializedParams <> "]"
+        -- Build a simple JSON array manually
+        serializedValues = map serializeSQLData paramValues
+        jsonArray = "[" <> T.intercalate "," serializedValues <> "]"
+    in jsonArray
 
 -- | Deserialize query results
-deserializeQueryResults :: (FromRow r) => ByteString -> TenM p 'Builder [r]
+deserializeQueryResults :: (FromRow r, Aeson.FromJSON r) => ByteString -> TenM p 'Builder [r]
 deserializeQueryResults payload = do
-    -- In a real implementation, this would deserialize the binary payload into rows
-    -- For a complete implementation, we would use a proper binary serialization format
-    -- that preserves type information and handles FromRow instances correctly.
-
-    -- As this is a real implementation, we'd need to:
-    -- 1. Decode the binary format (e.g., CBOR or MessagePack) containing the rows
-    -- 2. For each row, construct SQLData values from the decoded data
-    -- 3. Use the FromRow instance to convert SQLData values to the target type
-
-    -- For simplicity in this example, we'll provide stub with empty list
-    -- but note that a real implementation would need proper binary serialization
-    return []
+    -- Properly decode the binary response payload
+    case Aeson.eitherDecodeStrict payload of
+        Left err -> throwError $ toBuilderError $ DBQueryError $ "Failed to parse query results: " <> T.pack err
+        Right (rows :: Aeson.Value) -> do
+            -- Process the JSON value as an array of rows
+            case Aeson.fromJSON rows of
+                Aeson.Error err -> throwError $ toBuilderError $ DBQueryError $ "Failed to convert query results: " <> T.pack err
+                Aeson.Success result -> return result
