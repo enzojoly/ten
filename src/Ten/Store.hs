@@ -118,7 +118,7 @@ import qualified Database.SQLite.Simple as SQL
 
 import Ten.Core
 import Ten.DB.Core (HasDirectQueryOps(..), HasTransactionOps(..),
-                    withTransaction, withReadTransaction, withWriteTransaction,
+                    withTenTransaction, withTenReadTransaction, withTenWriteTransaction,
                     Database, TransactionMode(..))
 
 -- | Type class for basic store access operations
