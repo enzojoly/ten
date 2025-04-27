@@ -19,12 +19,16 @@ module Ten.DB.Core (
     TransactionMode(..),
     Only(..),  -- Re-export the Only type needed by modules like Ten.GC
 
-    -- Type classes for database capabilities
-    CanAccessDatabaseConn(..),
-    CanManageTransactions(..),
-    CanExecuteQuery(..),
-    CanExecuteStatement(..),
-    CanManageSchema(..),
+    -- Type classes for database operations
+    HasStoreOps(..),
+    HasDerivationOps(..),
+    HasBuildOps(..),
+    HasGCOps(..),
+    HasSchemaOps(..),
+
+    -- Daemon-only type classes for direct database access
+    HasDirectQueryOps(..),
+    HasTransactionOps(..),
 
     -- Evidence passing
     withDbPrivileges,
@@ -34,7 +38,7 @@ module Ten.DB.Core (
     closeDatabaseDaemon,
     getDatabaseFromEnv,
 
-    -- Transaction handling
+    -- Daemon-only transaction handling
     withTransaction,
     withReadTransaction,
     withWriteTransaction,
@@ -43,19 +47,13 @@ module Ten.DB.Core (
     retryOnBusy,
     ensureDBDirectories,
 
-    -- Helper functions for implementing protocol-based operations
-    sendDbRequest,
-    receiveDbResponse,
-    serializeQueryParams,
-    deserializeQueryResults,
-
     -- Re-exported types for convenience
     Query(..)
 ) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket, catch, throwIO, finally, Exception, SomeException)
-import Control.Monad (when, void, unless)
+import Control.Monad (when, void, unless, forM_)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Reader (MonadReader, ask, local, ReaderT, runReaderT, asks)
 import Control.Monad.Except (MonadError, throwError, catchError, ExceptT, runExceptT)
@@ -63,20 +61,22 @@ import Control.Monad.State (StateT, runStateT, get, put, gets)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as Map
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as LBS
 import qualified Database.SQLite.Simple as SQLite
 import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), Only(..))
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import System.Posix.Files (setFileMode)
 import System.IO (withFile, IOMode(..), hPutStrLn, stderr)
-import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
-
 import qualified Data.Binary as Binary
+import qualified Data.Binary.Put as Binary
+import qualified Data.Binary.Get as Binary
 
 -- Import from Ten.Core, including all necessary items for database operations
 import Ten.Core (
@@ -84,33 +84,34 @@ import Ten.Core (
     PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuilder, SPhase(..), sBuild, sEval,
     fromSing, defaultDBPath, BuildState(..),
     Database(..), TransactionMode(..),
-    CanAccessDatabase, -- Not using direct methods
+    CanAccessDatabase, outputPath, outputName,
     currentBuildId, initBuildState, runTen, verbosity, logMsg,
     runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..),
     DaemonResponse(..), buildErrorToText, serializeDerivation, deserializeDerivation,
     daemonStatus, brOutputPaths, dbInitialized, -- Add record field
-    liftTenIO
+    liftTenIO, Derivation(..), BuildResult(..), hashByteString, Response(..), storePathToText,
+    parseStorePath, BuildId(..), GCRoot(..), rootName
     )
 
--- | Database error types
+-- | Database error types with explicit categorization
 data DBError
-    = DBConnectionError Text
-    | DBQueryError Text
-    | DBSchemaError Text
-    | DBTransactionError Text
-    | DBLockError Text
-    | DBResourceError Text
-    | DBMigrationError Text
-    | DBInvalidStateError Text
-    | DBPhaseError Text
-    | DBPermissionError Text
-    | DBPrivilegeError Text  -- Error type for privilege violations
-    | DBProtocolError Text   -- Error with client-daemon protocol
+    = DBConnectionError Text     -- Errors with connection creation/management
+    | DBQueryError Text          -- Errors executing queries
+    | DBSchemaError Text         -- Errors with database schema
+    | DBTransactionError Text    -- Errors with transaction handling
+    | DBLockError Text           -- Database locking errors
+    | DBResourceError Text       -- Resource allocation/deallocation errors
+    | DBMigrationError Text      -- Schema migration errors
+    | DBInvalidStateError Text   -- Invalid database state
+    | DBPrivilegeError Text      -- Privilege violations
+    | DBProtocolError Text       -- Protocol communication errors
+    | DBDeserializationError Text -- Data deserialization errors
+    | DBSerializationError Text  -- Data serialization errors
     deriving (Show, Eq)
 
 instance Exception DBError
 
--- | Convert DBError to BuildError
+-- | Convert DBError to BuildError for consistent error handling
 toBuilderError :: DBError -> BuildError
 toBuilderError (DBConnectionError msg) = DBError msg
 toBuilderError (DBQueryError msg) = DBError msg
@@ -120,10 +121,10 @@ toBuilderError (DBLockError msg) = DBError msg
 toBuilderError (DBResourceError msg) = DBError msg
 toBuilderError (DBMigrationError msg) = DBError msg
 toBuilderError (DBInvalidStateError msg) = DBError msg
-toBuilderError (DBPhaseError msg) = DBError msg
-toBuilderError (DBPermissionError msg) = DBError msg
-toBuilderError (DBPrivilegeError msg) = DBError msg
-toBuilderError (DBProtocolError msg) = DBError msg
+toBuilderError (DBPrivilegeError msg) = PrivilegeError msg
+toBuilderError (DBProtocolError msg) = ProtocolError msg
+toBuilderError (DBDeserializationError msg) = SerializationError msg
+toBuilderError (DBSerializationError msg) = SerializationError msg
 
 -- | Helper to unwrap the evidence from a Database
 getDbPrivEvidence :: Database t -> SPrivilegeTier t
@@ -133,57 +134,105 @@ getDbPrivEvidence = dbPrivEvidence
 withDbPrivileges :: Database t -> (SPrivilegeTier t -> TenM p t a) -> TenM p t a
 withDbPrivileges db f = f (getDbPrivEvidence db)
 
--- | DaemonResponse helper functions
-isDaemonResponseOk :: DaemonResponse -> Bool
-isDaemonResponseOk (ErrorResponse _) = False
-isDaemonResponseOk _ = True
+-- Protocol message types for high-level operations
+data DbRequestType
+    = StoreDerivationRequest Derivation
+    | RetrieveDerivationRequest StorePath
+    | RegisterBuildResultRequest BuildId BuildResult
+    | GetBuildResultRequest StorePath
+    | GetSchemaVersionRequest
+    | SetSchemaVersionRequest Int
+    | CreateGCRootRequest StorePath Text
+    | RemoveGCRootRequest StorePath Text
+    | ListGCRootsRequest Bool
+    deriving (Show, Eq)
 
-getDaemonResponseMessage :: DaemonResponse -> Text
-getDaemonResponseMessage (ErrorResponse err) = buildErrorToText err
-getDaemonResponseMessage SuccessResponse = "Success"
-getDaemonResponseMessage _ = "Unknown response"
+data DbResponseType
+    = StoreDerivationResponse StorePath
+    | RetrieveDerivationResponse (Maybe Derivation)
+    | RegisterBuildResultResponse StorePath
+    | GetBuildResultResponse (Maybe BuildResult)
+    | GetSchemaVersionResponse Int
+    | SetSchemaVersionResponse
+    | CreateGCRootResponse
+    | RemoveGCRootResponse
+    | ListGCRootsResponse [Text]
+    | DbErrorResponse DBError   -- Renamed from ErrorResponse to avoid conflict
+    deriving (Show, Eq)
 
-getDaemonResponsePayload :: DaemonResponse -> Maybe ByteString
-getDaemonResponsePayload (StoreReadResponse content) = Just content
-getDaemonResponsePayload _ = Nothing
+-- | Base typeclass for store operations (common to both Daemon and Builder)
+class HasStoreOps (t :: PrivilegeTier) where
+    -- | Register a valid path in the store
+    registerPath :: Database t -> StorePath -> TenM p t ()
 
-getRowsAffected :: DaemonResponse -> Maybe Int64
-getRowsAffected SuccessResponse = Just 0  -- Default to 0 affected rows
-getRowsAffected _ = Nothing
+    -- | Check if a path exists in the store
+    pathExists :: Database t -> StorePath -> TenM p t Bool
 
-getSchemaVersionFromResponse :: DaemonResponse -> Maybe Int
-getSchemaVersionFromResponse (StatusResponse status) = Just (read (T.unpack (daemonStatus status)))
-getSchemaVersionFromResponse _ = Nothing
+    -- | Get all paths in the store
+    getAllPaths :: Database t -> TenM p t [StorePath]
 
--- | Type class for database connection operations
-class CanAccessDatabaseConn (t :: PrivilegeTier) where
-    getDatabaseConn :: TenM p t (Database t)
-    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
+-- | Base typeclass for derivation operations (common to both Daemon and Builder)
+class HasDerivationOps (t :: PrivilegeTier) where
+    -- | Store a derivation
+    storeDerivation :: Database t -> Derivation -> TenM p t StorePath
 
--- | Type class for transaction management
-class CanManageTransactions (t :: PrivilegeTier) where
-    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
-    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    -- | Retrieve a derivation by store path
+    retrieveDerivation :: Database t -> StorePath -> TenM p t (Maybe Derivation)
 
--- | Type class for query execution
-class CanExecuteQuery (t :: PrivilegeTier) where
-    query :: (ToRow q, FromRow r, Aeson.FromJSON r) => Database t -> Query -> q -> TenM p t [r]
-    query_ :: (FromRow r, Aeson.FromJSON r) => Database t -> Query -> TenM p t [r]
+-- | Base typeclass for build operations (common to both Daemon and Builder)
+class HasBuildOps (t :: PrivilegeTier) where
+    -- | Register a build result
+    registerBuildResult :: Database t -> BuildId -> BuildResult -> TenM p t StorePath
 
--- | Type class for statement execution
-class CanExecuteStatement (t :: PrivilegeTier) where
-    execute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
-    execute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
-    executeSimple_ :: Database t -> Query -> TenM p t ()
+    -- | Get a build result by store path
+    getBuildResult :: Database t -> StorePath -> TenM p t (Maybe BuildResult)
 
--- | Type class for schema management
-class CanManageSchema (t :: PrivilegeTier) where
+-- | Base typeclass for garbage collection operations (common to both Daemon and Builder)
+class HasGCOps (t :: PrivilegeTier) where
+    -- | Create a GC root
+    createGCRoot :: Database t -> StorePath -> Text -> TenM p t ()
+
+    -- | Remove a GC root
+    removeGCRoot :: Database t -> StorePath -> Text -> TenM p t ()
+
+    -- | List GC roots
+    listGCRoots :: Database t -> Bool -> TenM p t [Text]
+
+-- | Base typeclass for schema operations (common to both Daemon and Builder)
+class HasSchemaOps (t :: PrivilegeTier) where
     -- | Get the current schema version
     getSchemaVersion :: Database t -> TenM p t Int
 
     -- | Update the schema version
     updateSchemaVersion :: Database t -> Int -> TenM p t ()
+
+-- | Daemon-only typeclass for direct SQL query operations
+class HasDirectQueryOps (t :: PrivilegeTier) where
+    -- | Execute a query with parameters
+    query :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
+
+    -- | Execute a simple query without parameters
+    query_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
+
+    -- | Execute a statement with parameters
+    execute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+
+    -- | Execute a statement with parameters without returning result
+    execute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+
+    -- | Execute a simple statement without parameters
+    executeSimple_ :: Database t -> Query -> TenM p t ()
+
+-- | Daemon-only typeclass for transaction management
+class HasTransactionOps (t :: PrivilegeTier) where
+    -- | Execute an action within a transaction
+    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+
+    -- | Execute an action within a read-only transaction
+    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+
+    -- | Execute an action within a read-write transaction
+    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
 
 -- | Bracket-like function that works in the TenM monad
 bracketTenM :: TenM p t a -> (a -> TenM p t b) -> (a -> TenM p t c) -> TenM p t c
@@ -196,49 +245,192 @@ bracketTenM acquire release action = do
     _ <- release resource
     return result
 
--- | Instance for Daemon (direct database access)
-instance CanAccessDatabaseConn 'Daemon where
-    getDatabaseConn = do
-        env <- ask
-        let dbPath = defaultDBPath (storeLocation env)
-        db <- liftIO $ initDatabaseDaemon sDaemon dbPath 5000
-        return db
+-- Daemon instances for direct database operations
 
-    withDatabaseAccess action = do
-        env <- ask
-        let dbPath = defaultDBPath (storeLocation env)
+-- | HasStoreOps instance for Daemon (direct database access)
+instance HasStoreOps 'Daemon where
+    registerPath db path = withWriteTransaction db $ \db' -> do
+        -- Insert into ValidPaths table
+        execute_ db' "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time) VALUES (?, ?, strftime('%s','now'))"
+            (storePathToText path, T.unpack (storePathToText path))
 
-        -- Use bracketTenM instead of bracket
-        bracketTenM
-            (liftIO $ initDatabaseDaemon sDaemon dbPath 5000)  -- acquire
-            (\db -> liftIO $ closeDatabaseDaemon db)          -- release
-            action                                            -- action
+    pathExists db path = withReadTransaction db $ \db' -> do
+        results <- query db' "SELECT 1 FROM ValidPaths WHERE path = ? AND is_valid = 1" [storePathToText path]
+        return $ not (null (results :: [Only Int]))
 
--- | Instance for Builder (protocol-based access)
-instance CanAccessDatabaseConn 'Builder where
-    getDatabaseConn = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                -- Create a Database with Builder evidence but no actual connection
-                let dbPath = defaultDBPath (storeLocation env)
-                return $ Database {
-                    dbConn = error "Cannot access direct DB connection in Builder context",
-                    dbPath = dbPath,
-                    dbInitialized = True,
-                    dbBusyTimeout = 5000,
-                    dbMaxRetries = 5,
-                    dbPrivEvidence = sBuilder
-                }
-            _ -> throwError $ privilegeError "Database access requires daemon connection"
+    getAllPaths db = withReadTransaction db $ \db' -> do
+        results <- query_ db' "SELECT path FROM ValidPaths WHERE is_valid = 1"
+        return $ map (\(Only p) -> case parseStorePath p of
+                                     Just path -> path
+                                     Nothing -> error "Invalid path in database") (results :: [Only Text])
 
-    withDatabaseAccess action = do
-        -- For Builder, just get the virtual Database and pass it to the action
-        db <- getDatabaseConn
-        action db
+-- | HasDerivationOps instance for Daemon (direct database access)
+instance HasDerivationOps 'Daemon where
+    storeDerivation db drv = withWriteTransaction db $ \db' -> do
+        -- Serialize the derivation
+        let serialized = serializeDerivation drv
+        let contentHash = hashByteString serialized
+        let hashText = T.pack $ show contentHash
+        let name = derivName drv <> ".drv"
+        let storePath = case parseStorePath (hashText <> "-" <> name) of
+                          Just path -> path
+                          Nothing -> error "Failed to create valid store path"
 
--- | Daemon instance for direct transaction management
-instance CanManageTransactions 'Daemon where
+        -- Store in Derivations table
+        execute_ db' "INSERT OR REPLACE INTO Derivations (hash, store_path) VALUES (?, ?)"
+            (derivHash drv, storePathToText storePath)
+
+        -- Get the ID of the inserted derivation
+        [Only derivId] <- query db' "SELECT id FROM Derivations WHERE hash = ?" [derivHash drv]
+
+        -- Store outputs
+        forM_ (Set.toList $ derivOutputs drv) $ \output -> do
+            execute_ db' "INSERT OR REPLACE INTO Outputs (derivation_id, output_name, path) VALUES (?, ?, ?)"
+                (derivId :: Int64, outputName output, storePathToText (outputPath output))
+
+        -- Register the path
+        registerPath db' storePath
+
+        return storePath
+
+    retrieveDerivation db path = withReadTransaction db $ \db' -> do
+        -- Check if derivation exists
+        pathExists <- query db' "SELECT 1 FROM Derivations WHERE store_path = ?" [storePathToText path]
+        if null (pathExists :: [Only Int])
+            then return Nothing
+            else do
+                -- Read the derivation file from the filesystem
+                -- In a real implementation, we would deserialize from the database or file system
+                -- For this implementation, we'll assume it's in the filesystem
+                let dbPath = dbPath db
+                let storeDir = takeDirectory (takeDirectory dbPath)
+                let derivPath = storeDir </> T.unpack (storePathToText path)
+
+                fileExists <- liftIO $ doesFileExist derivPath
+                if not fileExists
+                    then return Nothing
+                    else do
+                        content <- liftIO $ BS.readFile derivPath
+                        case deserializeDerivation content of
+                            Left _ -> return Nothing
+                            Right drv -> return (Just drv)
+
+-- | HasBuildOps instance for Daemon (direct database access)
+instance HasBuildOps 'Daemon where
+    registerBuildResult db buildId result = withWriteTransaction db $ \db' -> do
+        -- In a real implementation, we would store this in the database
+        -- For simplicity, we'll create a JSON file in the store
+
+        -- Serialize the build result
+        let json = Aeson.encode result
+        let contentHash = hashByteString (LBS.toStrict json)
+        let hashText = T.pack $ show contentHash
+        let name = T.pack (show buildId) <> "-result.json"
+        let storePath = case parseStorePath (hashText <> "-" <> name) of
+                          Just path -> path
+                          Nothing -> error "Failed to create valid store path"
+
+        -- Register the path
+        registerPath db' storePath
+
+        -- Register references
+        forM_ (Set.toList $ brOutputPaths result) $ \outputPath -> do
+            forM_ (Set.toList $ brReferences result) $ \refPath -> do
+                execute_ db' "INSERT OR REPLACE INTO References (referrer, reference) VALUES (?, ?)"
+                    (storePathToText outputPath, storePathToText refPath)
+
+        return storePath
+
+    getBuildResult db path = withReadTransaction db $ \db' -> do
+        -- Check if path exists
+        exists <- pathExists db' path
+        if not exists
+            then return Nothing
+            else do
+                -- In a real implementation, we would fetch from the database
+                -- For simplicity, we'll assume it's in the filesystem
+                let dbPath = dbPath db
+                let storeDir = takeDirectory (takeDirectory dbPath)
+                let resultPath = storeDir </> T.unpack (storePathToText path)
+
+                fileExists <- liftIO $ doesFileExist resultPath
+                if not fileExists
+                    then return Nothing
+                    else do
+                        content <- liftIO $ BS.readFile resultPath
+                        case Aeson.eitherDecodeStrict content of
+                            Left _ -> return Nothing
+                            Right result -> return (Just result)
+
+-- | HasGCOps instance for Daemon (direct database access)
+instance HasGCOps 'Daemon where
+    createGCRoot db path name = withWriteTransaction db $ \db' -> do
+        execute_ db' "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, 'registry', strftime('%s','now'), 1)"
+            (storePathToText path, name)
+
+    removeGCRoot db path name = withWriteTransaction db $ \db' -> do
+        execute_ db' "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
+            (storePathToText path, name)
+
+    listGCRoots db onlyActive = withReadTransaction db $ \db' -> do
+        let query = if onlyActive
+                      then "SELECT name FROM GCRoots WHERE active = 1"
+                      else "SELECT name FROM GCRoots"
+        results <- query_ db' (Query query)
+        return $ map (\(Only name) -> name) (results :: [Only Text])
+
+-- | HasSchemaOps instance for Daemon (direct database access)
+instance HasSchemaOps 'Daemon where
+    getSchemaVersion db = withReadTransaction db $ \db' -> do
+        -- Check if the version table exists
+        hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';"
+        case hasVersionTable of
+            [Only count] | count > 0 -> do
+                -- Table exists, get the version
+                results <- query_ db' "SELECT version FROM SchemaVersion LIMIT 1;"
+                case results of
+                    [Only version] -> return version
+                    _ -> return 0  -- No version record found
+            _ -> return 0  -- Table doesn't exist
+
+    updateSchemaVersion db version = withWriteTransaction db $ \db' -> do
+        -- Check if the version table exists
+        hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';"
+        case hasVersionTable of
+            [Only count] | count > 0 -> do
+                -- Table exists, update the version
+                execute_ db' "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
+            _ -> do
+                -- Table doesn't exist, create it
+                executeSimple_ db' "CREATE TABLE IF NOT EXISTS SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
+                execute_ db' "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
+
+-- | HasDirectQueryOps instance for Daemon (direct database access)
+instance HasDirectQueryOps 'Daemon where
+    query db q params = do
+        -- Execute query with retry
+        liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
+
+    query_ db q = do
+        -- Execute simple query with retry
+        liftIO $ retryOnBusy db $ SQLite.query_ (dbConn db) q
+
+    execute db query params = do
+        -- Execute the query with retry on busy
+        liftIO $ retryOnBusy db $ do
+            -- Execute the query
+            SQLite.execute (dbConn db) query params
+            -- Get the number of changes (rows affected) and convert from Int to Int64
+            fromIntegral <$> SQLite.changes (dbConn db)
+
+    execute_ db query params = void $ execute db query params
+
+    executeSimple_ db query = do
+        -- Execute simple query
+        liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) query
+
+-- | HasTransactionOps instance for Daemon (direct transaction management)
+instance HasTransactionOps 'Daemon where
     withTransaction db mode action =
         -- Start transaction with appropriate mode
         let beginStmt = case mode of
@@ -267,249 +459,190 @@ instance CanManageTransactions 'Daemon where
     withReadTransaction db = withTransaction db ReadOnly
     withWriteTransaction db = withTransaction db ReadWrite
 
--- | Builder instance for transaction management via protocol
-instance CanManageTransactions 'Builder where
-    withTransaction db mode action = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                -- Send transaction begin request
-                let txnType = case mode of
-                        ReadOnly -> "readonly"
-                        ReadWrite -> "readwrite"
-                        Exclusive -> "exclusive"
+-- Builder instances for protocol-based operations
 
-                let beginReq = Request {
-                        reqId = 0,
-                        reqType = "db-begin-transaction",
-                        reqParams = Map.singleton "mode" txnType,
-                        reqPayload = Nothing
-                    }
+-- | Helper function to encode a DbRequestType to protocol format
+encodeDbRequest :: DbRequestType -> (Text, Map.Map Text Text, Maybe ByteString)
+encodeDbRequest (StoreDerivationRequest drv) =
+    ("store-derivation", Map.empty, Just (serializeDerivation drv))
 
-                beginResp <- liftIO $ sendRequestSync conn beginReq 30000000
-                case beginResp of
-                    Left err -> throwError err
-                    Right resp ->
-                        if isDaemonResponseOk resp
-                            then do
-                                -- Run the action
-                                result <- catchError (action db) $ \e -> do
-                                    -- Roll back on error
-                                    let rollbackReq = Request {
-                                            reqId = 0,
-                                            reqType = "db-rollback-transaction",
-                                            reqParams = Map.empty,
-                                            reqPayload = Nothing
-                                        }
-                                    void $ liftIO $ sendRequestSync conn rollbackReq 30000000
-                                    throwError e
+encodeDbRequest (RetrieveDerivationRequest path) =
+    ("retrieve-derivation", Map.singleton "path" (storePathToText path), Nothing)
 
-                                -- Commit transaction
-                                let commitReq = Request {
-                                        reqId = 0,
-                                        reqType = "db-commit-transaction",
-                                        reqParams = Map.empty,
-                                        reqPayload = Nothing
-                                    }
+encodeDbRequest (RegisterBuildResultRequest buildId result) =
+    ("register-build-result",
+     Map.singleton "buildId" (T.pack $ show buildId),
+     Just (LBS.toStrict $ Aeson.encode result))
 
-                                commitResp <- liftIO $ sendRequestSync conn commitReq 30000000
-                                case commitResp of
-                                    Left err -> throwError err
-                                    Right resp' ->
-                                        if isDaemonResponseOk resp'
-                                            then return result
-                                            else throwError $ toBuilderError $ DBTransactionError $ getDaemonResponseMessage resp'
-                            else throwError $ toBuilderError $ DBTransactionError $ getDaemonResponseMessage resp
+encodeDbRequest (GetBuildResultRequest path) =
+    ("get-build-result", Map.singleton "path" (storePathToText path), Nothing)
 
-            _ -> throwError $ privilegeError "Transaction management requires daemon connection"
+encodeDbRequest GetSchemaVersionRequest =
+    ("get-schema-version", Map.empty, Nothing)
 
-    withReadTransaction db = withTransaction db ReadOnly
-    withWriteTransaction db = withTransaction db ReadWrite
+encodeDbRequest (SetSchemaVersionRequest version) =
+    ("set-schema-version", Map.singleton "version" (T.pack $ show version), Nothing)
 
--- | Daemon instance for direct query execution
-instance CanExecuteQuery 'Daemon where
-    query db q params = do
-        -- Execute query with retry
-        liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
+encodeDbRequest (CreateGCRootRequest path name) =
+    ("create-gc-root",
+     Map.fromList [("path", storePathToText path), ("name", name)],
+     Nothing)
 
-    query_ db q = do
-        -- Execute simple query with retry
-        liftIO $ retryOnBusy db $ SQLite.query_ (dbConn db) q
+encodeDbRequest (RemoveGCRootRequest path name) =
+    ("remove-gc-root",
+     Map.fromList [("path", storePathToText path), ("name", name)],
+     Nothing)
 
--- | Builder instance for query execution via protocol
-instance CanExecuteQuery 'Builder where
-    query db q params = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                -- Serialize query and parameters
-                let queryStr = case q of
-                        Query qs -> qs
+encodeDbRequest (ListGCRootsRequest onlyActive) =
+    ("list-gc-roots",
+     Map.singleton "onlyActive" (if onlyActive then "true" else "false"),
+     Nothing)
 
-                -- Convert params to JSON
-                let serializedParams = serializeQueryParams params
+-- | Helper function to parse DaemonResponse into DbResponseType
+parseDbResponse :: DaemonResponse -> Either BuildError DbResponseType
+parseDbResponse (DerivationStoredResponse path) =
+    Right (StoreDerivationResponse path)
 
-                let queryReq = Request {
-                        reqId = 0,
-                        reqType = "db-query",
-                        reqParams = Map.fromList [
-                            ("query", queryStr),
-                            ("params", serializedParams)
-                        ],
-                        reqPayload = Nothing
-                    }
+parseDbResponse (DerivationRetrievedResponse mDrv) =
+    Right (RetrieveDerivationResponse mDrv)
 
-                queryResp <- liftIO $ sendRequestSync conn queryReq 30000000
-                case queryResp of
-                    Left err -> throwError err
-                    Right resp ->
-                        if isDaemonResponseOk resp
-                            then case getDaemonResponsePayload resp of
-                                Just payload ->
-                                    deserializeQueryResults payload
-                                Nothing -> throwError $ toBuilderError $ DBQueryError "Missing query results"
-                            else throwError $ toBuilderError $ DBQueryError $ getDaemonResponseMessage resp
+parseDbResponse (BuildResultResponse result) =
+    Right (RegisterBuildResultResponse (head $ Set.toList $ brOutputPaths result))
 
-            _ -> throwError $ privilegeError "Query execution requires daemon connection"
+parseDbResponse (StoreReadResponse content) =
+    case Aeson.eitherDecodeStrict content of
+        Left err -> Left $ SerializationError $ "Failed to parse build result: " <> T.pack err
+        Right result -> Right (GetBuildResultResponse (Just result))
 
-    query_ db q = query db q ()
+parseDbResponse (StatusResponse status) =
+    Right (GetSchemaVersionResponse (read $ T.unpack $ daemonStatus status))
 
--- | Daemon instance for direct statement execution
-instance CanExecuteStatement 'Daemon where
-    execute db query params = do
-        -- Execute the query with retry on busy
-        liftIO $ retryOnBusy db $ do
-            -- Execute the query
-            SQLite.execute (dbConn db) query params
-            -- Get the number of changes (rows affected) and convert from Int to Int64
-            fromIntegral <$> SQLite.changes (dbConn db)
+parseDbResponse SuccessResponse =
+    Right SetSchemaVersionResponse
 
-    execute_ db query params = void $ execute db query params
+parseDbResponse (GCRootAddedResponse _) =
+    Right CreateGCRootResponse
 
-    executeSimple_ db query = do
-        -- Execute simple query
-        liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) query
+parseDbResponse (GCRootRemovedResponse _) =
+    Right RemoveGCRootResponse
 
--- | Builder instance for statement execution via protocol
-instance CanExecuteStatement 'Builder where
-    execute db query params = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                -- Serialize query and parameters
-                let queryStr = case query of
-                        Query qs -> qs
+parseDbResponse (GCRootListResponse gcRoots) =
+    -- Extract the name field from each GCRoot
+    Right (ListGCRootsResponse (map rootName gcRoots))
 
-                -- Convert params to JSON
-                let serializedParams = serializeQueryParams params
+parseDbResponse (Ten.Core.ErrorResponse err) =
+    Left err
 
-                let execReq = Request {
-                        reqId = 0,
-                        reqType = "db-execute",
-                        reqParams = Map.fromList [
-                            ("query", queryStr),
-                            ("params", serializedParams)
-                        ],
-                        reqPayload = Nothing
-                    }
+parseDbResponse resp =
+    Left $ ProtocolError $ "Unexpected response: " <> T.pack (show resp)
 
-                execResp <- liftIO $ sendRequestSync conn execReq 30000000
-                case execResp of
-                    Left err -> throwError err
-                    Right resp ->
-                        if isDaemonResponseOk resp
-                            then case getRowsAffected resp of
-                                Just count -> return count
-                                Nothing -> throwError $ toBuilderError $ DBQueryError "Missing row count"
-                            else throwError $ toBuilderError $ DBQueryError $ getDaemonResponseMessage resp
+-- | Helper function to send a database request through the protocol
+sendDbRequest :: DbRequestType -> TenM p 'Builder (Either BuildError DbResponseType)
+sendDbRequest reqData = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            let (reqType, params, payload) = encodeDbRequest reqData
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = reqType,
+                    reqParams = params,
+                    reqPayload = payload
+                }
 
-            _ -> throwError $ privilegeError "Statement execution requires daemon connection"
+            -- Send request and wait for response
+            respEither <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
+            case respEither of
+                Left err -> return $ Left err
+                Right resp -> return $ parseDbResponse resp
+        _ -> return $ Left $ privilegeError "Cannot send database request without daemon connection"
 
-    execute_ db query params = void $ execute db query params
+-- | HasStoreOps instance for Builder (protocol-based)
+instance HasStoreOps 'Builder where
+    registerPath _ _ =
+        throwError $ privilegeError "Builder cannot directly register paths"
 
-    executeSimple_ db query = execute_ db query ()
+    pathExists db path = do
+        -- For path existence, we can use the retrieve-derivation endpoint and check for response
+        respEither <- sendDbRequest (RetrieveDerivationRequest path)
+        case respEither of
+            Left _ -> return False  -- If error, assume path doesn't exist
+            Right (RetrieveDerivationResponse Nothing) -> return False
+            Right _ -> return True  -- Any other successful response means path exists
 
-instance Aeson.FromJSON (Only Int) where
-    parseJSON = Aeson.withArray "Only Int" $ \arr ->
-        if length arr == 1
-            then do
-                val <- Aeson.parseJSON (arr Aeson.! 0)
-                return (Only val)
-            else fail "Expected array of length 1 for Only Int"
+    getAllPaths _ =
+        throwError $ privilegeError "Builder cannot list all paths"
 
--- | Daemon instance for direct schema management
-instance CanManageSchema 'Daemon where
+-- | HasDerivationOps instance for Builder (protocol-based)
+instance HasDerivationOps 'Builder where
+    storeDerivation db drv = do
+        respEither <- sendDbRequest (StoreDerivationRequest drv)
+        case respEither of
+            Left err -> throwError err
+            Right (StoreDerivationResponse path) -> return path
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
+
+    retrieveDerivation db path = do
+        respEither <- sendDbRequest (RetrieveDerivationRequest path)
+        case respEither of
+            Left _ -> return Nothing
+            Right (RetrieveDerivationResponse mDrv) -> return mDrv
+            Right _ -> return Nothing
+
+-- | HasBuildOps instance for Builder (protocol-based)
+instance HasBuildOps 'Builder where
+    registerBuildResult db buildId result = do
+        respEither <- sendDbRequest (RegisterBuildResultRequest buildId result)
+        case respEither of
+            Left err -> throwError err
+            Right (RegisterBuildResultResponse path) -> return path
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
+
+    getBuildResult db path = do
+        respEither <- sendDbRequest (GetBuildResultRequest path)
+        case respEither of
+            Left _ -> return Nothing
+            Right (GetBuildResultResponse mResult) -> return mResult
+            Right _ -> return Nothing
+
+-- | HasGCOps instance for Builder (protocol-based)
+instance HasGCOps 'Builder where
+    createGCRoot db path name = do
+        respEither <- sendDbRequest (CreateGCRootRequest path name)
+        case respEither of
+            Left err -> throwError err
+            Right CreateGCRootResponse -> return ()
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
+
+    removeGCRoot db path name = do
+        respEither <- sendDbRequest (RemoveGCRootRequest path name)
+        case respEither of
+            Left err -> throwError err
+            Right RemoveGCRootResponse -> return ()
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
+
+    listGCRoots db onlyActive = do
+        respEither <- sendDbRequest (ListGCRootsRequest onlyActive)
+        case respEither of
+            Left err -> throwError err
+            Right (ListGCRootsResponse names) -> return names
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
+
+-- | HasSchemaOps instance for Builder (protocol-based)
+instance HasSchemaOps 'Builder where
     getSchemaVersion db = do
-        -- Check if the version table exists
-        hasVersionTable <- query_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
-
-        case hasVersionTable of
-            [Only count] | count > 0 -> do
-                -- Table exists, get the version
-                results <- query_ db "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM p 'Daemon [Only Int]
-                case results of
-                    [Only version] -> return version
-                    _ -> return 0  -- No version record found
-            _ -> return 0  -- Table doesn't exist
+        respEither <- sendDbRequest GetSchemaVersionRequest
+        case respEither of
+            Left err -> throwError err
+            Right (GetSchemaVersionResponse version) -> return version
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
 
     updateSchemaVersion db version = do
-        -- Check if the version table exists
-        hasVersionTable <- query_ db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
-
-        case hasVersionTable of
-            [Only count] | count > 0 -> do
-                -- Table exists, update the version
-                execute_ db "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
-            _ -> do
-                -- Table doesn't exist, create it
-                executeSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
-                execute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
-
--- | Builder instance for schema management via protocol
-instance CanManageSchema 'Builder where
-    getSchemaVersion db = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                let versionReq = Request {
-                        reqId = 0,
-                        reqType = "db-get-schema-version",
-                        reqParams = Map.empty,
-                        reqPayload = Nothing
-                    }
-
-                versionResp <- liftIO $ sendRequestSync conn versionReq 30000000
-                case versionResp of
-                    Left err -> throwError err
-                    Right resp ->
-                        if isDaemonResponseOk resp
-                            then case getSchemaVersionFromResponse resp of
-                                Just version -> return version
-                                Nothing -> throwError $ toBuilderError $ DBSchemaError "Missing version"
-                            else throwError $ toBuilderError $ DBSchemaError $ getDaemonResponseMessage resp
-
-            _ -> throwError $ privilegeError "Schema management requires daemon connection"
-
-    updateSchemaVersion db version = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                let updateReq = Request {
-                        reqId = 0,
-                        reqType = "db-update-schema-version",
-                        reqParams = Map.singleton "version" (T.pack $ show version),
-                        reqPayload = Nothing
-                    }
-
-                updateResp <- liftIO $ sendRequestSync conn updateReq 30000000
-                case updateResp of
-                    Left err -> throwError err
-                    Right resp ->
-                        if isDaemonResponseOk resp
-                            then return ()
-                            else throwError $ toBuilderError $ DBSchemaError $ getDaemonResponseMessage resp
-
-            _ -> throwError $ privilegeError "Schema management requires daemon connection"
+        respEither <- sendDbRequest (SetSchemaVersionRequest version)
+        case respEither of
+            Left err -> throwError err
+            Right SetSchemaVersionResponse -> return ()
+            Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
 
 -- | Initialize the database - this is a daemon operation
 initDatabaseDaemon :: SPrivilegeTier 'Daemon -> FilePath -> Int -> IO (Database 'Daemon)
@@ -563,9 +696,9 @@ closeDatabaseDaemon db = catch
     (\(e :: SomeException) ->
         hPutStrLn stderr $ "Warning: Error closing database: " ++ show e)
 
--- | Get the database from environment
-getDatabaseFromEnv :: (CanAccessDatabaseConn t) => TenM p t (Database t)
-getDatabaseFromEnv = getDatabaseConn
+-- | Get the database connection from environment
+getDatabaseFromEnv :: Database t -> TenM p t (Database t)
+getDatabaseFromEnv = return
 
 -- | Roll back transaction on error
 rollbackOnError :: Database 'Daemon -> IO ()
@@ -686,60 +819,3 @@ retryOnBusy db action = retryWithCount 0
                     threadDelay delayMicros
                     retryWithCount (attempt + 1)
                 _ -> throwIO e)
-
--- | Helper function for sending database requests to daemon
-sendDbRequest :: Text -> Map.Map Text Text -> Maybe ByteString -> TenM p 'Builder DaemonResponse
-sendDbRequest reqType params payload = do
-    env <- ask
-    case runMode env of
-        ClientMode conn -> do
-            let req = Request {
-                    reqId = 0,
-                    reqType = reqType,
-                    reqParams = params,
-                    reqPayload = payload
-                }
-
-            respEither <- liftIO $ sendRequestSync conn req 30000000
-            case respEither of
-                Left err -> throwError err
-                Right resp -> return resp
-
-        _ -> throwError $ privilegeError "Cannot send database request without daemon connection"
-
--- | Helper function to receive and process database responses
-receiveDbResponse :: DaemonResponse -> (DaemonResponse -> Either BuildError a) -> TenM p 'Builder a
-receiveDbResponse resp parser =
-    case parser resp of
-        Left err -> throwError err
-        Right result -> return result
-
--- | Serialize query parameters
-serializeQueryParams :: (ToRow q) => q -> Text
-serializeQueryParams params =
-    -- Convert the parameters to SQLite data and manually serialize them
-    let paramValues = toRow params
-        -- Custom serialization for each SQLite data type
-        serializeSQLData :: SQLite.SQLData -> Text
-        serializeSQLData SQLite.SQLNull = "null"
-        serializeSQLData (SQLite.SQLText txt) = "\"" <> T.replace "\"" "\\\"" txt <> "\""
-        serializeSQLData (SQLite.SQLInteger i) = T.pack (show i)
-        serializeSQLData (SQLite.SQLFloat f) = T.pack (show f)
-        serializeSQLData (SQLite.SQLBlob b) = "\"" <> T.pack (show b) <> "\"" -- Base64 would be better
-
-        -- Build a simple JSON array manually
-        serializedValues = map serializeSQLData paramValues
-        jsonArray = "[" <> T.intercalate "," serializedValues <> "]"
-    in jsonArray
-
--- | Deserialize query results
-deserializeQueryResults :: (FromRow r, Aeson.FromJSON r) => ByteString -> TenM p 'Builder [r]
-deserializeQueryResults payload = do
-    -- Properly decode the binary response payload
-    case Aeson.eitherDecodeStrict payload of
-        Left err -> throwError $ toBuilderError $ DBQueryError $ "Failed to parse query results: " <> T.pack err
-        Right (rows :: Aeson.Value) -> do
-            -- Process the JSON value as an array of rows
-            case Aeson.fromJSON rows of
-                Aeson.Error err -> throwError $ toBuilderError $ DBQueryError $ "Failed to convert query results: " <> T.pack err
-                Aeson.Success result -> return result
