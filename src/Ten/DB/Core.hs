@@ -90,7 +90,7 @@ import Ten.Core (
     DaemonResponse(..), buildErrorToText, serializeDerivation, deserializeDerivation,
     daemonStatus, brOutputPaths, dbInitialized, -- Add record field
     liftTenIO, Derivation(..), BuildResult(..), hashByteString, Response(..), storePathToText,
-    parseStorePath, BuildId(..), GCRoot(..), rootName
+    parseStorePath, BuildId(..), GCRoot(..), rootName, storePathToFilePath
     )
 
 -- | Database error types with explicit categorization
@@ -299,12 +299,11 @@ instance HasDerivationOps 'Daemon where
         if null (pathExists :: [Only Int])
             then return Nothing
             else do
-                -- Read the derivation file from the filesystem
-                -- In a real implementation, we would deserialize from the database or file system
-                -- For this implementation, we'll assume it's in the filesystem
-                let dbPath = dbPath db
-                let storeDir = takeDirectory (takeDirectory dbPath)
-                let derivPath = storeDir </> T.unpack (storePathToText path)
+                -- Get the environment to determine store location
+                env <- ask
+
+                -- Use the proper store path determination function
+                let derivPath = storePathToFilePath path env
 
                 fileExists <- liftIO $ doesFileExist derivPath
                 if not fileExists
@@ -318,9 +317,6 @@ instance HasDerivationOps 'Daemon where
 -- | HasBuildOps instance for Daemon (direct database access)
 instance HasBuildOps 'Daemon where
     registerBuildResult db buildId result = withWriteTransaction db $ \db' -> do
-        -- In a real implementation, we would store this in the database
-        -- For simplicity, we'll create a JSON file in the store
-
         -- Serialize the build result
         let json = Aeson.encode result
         let contentHash = hashByteString (LBS.toStrict json)
@@ -347,11 +343,11 @@ instance HasBuildOps 'Daemon where
         if not exists
             then return Nothing
             else do
-                -- In a real implementation, we would fetch from the database
-                -- For simplicity, we'll assume it's in the filesystem
-                let dbPath = dbPath db
-                let storeDir = takeDirectory (takeDirectory dbPath)
-                let resultPath = storeDir </> T.unpack (storePathToText path)
+                -- Get the environment to determine store location
+                env <- ask
+
+                -- Use the proper store path determination function
+                let resultPath = storePathToFilePath path env
 
                 fileExists <- liftIO $ doesFileExist resultPath
                 if not fileExists
@@ -819,3 +815,12 @@ retryOnBusy db action = retryWithCount 0
                     threadDelay delayMicros
                     retryWithCount (attempt + 1)
                 _ -> throwIO e)
+
+-- | Get database connection from the database object (daemon-only)
+-- This function is used by all direct database operations
+tenQuery :: (ToRow q, FromRow r) => Database 'Daemon -> Query -> q -> TenM p 'Daemon [r]
+tenQuery db q params = liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
+
+-- | Execute a statement with parameters
+tenExecute :: (ToRow q) => Database 'Daemon -> Query -> q -> TenM p 'Daemon ()
+tenExecute db q params = liftIO $ retryOnBusy db $ void $ SQLite.execute (dbConn db) q params
