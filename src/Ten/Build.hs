@@ -15,7 +15,6 @@ module Ten.Build (
     buildMonadicStrategy,
 
     -- Build result handling
-    collectBuildResult,
     verifyBuildResult,
 
     -- Return-continuation handling
@@ -133,15 +132,6 @@ data BuilderEnv = BuilderEnv
     , builderTempDir :: FilePath         -- Temporary directory for the build
     , builderOutputDir :: FilePath       -- Directory for build outputs
     }
-
--- | Build a derivation, dispatching based on privilege tier
-buildDerivation :: Derivation -> TenM 'Build t Core.BuildResult
-buildDerivation deriv = do
-    -- Determine if we're in daemon or builder tier
-    env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> withSPrivilegeTier sDaemon $ \st -> buildDerivationDaemon st deriv
-        Builder -> withSPrivilegeTier sBuilder $ \st -> buildDerivationBuilder st deriv
 
 -- | Build a derivation in daemon context
 buildDerivationDaemon :: SPrivilegeTier 'Daemon -> Derivation -> TenM 'Build 'Daemon Core.BuildResult
@@ -787,7 +777,7 @@ setupBuilder builderPath builderContent buildDir = do
     return execPath
 
 -- | Get environment variables for the build
-getBuildEnvironment :: BuildEnv -> Derivation -> FilePath -> TenM 'Build t Map Text Text
+getBuildEnvironment :: BuildEnv -> Derivation -> FilePath -> TenM 'Build t (Map Text Text)
 getBuildEnvironment env deriv buildDir = do
     -- Get current build state
     state <- get
@@ -873,7 +863,7 @@ collectBuildResultDaemon deriv buildDir = do
         return outputPaths
   where
     -- Process a single output, adding it to the store
-    processOutput :: Database -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build 'Daemon (Set StorePath)
+    processOutput :: Database 'Daemon -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build 'Daemon (Set StorePath)
     processOutput db outDir accPaths output = do
         env <- ask
         let outputFile = outDir </> T.unpack (outputName output)
@@ -1298,7 +1288,7 @@ getBuildStatusBuilder buildId = do
         _ -> throwError $ BuildFailed "Unexpected response from daemon for status request"
 
 -- | Get daemon connection (should be available in builder context)
-getDaemonConnection :: TenM p 'Builder DaemonConnection
+getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
 getDaemonConnection = do
     env <- ask
     case runMode env of
@@ -1331,7 +1321,7 @@ createBuildStatusRequest bid status =
     return $ Protocol.BuildStatusRequest bid
 
 -- | Send request to daemon and get response
-sendToDaemon :: DaemonConnection -> Protocol.DaemonRequest -> TenM p 'Builder Core.DaemonResponse
+sendToDaemon :: DaemonConnection 'Builder -> Protocol.DaemonRequest -> TenM p 'Builder Core.DaemonResponse
 sendToDaemon conn req = do
     -- Use Client.sendRequestSync to communicate with the daemon
     let timeoutMicros = 30000000  -- 30 seconds timeout
