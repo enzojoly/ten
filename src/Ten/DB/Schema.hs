@@ -134,36 +134,36 @@ ensureSchema db = do
 
 -- | Create all database tables
 createTables :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
-createTables db = DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
+createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Create Derivations table
-    DBCore.tenExecuteSimple_ db derivationsTableDef
+    DBCore.ExecuteSimple_ db derivationsTableDef
 
     -- Create Outputs table
-    DBCore.tenExecuteSimple_ db outputsTableDef
+    DBCore.ExecuteSimple_ db outputsTableDef
 
     -- Create References table
-    DBCore.tenExecuteSimple_ db referencesTableDef
+    DBCore.ExecuteSimple_ db referencesTableDef
 
     -- Create ValidPaths table
-    DBCore.tenExecuteSimple_ db validPathsTableDef
+    DBCore.ExecuteSimple_ db validPathsTableDef
 
 -- | Create all indices for performance
 createIndices :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
-createIndices db = DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
+createIndices db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Derivations indices
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
 
     -- Outputs indices
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
 
     -- References indices
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
 
     -- ValidPaths indices
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
-    DBCore.tenExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
 
 -- | Validate the schema is correct
 validateSchema :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
@@ -305,7 +305,7 @@ migrateSchema db fromVersion toVersion =
 
             -- Apply each migration in a transaction
             forM_ requiredMigrations $ \migration ->
-                DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
+                DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
                     -- Run the migration
                     catchError
                         (migrationUp migration db)
@@ -328,10 +328,10 @@ migrations = [
             createTables db
             createIndices db,
         migrationDown = \db -> do
-            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS Outputs;"
-            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS References;"
-            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS ValidPaths;"
-            DBCore.tenExecuteSimple_ db "DROP TABLE IF EXISTS Derivations;"
+            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS Outputs;"
+            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS References;"
+            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS ValidPaths;"
+            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS Derivations;"
     }
 
     -- Add new migrations here as the schema evolves
