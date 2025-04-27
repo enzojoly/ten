@@ -77,7 +77,8 @@ import System.Exit
 import System.IO (hPutStrLn, stderr, Handle, hGetContents, hClose, IOMode(..), withFile, hSetBuffering, BufferMode(..))
 import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup)
 import qualified System.Posix.User as User
-import System.Posix.Process (ProcessStatus(..), getProcessStatus, forkProcess, executeFile, getProcessID)
+import qualified System.Posix.Process as Process
+import System.Posix.Process (getProcessStatus, forkProcess, executeFile, getProcessID)
 import System.Posix.Signals (signalProcess, sigKILL, sigTERM, installHandler, Handler(..))
 import System.Posix.Types (ProcessID, FileMode, UserID, GroupID, Fd)
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
@@ -621,9 +622,9 @@ runBuilder env = do
                 -- Kill the process if it's still running
                 forM_ mpid $ \pid -> do
                     -- Try to kill gracefully first, then force kill
-                    handle (\(_ :: SomeException) -> return ()) $ signalProcess sigTERM pid
+                    signalProcess sigTERM pid `catch` ignoreException
                     threadDelay 500000  -- Give it 0.5 seconds to terminate
-                    handle (\(_ :: SomeException) -> return ()) $ signalProcess sigKILL pid
+                    signalProcess sigKILL pid `catch` ignoreException
 
                 -- Close the pipes
                 hClose stdoutHandle
@@ -702,21 +703,21 @@ runBuilder env = do
                 stderrContent <- takeMVar stderrVar
 
                 -- Process exit status
-                case exitStatus of
-                    Just (Exited exitCode) -> do
-                        let exitResult = case exitCode of
-                                0 -> ExitSuccess
-                                n -> ExitFailure n
-                        return (Just pid, Right (exitResult, stdoutContent, stderrContent))
+case exitStatus of
+    Just (Process.Exited exitCode) -> do
+        let exitResult = case exitCode of
+                0 -> ExitSuccess
+                n -> ExitFailure n
+        return (Just pid, Right (exitResult, stdoutContent, stderrContent))
 
-                    Just (Terminated sig _) ->
-                        return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
+    Just (Process.Terminated sig _) ->
+        return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
 
-                    Just (Stopped sig) ->
-                        return (Just pid, Left $ "Builder stopped by signal: " <> T.pack (show sig))
+    Just (Process.Stopped sig) ->
+        return (Just pid, Left $ "Builder stopped by signal: " <> T.pack (show sig))
 
-                    Nothing ->
-                        return (Just pid, Left "Builder process disappeared")
+    Nothing ->
+        return (Just pid, Left "Builder process disappeared")
 
         -- Apply timeout if configured
         if builderTimeoutSecs env > 0
@@ -734,11 +735,11 @@ runBuilder env = do
                 timeoutAction `onException` cleanup
 
     -- Close the pipes (should be done by cleanup, but ensure it's done)
-    liftIO $ do
-        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutHandle
-        handle (\(_ :: SomeException) -> return ()) $ hClose stderrHandle
-        handle (\(_ :: SomeException) -> return ()) $ closeFd stdoutWrite
-        handle (\(_ :: SomeException) -> return ()) $ closeFd stderrWrite
+    liftIO $ do =
+        hClose stdoutHandle `catch` ignoreException
+        hClose stderrHandle `catch` ignoreException
+        closeFd stdoutWrite `catch` ignoreException
+        closeFd stderrWrite `catch` ignoreException
 
     -- Return the result
     return result
@@ -1239,6 +1240,10 @@ getDaemonConnection = do
     case runMode env of
         ClientMode conn -> return conn
         _ -> throwError $ DaemonError "No daemon connection available"
+
+-- Helper function for ignoring exceptions during cleanup
+ignoreException :: SomeException -> IO ()
+ignoreException _ = return ()
 
 -- Helper for reading safely
 readMaybe :: Read a => String -> Maybe a
