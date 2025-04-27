@@ -111,8 +111,6 @@ import Ten.DB.Core
 import qualified Ten.DB.Core as DB
 import Ten.DB.Derivations
 import qualified Ten.DB.Derivations as DBDeriv
-import Ten.DB.References
-import qualified Ten.DB.References as DBRef
 import qualified Ten.Daemon.Protocol as Protocol
 import qualified Ten.Daemon.Client as Client
 
@@ -913,15 +911,15 @@ collectBuildResultDaemon deriv buildDir = do
 
         forM_ (Set.toList outputPaths) $ \outputPath -> do
             -- 1. Register the derivation as a reference for this output
-            DBRef.addDerivationReference outputPath derivStorePath
+            DBDeriv.addDerivationReference outputPath derivStorePath
 
             -- 2. Register all input references for this output
             forM_ (Set.toList $ derivInputs deriv) $ \input -> do
-                DBRef.addDerivationReference outputPath (inputPath input)
+                DBDeriv.addDerivationReference outputPath (inputPath input)
 
             -- 3. Scan the output file for additional references
             refs <- Store.scanFileForStoreReferences $ storePathToFilePath outputPath env
-            DBRef.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
+            DBDeriv.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
 
         -- Add output proof
         addProof OutputProof
@@ -968,8 +966,8 @@ collectBuildResultDaemon deriv buildDir = do
                         Store.addToStore sDaemon (outputName output) content
 
                 -- Register this as a valid path in the database
-                DB.registerValidPath outputPath (Just derivPath)
-                where derivPath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
+                let derivPath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
+                DBDeriv.registerValidPath outputPath (Just derivPath)
 
                 -- Return updated set
                 return $ Set.insert outputPath accPaths
