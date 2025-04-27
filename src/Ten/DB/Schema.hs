@@ -134,7 +134,7 @@ ensureSchema db = do
 
 -- | Create all database tables
 createTables :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
-createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
+createTables db = DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
     -- Create Derivations table
     DBCore.executeSimple_ db derivationsTableDef
 
@@ -149,7 +149,7 @@ createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
 
 -- | Create all indices for performance
 createIndices :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
-createIndices db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
+createIndices db = DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
     -- Derivations indices
     DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
 
@@ -305,7 +305,7 @@ migrateSchema db fromVersion toVersion =
 
             -- Apply each migration in a transaction
             forM_ requiredMigrations $ \migration ->
-                DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
+                DBCore.withTenTransaction db DBCore.Exclusive $ \_ -> do
                     -- Run the migration
                     catchError
                         (migrationUp migration db)
