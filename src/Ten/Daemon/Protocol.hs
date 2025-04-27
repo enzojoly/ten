@@ -312,20 +312,20 @@ renderBuildId :: BuildId -> Text
 renderBuildId (BuildId u) = "build-" <> T.pack (show (hashUnique u))
 renderBuildId (BuildIdFromInt n) = "build-" <> T.pack (show n)
 
--- | Database query request
-data DBQueryRequest = DBQueryRequest {
+-- | Database query parameters
+data DBQueryParams = DBQueryParams {
     dbQueryStatement :: Text,
     dbQueryParams :: [Aeson.Value]
 } deriving (Show, Eq)
 
--- | Database execute request
-data DBExecuteRequest = DBExecuteRequest {
+-- | Database execute parameters
+data DBExecuteParams = DBExecuteParams {
     dbExecuteStatement :: Text,
     dbExecuteParams :: [Aeson.Value]
 } deriving (Show, Eq)
 
--- | Database transaction request
-data DBTransactionRequest = DBTransactionRequest {
+-- | Database transaction parameters
+data DBTransactionParams = DBTransactionParams {
     dbTransactionMode :: TransactionMode,
     dbTransactionAction :: Text  -- Identifier for the transaction action
 } deriving (Show, Eq)
@@ -359,8 +359,8 @@ data DaemonRequest
     | StatusRequest
     | ConfigRequest
     -- DB operation request types
-    | DBQueryRequest Text [BS.ByteString]
-    | DBExecuteRequest Text [BS.ByteString]
+    | DBQueryOp Text [BS.ByteString]
+    | DBExecuteOp Text [BS.ByteString]
     | DBTransactionBeginRequest TransactionMode
     | DBTransactionCommitRequest
     | DBTransactionRollbackRequest
