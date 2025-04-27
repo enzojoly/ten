@@ -106,7 +106,8 @@ import qualified Ten.Core as Core
 import qualified Ten.Store as Store
 
 -- | Type class for operations that can store derivations in the Eval phase
-class CanStoreDerivation (t :: Core.PrivilegeTier) where
+-- In a Nix-like architecture, storing a derivation requires basic store access
+class (Store.StoreAccessOps t) => CanStoreDerivation (t :: Core.PrivilegeTier) where
     storeDerivationEval :: Core.Derivation -> Core.TenM 'Core.Eval t Core.StorePath
 
 -- | Daemon instance for storing derivations
@@ -122,7 +123,8 @@ instance CanStoreDerivation 'Core.Builder where
         Core.storeDerivationBuilder drv
 
 -- | Type class for operations that can store derivations in the Build phase
-class CanStoreBuildDerivation (t :: Core.PrivilegeTier) where
+-- Extends StoreAccessOps to express the Nix-like capability hierarchy
+class (Store.StoreAccessOps t) => CanStoreBuildDerivation (t :: Core.PrivilegeTier) where
     storeDerivationBuild :: Core.Derivation -> Core.TenM 'Core.Build t Core.StorePath
 
 -- | Daemon instance for storing build derivations
@@ -176,7 +178,8 @@ instance CanStoreBuildDerivation 'Core.Builder where
             _ -> throwError $ Core.PrivilegeError "Cannot store derivation in build phase without daemon connection"
 
 -- | Type class for operations that can retrieve derivations
-class CanRetrieveDerivation p (t :: Core.PrivilegeTier) where
+-- Retrieval requires store access in Nix's capability model
+class (Store.StoreAccessOps t) => CanRetrieveDerivation p (t :: Core.PrivilegeTier) where
     retrieveDerivation :: Core.StorePath -> Core.TenM p t (Maybe Core.Derivation)
 
 -- | Daemon instance for retrieving derivations
@@ -187,7 +190,7 @@ instance CanRetrieveDerivation p 'Core.Daemon where
             throwError $ Core.StoreError $ "Invalid store path format: " <> Core.storePathToText path
 
         -- Check if the path exists in the store
-        exists <- Store.storePathExists path
+        exists <- Store.checkStorePathExists path
         if not exists
             then return Nothing
             else do
@@ -214,7 +217,7 @@ instance CanRetrieveDerivation p 'Core.Builder where
             throwError $ Core.StoreError $ "Invalid store path format: " <> Core.storePathToText path
 
         -- Check if the path exists in the store
-        exists <- Store.storePathExists path
+        exists <- Store.checkStorePathExists path
         if not exists
             then return Nothing
             else do
@@ -397,6 +400,7 @@ readViaProtocolBuilder path = do
         _ -> throwError $ Core.PrivilegeError "Cannot read via protocol without daemon connection"
 
 -- | Instantiate a derivation for building - context-aware implementation
+-- Uses StoreAccessOps for path existence verification from the CanStoreBuildDerivation constraint
 instantiateDerivation :: (CanStoreBuildDerivation t) => Core.Derivation -> Core.TenM 'Core.Build t ()
 instantiateDerivation deriv = do
     -- Store the derivation using the phase-specific implementation
@@ -404,7 +408,7 @@ instantiateDerivation deriv = do
 
     -- Verify inputs exist
     forM_ (Core.derivInputs deriv) $ \input -> do
-        exists <- Store.storePathExists (Core.inputPath input)
+        exists <- Store.checkStorePathExists (Core.inputPath input)
         unless exists $ throwError $
             Core.BuildFailed $ "Input does not exist: " <> T.pack (show $ Core.inputPath input)
 
@@ -413,7 +417,7 @@ instantiateDerivation deriv = do
     modify $ \s -> s { Core.buildInputs = Set.union inputPaths (Core.buildInputs s) }
 
     -- Verify builder exists
-    builderExists <- Store.storePathExists (Core.derivBuilder deriv)
+    builderExists <- Store.checkStorePathExists (Core.derivBuilder deriv)
     unless builderExists $ throwError $
         Core.BuildFailed $ "Builder does not exist: " <> T.pack (show $ Core.derivBuilder deriv)
 
@@ -442,6 +446,7 @@ addToDerivationChain drv (DerivationChain hashes) =
     DerivationChain (Core.derivHash drv : hashes)
 
 -- | The monadic join operation for Return-Continuation - context-aware implementation
+-- Uses store access capabilities inherited from CanStoreBuildDerivation and SandboxCreator
 joinDerivation :: (CanStoreBuildDerivation t, SandboxCreator t) => Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
 joinDerivation outerDrv = do
     -- Build the outer derivation just enough to get inner derivation
@@ -576,7 +581,7 @@ requestSandboxCreation e i c = do
 
                     return sandboxDir
                 Right (Core.ErrorResponse err) -> throwError $ Core.SandboxError $ Core.buildErrorToText err
-                Right resp -> throwError $ Core.SandboxError $ "Unexpected response: " <> T.pack (show resp)
+                Right resp -> throwError $ Core.SandboxError $ "Unexpected response type: " <> T.pack (show resp)
 
         _ -> throwError $ Core.PrivilegeError "Cannot request sandbox creation without daemon connection"
   where
@@ -599,6 +604,7 @@ requestSandboxCreation e i c = do
         in TE.decodeUtf8 $ LBS.toStrict $ Aeson.encode jsonObj
 
 -- | Build a derivation to the point where it returns an inner derivation
+-- StoreAccessOps is now transitively inherited from CanStoreBuildDerivation and SandboxCreator
 buildToGetInnerDerivation :: (CanStoreBuildDerivation t, SandboxCreator t) => Core.Derivation -> Core.TenM 'Core.Build t Core.Derivation
 buildToGetInnerDerivation drv = do
     env <- ask
@@ -613,7 +619,7 @@ buildToGetInnerDerivation drv = do
     -- Use withSandbox which handles both privilege tiers appropriately
     withSandbox (Set.map Core.inputPath $ Core.derivInputs drv) sandboxConfig $ \sandboxDir -> do
         -- Get the builder from the store - context-aware implementation
-        builderContent <- Store.readFromStore (Core.derivBuilder drv)
+        builderContent <- Store.readStoreContent (Core.derivBuilder drv)
 
         -- Write the builder to the sandbox
         let builderPath = sandboxDir </> "builder"
@@ -669,7 +675,8 @@ buildToGetInnerDerivation drv = do
                     "\nStderr: " <> T.pack stderr
 
 -- | Type class for sandbox operations with tier-specific implementations
-class SandboxCreator (t :: Core.PrivilegeTier) where
+-- Requires store access operations as a prerequisite for sandbox creation
+class (Store.StoreAccessOps t) => SandboxCreator (t :: Core.PrivilegeTier) where
     withSandboxImpl :: Set Core.StorePath -> SandboxConfig -> (FilePath -> Core.TenM 'Core.Build t a) -> Core.TenM 'Core.Build t a
 
 -- | Daemon instance implements direct sandbox creation
