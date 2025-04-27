@@ -30,11 +30,11 @@ module Ten.Store
     , StorePathReference(..)
 
     -- Type classes for store operations with privilege awareness
-    , CanAccessStore(..)
-    , CanModifyStore(..)
-    , CanQueryStore(..)
-    , CanScanStore(..)
-    , CanManageGC(..)
+    , StoreAccessOps(..)
+    , StoreModificationOps(..)
+    , StoreQueryOps(..)
+    , StoreScanOps(..)
+    , GCManagementOps(..)
 
     -- Store initialization (daemon only)
     , initializeStore
@@ -126,7 +126,7 @@ import Ten.DB.Core (HasDirectQueryOps(..), HasTransactionOps(..),
 
 -- | Type class for basic store access operations
 -- Available to both privilege tiers through appropriate implementations
-class CanAccessStore (t :: PrivilegeTier) where
+class StoreAccessOps (t :: PrivilegeTier) where
     -- | Read content from a store path
     readStoreContent :: StorePath -> TenM p t ByteString
 
@@ -138,7 +138,7 @@ class CanAccessStore (t :: PrivilegeTier) where
 
 -- | Type class for store modification operations
 -- Only available to Daemon tier
-class CanModifyStore (t :: PrivilegeTier) where
+class StoreModificationOps (t :: PrivilegeTier) where
     -- | Add content to the store
     addContentToStore :: Text -> ByteString -> TenM p t StorePath
 
@@ -153,7 +153,7 @@ class CanModifyStore (t :: PrivilegeTier) where
 
 -- | Type class for store query operations
 -- Available to both privilege tiers through appropriate implementations
-class CanQueryStore (t :: PrivilegeTier) where
+class StoreQueryOps (t :: PrivilegeTier) where
     -- | List all paths in the store
     listAllStorePaths :: TenM p t [StorePath]
 
@@ -165,7 +165,7 @@ class CanQueryStore (t :: PrivilegeTier) where
 
 -- | Type class for store scanning operations
 -- Available to both privilege tiers through appropriate implementations
-class CanScanStore (t :: PrivilegeTier) where
+class StoreScanOps (t :: PrivilegeTier) where
     -- | Scan content for references to other store paths
     scanForReferences_ :: ByteString -> TenM p t (Set StorePath)
 
@@ -177,7 +177,7 @@ class CanScanStore (t :: PrivilegeTier) where
 
 -- | Type class for garbage collection operations
 -- Only available to Daemon tier
-class CanManageGC (t :: PrivilegeTier) where
+class GCManagementOps (t :: PrivilegeTier) where
     -- | Collect garbage in the store
     performGC :: TenM p t (Int, Int, Integer)
 
@@ -193,8 +193,8 @@ class CanManageGC (t :: PrivilegeTier) where
     -- | Check if a path can be garbage collected
     canCollectPath :: StorePath -> TenM p t Bool
 
--- Daemon implementation of CanAccessStore
-instance CanAccessStore 'Daemon where
+-- Daemon implementation of StoreAccessOps
+instance StoreAccessOps 'Daemon where
     readStoreContent path = do
         -- Validate the path format to prevent attacks
         unless (validateStorePath path) $
@@ -231,8 +231,8 @@ instance CanAccessStore 'Daemon where
                 -- Compare with the expected hash from the path
                 return $ contentHash == storeHash path
 
--- Builder implementation of CanAccessStore (via protocol)
-instance CanAccessStore 'Builder where
+-- Builder implementation of StoreAccessOps (via protocol)
+instance StoreAccessOps 'Builder where
     readStoreContent path = do
         -- First try direct read - this works if the file is readable by the builder tier
         env <- ask
@@ -290,8 +290,8 @@ instance CanAccessStore 'Builder where
                     Left (_ :: IOException) -> requestVerifyViaProtocol path
             else requestVerifyViaProtocol path
 
--- Daemon implementation of CanModifyStore
-instance CanModifyStore 'Daemon where
+-- Daemon implementation of StoreModificationOps
+instance StoreModificationOps 'Daemon where
     addContentToStore nameHint content = do
         env <- ask
         let storeDir = storeLocation env
@@ -416,8 +416,8 @@ instance CanModifyStore 'Daemon where
         -- Unregister from valid paths
         unregisterValidPath path
 
--- Daemon implementation of CanQueryStore
-instance CanQueryStore 'Daemon where
+-- Daemon implementation of StoreQueryOps
+instance StoreQueryOps 'Daemon where
     listAllStorePaths = do
         -- Get store directory
         env <- ask
@@ -454,7 +454,7 @@ instance CanQueryStore 'Daemon where
         -- Query for paths with prefix
         rows <- tenQuery db
             "SELECT path FROM ValidPaths WHERE name LIKE ? || '%' AND is_valid = 1"
-            (Only prefix) :: TenM p 'Daemon [Only Text]
+            (Only prefix)
 
         -- Convert to StorePath objects
         return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
@@ -465,8 +465,8 @@ instance CanQueryStore 'Daemon where
             then return $ Just path
             else return Nothing
 
--- Builder implementation of CanQueryStore (via protocol)
-instance CanQueryStore 'Builder where
+-- Builder implementation of StoreQueryOps (via protocol)
+instance StoreQueryOps 'Builder where
     listAllStorePaths = do
         conn <- getDaemonConnection
         let req = Request {
@@ -501,8 +501,8 @@ instance CanQueryStore 'Builder where
             then return $ Just path
             else return Nothing
 
--- Daemon implementation of CanScanStore
-instance CanScanStore 'Daemon where
+-- Daemon implementation of StoreScanOps
+instance StoreScanOps 'Daemon where
     scanForReferences_ content = do
         env <- ask
         let storeDir = storeLocation env
@@ -570,8 +570,8 @@ instance CanScanStore 'Daemon where
 
                         return refs
 
--- Builder implementation of CanScanStore (via protocol)
-instance CanScanStore 'Builder where
+-- Builder implementation of StoreScanOps (via protocol)
+instance StoreScanOps 'Builder where
     scanForReferences_ content = do
         env <- ask
         let storeDir = storeLocation env
@@ -616,8 +616,8 @@ instance CanScanStore 'Builder where
             Right (DerivationOutputResponse paths) -> return paths
             Right _ -> return Set.empty
 
--- Daemon implementation of CanManageGC
-instance CanManageGC 'Daemon where
+-- Daemon implementation of GCManagementOps
+instance GCManagementOps 'Daemon where
     performGC = do
         env <- ask
         let storeDir = storeLocation env
@@ -894,7 +894,7 @@ isGCRootInDB path = do
     -- Query for roots
     rows <- tenQuery db
         "SELECT COUNT(*) FROM GCRoots WHERE path = ? AND active = 1"
-        (Only (storePathToText path)) :: TenM p 'Daemon [Only Int]
+        (Only (storePathToText path))
 
     -- Check if count > 0
     case rows of
@@ -910,7 +910,8 @@ getGCRootsFromDB = do
     db <- getDatabaseConn
     -- Query for roots
     rows <- tenQuery db
-        "SELECT path FROM GCRoots WHERE active = 1" :: TenM p 'Daemon [Only Text]
+        "SELECT path FROM GCRoots WHERE active = 1"
+        ()
 
     -- Convert to StorePath objects
     let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
@@ -990,7 +991,8 @@ getStorePathsFromDB = do
     db <- getDatabaseConn
     -- Query valid paths
     rows <- tenQuery db
-        "SELECT path FROM ValidPaths WHERE is_valid = 1" :: TenM p 'Daemon [Only Text]
+        "SELECT path FROM ValidPaths WHERE is_valid = 1"
+        ()
 
     -- Convert to StorePath objects
     return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
@@ -1066,7 +1068,7 @@ sanitizeName name =
     -- Remove any non-alphanumeric characters except allowed ones
     let filtered = T.filter isAllowedChar name
         -- Limit length
-        limited = if T.length filtered > 100 then T.take 100 filtered else limited
+        limited = if T.length filtered > 100 then T.take 100 filtered else filtered
         -- Provide fallback if empty
         result = if T.null limited then "unknown" else limited
     in result
@@ -1123,7 +1125,46 @@ addToStore nameHint content = do
     env <- ask
     case currentPrivilegeTier env of
         Daemon -> addContentToStore nameHint content
-        Builder -> requestAddToStore nameHint content
+        Builder -> do
+            -- Convert to Builder-specific operation
+            conn <- getDaemonConnection
+            let req = Request {
+                    reqId = 0,
+                    reqType = "store-add",
+                    reqParams = Map.singleton "name" nameHint,
+                    reqPayload = Just content
+                }
+            response <- liftIO $ sendRequestSync conn req 60000000
+            case response of
+                Left err ->
+                    throwError $ StoreError $ "Failed to add to store: " <> case err of
+                        DaemonError m -> m
+                        _ -> T.pack (show err)
+                Right (StoreAddResponse path) ->
+                    return path
+                Right resp ->
+                    throwError $ StoreError $ "Unexpected response type: " <> T.pack (show resp)
+
+-- | Helper for Builder to request content addition via protocol
+requestAddToStore :: Text -> ByteString -> TenM p 'Builder StorePath
+requestAddToStore nameHint content = do
+    conn <- getDaemonConnection
+    let req = Request {
+            reqId = 0,
+            reqType = "store-add",
+            reqParams = Map.singleton "name" nameHint,
+            reqPayload = Just content
+        }
+    response <- liftIO $ sendRequestSync conn req 60000000
+    case response of
+        Left err ->
+            throwError $ StoreError $ "Failed to add to store: " <> case err of
+                DaemonError m -> m
+                _ -> T.pack (show err)
+        Right (StoreAddResponse path) ->
+            return path
+        Right resp ->
+            throwError $ StoreError $ "Unexpected response type: " <> T.pack (show resp)
 
 -- | Store a file in the store
 storeFile :: FilePath -> TenM p t StorePath
@@ -1138,7 +1179,7 @@ storeFile filePath = do
                 throwError $ InputNotFound filePath
             content <- liftIO $ BS.readFile filePath
             let nameHint = T.pack $ takeFileName filePath
-            requestAddToStore nameHint content
+            addToStore nameHint content
 
 -- | Store a directory in the store
 storeDirectory :: FilePath -> TenM p t StorePath
@@ -1170,7 +1211,7 @@ storeDirectory dirPath = do
                     -- Clean up the temporary tarball
                     liftIO $ removeFile tarballPath
                     -- Add to store via protocol
-                    requestAddToStore (T.pack $ takeFileName dirPath ++ ".tar.gz") content
+                    addToStore (T.pack $ takeFileName dirPath ++ ".tar.gz") content
 
                 ExitFailure code ->
                     throwError $ StoreError $ "Failed to create tarball: " <> T.pack stderr
@@ -1180,20 +1221,6 @@ removeFromStore :: StorePath -> TenM p 'Daemon ()
 removeFromStore = removePathFromStore
 
 -- | Check if a store path exists
-storePathExists :: StorePath -> TenM p t Bool
-storePathExists = checkStorePathExists
-
--- | Verify a store path's integrity
-verifyStorePath :: StorePath -> TenM p t Bool
-verifyStorePath = verifyStoreIntegrity
-
--- | List all paths in the store
-listStorePaths :: TenM p t [StorePath]
-listStorePaths = listAllStorePaths
-
--- | Read content from a store path
-readFromStore :: StorePath -> TenM p t ByteString
-readFromStore = readStoreContent
 
 -- | Read a file path from the store
 readPathFromStore :: FilePath -> TenM p t ByteString
@@ -1273,3 +1300,29 @@ hashPath path = do
 -- | Get the hash part of a store path
 getPathHash :: StorePath -> Text
 getPathHash = storeHash
+
+-- | Helper function to get a database connection
+getDatabaseConn :: TenM p 'Daemon (Database 'Daemon)
+getDatabaseConn = do
+    env <- ask
+    let dbPath = defaultDBPath (storeLocation env)
+
+    -- In a real implementation, this would use a connection pool
+    -- For simplicity, we're creating a new connection each time
+    conn <- liftIO $ SQL.open dbPath
+    liftIO $ SQL.execute_ conn "PRAGMA foreign_keys = ON"
+
+    -- Return the database connection wrapped in our Database type
+    return $ Database conn dbPath True 5000 3 sDaemon
+
+-- | Execute a query against the database
+tenExecute :: (SQL.ToRow q) => Database 'Daemon -> Query -> q -> TenM p 'Daemon ()
+tenExecute db query params = do
+    -- For a real implementation, this would handle retries and error cases
+    liftIO $ SQL.execute (dbConn db) query params
+
+-- | Execute a query against the database and return results
+tenQuery :: (SQL.ToRow q, SQL.FromRow r) => Database 'Daemon -> Query -> q -> TenM p 'Daemon [r]
+tenQuery db query params = do
+    -- For a real implementation, this would handle retries and error cases
+    liftIO $ SQL.query (dbConn db) query params
