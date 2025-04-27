@@ -281,8 +281,8 @@ import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, myThreadId
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Char (isHexDigit)
-import Data.Singletons hiding (fromSing)
-import Data.Singletons.TH hiding (fromSing)
+import Data.Singletons
+import Data.Singletons.TH
 import Data.Kind (Type)
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
@@ -1182,9 +1182,9 @@ responseReaderThread handle requestMap shutdownFlag = forever $ do
 
 -- | Helper function to work with singletons
 -- | Extract the privilege tier from a singleton
-fromSing :: SPrivilegeTier t -> PrivilegeTier
-fromSing SDaemon = Daemon
-fromSing SBuilder = Builder
+fromSingTier :: SPrivilegeTier t -> PrivilegeTier
+fromSingTier SDaemon = Daemon
+fromSingTier SBuilder = Builder
 
 class CanBuildDerivation (t :: PrivilegeTier) where
   buildDerivation :: Derivation -> TenM 'Build t BuildResult
