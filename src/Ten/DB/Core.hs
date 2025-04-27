@@ -78,11 +78,12 @@ import Ten.Core (
     TenM, BuildEnv(..), BuildError(..), privilegeError, StorePath, Phase(..),
     PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuilder, SPhase(..), sBuild, sEval,
     fromSing, defaultDBPath, BuildState(..),
-    Database, CanAccessDatabase,
+    Database(..), TransactionMode(..),
+    CanAccessDatabase,
     currentBuildId, initBuildState, runTen, verbosity, logMsg,
     runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..),
     DaemonResponse(..), buildErrorToText, serializeDerivation, deserializeDerivation,
-    daemonStatus, brOutputPaths
+    daemonStatus, brOutputPaths, dbInitialized -- Add record field
     )
 
 -- | Database error types
@@ -380,6 +381,31 @@ instance CanExecuteStatement 'Builder where
     tenExecute_ db query params = void $ tenExecute db query params
 
     tenExecuteSimple_ db query = tenExecute_ db query ()
+
+-- | Type class for database capabilities
+class CanAccessDatabase (t :: PrivilegeTier) where
+    getDatabaseConn :: TenM p t (Database t)
+    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
+
+-- | Type class for transaction management
+class CanManageTransactions (t :: PrivilegeTier) where
+    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withTenReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withTenWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withTenTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+
+-- | Type class for query execution
+class CanExecuteQuery (t :: PrivilegeTier) where
+    tenQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
+    tenQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
+
+-- | Type class for statement execution
+class CanExecuteStatement (t :: PrivilegeTier) where
+    tenExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+    tenExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+    tenExecuteSimple_ :: Database t -> Query -> TenM p t ()
 
 -- | Type class for schema management
 class CanManageSchema (t :: PrivilegeTier) where
