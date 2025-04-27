@@ -120,16 +120,18 @@ dup2 oldfd newfd = throwErrnoIfMinus1_ "dup2" $ c_dup2 (fromIntegral oldfd) (fro
 
 -- | Runtime environment for a builder process
 data BuilderEnv = BuilderEnv
-    { builderProgram :: FilePath       -- Path to builder executable
-    , builderArgs :: [String]          -- Command-line arguments
-    , builderDir :: FilePath           -- Working directory
-    , builderEnvVars :: Map Text Text  -- Environment variables
-    , builderUser :: User.UserEntry    -- User to run as
-    , builderGroup :: User.GroupEntry  -- Group to run as
-    , builderTimeoutSecs :: Int        -- Timeout in seconds (0 = no timeout)
-    , builderIsolation :: Bool         -- Whether to use extra isolation
-    , builderTempDir :: FilePath       -- Temporary directory for the build
-    , builderOutputDir :: FilePath     -- Directory for build outputs
+    { builderProgram :: FilePath         -- Path to builder executable
+    , builderArgs :: [String]            -- Command-line arguments
+    , builderDir :: FilePath             -- Working directory
+    , builderEnvVars :: Map Text Text    -- Environment variables
+    , builderUid :: UserID               -- User ID to run as
+    , builderUsername :: Text            -- Username to run as
+    , builderGid :: GroupID              -- Group ID to run as
+    , builderGroupname :: Text           -- Group name to run as
+    , builderTimeoutSecs :: Int          -- Timeout in seconds
+    , builderIsolation :: Bool           -- Whether to use extra isolation
+    , builderTempDir :: FilePath         -- Temporary directory for the build
+    , builderOutputDir :: FilePath       -- Directory for build outputs
     }
 
 -- | Build a derivation, dispatching based on privilege tier
@@ -184,8 +186,8 @@ buildDerivationBuilder _ deriv = do
     response <- sendToDaemon daemonConn buildRequest
 
     case response of
-        Protocol.BuildResponse result -> return result
-        Protocol.ErrorResponse err -> throwError err
+        Core.BuildResultResponse result -> return result
+        Core.ErrorResponse err -> throwError err
         _ -> throwError $ BuildFailed "Unexpected response from daemon"
 
 -- | Store a derivation in daemon context
@@ -216,8 +218,8 @@ storeBuilderDerivation deriv = do
     response <- sendToDaemon daemonConn storeRequest
 
     case response of
-        Protocol.StoreAddResponse path -> return path
-        Protocol.ErrorResponse err -> throwError err
+        Core.StoreAddResponse path -> return path
+        Core.ErrorResponse err -> throwError err
         _ -> throwError $ BuildFailed "Unexpected response from daemon for store request"
 
 -- | Build a derivation using applicative strategy in daemon context
@@ -369,8 +371,8 @@ builderStorePathExists path = do
     response <- sendToDaemon daemonConn verifyRequest
 
     case response of
-        Protocol.StoreVerifyResponse exists -> return exists
-        Protocol.ErrorResponse err -> throwError err
+        Core.StoreVerifyResponse exists -> return exists
+        Core.ErrorResponse err -> throwError err
         _ -> throwError $ StoreError "Unexpected response from daemon for store verification"
 
 -- | Build a derivation in a sandbox (daemon operation)
@@ -383,7 +385,7 @@ buildWithSandboxDaemon deriv config = do
     Sandbox.withSandbox inputs config $ \buildDir -> do
         -- Get the builder path in the store
         let builderPath = derivBuilder deriv
-        builderContent <- Core.readFromStore builderPath
+        builderContent <- Store.readFromStore builderPath
 
         -- Set up builder with proper permissions
         execPath <- setupBuilder builderPath builderContent buildDir
@@ -426,8 +428,10 @@ buildWithSandboxDaemon deriv config = do
             builderArgs = map T.unpack $ derivArgs deriv,
             builderDir = buildDir,
             builderEnvVars = buildEnv,
-            builderUser = builderUser,
-            builderGroup = builderGroup,
+            builderUid = User.userID builderUser,
+            builderUsername = T.pack (User.userName builderUser),
+            builderGid = User.groupID builderGroup,
+            builderGroupname = T.pack (User.groupName builderGroup),
             builderTimeoutSecs = 3600, -- 1 hour default timeout
             builderIsolation = Sandbox.sandboxUseMountNamespace config && Sandbox.sandboxUseNetworkNamespace config,
             builderTempDir = buildDir </> "tmp",
@@ -858,7 +862,7 @@ collectBuildResultDaemon deriv buildDir = do
                             DB.registerReference txn outputPath (inputPath input)
 
                         -- 3. Scan the output file for additional references
-                        DB.scanAndRegisterReferences txn (storeLocation env) outputPath
+                        DB.bulkRegisterReferences txn (storeLocation env) outputPath
 
                 Nothing -> return () -- Should never happen if we stored the derivation first
 
@@ -997,7 +1001,7 @@ verifyStorePathBuilder path = do
     response <- sendToDaemon daemonConn verifyRequest
 
     case response of
-        StoreVerifyResponse valid -> return valid
+        Core.StoreVerifyResponse valid -> return valid
         _ -> return False
 
 -- | Check if a build result includes a returned derivation
@@ -1094,7 +1098,7 @@ buildDerivationGraph graph = do
 
     buildAndCollect results drv = do
         -- Build the derivation
-        result <- buildDerivation drv
+        result <- Ten.Build.buildDerivation drv
         -- Add to results
         let drvId = derivHash drv
         return $ Map.insert drvId result results
@@ -1108,7 +1112,7 @@ buildInDependencyOrder derivations = do
         throwError $ CyclicDependency "Cycle detected in build dependencies"
 
     -- Build each derivation in order
-    mapM buildDerivation derivations
+    mapM Ten.Build.buildDerivation derivations
 
 -- | Build dependencies concurrently
 buildDependenciesConcurrently :: [Derivation] -> TenM 'Build 'Daemon (Map String (Either BuildError Core.BuildResult))
@@ -1117,7 +1121,7 @@ buildDependenciesConcurrently derivations = do
     state <- get
 
     -- Create a map to hold results
-    resultMap <- liftIO $ atomically $ newTVar Map.empty
+    resultMap <- liftIO $ newTVarIO Map.empty
 
     -- Create a semaphore to limit concurrency
     maxConcurrent <- asks (\e -> fromMaybe 4 (maxConcurrentBuilds e))
@@ -1143,7 +1147,7 @@ buildDependenciesConcurrently derivations = do
 
     -- Wait for all threads to complete
     liftIO $ do
-        allThreads <- atomically $ readTVar threads
+        allThreads <- readTVarIO threads
         -- First try graceful termination
         forM_ allThreads $ \t -> catch (killThread t) $ \(_ :: SomeException) -> return ()
 
@@ -1151,7 +1155,7 @@ buildDependenciesConcurrently derivations = do
         threadDelay 1000000  -- 1 second
 
         -- Return the results
-        atomically $ readTVar resultMap
+        readTVarIO resultMap
 
 -- | Wait for dependencies to complete
 waitForDependencies :: Set BuildId -> TenM 'Build t ()
@@ -1289,8 +1293,8 @@ getBuildStatusBuilder buildId = do
     response <- sendToDaemon daemonConn statusRequest
 
     case response of
-        Protocol.BuildStatusResponse update -> return (buildStatus update)
-        Protocol.ErrorResponse err -> throwError err
+        Core.BuildStatusResponse update -> return (buildStatus update)
+        Core.ErrorResponse err -> throwError err
         _ -> throwError $ BuildFailed "Unexpected response from daemon for status request"
 
 -- | Get daemon connection (should be available in builder context)
@@ -1316,7 +1320,7 @@ createStoreVerifyRequest path =
 
 createRegisterDerivationRequest :: Derivation -> StorePath -> TenM p 'Builder Protocol.DaemonRequest
 createRegisterDerivationRequest deriv path =
-    return $ Protocol.StoreDerivationCmd $ Protocol.StoreDerivationRequest (Core.serializeDerivation deriv) True
+    return $ Protocol.StoreDerivationRequest (Core.serializeDerivation deriv) True
 
 createBuildProgressRequest :: BuildId -> Float -> TenM p 'Builder Protocol.DaemonRequest
 createBuildProgressRequest bid progress =
@@ -1327,11 +1331,23 @@ createBuildStatusRequest bid status =
     return $ Protocol.BuildStatusRequest bid
 
 -- | Send request to daemon and get response
-sendToDaemon :: DaemonConnection -> Protocol.DaemonRequest -> TenM p 'Builder Protocol.DaemonResponse
+sendToDaemon :: DaemonConnection -> Protocol.DaemonRequest -> TenM p 'Builder Core.DaemonResponse
 sendToDaemon conn req = do
-    -- This would use the actual client implementation from Ten.Daemon.Client
-    response <- liftIO $ Client.requestFromDaemon conn req
-    return response
+    -- Use Client.sendRequestSync to communicate with the daemon
+    let timeoutMicros = 30000000  -- 30 seconds timeout
+    result <- liftIO $ Client.sendRequestSync conn req timeoutMicros
+    case result of
+        Left err -> throwError err
+        Right resp -> return resp
+
+-- | Helper function to communicate with daemon
+requestFromDaemon :: DaemonConnection t -> Protocol.DaemonRequest -> IO Core.DaemonResponse
+requestFromDaemon conn req = do
+    -- Use Client.sendRequestSync and handle errors properly
+    result <- Client.sendRequestSync conn req 30000000  -- 30 second timeout
+    case result of
+        Left err -> throwIO err
+        Right resp -> return resp
 
 -- Helper for reading safely
 readMaybe :: Read a => String -> Maybe a
@@ -1340,9 +1356,9 @@ readMaybe s = case reads s of
     _ -> Nothing
 
 -- Default build request info
-defaultBuildRequestInfo :: Protocol.BuildRequestInfo
-defaultBuildRequestInfo = Protocol.BuildRequestInfo {
-    Protocol.buildTimeout = Nothing,
-    Protocol.buildEnv = Map.empty,
-    Protocol.buildFlags = []
+defaultBuildRequestInfo :: Core.BuildRequestInfo
+defaultBuildRequestInfo = Core.BuildRequestInfo {
+    Core.buildTimeout = Nothing,
+    Core.buildEnv = Map.empty,
+    Core.buildFlags = []
 }

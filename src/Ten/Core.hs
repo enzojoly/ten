@@ -685,6 +685,7 @@ data BuildResult = BuildResult
     , brExitCode :: ExitCode                -- Exit code from builder
     , brLog :: Text                         -- Build log
     , brReferences :: Set StorePath         -- References from outputs
+    , brMetadata :: Map Text Text           -- Metadata for the build result
     } deriving (Show, Eq)
 
 -- | Node in a build graph
