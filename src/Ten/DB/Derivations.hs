@@ -204,7 +204,7 @@ class CanStoreDerivation (t :: PrivilegeTier) where
     -- | Register a derivation with all its outputs in a single transaction
     registerDerivationWithOutputs :: Derivation -> StorePath -> TenM p t Int64
 
--- | Daemon instance for storing derivations
+-- | Daemon instance for storing derivations - direct database access
 instance CanStoreDerivation 'Daemon where
     storeDerivation derivation storePath = do
         db <- getDatabaseConn
@@ -299,7 +299,7 @@ instance CanStoreDerivation 'Daemon where
 
             return derivId
 
--- Builder implementation of CanStoreDerivation (via protocol)
+-- | Builder implementation of CanStoreDerivation via protocol
 instance CanStoreDerivation 'Builder where
     storeDerivation derivation storePath = do
         env <- ask
@@ -405,7 +405,7 @@ class CanRetrieveDerivation (p :: Phase) (t :: PrivilegeTier) where
     -- | Find derivations that produced the given outputs
     findDerivationsByOutputs :: [StorePath] -> TenM p t (Map String Derivation)
 
--- Implementation for Daemon in Eval phase
+-- | Implementation for Daemon in Eval phase - direct database access
 instance CanRetrieveDerivation 'Eval 'Daemon where
     retrieveDerivation hash = do
         db <- getDatabaseConn
@@ -505,7 +505,7 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
         -- Filter out Nothings and convert to Map
         return $ Map.fromList $ catMaybes derivations
 
--- Implementation for Daemon in Build phase
+-- | Implementation for Daemon in Build phase - direct database access
 instance CanRetrieveDerivation 'Build 'Daemon where
     retrieveDerivation hash = do
         db <- getDatabaseConn
@@ -605,7 +605,7 @@ instance CanRetrieveDerivation 'Build 'Daemon where
         -- Filter out Nothings and convert to Map
         return $ Map.fromList $ catMaybes derivations
 
--- Implementation for Builder in Eval phase (via protocol)
+-- | Implementation for Builder in Eval phase via protocol
 instance CanRetrieveDerivation 'Eval 'Builder where
     retrieveDerivation hash = do
         env <- ask
@@ -681,7 +681,7 @@ instance CanRetrieveDerivation 'Eval 'Builder where
 
             _ -> throwError $ privilegeError "Cannot find derivations by outputs without daemon connection"
 
--- Implementation for Builder in Build phase (via protocol)
+-- | Implementation for Builder in Build phase via protocol
 instance CanRetrieveDerivation 'Build 'Builder where
     retrieveDerivation hash = do
         env <- ask
@@ -765,7 +765,7 @@ class CanManageOutputs (t :: PrivilegeTier) where
     -- | Get all outputs for a derivation
     getOutputsForDerivation :: Int64 -> TenM p t [OutputInfo]
 
--- Daemon implementation of CanManageOutputs
+-- | Daemon implementation of CanManageOutputs with direct database access
 instance CanManageOutputs 'Daemon where
     registerDerivationOutput derivId outputName outPath = do
         db <- getDatabaseConn
@@ -786,7 +786,7 @@ instance CanManageOutputs 'Daemon where
         -- Validate all paths after extraction
         validateAndLogOutputInfos outputs
 
--- Builder implementation of CanManageOutputs (via protocol)
+-- | Builder implementation of CanManageOutputs via protocol
 instance CanManageOutputs 'Builder where
     registerDerivationOutput derivId outputName outPath = do
         env <- ask
@@ -859,7 +859,7 @@ class CanManageReferences (t :: PrivilegeTier) where
     -- | Bulk register multiple references for efficiency
     bulkRegisterReferences :: [(StorePath, StorePath)] -> TenM p t Int
 
--- Daemon implementation of CanManageReferences
+-- | Daemon implementation of CanManageReferences with direct database access
 instance CanManageReferences 'Daemon where
     addDerivationReference referrer reference =
         when (referrer /= reference) $ do
@@ -955,7 +955,7 @@ instance CanManageReferences 'Daemon where
 
             return count
 
--- Builder implementation of CanManageReferences (via protocol)
+-- | Builder implementation of CanManageReferences via protocol
 instance CanManageReferences 'Builder where
     addDerivationReference referrer reference =
         when (referrer /= reference) $ do
@@ -1121,7 +1121,7 @@ class CanQueryDerivations (t :: PrivilegeTier) where
     -- | Get the store path for a derivation by hash
     getDerivationPath :: Text -> TenM p t (Maybe StorePath)
 
--- Daemon implementation of CanQueryDerivations
+-- | Daemon implementation of CanQueryDerivations with direct database access
 instance CanQueryDerivations 'Daemon where
     isDerivationRegistered hash = do
         db <- getDatabaseConn
@@ -1160,7 +1160,7 @@ instance CanQueryDerivations 'Daemon where
                         return Nothing
             _ -> return Nothing
 
--- Builder implementation of CanQueryDerivations (via protocol)
+-- | Builder implementation of CanQueryDerivations via protocol
 instance CanQueryDerivations 'Builder where
     isDerivationRegistered hash = do
         env <- ask
@@ -1247,44 +1247,84 @@ class CanManagePathValidity (t :: PrivilegeTier) where
     -- | Get detailed information about a path
     getPathInfo :: StorePath -> TenM p t (Maybe PathInfo)
 
--- Daemon implementation of CanManagePathValidity
+-- | Daemon implementation of CanManagePathValidity with direct database access
 instance CanManagePathValidity 'Daemon where
     registerValidPath path mDeriver = do
-        db <- getDatabaseConn
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
 
-        let deriverText = case mDeriver of
-                Just deriver -> Just (storePathToText deriver)
-                Nothing -> Nothing
+        -- First check if path exists
+        let fullPath = storePathToFilePath path env
+        exists <- liftIO $ doesFileExist fullPath
+        unless exists $
+            throwError $ StoreError $ "Cannot register non-existent path: " <> storePathToText path
 
-        void $ tenExecute db
-            "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
-            \VALUES (?, ?, strftime('%s','now'), ?, 1)"
-            (storePathToText path, storeHash path, deriverText)
+        -- Open database connection
+        conn <- liftIO $ SQLite.open dbPath
+
+        -- Insert path into ValidPaths
+        liftIO $ SQLite.execute conn
+            "INSERT OR IGNORE INTO ValidPaths (path, hash, name, deriver, is_valid, timestamp) VALUES (?, ?, ?, ?, 1, strftime('%s','now'))"
+            (storePathToText path, storeHash path, storeName path, fmap storePathToText mDeriver)
+
+        -- If there's a deriver, register the reference
+        forM_ mDeriver $ \deriver ->
+            liftIO $ SQLite.execute conn
+                "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'derivation')"
+                (storePathToText path, storePathToText deriver)
+
+        -- Close connection
+        liftIO $ SQLite.close conn
 
     invalidatePath path = do
-        db <- getDatabaseConn
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
 
-        void $ tenExecute db
+        -- Open database connection
+        conn <- liftIO $ SQLite.open dbPath
+
+        -- Mark path as invalid
+        liftIO $ SQLite.execute conn
             "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
-            (Only (storePathToText path))
+            (Only $ storePathToText path)
+
+        -- Close connection
+        liftIO $ SQLite.close conn
 
     isPathValid path = do
-        db <- getDatabaseConn
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
 
-        results <- tenQuery db
+        -- Open database connection
+        conn <- liftIO $ SQLite.open dbPath
+
+        -- Query for validity
+        rows <- liftIO $ SQLite.query conn
             "SELECT is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
             (Only (storePathToText path)) :: TenM p 'Daemon [Only Int]
 
-        case results of
+        -- Close connection
+        liftIO $ SQLite.close conn
+
+        -- Check if valid
+        case rows of
             [Only valid] -> return (valid == 1)
             _ -> return False
 
     getPathInfo path = do
-        db <- getDatabaseConn
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
 
-        pathInfos <- tenQuery db
+        -- Open database connection
+        conn <- liftIO $ SQLite.open dbPath
+
+        -- Query for path info
+        pathInfos <- liftIO $ SQLite.query conn
             "SELECT path, hash, deriver, registration_time, is_valid FROM ValidPaths WHERE path = ? LIMIT 1"
             (Only (storePathToText path)) :: TenM p 'Daemon [PathInfo]
+
+        -- Close connection
+        liftIO $ SQLite.close conn
 
         -- Validate the returned paths
         validatedPathInfos <- forM pathInfos $ \info -> do
@@ -1297,7 +1337,7 @@ instance CanManagePathValidity 'Daemon where
 
         return $ listToMaybe validatedPathInfos
 
--- Builder implementation of CanManagePathValidity (via protocol)
+-- | Builder implementation of CanManagePathValidity via protocol
 instance CanManagePathValidity 'Builder where
     registerValidPath path mDeriver = do
         env <- ask

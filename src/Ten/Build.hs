@@ -7,6 +7,10 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Ten.Build (
     -- Core build functions
@@ -36,7 +40,17 @@ module Ten.Build (
     -- Build utilities
     runBuilder,
     setupBuilder,
-    getBuildEnvironment
+    getBuildEnvironment,
+
+    -- Type classes for privilege-aware operations
+    CanBuildDerivation(..),
+    CanBuildStrategy(..),
+    CanManageBuildStatus(..),
+
+    -- Transaction helpers
+    withTransaction,
+    withReadTransaction,
+    withWriteTransaction
 ) where
 
 import Control.Concurrent
@@ -124,154 +138,316 @@ data BuilderEnv = BuilderEnv
     , builderDir :: FilePath             -- Working directory
     , builderEnvVars :: Map Text Text    -- Environment variables
     , builderUid :: UserID               -- User ID to run as
-    , builderUsername :: Text            -- Username to run as
     , builderGid :: GroupID              -- Group ID to run as
-    , builderGroupname :: Text           -- Group name to run as
+    , builderUser :: User.UserEntry      -- User entry to run as
+    , builderGroup :: User.GroupEntry    -- Group entry to run as
     , builderTimeoutSecs :: Int          -- Timeout in seconds
     , builderIsolation :: Bool           -- Whether to use extra isolation
     , builderTempDir :: FilePath         -- Temporary directory for the build
     , builderOutputDir :: FilePath       -- Directory for build outputs
     }
 
--- | Build a derivation in daemon context
-buildDerivationDaemon :: SPrivilegeTier 'Daemon -> Derivation -> TenM 'Build 'Daemon Core.BuildResult
-buildDerivationDaemon _ deriv = do
-    -- Log start of build
-    logMsg 1 $ "Building derivation: " <> derivName deriv
+-- | Type classes for privilege-aware operations
 
-    -- Serialize and store the derivation in the store (daemon operation)
-    derivPath <- storeDaemonDerivation deriv
+-- | Type class for building derivations with appropriate privilege tier
+class CanBuildDerivation (t :: PrivilegeTier) where
+    -- | Build a derivation, respecting privilege tier constraints
+    buildDerivation :: Derivation -> TenM 'Build t BuildResult
 
-    -- Get current build ID
-    bid <- gets currentBuildId
+-- | Type class for building with specific strategies
+class CanBuildStrategy (t :: PrivilegeTier) where
+    -- | Build using applicative (parallel) strategy
+    buildApplicativeStrategy :: Derivation -> TenM 'Build t BuildResult
 
-    -- Register the derivation in the database (daemon operation)
+    -- | Build using monadic (sequential) strategy
+    buildMonadicStrategy :: Derivation -> TenM 'Build t BuildResult
+
+-- | Type class for managing build status
+class CanManageBuildStatus (t :: PrivilegeTier) where
+    -- | Get status of a build
+    getBuildStatus :: BuildId -> TenM 'Build t BuildStatus
+
+    -- | Update build status in store
+    updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build t ()
+
+-- | Transaction helpers with proper privilege constraints
+withTransaction :: (CanAccessDatabase t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withTransaction db mode logFn action = withTenTransaction db mode (\db' -> action)
+
+withReadTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withReadTransaction db logFn = withTransaction db ReadOnly logFn
+
+withWriteTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withWriteTransaction db logFn = withTransaction db ReadWrite logFn
+
+-- | Daemon instance for building derivations
+instance CanBuildDerivation 'Daemon where
+    buildDerivation deriv = do
+        -- Log start of build
+        logMsg 1 $ "Building derivation: " <> derivName deriv
+
+        -- Serialize and store the derivation in the store
+        derivPath <- storeDerivationDaemon deriv
+
+        -- Get current build ID
+        bid <- gets currentBuildId
+
+        -- Register the derivation in the database
+        env <- ask
+        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+            liftIO $ registerDerivationFile db deriv derivPath
+
+        -- First instantiate the derivation
+        Derivation.instantiateDerivation deriv
+
+        -- Select build strategy based on derivation
+        case derivStrategy deriv of
+            ApplicativeStrategy -> do
+                logMsg 2 $ "Using applicative (parallel) build strategy for " <> derivName deriv
+                buildApplicativeStrategy deriv
+            MonadicStrategy -> do
+                logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
+                buildMonadicStrategy deriv
+
+-- | Builder instance for building derivations via protocol
+instance CanBuildDerivation 'Builder where
+    buildDerivation deriv = do
+        -- Log start of build
+        logMsg 1 $ "Building derivation via daemon: " <> derivName deriv
+
+        -- Send build request to daemon
+        daemonConn <- getDaemonConnection
+
+        -- Create build request with derivation payload
+        let serialized = Derivation.serializeDerivation deriv
+        let request = Request {
+            reqId = 0,  -- Will be set by sendRequest
+            reqType = "build-derivation",
+            reqParams = Map.fromList [
+                ("hasDerivation", "true")
+            ],
+            reqPayload = Just serialized
+        }
+
+        -- Send request and wait for response
+        response <- liftIO $ sendRequestSync daemonConn request (3600 * 1000000) -- 1 hour timeout
+
+        case response of
+            Left err -> throwError err
+            Right (BuildResultResponse result) -> return result
+            Right resp -> throwError $ BuildFailed $ "Unexpected response from daemon: " <> T.pack (show resp)
+
+-- | Daemon instance for building with specific strategies
+instance CanBuildStrategy 'Daemon where
+    buildApplicativeStrategy deriv = do
+        env <- ask
+
+        -- Get all dependencies
+        let inputs = Set.map inputPath (derivInputs deriv)
+
+        -- Create sandbox config
+        let config = Sandbox.defaultSandboxConfig {
+            Sandbox.sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"],
+            Sandbox.sandboxReturnSupport = False,  -- Not using return continuation for applicative builds
+            Sandbox.sandboxPrivileged = False,     -- Always run as unprivileged user
+            Sandbox.sandboxUser = "nobody",        -- Default unprivileged user
+            Sandbox.sandboxGroup = "nogroup",      -- Default unprivileged group
+            Sandbox.sandboxUseMountNamespace = True, -- Use mount namespace for better isolation
+            Sandbox.sandboxUseNetworkNamespace = True -- Isolate network by default
+        }
+
+        -- Check if we need to build dependencies first
+        missingDeps <- filterM (\path -> not <$> storePathExists path) (Set.toList inputs)
+
+        if null missingDeps
+            then buildWithSandboxDaemon deriv config
+            else do
+                -- Build missing dependencies concurrently
+                logMsg 2 $ "Building " <> T.pack (show $ length missingDeps) <> " dependencies first"
+
+                -- Find the derivations for each missing dependency
+                deps <- findDependencyDerivations missingDeps
+
+                -- Build dependencies concurrently
+                results <- buildDependenciesConcurrently (Map.elems deps)
+
+                -- Check results for errors
+                let failures = Map.filter isLeft results
+                unless (Map.null failures) $ do
+                    let (hash, err) = head $ Map.toList failures
+                    case fromLeft (BuildFailed "Unknown error") err of
+                        err' -> throwError $ BuildFailed $ "Failed to build dependency: " <>
+                                            fromMaybe (T.pack hash) (Map.lookup hash (Map.map derivName deps)) <>
+                                            " - " <> getErrorMessage err'
+
+                -- Now build with all dependencies available
+                buildWithSandboxDaemon deriv config
+
+    buildMonadicStrategy deriv = do
+        env <- ask
+
+        -- Get all direct dependencies
+        let inputs = Set.map inputPath (derivInputs deriv)
+
+        -- Check if all inputs exist
+        missingDeps <- filterM (\path -> not <$> storePathExists path) (Set.toList inputs)
+        unless (null missingDeps) $
+            throwError $ BuildFailed $ "Missing dependencies: " <>
+                         T.intercalate ", " (map storeName missingDeps)
+
+        -- Create sandbox config with return-continuation support
+        let config = Sandbox.defaultSandboxConfig {
+            Sandbox.sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"],
+            Sandbox.sandboxReturnSupport = True,
+            Sandbox.sandboxPrivileged = False,     -- Always run as unprivileged user
+            Sandbox.sandboxUser = "nobody",        -- Default unprivileged user
+            Sandbox.sandboxGroup = "nogroup",      -- Default unprivileged group
+            Sandbox.sandboxUseMountNamespace = True, -- Use mount namespace for better isolation
+            Sandbox.sandboxUseNetworkNamespace = True -- Isolate network by default
+        }
+
+        -- Build in sandbox
+        result <- buildWithSandboxDaemon deriv config
+
+        -- Check if this build returned a derivation
+        returnDerivExists <- checkIfReturnDerivation result
+
+        if returnDerivExists
+            then do
+                -- Handle return-continuation case
+                innerDrv <- handleReturnedDerivation result
+                -- Track this in the derivation chain
+                Graph.addToDerivationChain innerDrv
+
+                -- Check for potential recursive build limits
+                chain <- gets buildChain
+                maxDepth <- asks maxRecursionDepth
+                when (length chain > maxDepth) $
+                    throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show maxDepth)
+
+                -- Recursively build the inner derivation (must use monadic strategy)
+                logMsg 1 $ "Building inner derivation returned by " <> derivName deriv
+                buildMonadicStrategy innerDrv
+            else
+                -- Normal build result
+                return result
+
+-- | Builder instance for build strategies (all go through daemon)
+instance CanBuildStrategy 'Builder where
+    buildApplicativeStrategy = buildDerivation
+    buildMonadicStrategy = buildDerivation
+
+-- | Daemon instance for managing build status
+instance CanManageBuildStatus 'Daemon where
+    getBuildStatus buildId = do
+        env <- ask
+        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+            results <- tenQuery db
+                "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
+                (Only (T.pack (show buildId))) :: TenM 'Build 'Daemon [Only Text]
+
+            case results of
+                [Only statusText] -> case parseStatus statusText of
+                    Just status -> return status
+                    Nothing -> throwError $ BuildFailed $ "Invalid build status: " <> statusText
+                _ -> throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
+      where
+        parseStatus :: Text -> Maybe BuildStatus
+        parseStatus "BuildPending" = Just BuildPending
+        parseStatus t | "BuildRunning " `T.isPrefixOf` t =
+            case T.stripPrefix "BuildRunning " t of
+                Just progressText ->
+                    case readMaybe (T.unpack progressText) of
+                        Just progress -> Just (BuildRunning progress)
+                        Nothing -> Nothing
+                Nothing -> Nothing
+        parseStatus t | "BuildRecursing " `T.isPrefixOf` t =
+            case T.stripPrefix "BuildRecursing " t of
+                Just bidText ->
+                    case readMaybe (T.unpack bidText) of
+                        Just bid -> Just (BuildRecursing (BuildIdFromInt bid))
+                        Nothing -> Nothing
+                Nothing -> Nothing
+        parseStatus "BuildCompleted" = Just BuildCompleted
+        parseStatus "BuildFailed'" = Just BuildFailed'
+        parseStatus _ = Nothing
+
+    updateBuildStatus buildId status = do
+        -- In a real daemon implementation, this would update a shared TVar
+        -- and notify any clients waiting for status updates
+        env <- ask
+        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+            liftIO $ tenExecute db
+                "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
+                (T.pack (show buildId), T.pack (show status))
+
+-- | Builder instance for managing build status (via protocol)
+instance CanManageBuildStatus 'Builder where
+    getBuildStatus buildId = do
+        daemonConn <- getDaemonConnection
+
+        -- Create build status request
+        let request = Request {
+            reqId = 0,
+            reqType = "build-status",
+            reqParams = Map.singleton "buildId" (renderBuildId buildId),
+            reqPayload = Nothing
+        }
+
+        -- Send request and wait for response
+        response <- liftIO $ sendRequestSync daemonConn request 10000000
+        case response of
+            Left err -> throwError err
+            Right (BuildStatusResponse update) -> return (buildStatus update)
+            Right resp -> throwError $ BuildFailed "Unexpected response from daemon for status request"
+
+    updateBuildStatus buildId status = do
+        daemonConn <- getDaemonConnection
+
+        -- Create status update request
+        let request = Request {
+            reqId = 0,
+            reqType = "update-build-status",
+            reqParams = Map.fromList [
+                ("buildId", renderBuildId buildId),
+                ("status", T.pack $ show status)
+            ],
+            reqPayload = Nothing
+        }
+
+        -- Send request (fire and forget)
+        void $ liftIO $ sendRequest daemonConn request
+
+-- | Store a derivation in daemon context (privileged operation)
+storeDerivationDaemon :: Derivation -> TenM 'Build 'Daemon StorePath
+storeDerivationDaemon deriv = do
     env <- ask
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        liftIO $ registerDerivationFile db deriv derivPath
 
-    -- First instantiate the derivation
-    Derivation.instantiateDerivation deriv
+    -- Serialize the derivation
+    let serialized = Core.serializeDerivation deriv
 
-    -- Select build strategy based on derivation
-    case derivStrategy deriv of
-        ApplicativeStrategy -> do
-            logMsg 2 $ "Using applicative (parallel) build strategy for " <> derivName deriv
-            buildApplicativeStrategyDaemon deriv
-        MonadicStrategy -> do
-            logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
-            buildMonadicStrategyDaemon deriv
+    -- Calculate a hash for the content
+    let contentHash = hashByteString serialized
+    let hashHex = T.pack $ show contentHash
 
--- | Build a derivation in builder context
-buildDerivationBuilder :: SPrivilegeTier 'Builder -> Derivation -> TenM 'Build 'Builder Core.BuildResult
-buildDerivationBuilder _ deriv = do
-    -- Log start of build
-    logMsg 1 $ "Building derivation via daemon: " <> derivName deriv
+    -- Determine store path
+    let name = derivName deriv <> ".drv"
+    let storePath = StorePath hashHex name
 
-    -- Send build request to daemon
-    daemonConn <- getDaemonConnection
-    buildRequest <- createBuildDerivationRequest deriv
+    -- Write to the store
+    let fullPath = storePathToFilePath storePath env
 
-    -- Wait for response from daemon
-    response <- sendToDaemon daemonConn buildRequest
+    -- Create parent directories
+    liftIO $ createDirectoryIfMissing True (takeDirectory fullPath)
 
-    case response of
-        Core.BuildResultResponse result -> return result
-        Core.ErrorResponse err -> throwError err
-        _ -> throwError $ BuildFailed "Unexpected response from daemon"
+    -- Write the file with proper permissions
+    liftIO $ BS.writeFile fullPath serialized
+    liftIO $ setFileMode fullPath 0o444  -- Read-only for everyone
 
--- | Store a derivation in daemon context
-storeDaemonDerivation :: Derivation -> TenM 'Build 'Daemon StorePath
-storeDaemonDerivation deriv = do
-    -- Create serialized representation
-    let derivContent = Core.serializeDerivation deriv
-    let derivName' = derivName deriv <> ".drv"
-
-    -- Store in content-addressable store (daemon operation)
-    storePath <- Store.addToStore derivName' derivContent
+    logMsg 1 $ "Stored derivation at " <> storePathToText storePath
 
     -- Return the store path
     return storePath
-
--- | Request daemon to store a derivation in builder context
-storeBuilderDerivation :: Derivation -> TenM 'Build 'Builder StorePath
-storeBuilderDerivation deriv = do
-    -- Get daemon connection
-    daemonConn <- getDaemonConnection
-
-    -- Create store request
-    let derivContent = Core.serializeDerivation deriv
-    let derivName' = derivName deriv <> ".drv"
-    storeRequest <- createStoreRequest derivName' derivContent
-
-    -- Send request to daemon
-    response <- sendToDaemon daemonConn storeRequest
-
-    case response of
-        Core.StoreAddResponse path -> return path
-        Core.ErrorResponse err -> throwError err
-        _ -> throwError $ BuildFailed "Unexpected response from daemon for store request"
-
--- | Build a derivation using applicative strategy in daemon context
-buildApplicativeStrategyDaemon :: Derivation -> TenM 'Build 'Daemon Core.BuildResult
-buildApplicativeStrategyDaemon deriv = do
-    env <- ask
-
-    -- Get all dependencies
-    let inputs = Set.map inputPath (derivInputs deriv)
-
-    -- Create sandbox config
-    let config = Sandbox.defaultSandboxConfig {
-        Sandbox.sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"],
-        Sandbox.sandboxReturnSupport = False,  -- Not using return continuation for applicative builds
-        Sandbox.sandboxPrivileged = False,     -- Always run as unprivileged user
-        Sandbox.sandboxUser = "nobody",        -- Default unprivileged user
-        Sandbox.sandboxGroup = "nogroup",      -- Default unprivileged group
-        Sandbox.sandboxUseMountNamespace = True, -- Use mount namespace for better isolation
-        Sandbox.sandboxUseNetworkNamespace = True -- Isolate network by default
-    }
-
-    -- Check if we need to build dependencies first
-    missingDeps <- filterM (\path -> not <$> daemonStorePathExists path) (Set.toList inputs)
-
-    if null missingDeps
-        then buildWithSandboxDaemon deriv config
-        else do
-            -- Build missing dependencies concurrently
-            logMsg 2 $ "Building " <> T.pack (show $ length missingDeps) <> " dependencies first"
-
-            -- Find the derivations for each missing dependency
-            deps <- findDependencyDerivations missingDeps
-
-            -- Build dependencies concurrently
-            results <- buildDependenciesConcurrently (Map.elems deps)
-
-            -- Check results for errors
-            let failures = Map.filter isLeft results
-            unless (Map.null failures) $ do
-                let (hash, err) = head $ Map.toList failures
-                case fromLeft (BuildFailed "Unknown error") err of
-                    err' -> throwError $ BuildFailed $ "Failed to build dependency: " <>
-                                        fromMaybe (T.pack hash) (Map.lookup hash (Map.map derivName deps)) <>
-                                        " - " <> getErrorMessage err'
-
-            -- Now build with all dependencies available
-            buildWithSandboxDaemon deriv config
-  where
-    isLeft (Left _) = True
-    isLeft _ = False
-
-    fromLeft def (Left x) = x
-    fromLeft def _ = def
-
-    getErrorMessage (BuildFailed msg) = msg
-    getErrorMessage (StoreError msg) = msg
-    getErrorMessage (SandboxError msg) = msg
-    getErrorMessage _ = "Build error"
-
--- | Build using applicative strategy in builder context
-buildApplicativeStrategy :: Derivation -> TenM 'Build 'Builder Core.BuildResult
-buildApplicativeStrategy = buildDerivationBuilder sBuilder
 
 -- | Find derivation objects for dependencies (daemon operation)
 findDependencyDerivations :: [StorePath] -> TenM 'Build 'Daemon (Map String Derivation)
@@ -281,7 +457,7 @@ findDependencyDerivations paths = do
     -- Use the database to look up derivations for the provided output paths
     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Use the database to look up derivations for the provided output paths
-        result <- liftIO $ DB.findDerivationsByOutputs db paths
+        result <- DB.findDerivationsByOutputs paths
 
         -- If any lookup failed, throw an error
         when (Map.size result /= length paths) $ do
@@ -291,82 +467,23 @@ findDependencyDerivations paths = do
 
         return result
 
--- | Build a derivation using monadic strategy in daemon context
-buildMonadicStrategyDaemon :: Derivation -> TenM 'Build 'Daemon Core.BuildResult
-buildMonadicStrategyDaemon deriv = do
-    env <- ask
+-- Helper function for determining left values in a Map
+isLeft :: Either a b -> Bool
+isLeft (Left _) = True
+isLeft _ = False
 
-    -- Get all direct dependencies
-    let inputs = Set.map inputPath (derivInputs deriv)
+fromLeft :: a -> Either a b -> a
+fromLeft def (Left x) = x
+fromLeft def _ = def
 
-    -- Check if all inputs exist
-    missingDeps <- filterM (\path -> not <$> daemonStorePathExists path) (Set.toList inputs)
-    unless (null missingDeps) $
-        throwError $ BuildFailed $ "Missing dependencies: " <>
-                     T.intercalate ", " (map storeName missingDeps)
-
-    -- Create sandbox config with return-continuation support
-    let config = Sandbox.defaultSandboxConfig {
-        Sandbox.sandboxExtraPaths = Set.fromList ["/usr/bin", "/bin", "/lib", "/usr/lib"],
-        Sandbox.sandboxReturnSupport = True,
-        Sandbox.sandboxPrivileged = False,     -- Always run as unprivileged user
-        Sandbox.sandboxUser = "nobody",        -- Default unprivileged user
-        Sandbox.sandboxGroup = "nogroup",      -- Default unprivileged group
-        Sandbox.sandboxUseMountNamespace = True, -- Use mount namespace for better isolation
-        Sandbox.sandboxUseNetworkNamespace = True -- Isolate network by default
-    }
-
-    -- Build in sandbox
-    result <- buildWithSandboxDaemon deriv config
-
-    -- Check if this build returned a derivation
-    returnDerivExists <- checkIfReturnDerivation result
-
-    if returnDerivExists
-        then do
-            -- Handle return-continuation case
-            innerDrv <- handleReturnedDerivation result
-            -- Track this in the derivation chain
-            Graph.addToDerivationChain innerDrv
-
-            -- Check for potential recursive build limits
-            chain <- gets buildChain
-            maxDepth <- asks maxRecursionDepth
-            when (length chain > maxDepth) $
-                throwError $ RecursionLimit $ "Maximum recursion depth exceeded: " <> T.pack (show maxDepth)
-
-            -- Recursively build the inner derivation (must use monadic strategy)
-            logMsg 1 $ "Building inner derivation returned by " <> derivName deriv
-            buildMonadicStrategyDaemon innerDrv
-        else
-            -- Normal build result
-            return result
-
--- | Build using monadic strategy in builder context
-buildMonadicStrategy :: Derivation -> TenM 'Build 'Builder Core.BuildResult
-buildMonadicStrategy = buildDerivationBuilder sBuilder
-
--- | Check if store path exists (daemon operation)
-daemonStorePathExists :: StorePath -> TenM p 'Daemon Bool
-daemonStorePathExists path = do
-    env <- ask
-    let fullPath = storePathToFilePath path env
-    liftIO $ doesPathExist fullPath
-
--- | Check if store path exists (builder operation via daemon)
-builderStorePathExists :: StorePath -> TenM p 'Builder Bool
-builderStorePathExists path = do
-    daemonConn <- getDaemonConnection
-    verifyRequest <- createStoreVerifyRequest path
-    response <- sendToDaemon daemonConn verifyRequest
-
-    case response of
-        Core.StoreVerifyResponse exists -> return exists
-        Core.ErrorResponse err -> throwError err
-        _ -> throwError $ StoreError "Unexpected response from daemon for store verification"
+getErrorMessage :: BuildError -> Text
+getErrorMessage (BuildFailed msg) = msg
+getErrorMessage (StoreError msg) = msg
+getErrorMessage (SandboxError msg) = msg
+getErrorMessage _ = "Build error"
 
 -- | Build a derivation in a sandbox (daemon operation)
-buildWithSandboxDaemon :: Derivation -> Sandbox.SandboxConfig -> TenM 'Build 'Daemon Core.BuildResult
+buildWithSandboxDaemon :: Derivation -> Sandbox.SandboxConfig -> TenM 'Build 'Daemon BuildResult
 buildWithSandboxDaemon deriv config = do
     -- Get all inputs
     let inputs = Set.map inputPath $ derivInputs deriv
@@ -419,9 +536,9 @@ buildWithSandboxDaemon deriv config = do
             builderDir = buildDir,
             builderEnvVars = buildEnv,
             builderUid = User.userID builderUser,
-            builderUsername = T.pack (User.userName builderUser),
             builderGid = User.groupID builderGroup,
-            builderGroupname = T.pack (User.groupName builderGroup),
+            builderUser = builderUser,
+            builderGroup = builderGroup,
             builderTimeoutSecs = 3600, -- 1 hour default timeout
             builderIsolation = Sandbox.sandboxUseMountNamespace config && Sandbox.sandboxUseNetworkNamespace config,
             builderTempDir = buildDir </> "tmp",
@@ -542,7 +659,7 @@ runBuilder env = do
     let tmpFiles = [(builderTempDir env </> "build.log", Nothing)]
 
     -- Generate a unique identifier for this build
-    buildId <- liftIO $ fmap (fromIntegral) $ randomRIO (100000, 999999 :: Int)
+    buildId <- liftIO $ randomRIO (100000, 999999 :: Int)
 
     -- Start the builder process with proper privilege handling and timeout
     (mPid, result) <- liftIO $ mask $ \restore -> do
@@ -600,8 +717,8 @@ runBuilder env = do
                     -- Drop privileges if needed
                     when needDropPrivs $ do
                         -- Set group first, then user
-                        User.setGroupID (User.groupID (builderGroup env))
-                        User.setUserID (User.userID (builderUser env))
+                        User.setGroupID (builderGid env)
+                        User.setUserID (builderUid env)
 
                     -- Execute the builder
                     executeFile program True (builderArgs env) (Just envList)
@@ -791,7 +908,7 @@ getBuildEnvironment env deriv buildDir = do
             [ ("TEN_STORE", T.pack $ storeLocation env)
             , ("TEN_BUILD_DIR", T.pack buildDir)
             , ("TEN_OUT", T.pack $ buildDir </> "out")
-            , ("TEN_RETURN_PATH", T.pack $ returnDerivationPath buildDir)
+            , ("TEN_RETURN_PATH", T.pack $ Sandbox.returnDerivationPath buildDir)
             , ("PATH", "/bin:/usr/bin:/usr/local/bin") -- Explicit PATH
             , ("HOME", T.pack buildDir) -- Set HOME to build directory
             , ("TMPDIR", T.pack $ buildDir </> "tmp") -- Set TMPDIR to sandbox tmp
@@ -828,33 +945,31 @@ collectBuildResultDaemon deriv buildDir = do
     env <- ask
 
     -- Process each expected output with database connection
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    db <- DB.getDatabaseConn
+
+    -- Process in a transaction for atomicity
+    withWriteTransaction db (logMsg 2) $ do
         -- Process each expected output
         outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
 
         -- Register all input-output references
-        liftIO $ withTransaction db DB.ReadWrite $ \txn -> do
-            -- Get derivation path in the store
-            let derivStorePath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
+        -- Get derivation path in the store
+        let derivStorePath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
 
-            -- Register each output in the database
-            derivInfo <- DB.getDerivationPath txn (derivHash deriv)
-            case derivInfo of
-                Just storedDerivPath -> do
-                    -- Register each output for this derivation
-                    derivId <- DB.storeDerivation txn deriv storedDerivPath
-                    forM_ (Set.toList outputPaths) $ \outputPath -> do
-                        -- 1. Register the derivation as a reference for this output
-                        DB.registerReference txn outputPath storedDerivPath
+        -- Register each output in the database
+        derivId <- DB.storeDerivation deriv derivStorePath
 
-                        -- 2. Register all input references for this output
-                        forM_ (Set.toList $ derivInputs deriv) $ \input -> do
-                            DB.registerReference txn outputPath (inputPath input)
+        forM_ (Set.toList outputPaths) $ \outputPath -> do
+            -- 1. Register the derivation as a reference for this output
+            DB.addDerivationReference outputPath derivStorePath
 
-                        -- 3. Scan the output file for additional references
-                        DB.bulkRegisterReferences txn (storeLocation env) outputPath
+            -- 2. Register all input references for this output
+            forM_ (Set.toList $ derivInputs deriv) $ \input -> do
+                DB.addDerivationReference outputPath (inputPath input)
 
-                Nothing -> return () -- Should never happen if we stored the derivation first
+            -- 3. Scan the output file for additional references
+            refs <- DB.scanFileForStoreReferences $ storePathToFilePath outputPath env
+            DB.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
 
         -- Add output proof
         addProof OutputProof
@@ -894,17 +1009,15 @@ collectBuildResultDaemon deriv buildDir = do
 
                         -- Read the tarball and add it to the store
                         content <- liftIO $ BS.readFile tarballPath
-                        Store.addToStore (outputName output <> ".tar.gz") content
+                        Store.addToStore sDaemon (outputName output <> ".tar.gz") content
                     else do
                         -- For regular files, read directly
                         content <- liftIO $ BS.readFile outputFile'
-                        Store.addToStore (outputName output) content
+                        Store.addToStore sDaemon (outputName output) content
 
                 -- Register this as a valid path in the database
-                liftIO $ dbExecute db
-                    "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time, deriver, is_valid) \
-                    \VALUES (?, ?, strftime('%s','now'), ?, 1)"
-                    (storePathToText outputPath, storeHash outputPath, Just $ derivHash deriv)
+                DB.registerValidPath outputPath (Just derivPath)
+                where derivPath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
 
                 -- Return updated set
                 return $ Set.insert outputPath accPaths
@@ -962,37 +1075,11 @@ verifyBuildResult deriv result = do
                     -- Check if all expected outputs are included in actual outputs
                     let allOutputsPresent = expectedOutputNames `Set.isSubsetOf` actualOutputNames
 
-                    -- Check that each output verifies correctly - verify differently based on context
-                    env <- ask
-                    validOutputs <- case currentPrivilegeTier env of
-                        Daemon -> forM (Set.toList (Core.brOutputPaths result)) verifyStorePathDaemon
-                        Builder -> forM (Set.toList (Core.brOutputPaths result)) verifyStorePathBuilder
+                    -- Check that each output exists in the store
+                    validOutputs <- forM (Set.toList (Core.brOutputPaths result)) storePathExists
 
                     -- Return True if all checks pass
                     return $ allOutputsPresent && and validOutputs
-
--- | Verify a store path in daemon context
-verifyStorePathDaemon :: StorePath -> TenM p 'Daemon Bool
-verifyStorePathDaemon path = do
-    env <- ask
-    let fullPath = storePathToFilePath path env
-    exists <- liftIO $ doesPathExist fullPath
-    if not exists
-        then return False
-        else do
-            -- For a real implementation, we'd verify hash integrity here
-            return True
-
--- | Verify a store path in builder context (via daemon)
-verifyStorePathBuilder :: StorePath -> TenM p 'Builder Bool
-verifyStorePathBuilder path = do
-    daemonConn <- getDaemonConnection
-    verifyRequest <- createStoreVerifyRequest path
-    response <- sendToDaemon daemonConn verifyRequest
-
-    case response of
-        Core.StoreVerifyResponse valid -> return valid
-        _ -> return False
 
 -- | Check if a build result includes a returned derivation
 checkIfReturnDerivation :: Core.BuildResult -> TenM 'Build t Bool
@@ -1045,22 +1132,14 @@ handleReturnedDerivation result = do
             -- Add proof that we successfully got a returned derivation
             addProof RecursionProof
 
-            -- Store the inner derivation in the content store - context appropriate
+            -- Get current environment (Daemon or Builder)
             env <- ask
-            derivPath <- case currentPrivilegeTier env of
-                Daemon -> storeDaemonDerivation innerDrv
-                Builder -> storeBuilderDerivation innerDrv
+            let tier = currentPrivilegeTier env
 
-            -- Register the inner derivation appropriately
-            case currentPrivilegeTier env of
-                Daemon -> do
-                    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                        liftIO $ registerDerivationFile db innerDrv derivPath
-                Builder -> do
-                    daemonConn <- getDaemonConnection
-                    regRequest <- createRegisterDerivationRequest innerDrv derivPath
-                    _ <- sendToDaemon daemonConn regRequest
-                    return ()
+            -- Store the inner derivation in the content store - in appropriate context
+            derivPath <- case tier of
+                Daemon -> storeDerivationDaemon innerDrv
+                Builder -> DB.storeDerivation innerDrv
 
             -- Check for cycles
             chain <- gets buildChain
@@ -1088,7 +1167,7 @@ buildDerivationGraph graph = do
 
     buildAndCollect results drv = do
         -- Build the derivation
-        result <- Ten.Build.buildDerivation drv
+        result <- buildDerivation drv
         -- Add to results
         let drvId = derivHash drv
         return $ Map.insert drvId result results
@@ -1102,7 +1181,7 @@ buildInDependencyOrder derivations = do
         throwError $ CyclicDependency "Cycle detected in build dependencies"
 
     -- Build each derivation in order
-    mapM Ten.Build.buildDerivation derivations
+    mapM buildDerivation derivations
 
 -- | Build dependencies concurrently
 buildDependenciesConcurrently :: [Derivation] -> TenM 'Build 'Daemon (Map String (Either BuildError Core.BuildResult))
@@ -1126,8 +1205,8 @@ buildDependenciesConcurrently derivations = do
         thread <- mask $ \restore -> forkIO $ do
             -- Acquire semaphore
             bracket (Control.Concurrent.waitQSem sem) (\_ -> Control.Concurrent.signalQSem sem) $ \_ -> restore $ do
-                -- Run the build in a separate thread
-                result <- runTenDaemon (buildDerivationDaemon sDaemon drv) env state
+                -- Run the build with daemon privileges
+                result <- runTenDaemon (buildDerivation drv) env state
                 -- Store the result
                 atomically $ modifyTVar resultMap $ \m ->
                     Map.insert hash (either Left (Right . fst) result) m
@@ -1165,9 +1244,13 @@ waitForDependencies depIds = do
   where
     checkDependencies :: Set BuildId -> TenM 'Build t Bool
     checkDependencies deps = do
+        env <- ask
+        let tier = currentPrivilegeTier env
+
         statuses <- forM (Set.toList deps) $ \bid -> do
-            stat <- Client.getBuildStatus bid
-            return $ case stat of
+            -- Use the appropriate instance based on privilege tier
+            status <- getBuildStatus bid
+            return $ case status of
                 BuildCompleted -> True
                 _ -> False
         return $ and statuses
@@ -1184,20 +1267,9 @@ reportBuildProgress buildId progress = do
     logMsg 2 $ "Build progress for " <> T.pack (show buildId) <> ": " <>
                T.pack (show (progress * 100)) <> "%"
 
-    -- Update build status in daemon state if in daemon mode
+    -- Update build status based on context
     env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> do
-            isDaemon <- isDaemonMode
-            when isDaemon $ do
-                -- Update the status and notify any waiting clients
-                updateBuildStatus buildId (BuildRunning progress)
-        Builder -> do
-            -- Notify daemon of progress via protocol
-            daemonConn <- getDaemonConnection
-            progressRequest <- createBuildProgressRequest buildId progress
-            _ <- sendToDaemon daemonConn progressRequest
-            return ()
+    updateBuildStatus buildId (BuildRunning progress)
 
 -- | Report build status
 reportBuildStatus :: BuildId -> BuildStatus -> TenM 'Build t ()
@@ -1208,84 +1280,7 @@ reportBuildStatus buildId status = do
 
     -- Update status based on context
     env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> do
-            -- Update status in daemon state if in daemon mode
-            isDaemon <- isDaemonMode
-            when isDaemon $
-                updateBuildStatus buildId status
-        Builder -> do
-            -- Notify daemon of status via protocol
-            daemonConn <- getDaemonConnection
-            statusRequest <- createBuildStatusRequest buildId status
-            _ <- sendToDaemon daemonConn statusRequest
-            return ()
-
--- | Update build status in daemon state
-updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build 'Daemon ()
-updateBuildStatus buildId status = do
-    -- In a real daemon implementation, this would update a shared TVar
-    -- and notify any clients waiting for status updates
-    env <- ask
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        liftIO $ dbExecute db
-            "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
-            (T.pack (show buildId), T.pack (show status))
-
--- | Get build status from daemon state
-getBuildStatus :: BuildId -> TenM 'Build t BuildStatus
-getBuildStatus buildId = do
-    env <- ask
-    case currentPrivilegeTier env of
-        Daemon -> getBuildStatusDaemon buildId
-        Builder -> getBuildStatusBuilder buildId
-
--- | Get build status in daemon context
-getBuildStatusDaemon :: BuildId -> TenM 'Build 'Daemon BuildStatus
-getBuildStatusDaemon buildId = do
-    env <- ask
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        results <- liftIO $ dbQuery db
-            "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
-            [T.pack (show buildId)] :: TenM 'Build 'Daemon [Only Text]
-
-        case results of
-            [Only statusText] -> case parseStatus statusText of
-                Just status -> return status
-                Nothing -> throwError $ BuildFailed $ "Invalid build status: " <> statusText
-            _ -> throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
-  where
-    parseStatus :: Text -> Maybe BuildStatus
-    parseStatus "BuildPending" = Just BuildPending
-    parseStatus t | "BuildRunning " `T.isPrefixOf` t =
-        case T.stripPrefix "BuildRunning " t of
-            Just progressText ->
-                case readMaybe (T.unpack progressText) of
-                    Just progress -> Just (BuildRunning progress)
-                    Nothing -> Nothing
-            Nothing -> Nothing
-    parseStatus t | "BuildRecursing " `T.isPrefixOf` t =
-        case T.stripPrefix "BuildRecursing " t of
-            Just bidText ->
-                case readMaybe (T.unpack bidText) of
-                    Just bid -> Just (BuildRecursing (BuildIdFromInt bid))
-                    Nothing -> Nothing
-            Nothing -> Nothing
-    parseStatus "BuildCompleted" = Just BuildCompleted
-    parseStatus "BuildFailed'" = Just BuildFailed'
-    parseStatus _ = Nothing
-
--- | Get build status in builder context
-getBuildStatusBuilder :: BuildId -> TenM 'Build 'Builder BuildStatus
-getBuildStatusBuilder buildId = do
-    daemonConn <- getDaemonConnection
-    statusRequest <- createBuildStatusRequest buildId BuildPending  -- Dummy status for request
-    response <- sendToDaemon daemonConn statusRequest
-
-    case response of
-        Core.BuildStatusResponse update -> return (buildStatus update)
-        Core.ErrorResponse err -> throwError err
-        _ -> throwError $ BuildFailed "Unexpected response from daemon for status request"
+    updateBuildStatus buildId status
 
 -- | Get daemon connection (should be available in builder context)
 getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
@@ -1295,60 +1290,8 @@ getDaemonConnection = do
         ClientMode conn -> return conn
         _ -> throwError $ DaemonError "No daemon connection available"
 
--- | Create daemon protocol requests
-createBuildDerivationRequest :: Derivation -> TenM p 'Builder Protocol.DaemonRequest
-createBuildDerivationRequest deriv =
-    return $ Protocol.BuildDerivationRequest deriv defaultBuildRequestInfo
-
-createStoreRequest :: Text -> BS.ByteString -> TenM p 'Builder Protocol.DaemonRequest
-createStoreRequest name content =
-    return $ Protocol.StoreAddRequest name content
-
-createStoreVerifyRequest :: StorePath -> TenM p 'Builder Protocol.DaemonRequest
-createStoreVerifyRequest path =
-    return $ Protocol.StoreVerifyRequest (storePathToText path)
-
-createRegisterDerivationRequest :: Derivation -> StorePath -> TenM p 'Builder Protocol.DaemonRequest
-createRegisterDerivationRequest deriv path =
-    return $ Protocol.StoreDerivationRequest (Core.serializeDerivation deriv) True
-
-createBuildProgressRequest :: BuildId -> Float -> TenM p 'Builder Protocol.DaemonRequest
-createBuildProgressRequest bid progress =
-    return $ Protocol.BuildStatusRequest bid
-
-createBuildStatusRequest :: BuildId -> BuildStatus -> TenM p 'Builder Protocol.DaemonRequest
-createBuildStatusRequest bid status =
-    return $ Protocol.BuildStatusRequest bid
-
--- | Send request to daemon and get response
-sendToDaemon :: DaemonConnection 'Builder -> Protocol.DaemonRequest -> TenM p 'Builder Core.DaemonResponse
-sendToDaemon conn req = do
-    -- Use Client.sendRequestSync to communicate with the daemon
-    let timeoutMicros = 30000000  -- 30 seconds timeout
-    result <- liftIO $ Client.sendRequestSync conn req timeoutMicros
-    case result of
-        Left err -> throwError err
-        Right resp -> return resp
-
--- | Helper function to communicate with daemon
-requestFromDaemon :: DaemonConnection t -> Protocol.DaemonRequest -> IO Core.DaemonResponse
-requestFromDaemon conn req = do
-    -- Use Client.sendRequestSync and handle errors properly
-    result <- Client.sendRequestSync conn req 30000000  -- 30 second timeout
-    case result of
-        Left err -> throwIO err
-        Right resp -> return resp
-
 -- Helper for reading safely
 readMaybe :: Read a => String -> Maybe a
 readMaybe s = case reads s of
     [(x, "")] -> Just x
     _ -> Nothing
-
--- Default build request info
-defaultBuildRequestInfo :: Core.BuildRequestInfo
-defaultBuildRequestInfo = Core.BuildRequestInfo {
-    Core.buildTimeout = Nothing,
-    Core.buildEnv = Map.empty,
-    Core.buildFlags = []
-}

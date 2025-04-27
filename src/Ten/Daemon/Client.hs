@@ -579,7 +579,7 @@ cancelBuild conn buildId = do
                 "Invalid response type for cancel build request: " <> T.pack (show resp)
 
 -- | Get status of a build
-getBuildStatus :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError BuildStatusUpdate)
+getBuildStatus :: DaemonConnection 'Builder -> BuildId -> IO (Either BuildError BuildStatus)
 getBuildStatus conn buildId = do
     -- Create build status request
     let request = Request {
@@ -597,8 +597,8 @@ getBuildStatus conn buildId = do
         Left err ->
             return $ Left err
 
-        Right (BuildStatusResponse status) ->
-            return $ Right status
+        Right (BuildStatusResponse update) ->
+            return $ Right (buildStatus update)
 
         Right resp ->
             return $ Left $ DaemonError $

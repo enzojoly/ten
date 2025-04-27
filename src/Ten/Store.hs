@@ -2,12 +2,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Ten.Store
     ( -- Store path types
@@ -25,41 +29,37 @@ module Ten.Store
     , ReferenceType(..)
     , StorePathReference(..)
 
-    -- Store initialization
+    -- Type classes for store operations with privilege awareness
+    , CanAccessStore(..)
+    , CanModifyStore(..)
+    , CanQueryStore(..)
+    , CanScanStore(..)
+    , CanManageGC(..)
+
+    -- Store initialization (daemon only)
     , initializeStore
     , createStoreDirectories
     , verifyStore
     , ensureStoreDirectories
 
-    -- Store path operations
+    -- Store path operations (available to both)
     , storePathExists
     , verifyStorePath
     , listStorePaths
 
-    -- Daemon-only store operations
+    -- Content operations (available to both through appropriate tier)
     , addToStore
     , storeFile
     , storeDirectory
     , removeFromStore
-
-    -- Store reading (available to both tiers)
     , readFromStore
     , readPathFromStore
 
-    -- Store protocol message types
-    , StoreRequest(..)
-    , StoreOperationResult(..)
-
-    -- Protocol operations (for builder tier)
-    , requestAddToStore
-    , requestReadFromStore
-    , requestVerifyPath
-
-    -- Garbage collection support
+    -- Garbage collection (daemon only)
     , collectGarbage
     , isGCRoot
-    , collectGarbageCandidate
-    , findPathReferences
+    , findGCRoots
+    , registerGCRoot
 
     -- Store reference scanning
     , scanFileForStoreReferences
@@ -114,77 +114,666 @@ import qualified Crypto.Hash as Crypto
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Encode.Pretty as Aeson
 import Data.Singletons
-import Data.Singletons.TH
 import Network.Socket (Socket)
 import qualified Network.Socket as Network
 import Database.SQLite.Simple (Connection, Query(..), Only(..), execute, execute_, query, query_)
 import qualified Database.SQLite.Simple as SQL
 
 import Ten.Core
+import Ten.DB.Core (CanAccessDatabase(..), CanExecuteStatement(..), CanExecuteQuery(..),
+                    withTenTransaction, withTenReadTransaction, withTenWriteTransaction,
+                    Database, TransactionMode(..))
 
--- | Helper functions for DaemonResponse
-isDaemonResponseOk :: DaemonResponse -> Bool
-isDaemonResponseOk (ErrorResponse _) = False
-isDaemonResponseOk _ = True
+-- | Type class for basic store access operations
+-- Available to both privilege tiers through appropriate implementations
+class CanAccessStore (t :: PrivilegeTier) where
+    -- | Read content from a store path
+    readStoreContent :: StorePath -> TenM p t ByteString
 
-getDaemonResponseMessage :: DaemonResponse -> Text
-getDaemonResponseMessage (ErrorResponse err) = buildErrorToText err
-getDaemonResponseMessage SuccessResponse = "Success"
-getDaemonResponseMessage _ = "Unknown response"
+    -- | Check if a store path exists
+    checkStorePathExists :: StorePath -> TenM p t Bool
 
-getPathFromDaemonResponse :: DaemonResponse -> Maybe Text
-getPathFromDaemonResponse (StoreAddResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse (StorePathResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse (DerivationStoredResponse path) = Just $ storePathToText path
-getPathFromDaemonResponse _ = Nothing
+    -- | Verify a store path's integrity
+    verifyStoreIntegrity :: StorePath -> TenM p t Bool
 
-getBytesFromDaemonResponse :: DaemonResponse -> Maybe ByteString
-getBytesFromDaemonResponse (StoreReadResponse content) = Just content
-getBytesFromDaemonResponse _ = Nothing
+-- | Type class for store modification operations
+-- Only available to Daemon tier
+class CanModifyStore (t :: PrivilegeTier) where
+    -- | Add content to the store
+    addContentToStore :: Text -> ByteString -> TenM p t StorePath
 
-getReferencesFromDaemonResponse :: DaemonResponse -> Set StorePath
-getReferencesFromDaemonResponse (DerivationOutputResponse paths) = paths
-getReferencesFromDaemonResponse _ = Set.empty
+    -- | Store a file in the store
+    storeFileToStore :: FilePath -> TenM p t StorePath
 
-getExistsFromDaemonResponse :: DaemonResponse -> Bool
-getExistsFromDaemonResponse (StoreVerifyResponse exists) = exists
-getExistsFromDaemonResponse _ = False
+    -- | Store a directory in the store (as a tarball)
+    storeDirectoryToStore :: FilePath -> TenM p t StorePath
 
--- | Store request message types for protocol communication
-data StoreRequest
-    = StoreAddRequest Text ByteString       -- Name hint and content to store
-    | StoreReadRequest StorePath            -- Request to read from store
-    | StoreVerifyRequest StorePath          -- Request to verify a path exists
-    | StoreListRequest                      -- Request to list store paths
-    | StoreDerivationRequest ByteString     -- Serialized derivation to store
-    | StoreReferenceRequest StorePath       -- Request to get references of a path
-    | StoreGCRequest Bool                   -- Request garbage collection (force flag)
-    deriving (Show, Eq)
+    -- | Remove a path from the store
+    removePathFromStore :: StorePath -> TenM p t ()
 
--- | Store response message types for internal operations
--- These are distinct from the protocol-level responses in Ten.Core
-data StoreOperationResult
-    = StoreAddResult StorePath             -- Path where content was stored
-    | StoreReadResult ByteString           -- Content read from store
-    | StoreVerifyResult Bool               -- Whether path exists and is valid
-    | StoreListResult [StorePath]          -- List of paths in store
-    | StoreDerivationResult StorePath      -- Path where derivation was stored
-    | StoreReferenceResult (Set StorePath) -- Set of references for a path
-    | StoreGCResult Int Int Integer        -- GC stats: collected, remaining, bytes freed
-    | StoreErrorResult Text                -- Error response
-    deriving (Show, Eq)
+-- | Type class for store query operations
+-- Available to both privilege tiers through appropriate implementations
+class CanQueryStore (t :: PrivilegeTier) where
+    -- | List all paths in the store
+    listAllStorePaths :: TenM p t [StorePath]
+
+    -- | Find paths with a specific prefix
+    findPathsWithPrefix_ :: Text -> TenM p t [StorePath]
+
+    -- | Get details about a store path
+    getStorePathInfo :: StorePath -> TenM p t (Maybe StorePath)
+
+-- | Type class for store scanning operations
+-- Available to both privilege tiers through appropriate implementations
+class CanScanStore (t :: PrivilegeTier) where
+    -- | Scan content for references to other store paths
+    scanForReferences_ :: ByteString -> TenM p t (Set StorePath)
+
+    -- | Get references to a path (what refers to this path)
+    getReferencesTo :: StorePath -> TenM p t (Set StorePath)
+
+    -- | Get references from a path (what this path refers to)
+    getReferencesFrom :: StorePath -> TenM p t (Set StorePath)
+
+-- | Type class for garbage collection operations
+-- Only available to Daemon tier
+class CanManageGC (t :: PrivilegeTier) where
+    -- | Collect garbage in the store
+    performGC :: TenM p t (Int, Int, Integer)
+
+    -- | Check if a path is a GC root
+    checkGCRoot :: StorePath -> TenM p t Bool
+
+    -- | Register a path as a GC root
+    registerGCRoot_ :: StorePath -> Text -> Text -> TenM p t ()
+
+    -- | Find all GC roots
+    findAllGCRoots :: TenM p t (Set StorePath)
+
+    -- | Check if a path can be garbage collected
+    canCollectPath :: StorePath -> TenM p t Bool
+
+-- Daemon implementation of CanAccessStore
+instance CanAccessStore 'Daemon where
+    readStoreContent path = do
+        -- Validate the path format to prevent attacks
+        unless (validateStorePath path) $
+            throwError $ StoreError $ "Invalid store path format: " <> storePathToText path
+
+        -- Get the file path
+        env <- ask
+        let filePath = storePathToFilePath path env
+
+        -- Check if it exists
+        exists <- liftIO $ doesFileExist filePath
+        unless exists $
+            throwError $ StoreError $ "Store path does not exist: " <> storePathToText path
+
+        -- Read the content
+        liftIO $ BS.readFile filePath
+
+    checkStorePathExists path = do
+        env <- ask
+        let filePath = storePathToFilePath path env
+        liftIO $ doesFileExist filePath
+
+    verifyStoreIntegrity path = do
+        -- First check if the path exists
+        exists <- checkStorePathExists path
+        if not exists
+            then return False
+            else do
+                -- Read the content and verify the hash
+                content <- readStoreContent path
+                -- Calculate hash of the content
+                let contentHashDigest = hashByteString content
+                let contentHash = T.pack $ show contentHashDigest
+                -- Compare with the expected hash from the path
+                return $ contentHash == storeHash path
+
+-- Builder implementation of CanAccessStore (via protocol)
+instance CanAccessStore 'Builder where
+    readStoreContent path = do
+        -- First try direct read - this works if the file is readable by the builder tier
+        env <- ask
+        let filePath = storePathToFilePath path env
+        fileExists <- liftIO $ doesFileExist filePath
+        if fileExists
+            then do
+                -- Try to read the file directly
+                result <- liftIO $ try $ BS.readFile filePath
+                case result of
+                    Right content -> return content
+                    Left (_ :: IOException) -> do
+                        -- If direct read fails, go through the daemon
+                        requestReadViaProtocol path
+            else do
+                -- File doesn't exist or can't be accessed, request from daemon
+                requestReadViaProtocol path
+
+    checkStorePathExists path = do
+        -- Try direct check first
+        env <- ask
+        let filePath = storePathToFilePath path env
+        directExists <- liftIO $ doesFileExist filePath
+        if directExists
+            then return True
+            else do
+                -- If direct check fails, go through the daemon
+                conn <- getDaemonConnection
+                let req = Request {
+                        reqId = 0,
+                        reqType = "store-verify",
+                        reqParams = Map.singleton "path" (storePathToText path),
+                        reqPayload = Nothing
+                    }
+                response <- liftIO $ sendRequestSync conn req 10000000
+                case response of
+                    Left _ -> return False
+                    Right (StoreVerifyResponse exists) -> return exists
+                    Right _ -> return False
+
+    verifyStoreIntegrity path = do
+        -- Try to verify directly first
+        env <- ask
+        let filePath = storePathToFilePath path env
+        fileExists <- liftIO $ doesFileExist filePath
+        if fileExists
+            then do
+                -- Try to read and verify directly
+                contentResult <- liftIO $ try $ BS.readFile filePath
+                case contentResult of
+                    Right content -> do
+                        let contentHashDigest = hashByteString content
+                        let contentHash = T.pack $ show contentHashDigest
+                        return $ contentHash == storeHash path
+                    Left (_ :: IOException) -> requestVerifyViaProtocol path
+            else requestVerifyViaProtocol path
+
+-- Daemon implementation of CanModifyStore
+instance CanModifyStore 'Daemon where
+    addContentToStore nameHint content = do
+        env <- ask
+        let storeDir = storeLocation env
+
+        -- Calculate hash of content
+        let contentHashDigest = hashByteString content
+        let contentHash = T.pack $ show contentHashDigest
+
+        -- Sanitize name hint
+        let name = sanitizeName nameHint
+
+        -- Create store path
+        let path = StorePath contentHash name
+
+        -- Create full file path
+        let filePath = storePathToFilePath path env
+
+        -- Check if the path already exists
+        exists <- liftIO $ doesFileExist filePath
+        if exists
+            then do
+                -- Verify hash of existing file matches
+                existingContent <- liftIO $ BS.readFile filePath
+                let existingHashDigest = hashByteString existingContent
+                let existingHash = T.pack $ show existingHashDigest
+                if existingHash == contentHash
+                    then do
+                        -- Path exists with correct content, register it
+                        registerValidPath path Nothing
+                        return path
+                    else throwError $ HashError $ "Hash collision in store for: " <> T.pack filePath
+            else do
+                -- Create directory structure if needed
+                liftIO $ createDirectoryIfMissing True (takeDirectory filePath)
+
+                -- Write content to temporary file
+                let tempFile = filePath <> ".tmp"
+                liftIO $ BS.writeFile tempFile content
+
+                -- Set correct permissions (read-only for all, no execute)
+                liftIO $ setFileMode tempFile 0o444
+
+                -- Move to final location atomically
+                liftIO $ renameFile tempFile filePath
+
+                -- Register as valid path in database
+                registerValidPath path Nothing
+
+                -- Return the store path
+                return path
+
+    storeFileToStore filePath = do
+        -- Check if file exists
+        exists <- liftIO $ doesFileExist filePath
+        unless exists $
+            throwError $ InputNotFound filePath
+
+        -- Read file content
+        content <- liftIO $ BS.readFile filePath
+
+        -- Use file name as hint
+        let nameHint = T.pack $ takeFileName filePath
+
+        -- Add to store
+        addContentToStore nameHint content
+
+    storeDirectoryToStore dirPath = do
+        -- Check if directory exists
+        exists <- liftIO $ doesDirectoryExist dirPath
+        unless exists $
+            throwError $ InputNotFound dirPath
+
+        -- Create a temporary tarball
+        env <- ask
+        let tempDir = workDir env </> "tmp"
+        liftIO $ createDirectoryIfMissing True tempDir
+
+        let tarballPath = tempDir </> (takeFileName dirPath ++ ".tar.gz")
+
+        -- Run tar to create the tarball
+        (exitCode, _, stderr) <- liftIO $
+            readCreateProcessWithExitCode
+                (proc "tar" ["-czf", tarballPath, "-C", takeDirectory dirPath, takeFileName dirPath])
+                ""
+
+        case exitCode of
+            ExitSuccess -> do
+                -- Read the tarball content
+                content <- liftIO $ BS.readFile tarballPath
+
+                -- Clean up the temporary tarball
+                liftIO $ removeFile tarballPath
+
+                -- Add to store with directory name + .tar.gz as hint
+                addContentToStore (T.pack $ takeFileName dirPath ++ ".tar.gz") content
+
+            ExitFailure code ->
+                throwError $ StoreError $ "Failed to create tarball: " <> T.pack stderr
+
+    removePathFromStore path = do
+        env <- ask
+        let filePath = storePathToFilePath path env
+
+        -- Check if path exists
+        exists <- liftIO $ doesFileExist filePath
+        unless exists $
+            throwError $ StoreError $ "Path does not exist: " <> storePathToText path
+
+        -- Check if path has any referrers
+        refs <- getReferencesTo path
+        unless (Set.null refs) $
+            throwError $ StoreError $ "Cannot remove path with referrers: " <> storePathToText path
+
+        -- Check if path is a GC root
+        isRoot <- checkGCRoot path
+        when isRoot $
+            throwError $ StoreError $ "Cannot remove GC root: " <> storePathToText path
+
+        -- Remove the path
+        liftIO $ removeFile filePath
+
+        -- Unregister from valid paths
+        unregisterValidPath path
+
+-- Daemon implementation of CanQueryStore
+instance CanQueryStore 'Daemon where
+    listAllStorePaths = do
+        -- Get store directory
+        env <- ask
+        let storeDir = storeLocation env
+
+        -- Check if directory exists
+        exists <- liftIO $ doesDirectoryExist storeDir
+        if not exists
+            then return []
+            else do
+                -- Try to get paths from database first (more reliable)
+                dbPaths <- getStorePathsFromDB
+
+                if null dbPaths
+                    then do
+                        -- Fall back to filesystem scan if database is empty
+                        entries <- liftIO $ listDirectory storeDir
+
+                        -- Filter and parse valid store paths
+                        let paths = catMaybes $ map (parseStorePath . T.pack) $
+                                    filter (\e -> not $ e `elem` ["gc-roots", "tmp", "var", "locks"]) entries
+
+                        -- Register any found paths in the database
+                        forM_ paths $ \path -> registerValidPath path Nothing
+
+                        return paths
+                    else return dbPaths
+
+    findPathsWithPrefix_ prefix = do
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
+
+        db <- getDatabaseConn
+        -- Query for paths with prefix
+        rows <- tenQuery db
+            "SELECT path FROM ValidPaths WHERE name LIKE ? || '%' AND is_valid = 1"
+            (Only prefix) :: TenM p 'Daemon [Only Text]
+
+        -- Convert to StorePath objects
+        return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
+
+    getStorePathInfo path = do
+        exists <- checkStorePathExists path
+        if exists
+            then return $ Just path
+            else return Nothing
+
+-- Builder implementation of CanQueryStore (via protocol)
+instance CanQueryStore 'Builder where
+    listAllStorePaths = do
+        conn <- getDaemonConnection
+        let req = Request {
+                reqId = 0,
+                reqType = "store-list",
+                reqParams = Map.empty,
+                reqPayload = Nothing
+            }
+        response <- liftIO $ sendRequestSync conn req 60000000
+        case response of
+            Left _ -> return []
+            Right (StoreListResponse paths) -> return paths
+            Right _ -> return []
+
+    findPathsWithPrefix_ prefix = do
+        conn <- getDaemonConnection
+        let req = Request {
+                reqId = 0,
+                reqType = "find-paths-with-prefix",
+                reqParams = Map.singleton "prefix" prefix,
+                reqPayload = Nothing
+            }
+        response <- liftIO $ sendRequestSync conn req 30000000
+        case response of
+            Left _ -> return []
+            Right (StoreListResponse paths) -> return paths
+            Right _ -> return []
+
+    getStorePathInfo path = do
+        exists <- checkStorePathExists path
+        if exists
+            then return $ Just path
+            else return Nothing
+
+-- Daemon implementation of CanScanStore
+instance CanScanStore 'Daemon where
+    scanForReferences_ content = do
+        env <- ask
+        let storeDir = storeLocation env
+
+        -- Convert to text for easier scanning
+        let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
+
+        -- Find potential store paths
+        let paths = findStorePaths contentText storeDir
+
+        -- Verify each path exists
+        foldM (\acc path -> do
+            exists <- checkStorePathExists path
+            if exists
+                then return $ Set.insert path acc
+                else return acc
+            ) Set.empty paths
+
+    getReferencesTo path = do
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
+
+        db <- getDatabaseConn
+        -- Query for referrers
+        rows <- tenQuery db
+            "SELECT referrer FROM References WHERE reference = ?"
+            (Only (storePathToText path))
+
+        -- Convert to StorePath objects
+        let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
+        return $ Set.fromList paths
+
+    getReferencesFrom path = do
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
+
+        -- First try to get references from database (faster)
+        db <- getDatabaseConn
+        rows <- tenQuery db
+            "SELECT reference FROM References WHERE referrer = ?"
+            (Only (storePathToText path))
+
+        let dbRefs = Set.fromList $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
+
+        if not (Set.null dbRefs)
+            then return dbRefs
+            else do
+                -- Fall back to file scanning if database has no entries
+                let filePath = storePathToFilePath path env
+
+                -- Check file existence
+                exists <- liftIO $ doesFileExist filePath
+                if not exists
+                    then return Set.empty
+                    else do
+                        -- Read file content
+                        content <- liftIO $ BS.readFile filePath
+
+                        -- Scan for references
+                        refs <- scanForReferences_ content
+
+                        -- Register references in database for future use
+                        forM_ (Set.toList refs) $ \refPath ->
+                            registerReference path refPath
+
+                        return refs
+
+-- Builder implementation of CanScanStore (via protocol)
+instance CanScanStore 'Builder where
+    scanForReferences_ content = do
+        env <- ask
+        let storeDir = storeLocation env
+
+        -- Try to scan locally first
+        let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
+        let potentialPaths = findStorePaths contentText storeDir
+
+        -- Verify each path exists through daemon
+        foldM (\acc path -> do
+            exists <- checkStorePathExists path
+            if exists
+                then return $ Set.insert path acc
+                else return acc
+            ) Set.empty potentialPaths
+
+    getReferencesTo path = do
+        conn <- getDaemonConnection
+        let req = Request {
+                reqId = 0,
+                reqType = "store-referrers",
+                reqParams = Map.singleton "path" (storePathToText path),
+                reqPayload = Nothing
+            }
+        response <- liftIO $ sendRequestSync conn req 30000000
+        case response of
+            Left _ -> return Set.empty
+            Right (DerivationOutputResponse paths) -> return paths
+            Right _ -> return Set.empty
+
+    getReferencesFrom path = do
+        conn <- getDaemonConnection
+        let req = Request {
+                reqId = 0,
+                reqType = "store-references",
+                reqParams = Map.singleton "path" (storePathToText path),
+                reqPayload = Nothing
+            }
+        response <- liftIO $ sendRequestSync conn req 30000000
+        case response of
+            Left _ -> return Set.empty
+            Right (DerivationOutputResponse paths) -> return paths
+            Right _ -> return Set.empty
+
+-- Daemon implementation of CanManageGC
+instance CanManageGC 'Daemon where
+    performGC = do
+        env <- ask
+        let storeDir = storeLocation env
+
+        -- Find all store paths
+        allPaths <- listAllStorePaths
+
+        -- Find all roots
+        rootPaths <- findAllGCRoots
+
+        -- Find reachable paths
+        reachable <- computeReachablePaths rootPaths
+
+        -- Determine unreachable paths
+        let unreachable = filter (\p -> not $ p `Set.member` reachable) allPaths
+
+        -- Get size of unreachable paths
+        sizes <- forM unreachable $ \path -> do
+            let fullPath = storePathToFilePath path env
+            fileExists <- liftIO $ doesFileExist fullPath
+            if fileExists
+                then do
+                    stat <- liftIO $ getFileStatus fullPath
+                    return $ fromIntegral $ fileSize stat
+                else return 0
+
+        let totalSize = sum sizes
+
+        -- Delete unreachable paths
+        forM_ unreachable $ \path -> do
+            -- Skip if the path is a GC root
+            isRoot <- checkGCRoot path
+            unless isRoot $ do
+                -- Remove from store if no referrers
+                let fullPath = storePathToFilePath path env
+                liftIO $ removeFile fullPath `catch` \(_ :: IOException) -> return ()
+                -- Unregister from database
+                unregisterValidPath path
+
+        -- Return stats: collected, remaining, bytes freed
+        return (length unreachable, length allPaths - length unreachable, totalSize)
+
+    checkGCRoot path = do
+        env <- ask
+        let storeDir = storeLocation env
+        let rootsDir = storeDir </> "gc-roots"
+
+        -- Check database first
+        isDbRoot <- isGCRootInDB path
+
+        if isDbRoot
+            then return True
+            else do
+                -- If not in database, check filesystem
+                -- List all roots
+                roots <- liftIO $ listDirectory rootsDir `catch` \(_ :: IOException) -> return []
+
+                -- Check if any root links to this path
+                isFileRoot <- liftIO $ foldM (\found root -> do
+                    if found
+                        then return True
+                        else do
+                            -- Check if this root points to our path
+                            let rootPath = rootsDir </> root
+                            linkStatus <- try $ getFileStatus rootPath
+                            let isLink = case linkStatus of
+                                          Right stat -> isSymbolicLink stat
+                                          Left (_ :: SomeException) -> False
+                            if isLink
+                                then do
+                                    target <- readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
+                                    let targetPath = storePathToFilePath path env
+                                    return $ targetPath == target
+                                else return False
+                    ) False roots
+
+                -- If found in filesystem but not in DB, register it
+                when (isFileRoot && not isDbRoot) $
+                    registerGCRoot_ path (T.pack "filesystem-found") "symlink"
+
+                return isFileRoot
+
+    registerGCRoot_ path name rootType = do
+        env <- ask
+        let dbPath = defaultDBPath (storeLocation env)
+
+        db <- getDatabaseConn
+        -- Insert or update root
+        tenExecute db
+            "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
+            (storePathToText path, name, rootType)
+
+    findAllGCRoots = do
+        env <- ask
+        let storeDir = storeLocation env
+        let rootsDir = storeDir </> "gc-roots"
+
+        -- Get roots from database
+        dbRoots <- getGCRootsFromDB
+
+        -- Check if roots directory exists
+        exists <- liftIO $ doesDirectoryExist rootsDir
+        if not exists
+            then return dbRoots
+            else do
+                -- List all files in the roots directory
+                files <- liftIO $ listDirectory rootsDir
+
+                -- Process each file that is a symlink
+                fsRoots <- liftIO $ foldM (\acc file -> do
+                    let path = rootsDir </> file
+                    -- Check if it's a symlink
+                    linkStatus <- try $ getFileStatus path
+                    let isLink = case linkStatus of
+                                  Right stat -> isSymbolicLink stat
+                                  Left (_ :: SomeException) -> False
+                    if isLink
+                        then do
+                            -- Read the target
+                            targetE <- try $ readSymbolicLink path
+                            case targetE of
+                                Left (_ :: IOException) -> return acc
+                                Right targetPath -> do
+                                    -- Convert to store path
+                                    case filePathToStorePath targetPath of
+                                        Just sp -> return $ Set.insert sp acc
+                                        Nothing -> return acc
+                        else return acc
+                    ) Set.empty files
+
+                -- Combine both sets of roots
+                return $ Set.union dbRoots fsRoots
+
+    canCollectPath path = do
+        -- Check if path is a GC root
+        isRoot <- checkGCRoot path
+        if isRoot
+            then return False
+            else do
+                -- Check if path has any referrers
+                refs <- getReferencesTo path
+                return $ Set.null refs
+
+-- Public API functions that use the type classes
 
 -- | Initialize the content-addressable store
 -- Requires daemon privileges
-initializeStore :: SPrivilegeTier 'Daemon -> FilePath -> TenM p 'Daemon ()
-initializeStore _ storeDir = do
+initializeStore :: FilePath -> TenM p 'Daemon ()
+initializeStore storeDir = do
     -- Create the basic store structure
     liftIO $ createDirectoryIfMissing True storeDir
     liftIO $ createDirectoryIfMissing True (storeDir </> "gc-roots")
     liftIO $ createDirectoryIfMissing True (storeDir </> "var/ten")
 
     -- Create lock directory for GC
-    storeEnv <- ask  -- Get BuildEnv, not FilePath
+    storeEnv <- ask
     liftIO $ createDirectoryIfMissing True (takeDirectory $ getGCLockPath storeEnv)
 
     -- Set appropriate permissions
@@ -199,6 +788,54 @@ initializeStore _ storeDir = do
 
     -- Verify the store
     verifyStore storeDir
+
+-- | Create store directories with proper permissions
+-- Requires daemon privileges
+createStoreDirectories :: FilePath -> TenM p 'Daemon ()
+createStoreDirectories storeDir = do
+    -- Core directories needed for store operation
+    let coreDirs = [
+            storeDir,
+            storeDir </> "gc-roots",
+            storeDir </> "var",
+            storeDir </> "var/ten",
+            storeDir </> "var/ten/db",
+            storeDir </> "tmp"
+            ]
+
+    -- Create each directory with proper permissions
+    forM_ coreDirs $ \dir -> liftIO $ do
+        createDirectoryIfMissing True dir
+        setFileMode dir 0o755
+
+-- | Ensure all store directories exist
+-- Requires daemon privileges
+ensureStoreDirectories :: FilePath -> TenM p 'Daemon ()
+ensureStoreDirectories = createStoreDirectories
+
+-- | Verify the store structure and permissions
+-- Requires daemon privileges
+verifyStore :: FilePath -> TenM p 'Daemon ()
+verifyStore storeDir = do
+    -- Check if store directory exists
+    storeExists <- liftIO $ doesDirectoryExist storeDir
+    unless storeExists $
+        throwError $ StoreError $ "Store directory does not exist: " <> T.pack storeDir
+
+    -- Check permissions on store directory
+    perms <- liftIO $ getPermissions storeDir
+    unless (readable perms && executable perms) $
+        throwError $ StoreError $ "Store directory has incorrect permissions: " <> T.pack storeDir
+
+    -- Verify database exists and is accessible
+    let dbPath = defaultDBPath storeDir
+    dbExists <- liftIO $ doesFileExist dbPath
+    unless dbExists $ do
+        logMsg 1 $ "Store database doesn't exist, creating at: " <> T.pack dbPath
+        initializeDatabase dbPath
+
+    -- Log successful verification
+    logMsg 1 $ "Store verified: " <> T.pack storeDir
 
 -- | Initialize the store database
 initializeDatabase :: FilePath -> TenM p 'Daemon ()
@@ -247,491 +884,22 @@ initializeDatabase dbPath = do
         -- Close connection
         SQL.close conn
 
--- | Create store directories with proper permissions
--- Requires daemon privileges
-createStoreDirectories :: SPrivilegeTier 'Daemon -> FilePath -> TenM p 'Daemon ()
-createStoreDirectories _ storeDir = do
-    -- Core directories needed for store operation
-    let coreDirs = [
-            storeDir,
-            storeDir </> "gc-roots",
-            storeDir </> "var",
-            storeDir </> "var/ten",
-            storeDir </> "var/ten/db",
-            storeDir </> "tmp"
-            ]
-
-    -- Create each directory with proper permissions
-    forM_ coreDirs $ \dir -> liftIO $ do
-        createDirectoryIfMissing True dir
-        setFileMode dir 0o755
-
--- | Ensure all store directories exist
--- Requires daemon privileges
-ensureStoreDirectories :: SPrivilegeTier 'Daemon -> FilePath -> TenM p 'Daemon ()
-ensureStoreDirectories st = createStoreDirectories st
-
--- | Verify the store structure and permissions
--- Requires daemon privileges
-verifyStore :: FilePath -> TenM p 'Daemon ()
-verifyStore storeDir = do
-    -- Check if store directory exists
-    storeExists <- liftIO $ doesDirectoryExist storeDir
-    unless storeExists $
-        throwError $ StoreError $ "Store directory does not exist: " <> T.pack storeDir
-
-    -- Check permissions on store directory
-    perms <- liftIO $ getPermissions storeDir
-    unless (readable perms && executable perms) $
-        throwError $ StoreError $ "Store directory has incorrect permissions: " <> T.pack storeDir
-
-    -- Verify database exists and is accessible
-    let dbPath = defaultDBPath storeDir
-    dbExists <- liftIO $ doesFileExist dbPath
-    unless dbExists $ do
-        logMsg 1 $ "Store database doesn't exist, creating at: " <> T.pack dbPath
-        initializeDatabase dbPath
-
-    -- Log successful verification
-    logMsg 1 $ "Store verified: " <> T.pack storeDir
-
--- | Add content to the store with a name hint
--- This is a daemon-only operation
-addToStore :: SPrivilegeTier 'Daemon -> Text -> ByteString -> TenM p 'Daemon StorePath
-addToStore _ nameHint content = do
-    env <- ask
-    let storeDir = storeLocation env
-
-    -- Calculate hash of content
-    let contentHashDigest = hashByteString content
-    let contentHash = T.pack $ show contentHashDigest
-
-    -- Sanitize name hint (remove special characters, etc.)
-    let name = sanitizeName nameHint
-
-    -- Create store path
-    let path = StorePath contentHash name
-
-    -- Create full file path
-    let filePath = storePathToFilePath path env
-
-    -- Check if the path already exists
-    exists <- liftIO $ doesFileExist filePath
-    if exists
-        then do
-            -- Verify hash of existing file matches
-            existingContent <- liftIO $ BS.readFile filePath
-            let existingHashDigest = hashByteString existingContent
-            let existingHash = T.pack $ show existingHashDigest
-            if existingHash == contentHash
-                then do
-                    -- Path exists with correct content, register it if not already
-                    registerValidPath path Nothing
-                    return path
-                else throwError $ HashError $ "Hash collision in store for: " <> T.pack filePath
-        else do
-            -- Create directory structure if needed
-            liftIO $ createDirectoryIfMissing True (takeDirectory filePath)
-
-            -- Write content to temporary file
-            let tempFile = filePath <> ".tmp"
-            liftIO $ BS.writeFile tempFile content
-
-            -- Set correct permissions (read-only for all, no execute)
-            liftIO $ setFileMode tempFile 0o444
-
-            -- Move to final location atomically
-            liftIO $ renameFile tempFile filePath
-
-            -- Register as valid path in database
-            registerValidPath path Nothing
-
-            -- Return the store path
-            return path
-
--- | Store a file in the content-addressable store
--- This is a daemon-only operation
-storeFile :: SPrivilegeTier 'Daemon -> FilePath -> TenM p 'Daemon StorePath
-storeFile st filePath = do
-    -- Check if file exists
-    exists <- liftIO $ doesFileExist filePath
-    unless exists $
-        throwError $ InputNotFound filePath
-
-    -- Read file content
-    content <- liftIO $ BS.readFile filePath
-
-    -- Use file name as hint
-    let nameHint = T.pack $ takeFileName filePath
-
-    -- Add to store
-    addToStore st nameHint content
-
--- | Store a directory in the content-addressable store (as a tarball)
--- This is a daemon-only operation
-storeDirectory :: SPrivilegeTier 'Daemon -> FilePath -> TenM p 'Daemon StorePath
-storeDirectory st dirPath = do
-    -- Check if directory exists
-    exists <- liftIO $ doesDirectoryExist dirPath
-    unless exists $
-        throwError $ InputNotFound dirPath
-
-    -- Create a temporary tarball
-    env <- ask
-    let tempDir = workDir env </> "tmp"
-    liftIO $ createDirectoryIfMissing True tempDir
-
-    let tarballPath = tempDir </> (takeFileName dirPath ++ ".tar.gz")
-
-    -- Run tar to create the tarball
-    (exitCode, _, stderr) <- liftIO $
-        readCreateProcessWithExitCode
-            (proc "tar" ["-czf", tarballPath, "-C", takeDirectory dirPath, takeFileName dirPath])
-            ""
-
-    case exitCode of
-        ExitSuccess -> do
-            -- Read the tarball content
-            content <- liftIO $ BS.readFile tarballPath
-
-            -- Clean up the temporary tarball
-            liftIO $ removeFile tarballPath
-
-            -- Add to store with directory name + .tar.gz as hint
-            addToStore st (T.pack $ takeFileName dirPath ++ ".tar.gz") content
-
-        ExitFailure code ->
-            throwError $ StoreError $ "Failed to create tarball: " <> T.pack stderr
-
--- | Check if a path exists in the store
--- Available in both daemon and builder tiers
-storePathExists :: StorePath -> TenM p t Bool
-storePathExists path = do
-    env <- ask
-    let filePath = storePathToFilePath path env
-    liftIO $ doesFileExist filePath
-
--- | Verify that a store path exists and has the correct content hash
--- Available in both daemon and builder tiers
-verifyStorePath :: StorePath -> TenM p t Bool
-verifyStorePath path = do
-    -- First check if the path exists
-    exists <- storePathExists path
-
-    if not exists
-        then return False
-        else do
-            -- Read the content and verify the hash
-            content <- readFromStore path
-
-            -- Calculate hash of the content
-            let contentHashDigest = hashByteString content
-            let contentHash = T.pack $ show contentHashDigest
-
-            -- Compare with the expected hash from the path
-            return $ contentHash == storeHash path
-
--- | List all paths in the store
--- This is a daemon-only operation
-listStorePaths :: SPrivilegeTier 'Daemon -> TenM p 'Daemon [StorePath]
-listStorePaths _ = do
-    -- Get store directory
-    env <- ask
-    let storeDir = storeLocation env
-
-    -- Check if directory exists
-    exists <- liftIO $ doesDirectoryExist storeDir
-    if not exists
-        then return []
-        else do
-            -- Try to get paths from database first (more reliable)
-            dbPaths <- getStorePathsFromDB
-
-            if null dbPaths
-                then do
-                    -- Fall back to filesystem scan if database is empty
-                    -- List all entries in store directory
-                    entries <- liftIO $ listDirectory storeDir
-
-                    -- Filter and parse valid store paths
-                    let paths = catMaybes $ map (parseStorePath . T.pack) $
-                                filter (\e -> not $ e `elem` ["gc-roots", "tmp", "var", "locks"]) entries
-
-                    -- Register any found paths in the database
-                    forM_ paths $ \path -> registerValidPath path Nothing
-
-                    return paths
-                else return dbPaths
-
--- | Get paths from database
-getStorePathsFromDB :: TenM p 'Daemon [StorePath]
-getStorePathsFromDB = do
-    env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
-
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
-    -- Query valid paths
-    rows <- liftIO $ SQL.query_ conn "SELECT path FROM ValidPaths WHERE is_valid = 1" :: TenM p 'Daemon [Only Text]
-
-    -- Close connection
-    liftIO $ SQL.close conn
-
-    -- Convert to StorePath objects
-    return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
-
--- | Remove a path from the store
--- This is a daemon-only operation
-removeFromStore :: SPrivilegeTier 'Daemon -> StorePath -> TenM p 'Daemon ()
-removeFromStore _ path = do
-    env <- ask
-    let filePath = storePathToFilePath path env
-
-    -- Check if path exists
-    exists <- liftIO $ doesFileExist filePath
-    unless exists $
-        throwError $ StoreError $ "Path does not exist: " <> storePathToText path
-
-    -- Check if path has any referrers
-    refs <- getReferencesToPath path
-    unless (Set.null refs) $
-        throwError $ StoreError $ "Cannot remove path with referrers: " <> storePathToText path
-
-    -- Check if path is a GC root
-    isRoot <- isGCRoot sDaemon path
-    when isRoot $
-        throwError $ StoreError $ "Cannot remove GC root: " <> storePathToText path
-
-    -- Remove the path
-    liftIO $ removeFile filePath
-
-    -- Unregister from valid paths
-    unregisterValidPath path
-
--- | Read content from a store path
--- Available in both daemon and builder tiers
-readFromStore :: StorePath -> TenM p t ByteString
-readFromStore path = do
-    -- Validate the path format to prevent attacks
-    unless (validateStorePath path) $
-        throwError $ StoreError $ "Invalid store path format: " <> storePathToText path
-
-    -- Get the file path
-    env <- ask
-    let filePath = storePathToFilePath path env
-
-    -- Check if it exists
-    exists <- liftIO $ doesFileExist filePath
-    unless exists $
-        throwError $ StoreError $ "Store path does not exist: " <> storePathToText path
-
-    -- Read the content
-    liftIO $ BS.readFile filePath
-
--- | Read a file path from the store, making sure it's within the store boundaries
--- Available in both daemon and builder tiers
-readPathFromStore :: FilePath -> TenM p t ByteString
-readPathFromStore filePath = do
-    -- Convert to store path for validation
-    env <- ask
-    case filePathToStorePath filePath of
-        Just path -> readFromStore path
-        Nothing ->
-            -- Additional security check - make sure the path is within the store
-            if isStoreSubPath (storeLocation env) filePath
-                then liftIO $ BS.readFile filePath
-                else throwError $ StoreError $ "Path is outside the store: " <> T.pack filePath
-
--- Helper to check if a path is within the store
-isStoreSubPath :: FilePath -> FilePath -> Bool
-isStoreSubPath storeDir path =
-    let normalStore = normalise storeDir
-        normalPath = normalise path
-    in normalStore `isPrefixOf` normalPath
-
--- | Check if a path is a GC root
--- This is a daemon-only operation
-isGCRoot :: SPrivilegeTier 'Daemon -> StorePath -> TenM p 'Daemon Bool
-isGCRoot _ path = do
-    env <- ask
-    let storeDir = storeLocation env
-    let rootsDir = storeDir </> "gc-roots"
-
-    -- Check database first
-    isDbRoot <- isGCRootInDB path
-
-    if isDbRoot
-        then return True
-        else do
-            -- If not in database, check filesystem
-            -- List all roots
-            roots <- liftIO $ listDirectory rootsDir `catch` \(_ :: IOException) -> return []
-
-            -- Check if any root links to this path
-            isFileRoot <- liftIO $ foldM (\found root -> do
-                if found
-                    then return True
-                    else do
-                        -- Check if this root points to our path
-                        let rootPath = rootsDir </> root
-                        linkStatus <- try $ getFileStatus rootPath
-                        let isLink = case linkStatus of
-                                      Right stat -> isSymbolicLink stat
-                                      Left (_ :: SomeException) -> False
-                        if isLink
-                            then do
-                                target <- readSymbolicLink rootPath `catch` \(_ :: IOException) -> return ""
-                                let targetPath = storePathToFilePath path env
-                                return $ targetPath == target
-                            else return False
-                ) False roots
-
-            -- If found in filesystem but not in DB, register it
-            when (isFileRoot && not isDbRoot) $
-                registerGCRoot path (T.pack "filesystem-found") "symlink"
-
-            return isFileRoot
-
 -- | Check if a path is a GC root in the database
 isGCRootInDB :: StorePath -> TenM p 'Daemon Bool
 isGCRootInDB path = do
     env <- ask
     let dbPath = defaultDBPath (storeLocation env)
 
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
+    db <- getDatabaseConn
     -- Query for roots
-    rows <- liftIO $ SQL.query conn
+    rows <- tenQuery db
         "SELECT COUNT(*) FROM GCRoots WHERE path = ? AND active = 1"
         (Only (storePathToText path)) :: TenM p 'Daemon [Only Int]
-
-    -- Close connection
-    liftIO $ SQL.close conn
 
     -- Check if count > 0
     case rows of
         [Only count] -> return (count > 0)
         _ -> return False
-
--- | Register a GC root in the database
-registerGCRoot :: StorePath -> Text -> Text -> TenM p 'Daemon ()
-registerGCRoot path name rootType = do
-    env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
-
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
-    -- Insert or update root
-    liftIO $ SQL.execute conn
-        "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, ?, strftime('%s','now'), 1)"
-        (storePathToText path, name, rootType)
-
-    -- Close connection
-    liftIO $ SQL.close conn
-
--- | Collect garbage candidate check
--- This is a daemon-only operation
-collectGarbageCandidate :: SPrivilegeTier 'Daemon -> StorePath -> TenM p 'Daemon Bool
-collectGarbageCandidate st path = do
-    -- Check if path is a GC root
-    isRoot <- isGCRoot st path
-    if isRoot
-        then return False
-        else do
-            -- Check if path has any referrers
-            refs <- getReferencesToPath path
-            return $ Set.null refs
-
--- | Garbage collection
--- This is a daemon-only operation
-collectGarbage :: SPrivilegeTier 'Daemon -> TenM p 'Daemon (Int, Int, Integer)
-collectGarbage st = do
-    env <- ask
-    let storeDir = storeLocation env
-
-    -- Find all store paths
-    allPaths <- listStorePaths st
-
-    -- Find all roots
-    rootPaths <- findGCRoots st
-
-    -- Find reachable paths
-    reachable <- computeReachablePaths st rootPaths
-
-    -- Determine unreachable paths
-    let unreachable = filter (\p -> not $ p `Set.member` reachable) allPaths
-
-    -- Get size of unreachable paths
-    sizes <- forM unreachable $ \path -> do
-        let fullPath = storePathToFilePath path env
-        fileExists <- liftIO $ doesFileExist fullPath
-        if fileExists
-            then do
-                stat <- liftIO $ getFileStatus fullPath
-                return $ fromIntegral $ fileSize stat
-            else return 0
-
-    let totalSize = sum sizes
-
-    -- Delete unreachable paths
-    forM_ unreachable $ \path -> do
-        -- Skip if the path is a GC root
-        isRoot <- isGCRoot st path
-        unless isRoot $ do
-            -- Remove from store if no referrers
-            let fullPath = storePathToFilePath path env
-            liftIO $ removeFile fullPath `catch` \(_ :: IOException) -> return ()
-            -- Unregister from database
-            unregisterValidPath path
-
-    -- Return stats: collected, remaining, bytes freed
-    return (length unreachable, length allPaths - length unreachable, totalSize)
-
--- | Find all GC roots
-findGCRoots :: SPrivilegeTier 'Daemon -> TenM p 'Daemon (Set StorePath)
-findGCRoots _ = do
-    env <- ask
-    let storeDir = storeLocation env
-    let rootsDir = storeDir </> "gc-roots"
-
-    -- Get roots from database
-    dbRoots <- getGCRootsFromDB
-
-    -- Check if roots directory exists
-    exists <- liftIO $ doesDirectoryExist rootsDir
-    if not exists
-        then return dbRoots
-        else do
-            -- List all files in the roots directory
-            files <- liftIO $ listDirectory rootsDir
-
-            -- Process each file that is a symlink
-            fsRoots <- liftIO $ foldM (\acc file -> do
-                let path = rootsDir </> file
-                -- Check if it's a symlink
-                linkStatus <- try $ getFileStatus path
-                let isLink = case linkStatus of
-                              Right stat -> isSymbolicLink stat
-                              Left (_ :: SomeException) -> False
-                if isLink
-                    then do
-                        -- Read the target
-                        targetE <- try $ readSymbolicLink path
-                        case targetE of
-                            Left (_ :: IOException) -> return acc
-                            Right targetPath -> do
-                                -- Convert to store path
-                                case filePathToStorePath targetPath of
-                                    Just sp -> return $ Set.insert sp acc
-                                    Nothing -> return acc
-                    else return acc
-                ) Set.empty files
-
-            -- Combine both sets of roots
-            return $ Set.union dbRoots fsRoots
 
 -- | Get GC roots from database
 getGCRootsFromDB :: TenM p 'Daemon (Set StorePath)
@@ -739,87 +907,29 @@ getGCRootsFromDB = do
     env <- ask
     let dbPath = defaultDBPath (storeLocation env)
 
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
+    db <- getDatabaseConn
     -- Query for roots
-    rows <- liftIO $ SQL.query_ conn
+    rows <- tenQuery db
         "SELECT path FROM GCRoots WHERE active = 1" :: TenM p 'Daemon [Only Text]
-
-    -- Close connection
-    liftIO $ SQL.close conn
 
     -- Convert to StorePath objects
     let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
     return $ Set.fromList paths
 
 -- | Compute all paths reachable from a set of roots
-computeReachablePaths :: SPrivilegeTier 'Daemon -> Set StorePath -> TenM p 'Daemon (Set StorePath)
-computeReachablePaths st roots = do
+computeReachablePaths :: Set StorePath -> TenM p 'Daemon (Set StorePath)
+computeReachablePaths roots = do
     -- Include the roots themselves
     let reachable = roots
 
     -- For each root, add its references recursively
     foldM (\reached root -> do
-        refs <- findPathReferences st root
+        refs <- getReferencesFrom root
         let newReached = Set.union reached (Set.insert root refs)
         if Set.size newReached > Set.size reached
-            then computeReachablePaths st newReached  -- Continue if we found new paths
-            else return newReached                    -- Stop if no new paths found
+            then computeReachablePaths newReached  -- Continue if we found new paths
+            else return newReached                 -- Stop if no new paths found
         ) reachable (Set.toList roots)
-
--- | Find all references in a path
--- This is a daemon-only operation
-findPathReferences :: SPrivilegeTier 'Daemon -> StorePath -> TenM p 'Daemon (Set StorePath)
-findPathReferences _ path = do
-    env <- ask
-
-    -- First try to get references from database (faster)
-    dbRefs <- getReferencesFromDB path
-
-    if not (Set.null dbRefs)
-        then return dbRefs
-        else do
-            -- Fall back to file scanning if database has no entries
-            let filePath = storePathToFilePath path env
-
-            -- Check file existence
-            exists <- liftIO $ doesFileExist filePath
-            if not exists
-                then return Set.empty
-                else do
-                    -- Read file content
-                    content <- liftIO $ BS.readFile filePath
-
-                    -- Scan for references
-                    refs <- scanForReferences content
-
-                    -- Register references in database for future use
-                    forM_ (Set.toList refs) $ \refPath ->
-                        registerReference path refPath
-
-                    return refs
-
--- | Get references from database
-getReferencesFromDB :: StorePath -> TenM p 'Daemon (Set StorePath)
-getReferencesFromDB path = do
-    env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
-
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
-    -- Query for references
-    rows <- liftIO $ SQL.query conn
-        "SELECT reference FROM References WHERE referrer = ?"
-        (Only (storePathToText path)) :: TenM p 'Daemon [Only Text]
-
-    -- Close connection
-    liftIO $ SQL.close conn
-
-    -- Convert to StorePath objects
-    let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
-    return $ Set.fromList paths
 
 -- | Register a reference between paths
 registerReference :: StorePath -> StorePath -> TenM p 'Daemon ()
@@ -827,37 +937,152 @@ registerReference referrer reference = do
     env <- ask
     let dbPath = defaultDBPath (storeLocation env)
 
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
+    db <- getDatabaseConn
     -- Insert reference (ignore if already exists)
-    liftIO $ SQL.execute conn
+    tenExecute db
         "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'direct')"
         (storePathToText referrer, storePathToText reference)
 
-    -- Close connection
-    liftIO $ SQL.close conn
-
--- | Scan content for references to other store paths
+-- | Register a valid path in the database
 -- This is a daemon-only operation
-scanForReferences :: ByteString -> TenM p 'Daemon (Set StorePath)
-scanForReferences content = do
+registerValidPath :: StorePath -> Maybe StorePath -> TenM p 'Daemon ()
+registerValidPath path mDeriver = do
     env <- ask
-    let storeDir = storeLocation env
+    let dbPath = defaultDBPath (storeLocation env)
 
-    -- Convert to text for easier scanning
-    let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
+    -- First check if path exists
+    let fullPath = storePathToFilePath path env
+    exists <- liftIO $ doesFileExist fullPath
+    unless exists $
+        throwError $ StoreError $ "Cannot register non-existent path: " <> storePathToText path
 
-    -- Find potential store paths
-    let paths = findStorePaths contentText storeDir
+    db <- getDatabaseConn
+    -- Insert path into ValidPaths
+    tenExecute db
+        "INSERT OR IGNORE INTO ValidPaths (path, hash, name, deriver, is_valid, timestamp) VALUES (?, ?, ?, ?, 1, strftime('%s','now'))"
+        (storePathToText path, storeHash path, storeName path, fmap storePathToText mDeriver)
 
-    -- Verify each path exists
-    foldM (\acc path -> do
-        exists <- storePathExists path
-        if exists
-            then return $ Set.insert path acc
-            else return acc
-        ) Set.empty paths
+    -- If there's a deriver, register the reference
+    forM_ mDeriver $ \deriver ->
+        tenExecute db
+            "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'derivation')"
+            (storePathToText path, storePathToText deriver)
+
+-- | Unregister a path
+-- This is a daemon-only operation
+unregisterValidPath :: StorePath -> TenM p 'Daemon ()
+unregisterValidPath path = do
+    env <- ask
+    let dbPath = defaultDBPath (storeLocation env)
+
+    db <- getDatabaseConn
+    -- Mark path as invalid
+    tenExecute db
+        "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
+        (Only $ storePathToText path)
+
+-- | Get paths from database
+getStorePathsFromDB :: TenM p 'Daemon [StorePath]
+getStorePathsFromDB = do
+    env <- ask
+    let dbPath = defaultDBPath (storeLocation env)
+
+    db <- getDatabaseConn
+    -- Query valid paths
+    rows <- tenQuery db
+        "SELECT path FROM ValidPaths WHERE is_valid = 1" :: TenM p 'Daemon [Only Text]
+
+    -- Convert to StorePath objects
+    return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
+
+-- | Request store content via protocol
+requestReadViaProtocol :: StorePath -> TenM p 'Builder ByteString
+requestReadViaProtocol path = do
+    -- Get daemon connection
+    conn <- getDaemonConnection
+
+    -- Create the request
+    let req = Request {
+            reqId = 0,
+            reqType = "store-read",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
+
+    -- Send request and wait for response
+    response <- liftIO $ sendRequestSync conn req 30000000
+
+    -- Handle response
+    case response of
+        Left err ->
+            throwError $ StoreError $ "Failed to read from store: " <> case err of
+                DaemonError m -> m
+                _ -> T.pack (show err)
+
+        -- Direct pattern matching on the expected response type
+        Right (StoreReadResponse content) ->
+            return content
+
+        -- Handle unexpected response types with a clear error
+        Right resp ->
+            throwError $ StoreError $ "Unexpected response type: " <> T.pack (show resp)
+
+-- | Request to verify a path via protocol
+requestVerifyViaProtocol :: StorePath -> TenM p 'Builder Bool
+requestVerifyViaProtocol path = do
+    conn <- getDaemonConnection
+
+    -- Create the request
+    let req = Request {
+            reqId = 0,
+            reqType = "store-verify-integrity",
+            reqParams = Map.singleton "path" (storePathToText path),
+            reqPayload = Nothing
+        }
+
+    -- Send request and wait for response
+    response <- liftIO $ sendRequestSync conn req 10000000
+
+    -- Handle response
+    case response of
+        Left _ ->
+            return False  -- Any error means verification failed
+        Right (StoreVerifyResponse valid) ->
+            return valid
+        Right _ ->
+            return False
+
+-- | Get daemon connection from environment
+getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
+getDaemonConnection = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> return conn
+        _ -> throwError $ ConfigError "Not in client mode - no daemon connection available"
+
+-- | Sanitize a name for use in store paths
+sanitizeName :: Text -> Text
+sanitizeName name =
+    -- Remove any non-alphanumeric characters except allowed ones
+    let filtered = T.filter isAllowedChar name
+        -- Limit length
+        limited = if T.length filtered > 100 then T.take 100 filtered else limited
+        -- Provide fallback if empty
+        result = if T.null limited then "unknown" else limited
+    in result
+  where
+    isAllowedChar c = isAlphaNum c || c == '-' || c == '_' || c == '.' || c == '+'
+
+    isAlphaNum c = (c >= 'a' && c <= 'z') ||
+                   (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9')
+
+-- | Helper function to check if a path is within the store
+isStoreSubPath :: FilePath -> FilePath -> Bool
+isStoreSubPath storeDir path =
+    let normalStore = normalise storeDir
+        normalPath = normalise path
+    in normalStore `isPrefixOf` normalPath
 
 -- | Find potential store paths in text
 findStorePaths :: Text -> FilePath -> [StorePath]
@@ -890,307 +1115,116 @@ findStorePaths content storeDir =
             -- Handle just hash-name format
             parseStorePath text
 
--- | Register a valid path in the database
--- This is a daemon-only operation
-registerValidPath :: StorePath -> Maybe StorePath -> TenM p 'Daemon ()
-registerValidPath path mDeriver = do
+-- | Public API functions that delegate to the type classes
+
+-- | Add content to the store
+addToStore :: Text -> ByteString -> TenM p t StorePath
+addToStore nameHint content = do
     env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
+    case currentPrivilegeTier env of
+        Daemon -> addContentToStore nameHint content
+        Builder -> requestAddToStore nameHint content
 
-    -- First check if path exists
-    let fullPath = storePathToFilePath path env
-    exists <- liftIO $ doesFileExist fullPath
-    unless exists $
-        throwError $ StoreError $ "Cannot register non-existent path: " <> storePathToText path
-
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
-    -- Insert path into ValidPaths
-    liftIO $ SQL.execute conn
-        "INSERT OR IGNORE INTO ValidPaths (path, hash, name, deriver, is_valid, timestamp) VALUES (?, ?, ?, ?, 1, strftime('%s','now'))"
-        (storePathToText path, storeHash path, storeName path, fmap storePathToText mDeriver)
-
-    -- If there's a deriver, register the reference
-    forM_ mDeriver $ \deriver ->
-        liftIO $ SQL.execute conn
-            "INSERT OR IGNORE INTO References (referrer, reference, type) VALUES (?, ?, 'derivation')"
-            (storePathToText path, storePathToText deriver)
-
-    -- Close connection
-    liftIO $ SQL.close conn
-
--- | Unregister a path
--- This is a daemon-only operation
-unregisterValidPath :: StorePath -> TenM p 'Daemon ()
-unregisterValidPath path = do
+-- | Store a file in the store
+storeFile :: FilePath -> TenM p t StorePath
+storeFile filePath = do
     env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
+    case currentPrivilegeTier env of
+        Daemon -> storeFileToStore filePath
+        Builder -> do
+            -- Read file content
+            exists <- liftIO $ doesFileExist filePath
+            unless exists $
+                throwError $ InputNotFound filePath
+            content <- liftIO $ BS.readFile filePath
+            let nameHint = T.pack $ takeFileName filePath
+            requestAddToStore nameHint content
 
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
-
-    -- Mark path as invalid
-    liftIO $ SQL.execute conn
-        "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
-        (Only $ storePathToText path)
-
-    -- Close connection
-    liftIO $ SQL.close conn
-
--- | Get references to a path (what refers to this path) - Daemon implementation
--- This is a privileged operation requiring access to the store database
-getReferencesToPath :: StorePath -> TenM p 'Daemon (Set StorePath)
-getReferencesToPath path = do
+-- | Store a directory in the store
+storeDirectory :: FilePath -> TenM p t StorePath
+storeDirectory dirPath = do
     env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
+    case currentPrivilegeTier env of
+        Daemon -> storeDirectoryToStore dirPath
+        Builder -> do
+            -- For Builder, we need to tarball locally and then send the content
+            exists <- liftIO $ doesDirectoryExist dirPath
+            unless exists $
+                throwError $ InputNotFound dirPath
 
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+            -- Create a temporary tarball
+            let tempDir = workDir env </> "tmp"
+            liftIO $ createDirectoryIfMissing True tempDir
+            let tarballPath = tempDir </> (takeFileName dirPath ++ ".tar.gz")
 
-    -- Query for referrers
-    rows <- liftIO $ query conn
-        "SELECT referrer FROM References WHERE reference = ?"
-        (Only (storePathToText path))
+            -- Run tar to create the tarball
+            (exitCode, _, stderr) <- liftIO $
+                readCreateProcessWithExitCode
+                    (proc "tar" ["-czf", tarballPath, "-C", takeDirectory dirPath, takeFileName dirPath])
+                    ""
 
-    -- Close connection
-    liftIO $ SQL.close conn
+            case exitCode of
+                ExitSuccess -> do
+                    -- Read the tarball content
+                    content <- liftIO $ BS.readFile tarballPath
+                    -- Clean up the temporary tarball
+                    liftIO $ removeFile tarballPath
+                    -- Add to store via protocol
+                    requestAddToStore (T.pack $ takeFileName dirPath ++ ".tar.gz") content
 
-    -- Convert to StorePath objects
-    let paths = catMaybes $ map (\(Only t) -> parseStorePath t) rows
-    return $ Set.fromList paths
+                ExitFailure code ->
+                    throwError $ StoreError $ "Failed to create tarball: " <> T.pack stderr
 
--- | Get references to a path - Builder implementation
--- This is an unprivileged operation that goes through the daemon protocol
-getReferencesToPathBuilder :: StorePath -> TenM p 'Builder (Set StorePath)
-getReferencesToPathBuilder = requestReferrersToPath
+-- | Remove a path from the store
+removeFromStore :: StorePath -> TenM p 'Daemon ()
+removeFromStore = removePathFromStore
 
--- | Get references from a path (what this path refers to) - Daemon implementation
--- This is a privileged operation requiring access to store content
-getReferencesFromPath :: StorePath -> TenM p 'Daemon (Set StorePath)
-getReferencesFromPath path = findPathReferences sDaemon path
+-- | Check if a store path exists
+storePathExists :: StorePath -> TenM p t Bool
+storePathExists = checkStorePathExists
 
--- | Get references from a path - Builder implementation
--- This is an unprivileged operation that goes through the daemon protocol
-getReferencesFromPathBuilder :: StorePath -> TenM p 'Builder (Set StorePath)
-getReferencesFromPathBuilder = requestReferencesFromPath
+-- | Verify a store path's integrity
+verifyStorePath :: StorePath -> TenM p t Bool
+verifyStorePath = verifyStoreIntegrity
 
--- | Find store paths with a specific prefix
--- This is a daemon-only operation
-findPathsWithPrefix :: SPrivilegeTier 'Daemon -> Text -> TenM p 'Daemon [StorePath]
-findPathsWithPrefix st prefix = do
+-- | List all paths in the store
+listStorePaths :: TenM p t [StorePath]
+listStorePaths = listAllStorePaths
+
+-- | Read content from a store path
+readFromStore :: StorePath -> TenM p t ByteString
+readFromStore = readStoreContent
+
+-- | Read a file path from the store
+readPathFromStore :: FilePath -> TenM p t ByteString
+readPathFromStore filePath = do
+    -- Convert to store path for validation
     env <- ask
-    let dbPath = defaultDBPath (storeLocation env)
+    case filePathToStorePath filePath of
+        Just path -> readStoreContent path
+        Nothing ->
+            -- Additional security check - make sure the path is within the store
+            if isStoreSubPath (storeLocation env) filePath
+                then liftIO $ BS.readFile filePath
+                else throwError $ StoreError $ "Path is outside the store: " <> T.pack filePath
 
-    -- Open database connection
-    conn <- liftIO $ SQL.open dbPath
+-- | Check if a path is a GC root
+isGCRoot :: StorePath -> TenM p 'Daemon Bool
+isGCRoot = checkGCRoot
 
-    -- Query for paths with prefix
-    rows <- liftIO $ SQL.query conn
-        "SELECT path FROM ValidPaths WHERE name LIKE ? || '%' AND is_valid = 1"
-        (Only prefix) :: TenM p 'Daemon [Only Text]
+-- | Garbage collection
+collectGarbage :: TenM p 'Daemon (Int, Int, Integer)
+collectGarbage = performGC
 
-    -- Close connection
-    liftIO $ SQL.close conn
+-- | Find all GC roots
+findGCRoots :: TenM p 'Daemon (Set StorePath)
+findGCRoots = findAllGCRoots
 
-    -- Convert to StorePath objects
-    return $ catMaybes $ map (\(Only t) -> parseStorePath t) rows
-
--- | Get all store paths
--- This is a daemon-only operation
-getStorePaths :: SPrivilegeTier 'Daemon -> TenM p 'Daemon [StorePath]
-getStorePaths = listStorePaths
-
--- | Calculate hash for a file path
--- Available in both daemon and builder tiers
-hashPath :: FilePath -> TenM p t Text
-hashPath path = do
-    -- Read file content
-    content <- liftIO $ BS.readFile path
-    -- Calculate hash
-    let hashDigest = hashByteString content
-    return $ T.pack $ show hashDigest
-
--- | Get the hash part of a store path
--- Available in both daemon and builder tiers
-getPathHash :: StorePath -> Text
-getPathHash = storeHash
-
--- | Request to add content to the store via daemon protocol
--- For use in builder tier
-requestAddToStore :: Text -> ByteString -> TenM p 'Builder StorePath
-requestAddToStore nameHint content = do
-    -- Get daemon connection from environment
-    conn <- getDaemonConnection
-
-    -- Create the request object
-    let req = Request {
-            reqId = 0,  -- Will be set by sendRequest
-            reqType = "store-add",
-            reqParams = Map.singleton "name" nameHint,
-            reqPayload = Just content
-        }
-
-    -- Send the request and wait for response
-    response <- liftIO $ sendRequestSync conn req 60000000 -- 60 second timeout
-
-    -- Handle response
-    case response of
-        Left err ->
-            throwError $ StoreError $ "Failed to add to store: " <> case err of
-                DaemonError m -> m
-                _ -> T.pack (show err)
-        Right resp ->
-            if isDaemonResponseOk resp
-                then case getPathFromDaemonResponse resp of
-                    Just pathText ->
-                        case parseStorePath pathText of
-                            Just path -> return path
-                            Nothing -> throwError $ StoreError $ "Invalid path in response: " <> pathText
-                    Nothing -> throwError $ StoreError "Missing path in response"
-                else throwError $ StoreError $ getDaemonResponseMessage resp
-
--- | Request to read from the store via daemon protocol
--- For use in builder tier when direct read is not possible
-requestReadFromStore :: StorePath -> TenM p 'Builder ByteString
-requestReadFromStore path = do
-    -- First try direct read - this works if the file is readable
-    -- by the builder tier
-    env <- ask
-    let filePath = storePathToFilePath path env
-    fileExists <- liftIO $ doesFileExist filePath
-    if fileExists
-        then do
-            -- Try to read the file directly
-            result <- liftIO $ try $ BS.readFile filePath
-            case result of
-                Right content -> return content
-                Left (_ :: IOException) -> do
-                    -- If direct read fails, go through the daemon
-                    requestReadViaProtocol path
-        else do
-            -- File doesn't exist or can't be accessed, request from daemon
-            requestReadViaProtocol path
-
--- | Request store content via protocol
-requestReadViaProtocol :: StorePath -> TenM p 'Builder ByteString
-requestReadViaProtocol path = do
-    -- Get daemon connection
-    conn <- getDaemonConnection
-
-    -- Create the request
-    let req = Request {
-            reqId = 0,  -- Will be set by sendRequest
-            reqType = "store-read",
-            reqParams = Map.singleton "path" (storePathToText path),
-            reqPayload = Nothing
-        }
-
-    -- Send request and wait for response
-    response <- liftIO $ sendRequestSync conn req 30000000 -- 30 second timeout
-
-    -- Handle response
-    case response of
-        Left err ->
-            throwError $ StoreError $ "Failed to read from store: " <> case err of
-                DaemonError m -> m
-                _ -> T.pack (show err)
-
-        -- Direct pattern matching on the expected response type
-        Right (StoreReadResponse content) ->
-            return content
-
-        -- Handle unexpected response types with a clear error
-        Right resp ->
-            throwError $ StoreError $ "Unexpected response type: " <> T.pack (show resp)
-
--- | Request to verify a path via daemon protocol
--- For use in builder tier
-requestVerifyPath :: StorePath -> TenM p 'Builder Bool
-requestVerifyPath path = do
-    -- Try to check directly first
-    env <- ask
-    let filePath = storePathToFilePath path env
-    fileExists <- liftIO $ doesFileExist filePath
-
-    if fileExists
-        then return True  -- File exists and is accessible
-        else do
-            -- If not accessible, ask daemon
-            conn <- getDaemonConnection
-
-            -- Create the request
-            let req = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "store-verify",
-                    reqParams = Map.singleton "path" (storePathToText path),
-                    reqPayload = Nothing
-                }
-
-            -- Send request and wait for response
-            response <- liftIO $ sendRequestSync conn req 10000000 -- 10 second timeout
-
-            -- Handle response
-            case response of
-                Left _ ->
-                    return False  -- Any error means verification failed
-                Right resp ->
-                    if isDaemonResponseOk resp
-                        then return $ getExistsFromDaemonResponse resp
-                        else return False
-
--- | Request references from a path via protocol
-requestReferencesFromPath :: StorePath -> TenM p 'Builder (Set StorePath)
-requestReferencesFromPath path = do
-    conn <- getDaemonConnection
-
-    -- Create the request
-    let req = Request {
-            reqId = 0,  -- Will be set by sendRequest
-            reqType = "store-references",
-            reqParams = Map.singleton "path" (storePathToText path),
-            reqPayload = Nothing
-        }
-
-    -- Send request and wait for response
-    response <- liftIO $ sendRequestSync conn req 30000000 -- 30 second timeout
-
-    -- Handle response
-    case response of
-        Left _ ->
-            return Set.empty  -- Return empty set on error
-        Right resp ->
-            if isDaemonResponseOk resp
-                then return $ getReferencesFromDaemonResponse resp
-                else return Set.empty
-
--- | Request referrers to a path via protocol
-requestReferrersToPath :: StorePath -> TenM p 'Builder (Set StorePath)
-requestReferrersToPath path = do
-    conn <- getDaemonConnection
-
-    -- Create the request
-    let req = Request {
-            reqId = 0,  -- Will be set by sendRequest
-            reqType = "store-referrers",
-            reqParams = Map.singleton "path" (storePathToText path),
-            reqPayload = Nothing
-        }
-
-    -- Send request and wait for response
-    response <- liftIO $ sendRequestSync conn req 30000000 -- 30 second timeout
-
-    -- Handle response
-    case response of
-        Left _ ->
-            return Set.empty  -- Return empty set on error
-        Right resp ->
-            if isDaemonResponseOk resp
-                then return $ getReferencesFromDaemonResponse resp
-                else return Set.empty
+-- | Register a GC root
+registerGCRoot :: StorePath -> Text -> Text -> TenM p 'Daemon ()
+registerGCRoot = registerGCRoot_
 
 -- | Scan a file for references to store paths
--- Available in both daemon and builder tiers
 scanFileForStoreReferences :: FilePath -> TenM p t (Set StorePath)
 scanFileForStoreReferences filePath = do
     -- Check if file exists
@@ -1208,44 +1242,34 @@ scanFileForStoreReferences filePath = do
                 Right c -> return c
                 Left (_ :: IOException) -> return BS.empty
 
-            -- Extract store paths from binary content
-            let contentText = TE.decodeUtf8With (\_ _ -> Just '\xFFFD') content
-            let paths = findStorePaths contentText storeDir
+            -- Extract store paths
+            scanForReferences_ content
 
-            -- Filter for valid paths
-            validPaths <- filterM storePathExists paths
+-- | Get references to a path (what refers to this path)
+getReferencesToPath :: StorePath -> TenM p t (Set StorePath)
+getReferencesToPath = getReferencesTo
 
-            -- Return the set of found paths
-            return $ Set.fromList validPaths
+-- | Get references from a path (what this path refers to)
+getReferencesFromPath :: StorePath -> TenM p t (Set StorePath)
+getReferencesFromPath = getReferencesFrom
 
+-- | Find store paths with a specific prefix
+findPathsWithPrefix :: Text -> TenM p t [StorePath]
+findPathsWithPrefix = findPathsWithPrefix_
 
--- | Sanitize a name for use in store paths
-sanitizeName :: Text -> Text
-sanitizeName name =
-    -- Remove any non-alphanumeric characters except allowed ones
-    let filtered = T.filter isAllowedChar name
-        -- Limit length
-        limited = if T.length filtered > 100 then T.take 100 filtered else filtered
-        -- Provide fallback if empty
-        result = if T.null limited then "unknown" else limited
-    in result
-  where
-    isAllowedChar c = isAlphaNum c || c == '-' || c == '_' || c == '.' || c == '+'
+-- | Get all store paths
+getStorePaths :: TenM p 'Daemon [StorePath]
+getStorePaths = listAllStorePaths
 
-    isAlphaNum c = (c >= 'a' && c <= 'z') ||
-                   (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9')
+-- | Calculate hash for a file path
+hashPath :: FilePath -> TenM p t Text
+hashPath path = do
+    -- Read file content
+    content <- liftIO $ BS.readFile path
+    -- Calculate hash
+    let hashDigest = hashByteString content
+    return $ T.pack $ show hashDigest
 
--- | Get daemon connection from environment
-getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
-getDaemonConnection = do
-    env <- ask
-    case runMode env of
-        ClientMode conn -> return conn
-        _ -> throwError $ ConfigError "Not in client mode - no daemon connection available"
-
--- | Helper function for reading Maybe values
-readMaybe :: Read a => String -> Maybe a
-readMaybe s = case reads s of
-    [(x, "")] -> Just x
-    _ -> Nothing
+-- | Get the hash part of a store path
+getPathHash :: StorePath -> Text
+getPathHash = storeHash

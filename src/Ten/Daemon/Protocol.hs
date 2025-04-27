@@ -36,14 +36,14 @@ module Ten.Daemon.Protocol (
     UserCredentials(..),
     AuthRequestContent(..),
 
-    -- Privilege transition
-    PrivilegeTransition(..),
-    dropPrivilege,
-    SomePrivilegeTier(..),
-    withSomePrivilegeTier,
-
     -- Protocol message types
     DaemonRequest(..),
+
+    -- Database operation request types
+    DBQueryRequest(..),
+    DBExecuteRequest(..),
+    DBTransactionRequest(..),
+    TransactionMode(..),
 
     -- Serialization
     serializeDaemonRequest,
@@ -82,7 +82,12 @@ module Ten.Daemon.Protocol (
 
     -- Utilities for working with paths
     parseBuildId,
-    renderBuildId
+    renderBuildId,
+
+    -- Serialization utilities for database operations
+    serializeQueryParams,
+    deserializeQueryResults,
+    getRowsAffected
 ) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay, myThreadId)
@@ -128,6 +133,7 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Unique (Unique, hashUnique)
 import qualified Data.ByteString.Lazy.Char8 as LC8
 import qualified Data.ByteString.Char8 as C8
+import Data.Int (Int64)
 
 import Ten.Derivation
 
@@ -154,6 +160,7 @@ import Ten.Core (
     DerivationOutputMappingResponse(..),
     GCRequestParams(..),
     GCStatusRequestParams(..),
+    TransactionMode(..),
 
     -- Protocol utilities moved to Core
     parseRequestFrame,
@@ -182,14 +189,6 @@ compatibleVersions = [
     ProtocolVersion 1 0 0
     ]
 
--- | Existential wrapper for privilege tier singletons
-data SomePrivilegeTier where
-    SomePrivilegeTier :: SPrivilegeTier t -> SomePrivilegeTier
-
--- | Pattern match on SomePrivilegeTier to use the contained singleton
-withSomePrivilegeTier :: SomePrivilegeTier -> (forall t. SPrivilegeTier t -> r) -> r
-withSomePrivilegeTier (SomePrivilegeTier s) f = f s
-
 -- | Daemon capabilities - mapped to privilege tiers
 data DaemonCapability =
     StoreAccess             -- requires CanAccessStore t ~ 'True
@@ -199,16 +198,8 @@ data DaemonCapability =
   | DerivationBuild         -- available to all
   | StoreQuery              -- available to all
   | BuildQuery              -- available to all
+  | DatabaseAccess          -- requires CanAccessDatabase t ~ 'True
   deriving (Show, Eq, Ord, Bounded, Enum)
-
--- | Privilege transition type
-data PrivilegeTransition (p :: PrivilegeTier) (q :: PrivilegeTier) where
-    DropPrivilege :: PrivilegeTransition 'Daemon 'Builder
-    -- No constructor for gaining privilege - can only drop
-
--- | Perform a privilege transition (can only drop privileges)
-dropPrivilege :: SPrivilegeTier 'Daemon -> SPrivilegeTier 'Builder
-dropPrivilege SDaemon = SBuilder
 
 -- | Protocol errors
 data ProtocolError
@@ -228,7 +219,6 @@ instance Exception ProtocolError
 -- | Privilege errors
 data PrivilegeError
     = InsufficientPrivileges Text
-    | PrivilegeDowngradeError Text
     | InvalidCapability Text
     | AuthorizationError Text
     deriving (Show, Eq)
@@ -322,6 +312,24 @@ renderBuildId :: BuildId -> Text
 renderBuildId (BuildId u) = "build-" <> T.pack (show (hashUnique u))
 renderBuildId (BuildIdFromInt n) = "build-" <> T.pack (show n)
 
+-- | Database query request
+data DBQueryRequest = DBQueryRequest {
+    dbQueryStatement :: Text,
+    dbQueryParams :: [Aeson.Value]
+} deriving (Show, Eq)
+
+-- | Database execute request
+data DBExecuteRequest = DBExecuteRequest {
+    dbExecuteStatement :: Text,
+    dbExecuteParams :: [Aeson.Value]
+} deriving (Show, Eq)
+
+-- | Database transaction request
+data DBTransactionRequest = DBTransactionRequest {
+    dbTransactionMode :: TransactionMode,
+    dbTransactionAction :: Text  -- Identifier for the transaction action
+} deriving (Show, Eq)
+
 -- | Daemon request types for protocol communication
 data DaemonRequest
     = AuthRequest AuthRequestContent
@@ -350,6 +358,19 @@ data DaemonRequest
     | ShutdownRequest
     | StatusRequest
     | ConfigRequest
+    -- DB operation request types
+    | DBQueryRequest Text [BS.ByteString]
+    | DBExecuteRequest Text [BS.ByteString]
+    | DBTransactionBeginRequest TransactionMode
+    | DBTransactionCommitRequest
+    | DBTransactionRollbackRequest
+    | DBGetSchemaVersionRequest
+    | DBUpdateSchemaVersionRequest Int
+    | RegisterDerivationFileRequest StorePath BS.ByteString
+    | RegisterDerivationWithOutputsRequest StorePath BS.ByteString
+    | GetReferencesToPathRequest StorePath
+    | GetReferencesFromPathRequest StorePath
+    | BulkRegisterReferencesRequest [(StorePath, StorePath)]
     deriving (Show, Eq)
 
 -- | Protocol handle type for managing connections
@@ -381,6 +402,7 @@ verifyCapabilities st capabilities =
     restrictedCapability SandboxCreation = True
     restrictedCapability GarbageCollection = True
     restrictedCapability DerivationRegistration = True
+    restrictedCapability DatabaseAccess = True
     restrictedCapability _ = False
 
 -- | Check if a request can be performed with given privilege tier
@@ -397,6 +419,43 @@ checkPrivilegeRequirement st reqPriv =
         (Builder, UnprivilegedRequest) ->
             -- Builder can perform unprivileged operations
             Right ()
+
+-- | Determine capabilities required for a request
+requestCapabilities :: DaemonRequest -> Set DaemonCapability
+requestCapabilities = \case
+    AuthRequest _ -> Set.empty  -- Auth requests don't require capabilities
+    GCRequest _ -> Set.singleton GarbageCollection
+    StoreAddRequest _ _ -> Set.singleton StoreAccess
+    StoreDerivationRequest _ -> Set.singleton DerivationRegistration
+    AddGCRootRequest _ _ _ -> Set.singleton StoreAccess
+    RemoveGCRootRequest _ -> Set.singleton StoreAccess
+    BuildDerivationRequest _ _ -> Set.fromList [DerivationBuild, StoreAccess]
+    DBQueryRequest _ _ -> Set.singleton DatabaseAccess
+    DBExecuteRequest _ _ -> Set.singleton DatabaseAccess
+    DBTransactionBeginRequest _ -> Set.singleton DatabaseAccess
+    DBTransactionCommitRequest -> Set.singleton DatabaseAccess
+    DBTransactionRollbackRequest -> Set.singleton DatabaseAccess
+    DBGetSchemaVersionRequest -> Set.singleton DatabaseAccess
+    DBUpdateSchemaVersionRequest _ -> Set.singleton DatabaseAccess
+    RegisterDerivationFileRequest _ _ -> Set.fromList [DerivationRegistration, DatabaseAccess]
+    RegisterDerivationWithOutputsRequest _ _ -> Set.fromList [DerivationRegistration, DatabaseAccess]
+    GetReferencesToPathRequest _ -> Set.singleton DatabaseAccess
+    GetReferencesFromPathRequest _ -> Set.fromList [StoreAccess, DatabaseAccess]
+    BulkRegisterReferencesRequest _ -> Set.singleton DatabaseAccess
+    -- Most operations are unprivileged
+    _ -> Set.empty
+
+-- | Get privilege requirement for a response
+responsePrivilegeRequirement :: DaemonResponse -> ResponsePrivilege
+responsePrivilegeRequirement = \case
+    -- Privileged responses
+    StoreAddResponse _ -> PrivilegedResponse
+    GCResultResponse _ -> PrivilegedResponse
+    DerivationStoredResponse _ -> PrivilegedResponse
+    GCRootAddedResponse _ -> PrivilegedResponse
+    GCRootRemovedResponse _ -> PrivilegedResponse
+    -- Unprivileged responses
+    _ -> UnprivilegedResponse
 
 -- | Create a protocol handle from a socket
 createProtocolHandle :: Socket -> PrivilegeTier -> IO ProtocolHandle
@@ -432,31 +491,6 @@ parseResponseFrame = parseRequestFrame  -- Same format
 -- | Convert BuildError to Text
 errorToText :: BuildError -> Text
 errorToText = buildErrorToText
-
--- | Determine capabilities required for a request
-requestCapabilities :: DaemonRequest -> Set DaemonCapability
-requestCapabilities = \case
-    AuthRequest _ -> Set.empty  -- Auth requests don't require capabilities
-    GCRequest _ -> Set.singleton GarbageCollection
-    StoreAddRequest _ _ -> Set.singleton StoreAccess
-    StoreDerivationRequest _ -> Set.singleton DerivationRegistration
-    AddGCRootRequest _ _ _ -> Set.singleton StoreAccess
-    RemoveGCRootRequest _ -> Set.singleton StoreAccess
-    BuildDerivationRequest _ _ -> Set.fromList [DerivationBuild, StoreAccess]
-    -- Most operations are unprivileged
-    _ -> Set.empty
-
--- | Get privilege requirement for a response
-responsePrivilegeRequirement :: DaemonResponse -> ResponsePrivilege
-responsePrivilegeRequirement = \case
-    -- Privileged responses
-    StoreAddResponse _ -> PrivilegedResponse
-    GCResultResponse _ -> PrivilegedResponse
-    DerivationStoredResponse _ -> PrivilegedResponse
-    GCRootAddedResponse _ -> PrivilegedResponse
-    GCRootRemovedResponse _ -> PrivilegedResponse
-    -- Unprivileged responses
-    _ -> UnprivilegedResponse
 
 -- | Serialize a daemon request to ByteString
 serializeDaemonRequest :: DaemonRequest -> (BS.ByteString, Maybe BS.ByteString)
@@ -622,6 +656,85 @@ serializeDaemonRequest req =
         ConfigRequest ->
             (LBS.toStrict $ Aeson.encode $ Aeson.object [
                 "type" .= ("config" :: Text)
+            ], Nothing)
+
+        DBQueryRequest query params ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-query" :: Text),
+                "query" .= query,
+                "params" .= T.pack (show params),
+                "hasContent" .= True
+            ], Just (BS.concat params))
+
+        DBExecuteRequest query params ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-execute" :: Text),
+                "query" .= query,
+                "params" .= T.pack (show params),
+                "hasContent" .= isJust (if null params then Nothing else Just params)
+            ], if null params then Nothing else Just (BS.concat params))
+
+        DBTransactionBeginRequest mode ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-begin-transaction" :: Text),
+                "mode" .= case mode of
+                    ReadOnly -> "readonly" :: Text
+                    ReadWrite -> "readwrite" :: Text
+                    Exclusive -> "exclusive" :: Text
+            ], Nothing)
+
+        DBTransactionCommitRequest ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-commit-transaction" :: Text)
+            ], Nothing)
+
+        DBTransactionRollbackRequest ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-rollback-transaction" :: Text)
+            ], Nothing)
+
+        DBGetSchemaVersionRequest ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-get-schema-version" :: Text)
+            ], Nothing)
+
+        DBUpdateSchemaVersionRequest version ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("db-update-schema-version" :: Text),
+                "version" .= version
+            ], Nothing)
+
+        RegisterDerivationFileRequest path content ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("register-derivation-file" :: Text),
+                "storePath" .= storePathToText path,
+                "hasContent" .= True
+            ], Just content)
+
+        RegisterDerivationWithOutputsRequest path content ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("register-derivation-with-outputs" :: Text),
+                "storePath" .= storePathToText path,
+                "hasContent" .= True
+            ], Just content)
+
+        GetReferencesToPathRequest path ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("get-references-to-path" :: Text),
+                "path" .= storePathToText path
+            ], Nothing)
+
+        GetReferencesFromPathRequest path ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("get-references-from-path" :: Text),
+                "path" .= storePathToText path
+            ], Nothing)
+
+        BulkRegisterReferencesRequest refs ->
+            (LBS.toStrict $ Aeson.encode $ Aeson.object [
+                "type" .= ("bulk-register-references" :: Text),
+                "references" .= T.intercalate ";" (map
+                    (\(from, to) -> storePathToText from <> "," <> storePathToText to) refs)
             ], Nothing)
 
 -- | Deserialize a daemon request from ByteString
@@ -851,6 +964,113 @@ deserializeDaemonRequest bs mPayload =
                     Just (Aeson.String "status") -> Right StatusRequest
 
                     Just (Aeson.String "config") -> Right ConfigRequest
+
+                    Just (Aeson.String "db-query") -> do
+                        query <- case KeyMap.lookup "query" obj of
+                            Just (Aeson.String q) -> Right q
+                            _ -> Left "Missing or invalid query"
+
+                        -- Parameters are in the payload
+                        case mPayload of
+                            Nothing -> Right $ DBQueryRequest query []
+                            Just payload -> Right $ DBQueryRequest query [payload]
+
+                    Just (Aeson.String "db-execute") -> do
+                        query <- case KeyMap.lookup "query" obj of
+                            Just (Aeson.String q) -> Right q
+                            _ -> Left "Missing or invalid query"
+
+                        -- Parameters are in the payload
+                        case mPayload of
+                            Nothing -> Right $ DBExecuteRequest query []
+                            Just payload -> Right $ DBExecuteRequest query [payload]
+
+                    Just (Aeson.String "db-begin-transaction") -> do
+                        modeStr <- case KeyMap.lookup "mode" obj of
+                            Just (Aeson.String m) -> Right m
+                            _ -> Right "readwrite"  -- Default to read-write
+
+                        let mode = case modeStr of
+                                "readonly" -> ReadOnly
+                                "exclusive" -> Exclusive
+                                _ -> ReadWrite
+
+                        Right $ DBTransactionBeginRequest mode
+
+                    Just (Aeson.String "db-commit-transaction") ->
+                        Right DBTransactionCommitRequest
+
+                    Just (Aeson.String "db-rollback-transaction") ->
+                        Right DBTransactionRollbackRequest
+
+                    Just (Aeson.String "db-get-schema-version") ->
+                        Right DBGetSchemaVersionRequest
+
+                    Just (Aeson.String "db-update-schema-version") -> do
+                        version <- case KeyMap.lookup "version" obj of
+                            Just (Aeson.Number v) -> Right (round v)
+                            _ -> Left "Missing or invalid version"
+
+                        Right $ DBUpdateSchemaVersionRequest version
+
+                    Just (Aeson.String "register-derivation-file") -> do
+                        pathText <- case KeyMap.lookup "storePath" obj of
+                            Just (Aeson.String p) -> Right p
+                            _ -> Left "Missing or invalid storePath"
+
+                        case parseStorePath pathText of
+                            Nothing -> Left $ "Invalid store path format: " <> pathText
+                            Just path -> case mPayload of
+                                Nothing -> Left "Missing derivation content"
+                                Just content -> Right $ RegisterDerivationFileRequest path content
+
+                    Just (Aeson.String "register-derivation-with-outputs") -> do
+                        pathText <- case KeyMap.lookup "storePath" obj of
+                            Just (Aeson.String p) -> Right p
+                            _ -> Left "Missing or invalid storePath"
+
+                        case parseStorePath pathText of
+                            Nothing -> Left $ "Invalid store path format: " <> pathText
+                            Just path -> case mPayload of
+                                Nothing -> Left "Missing derivation content"
+                                Just content -> Right $ RegisterDerivationWithOutputsRequest path content
+
+                    Just (Aeson.String "get-references-to-path") -> do
+                        pathText <- case KeyMap.lookup "path" obj of
+                            Just (Aeson.String p) -> Right p
+                            _ -> Left "Missing or invalid path"
+
+                        case parseStorePath pathText of
+                            Nothing -> Left $ "Invalid store path format: " <> pathText
+                            Just path -> Right $ GetReferencesToPathRequest path
+
+                    Just (Aeson.String "get-references-from-path") -> do
+                        pathText <- case KeyMap.lookup "path" obj of
+                            Just (Aeson.String p) -> Right p
+                            _ -> Left "Missing or invalid path"
+
+                        case parseStorePath pathText of
+                            Nothing -> Left $ "Invalid store path format: " <> pathText
+                            Just path -> Right $ GetReferencesFromPathRequest path
+
+                    Just (Aeson.String "bulk-register-references") -> do
+                        refsText <- case KeyMap.lookup "references" obj of
+                            Just (Aeson.String r) -> Right r
+                            _ -> Left "Missing or invalid references"
+
+                        -- Parse the references from format "from1,to1;from2,to2"
+                        let refPairs = T.splitOn ";" refsText
+                        refs <- foldM (\acc pairText -> do
+                            let parts = T.splitOn "," pairText
+                            if length parts /= 2
+                                then Left $ "Invalid reference pair: " <> pairText
+                                else do
+                                    case (parseStorePath (parts !! 0), parseStorePath (parts !! 1)) of
+                                        (Just from, Just to) -> Right $ (from, to) : acc
+                                        _ -> Left $ "Invalid store paths in reference: " <> pairText
+                            ) [] refPairs
+
+                        Right $ BulkRegisterReferencesRequest refs
 
                     Just (Aeson.String t) -> Left $ "Unknown request type: " <> t
 
@@ -1347,6 +1567,45 @@ requestToText = \case
     ConfigRequest ->
         "Get daemon configuration"
 
+    DBQueryRequest query _ ->
+        "Execute DB query: " <> query
+
+    DBExecuteRequest query _ ->
+        "Execute DB statement: " <> query
+
+    DBTransactionBeginRequest mode ->
+        "Begin transaction: " <> case mode of
+            ReadOnly -> "read-only"
+            ReadWrite -> "read-write"
+            Exclusive -> "exclusive"
+
+    DBTransactionCommitRequest ->
+        "Commit transaction"
+
+    DBTransactionRollbackRequest ->
+        "Rollback transaction"
+
+    DBGetSchemaVersionRequest ->
+        "Get DB schema version"
+
+    DBUpdateSchemaVersionRequest ver ->
+        "Update DB schema version to: " <> T.pack (show ver)
+
+    RegisterDerivationFileRequest path _ ->
+        "Register derivation file: " <> storePathToText path
+
+    RegisterDerivationWithOutputsRequest path _ ->
+        "Register derivation with outputs: " <> storePathToText path
+
+    GetReferencesToPathRequest path ->
+        "Get references to path: " <> storePathToText path
+
+    GetReferencesFromPathRequest path ->
+        "Get references from path: " <> storePathToText path
+
+    BulkRegisterReferencesRequest refs ->
+        "Bulk register " <> T.pack (show (length refs)) <> " references"
+
 -- | Convert a response to human-readable text
 responseToText :: DaemonResponse -> Text
 responseToText = \case
@@ -1456,6 +1715,24 @@ responseToText = \case
     showStatus (BuildRecursing innerBuildId) = "recursing to " <> renderBuildId innerBuildId
     showStatus BuildCompleted = "completed"
     showStatus BuildFailed' = "failed"
+
+-- | Serialize query parameters
+serializeQueryParams :: [BS.ByteString] -> Text
+serializeQueryParams params =
+    "[" <> T.intercalate ", " (map encodeBinary params) <> "]"
+  where
+    encodeBinary :: BS.ByteString -> Text
+    encodeBinary bs = "\"" <> T.pack (show bs) <> "\""
+
+-- | Deserialize query results
+deserializeQueryResults :: BS.ByteString -> Either Text a
+deserializeQueryResults bs =
+    Left "Query result deserialization not implemented"
+
+-- | Get rows affected from a response
+getRowsAffected :: DaemonResponse -> Maybe Int64
+getRowsAffected (SuccessResponse) = Just 0  -- Default for successful operations
+getRowsAffected _ = Nothing
 
 -- Type alias for consistency
 type Int64 = Int

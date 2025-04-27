@@ -34,6 +34,11 @@ module Ten.DB.Core (
     closeDatabaseDaemon,
     getDatabaseFromEnv,
 
+    -- Transaction handling
+    withTransaction,
+    withReadTransaction,
+    withWriteTransaction,
+
     -- Utility functions
     retryOnBusy,
     ensureDBDirectories,
@@ -41,6 +46,8 @@ module Ten.DB.Core (
     -- Helper functions for implementing protocol-based operations
     sendDbRequest,
     receiveDbResponse,
+    serializeQueryParams,
+    deserializeQueryResults,
 
     -- Re-exported types for convenience
     Query(..)
@@ -146,15 +153,15 @@ getDaemonResponseMessage SuccessResponse = "Success"
 getDaemonResponseMessage _ = "Unknown response"
 
 getDaemonResponsePayload :: DaemonResponse -> Maybe ByteString
-getDaemonResponsePayload (DerivationResponse drv) = Just $ serializeDerivation drv
+getDaemonResponsePayload (StoreReadResponse content) = Just content
 getDaemonResponsePayload _ = Nothing
 
 getRowsAffected :: DaemonResponse -> Maybe Int64
-getRowsAffected (BuildResultResponse res) = Just (fromIntegral $ length $ Set.toList $ brOutputPaths res)
+getRowsAffected (SuccessResponse) = Just 0  -- Default to 0 affected rows
 getRowsAffected _ = Nothing
 
 getSchemaVersionFromResponse :: DaemonResponse -> Maybe Int
-getSchemaVersionFromResponse (StatusResponse status) = Just $ read $ T.unpack $ daemonStatus status
+getSchemaVersionFromResponse (StatusResponse status) = Just (read (T.unpack (daemonStatus status)))
 getSchemaVersionFromResponse _ = Nothing
 
 -- | Type class for database access capabilities
@@ -176,14 +183,12 @@ instance CanAccessDatabase 'Daemon where
     withDatabaseAccess action = do
         env <- ask
         let dbPath = defaultDBPath (storeLocation env)
-        -- Get the current build ID from the TenM context
-        bid <- gets currentBuildId
 
         -- Use bracket to ensure proper cleanup
-        db <- liftIO $ initDatabaseDaemon sDaemon dbPath 5000
-        result <- action db
-        liftIO $ closeDatabaseDaemon db
-        return result
+        bracket
+            (liftIO $ initDatabaseDaemon sDaemon dbPath 5000)
+            (\db -> liftIO $ closeDatabaseDaemon db)
+            action
 
 -- | Instance for Builder (protocol-based access)
 instance CanAccessDatabase 'Builder where
@@ -210,8 +215,13 @@ instance CanAccessDatabase 'Builder where
 
 -- | Type class for transaction management
 class CanManageTransactions (t :: PrivilegeTier) where
+    -- | Execute an action within a transaction with specified mode
     withTenTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+
+    -- | Execute an action within a read-only transaction
     withTenReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+
+    -- | Execute an action within a read-write transaction
     withTenWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
 
 -- | Daemon instance for direct transaction management
@@ -227,13 +237,13 @@ instance CanManageTransactions 'Daemon where
         catchError
             (do
                 -- Begin transaction
-                tenExecuteSimple_ db (Query beginStmt)
+                liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) (Query beginStmt)
 
                 -- Run the action
                 result <- action db
 
                 -- Commit transaction
-                tenExecuteSimple_ db "COMMIT;"
+                liftIO $ retryOnBusy db $ SQLite.execute_ (dbConn db) "COMMIT;"
 
                 return result)
             (\e -> do
@@ -305,7 +315,10 @@ instance CanManageTransactions 'Builder where
 
 -- | Type class for query execution
 class CanExecuteQuery (t :: PrivilegeTier) where
+    -- | Execute a query with parameters, returning results
     tenQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
+
+    -- | Execute a query without parameters, returning results
     tenQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
 
 -- | Daemon instance for direct query execution
@@ -358,8 +371,13 @@ instance CanExecuteQuery 'Builder where
 
 -- | Type class for statement execution
 class CanExecuteStatement (t :: PrivilegeTier) where
+    -- | Execute a statement with parameters, returning affected row count
     tenExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+
+    -- | Execute a statement with parameters, ignoring result
     tenExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+
+    -- | Execute a simple statement without parameters
     tenExecuteSimple_ :: Database t -> Query -> TenM p t ()
 
 -- | Daemon instance for direct statement execution
@@ -419,7 +437,10 @@ instance CanExecuteStatement 'Builder where
 
 -- | Type class for schema management
 class CanManageSchema (t :: PrivilegeTier) where
+    -- | Get the current schema version
     getSchemaVersion :: Database t -> TenM p t Int
+
+    -- | Update the schema version
     updateSchemaVersion :: Database t -> Int -> TenM p t ()
 
 -- | Daemon instance for direct schema management
@@ -495,6 +516,34 @@ instance CanManageSchema 'Builder where
                             else throwError $ toBuilderError $ DBSchemaError $ getDaemonResponseMessage resp
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
+
+-- | Database transaction functions with proper tier constraints
+-- | Execute an action within a transaction
+withTransaction :: (CanManageTransactions t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withTransaction db mode logger action = do
+    -- Start transaction with logger
+    logger $ "Starting transaction with mode: " <> case mode of
+        ReadOnly -> "ReadOnly"
+        ReadWrite -> "ReadWrite"
+        Exclusive -> "Exclusive"
+
+    -- Run transaction using tier-specific implementation
+    withTenTransaction db mode $ \db' -> do
+        -- Execute the action
+        result <- action
+
+        -- Log completion
+        logger "Transaction completed successfully"
+
+        return result
+
+-- | Execute an action within a read-only transaction
+withReadTransaction :: (CanManageTransactions t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withReadTransaction db logger = withTransaction db ReadOnly logger
+
+-- | Execute an action within a read-write transaction
+withWriteTransaction :: (CanManageTransactions t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withWriteTransaction db logger = withTransaction db ReadWrite logger
 
 -- | Initialize the database - this is a daemon operation
 initDatabaseDaemon :: SPrivilegeTier 'Daemon -> FilePath -> Int -> IO (Database 'Daemon)
@@ -711,7 +760,7 @@ serializeQueryParams params =
         serializeParam (SQLite.SQLText t) = "\"" <> t <> "\""
         serializeParam (SQLite.SQLInteger i) = T.pack (show i)
         serializeParam (SQLite.SQLFloat f) = T.pack (show f)
-        serializeParam (SQLite.SQLBlob b) = "\"<binary>\"" -- Simplified representation
+        serializeParam (SQLite.SQLBlob b) = "\"<binary>\""  -- Simplified representation
 
         serializedParams = map serializeParam paramValues
     in
@@ -721,7 +770,14 @@ serializeQueryParams params =
 deserializeQueryResults :: (FromRow r) => ByteString -> TenM p 'Builder [r]
 deserializeQueryResults payload = do
     -- In a real implementation, this would deserialize the binary payload into rows
-    -- Here we would use a binary format like CBOR or MessagePack to encode/decode rows
-    -- For now, we'll just return an empty list as a placeholder
-    -- The actual implementation would parse the payload based on the FromRow instance
+    -- For a complete implementation, we would use a proper binary serialization format
+    -- that preserves type information and handles FromRow instances correctly.
+
+    -- As this is a real implementation, we'd need to:
+    -- 1. Decode the binary format (e.g., CBOR or MessagePack) containing the rows
+    -- 2. For each row, construct SQLData values from the decoded data
+    -- 3. Use the FromRow instance to convert SQLData values to the target type
+
+    -- For simplicity in this example, we'll provide stub with empty list
+    -- but note that a real implementation would need proper binary serialization
     return []
