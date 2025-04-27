@@ -78,6 +78,7 @@ import Ten.Core (
     TenM, BuildEnv(..), BuildError(..), privilegeError, StorePath, Phase(..),
     PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuilder, SPhase(..), sBuild, sEval,
     fromSing, defaultDBPath, BuildState(..),
+    Database, CanAccessDatabase,
     currentBuildId, initBuildState, runTen, verbosity, logMsg,
     runMode, RunMode(..), DaemonConnection, sendRequestSync, Request(..),
     DaemonResponse(..), buildErrorToText, serializeDerivation, deserializeDerivation,
@@ -190,7 +191,7 @@ instance CanAccessDatabase 'Builder where
 
 -- | Daemon instance for direct transaction management
 instance CanManageTransactions 'Daemon where
-    withTenTransaction db mode action =
+    withTransaction db mode action =
         -- Start transaction with appropriate mode
         let beginStmt = case mode of
                 ReadOnly -> "BEGIN TRANSACTION READONLY;"
@@ -215,12 +216,12 @@ instance CanManageTransactions 'Daemon where
                 liftIO $ rollbackOnError db
                 throwError e)
 
-    withTenReadTransaction db = withTenTransaction db ReadOnly
-    withTenWriteTransaction db = withTenTransaction db ReadWrite
+    withReadTransaction db = withTransaction db ReadOnly
+    withWriteTransaction db = withTransaction db ReadWrite
 
 -- | Builder instance for transaction management via protocol
 instance CanManageTransactions 'Builder where
-    withTenTransaction db mode action = do
+    withTransaction db mode action = do
         env <- ask
         case runMode env of
             ClientMode conn -> do
@@ -416,6 +417,24 @@ instance CanManageSchema 'Daemon where
                 tenExecuteSimple_ db "CREATE TABLE SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
                 tenExecute_ db "INSERT INTO SchemaVersion (version, updated_at) VALUES (?, CURRENT_TIMESTAMP)" [version]
 
+
+-- | Type class for transaction management
+class CanManageTransactions (t :: PrivilegeTier) where
+    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+
+-- | Type class for query execution
+class CanExecuteQuery (t :: PrivilegeTier) where
+    dbQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
+    dbQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
+
+-- | Type class for statement execution
+class CanExecuteStatement (t :: PrivilegeTier) where
+    dbExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+    dbExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+    dbExecuteSimple_ :: Database t -> Query -> TenM p t ()
+
 -- | Builder instance for schema management via protocol
 instance CanManageSchema 'Builder where
     getSchemaVersion db = do
@@ -462,33 +481,6 @@ instance CanManageSchema 'Builder where
 
             _ -> throwError $ privilegeError "Schema management requires daemon connection"
 
--- | Database transaction functions with proper tier constraints
--- | Execute an action within a transaction
-withTransaction :: (CanManageTransactions t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withTransaction db mode logger action = do
-    -- Start transaction with logger
-    logger $ "Starting transaction with mode: " <> case mode of
-        ReadOnly -> "ReadOnly"
-        ReadWrite -> "ReadWrite"
-        Exclusive -> "Exclusive"
-
-    -- Run transaction using tier-specific implementation
-    withTenTransaction db mode $ \db' -> do
-        -- Execute the action
-        result <- action
-
-        -- Log completion
-        logger "Transaction completed successfully"
-
-        return result
-
--- | Execute an action within a read-only transaction
-withReadTransaction :: (CanManageTransactions t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withReadTransaction db logger = withTransaction db ReadOnly logger
-
--- | Execute an action within a read-write transaction
-withWriteTransaction :: (CanManageTransactions t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withWriteTransaction db logger = withTransaction db ReadWrite logger
 
 -- | Initialize the database - this is a daemon operation
 initDatabaseDaemon :: SPrivilegeTier 'Daemon -> FilePath -> Int -> IO (Database 'Daemon)

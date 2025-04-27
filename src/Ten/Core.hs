@@ -34,6 +34,7 @@ module Ten.Core (
     BuildStatus(..),
     BuildStrategy(..),
     RunMode(..),
+    runMode,
     DaemonConfig(..),
     UserId(..),
     AuthToken(..),
@@ -456,22 +457,6 @@ data BuildError
     | ConfigError Text                   -- Configuration error
     deriving (Show, Eq)
 
--- | Type class for transaction management
-class CanManageTransactions (t :: PrivilegeTier) where
-    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
-    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-
--- | Type class for query execution
-class CanExecuteQuery (t :: PrivilegeTier) where
-    dbQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
-    dbQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
-
--- | Type class for statement execution
-class CanExecuteStatement (t :: PrivilegeTier) where
-    dbExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
-    dbExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
-    dbExecuteSimple_ :: Database t -> Query -> TenM p t ()
 
 instance Aeson.FromJSON BuildError where
     parseJSON = Aeson.withObject "BuildError" $ \o -> do
