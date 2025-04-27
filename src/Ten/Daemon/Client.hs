@@ -104,7 +104,6 @@ import Data.Maybe (fromJust, isJust)
 import Ten.Core hiding (sendRequest, receiveResponse, sendRequestSync, timeout)
 import qualified Ten.Core as Core
 import Ten.Daemon.Protocol
-import Ten.Daemon.Config (getDefaultSocketPath)
 import qualified Ten.Derivation as Derivation
 
 -- | Connect to the Ten daemon - always in Builder context

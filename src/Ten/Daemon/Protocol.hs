@@ -20,6 +20,9 @@ module Ten.Daemon.Protocol (
     -- Protocol versions
     compatibleVersions,
 
+    -- Socket path finder
+    getDefaultSocketPath,
+
     -- Daemon capability system
     DaemonCapability(..),
     requestCapabilities,
@@ -120,6 +123,9 @@ import Data.Int (Int64)
 import GHC.Generics (Generic)
 import Network.Socket (Socket, close, socketToHandle)
 import System.IO (Handle, IOMode(..), hClose, hFlush, hSetBuffering, BufferMode(..))
+import System.Environment (lookupEnv)
+import System.Directory (getHomeDirectory)
+import System.FilePath ((</>))
 import System.Exit (ExitCode(ExitSuccess, ExitFailure))
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush)
 import System.IO.Error (isEOFError)
@@ -292,6 +298,13 @@ instance Aeson.FromJSON AuthRequestContent where
                 "Daemon" -> Daemon
                 _ -> Builder  -- Default to less privileged
         return AuthRequestContent{..}
+
+getDefaultSocketPath :: IO FilePath
+getDefaultSocketPath = do
+    xdgRuntimeDir <- lookupEnv "XDG_RUNTIME_DIR"
+    home <- getHomeDirectory
+    return $ fromMaybe (home </> ".ten/daemon.socket")
+                       (fmap (</> "ten/daemon.socket") xdgRuntimeDir)
 
 -- | Parse a BuildId from Text
 parseBuildId :: Text -> Either Text BuildId
