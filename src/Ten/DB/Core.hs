@@ -117,23 +117,6 @@ toBuilderError (DBPermissionError msg) = DBError msg
 toBuilderError (DBPrivilegeError msg) = DBError msg
 toBuilderError (DBProtocolError msg) = DBError msg
 
--- | Transaction modes
-data TransactionMode
-    = ReadOnly     -- ^ Read-only transaction
-    | ReadWrite    -- ^ Read-write transaction
-    | Exclusive    -- ^ Exclusive access
-    deriving (Show, Eq)
-
--- | Database connection wrapper, parameterized by privilege tier
-data Database (t :: PrivilegeTier) = Database {
-    dbConn :: Connection,         -- ^ SQLite connection (Daemon) or Nothing (Builder)
-    dbPath :: FilePath,           -- ^ Path to database file
-    dbInitialized :: Bool,        -- ^ Whether schema is initialized
-    dbBusyTimeout :: Int,         -- ^ Busy timeout in milliseconds
-    dbMaxRetries :: Int,          -- ^ Maximum number of retries for busy operations
-    dbPrivEvidence :: SPrivilegeTier t  -- ^ Runtime evidence of privilege tier
-}
-
 -- | Helper to unwrap the evidence from a Database
 getDbPrivEvidence :: Database t -> SPrivilegeTier t
 getDbPrivEvidence = dbPrivEvidence
@@ -163,14 +146,6 @@ getRowsAffected _ = Nothing
 getSchemaVersionFromResponse :: DaemonResponse -> Maybe Int
 getSchemaVersionFromResponse (StatusResponse status) = Just (read (T.unpack (daemonStatus status)))
 getSchemaVersionFromResponse _ = Nothing
-
--- | Type class for database access capabilities
-class CanAccessDatabase (t :: PrivilegeTier) where
-    -- | Get database connection, creating if needed
-    getDatabaseConn :: TenM p t (Database t)
-
-    -- | Run an action with a database connection
-    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
 
 -- | Instance for Daemon (direct database access)
 instance CanAccessDatabase 'Daemon where
@@ -212,17 +187,6 @@ instance CanAccessDatabase 'Builder where
         -- For Builder, just get the virtual Database and pass it to the action
         db <- getDatabaseConn
         action db
-
--- | Type class for transaction management
-class CanManageTransactions (t :: PrivilegeTier) where
-    -- | Execute an action within a transaction with specified mode
-    withTenTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
-
-    -- | Execute an action within a read-only transaction
-    withTenReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
-
-    -- | Execute an action within a read-write transaction
-    withTenWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
 
 -- | Daemon instance for direct transaction management
 instance CanManageTransactions 'Daemon where
@@ -313,14 +277,6 @@ instance CanManageTransactions 'Builder where
     withTenReadTransaction db = withTenTransaction db ReadOnly
     withTenWriteTransaction db = withTenTransaction db ReadWrite
 
--- | Type class for query execution
-class CanExecuteQuery (t :: PrivilegeTier) where
-    -- | Execute a query with parameters, returning results
-    tenQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
-
-    -- | Execute a query without parameters, returning results
-    tenQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
-
 -- | Daemon instance for direct query execution
 instance CanExecuteQuery 'Daemon where
     tenQuery db q params = do
@@ -368,17 +324,6 @@ instance CanExecuteQuery 'Builder where
             _ -> throwError $ privilegeError "Query execution requires daemon connection"
 
     tenQuery_ db q = tenQuery db q ()
-
--- | Type class for statement execution
-class CanExecuteStatement (t :: PrivilegeTier) where
-    -- | Execute a statement with parameters, returning affected row count
-    tenExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
-
-    -- | Execute a statement with parameters, ignoring result
-    tenExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
-
-    -- | Execute a simple statement without parameters
-    tenExecuteSimple_ :: Database t -> Query -> TenM p t ()
 
 -- | Daemon instance for direct statement execution
 instance CanExecuteStatement 'Daemon where

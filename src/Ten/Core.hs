@@ -77,8 +77,11 @@ module Ten.Core (
     -- Singletons and witnesses
     SingI(..),
     sing,
-    withSPhase,
     fromSing,
+    sDaemon,
+    sBuilder,
+    sEval,
+    sBuild,
 
     -- Type families for permissions
     CanAccessStore,
@@ -87,37 +90,6 @@ module Ten.Core (
     CanModifyStore,
     CanAccessDatabase,
     CanRunGC,
-    CanExecuteQuery,
-    CanExecuteStatement,
-    CanManageSchema,
-    CanManageTransactions,
-
-    -- Type class for database operations
-    class CanAccessDatabase,
-    getDatabaseConn,
-    withDatabaseAccess,
-
-    -- Type class for transaction management
-    class CanManageTransactions,
-    withTransaction,
-    withReadTransaction,
-    withWriteTransaction,
-
-    -- Type class for query execution
-    class CanExecuteQuery,
-    dbQuery,
-    dbQuery_,
-
-    -- Type class for statement execution
-    class CanExecuteStatement,
-    dbExecute,
-    dbExecute_,
-    dbExecuteSimple_,
-
-    -- Type class for schema management
-    class CanManageSchema,
-    getSchemaVersion,
-    updateSchemaVersion,
 
     -- Type classes for privilege and phase constraints
     RequiresDaemon,
@@ -236,6 +208,10 @@ module Ten.Core (
 
     -- Process isolation utilities
     withStore,
+
+    -- Database
+    --Database,
+    --TransactionMode,
 
     -- Time utilities
     getCurrentMillis,
@@ -406,6 +382,23 @@ currentProtocolVersion = ProtocolVersion 1 0 0
 newtype RequestId = RequestId Int
     deriving (Eq, Ord, Show)
 
+-- | Transaction modes
+data TransactionMode
+    = ReadOnly     -- ^ Read-only transaction
+    | ReadWrite    -- ^ Read-write transaction
+    | Exclusive    -- ^ Exclusive access
+    deriving (Show, Eq)
+
+-- | Database connection wrapper, parameterized by privilege tier
+data Database (t :: PrivilegeTier) = Database {
+    dbConn :: Connection,         -- ^ SQLite connection (Daemon) or Nothing (Builder)
+    dbPath :: FilePath,           -- ^ Path to database file
+    dbInitialized :: Bool,        -- ^ Whether schema is initialized
+    dbBusyTimeout :: Int,         -- ^ Busy timeout in milliseconds
+    dbMaxRetries :: Int,          -- ^ Maximum number of retries for busy operations
+    dbPrivEvidence :: SPrivilegeTier t  -- ^ Runtime evidence of privilege tier
+}
+
 -- | Build identifier type
 data BuildId
     = BuildId Unique               -- Normal constructor
@@ -460,6 +453,23 @@ data BuildError
     | InternalError Text                 -- Internal implementation error
     | ConfigError Text                   -- Configuration error
     deriving (Show, Eq)
+
+-- | Type class for transaction management
+class CanManageTransactions (t :: PrivilegeTier) where
+    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+
+-- | Type class for query execution
+class CanExecuteQuery (t :: PrivilegeTier) where
+    dbQuery :: (ToRow q, FromRow r) => Database t -> Query -> q -> TenM p t [r]
+    dbQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
+
+-- | Type class for statement execution
+class CanExecuteStatement (t :: PrivilegeTier) where
+    dbExecute :: (ToRow q) => Database t -> Query -> q -> TenM p t Int64
+    dbExecute_ :: (ToRow q) => Database t -> Query -> q -> TenM p t ()
+    dbExecuteSimple_ :: Database t -> Query -> TenM p t ()
 
 instance Aeson.FromJSON BuildError where
     parseJSON = Aeson.withObject "BuildError" $ \o -> do
@@ -1052,6 +1062,12 @@ createDaemonConnection handle userId authToken priEvidence = do
         connPrivEvidence = priEvidence
     }
 
+-- | Helper function to work with singletons
+withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a
+withSPhase sp f = TenM $ \_ st -> do
+    let (TenM g) = f sp
+    g sp st
+
 -- | Close a daemon connection, cleaning up resources
 closeDaemonConnection :: DaemonConnection t -> IO ()
 closeDaemonConnection conn = do
@@ -1162,45 +1178,29 @@ responseReaderThread handle requestMap shutdownFlag = forever $ do
                         Nothing -> return ()
                 Nothing -> return ()
 
--- Extract request ID from response bytes
-extractRequestIdFromBytes :: BS.ByteString -> Maybe Int
-extractRequestIdFromBytes bytes = do
-    -- Quick and dirty way to extract ID without full deserialization
-    case Aeson.decodeStrict bytes of
-        Just obj -> case Aeson.fromJSON obj of
-            Aeson.Success (Aeson.Object o) ->
-                case AKeyMap.lookup "id" o of
-                    Just (Aeson.Number n) -> Just (round n)
-                    _ -> Nothing
-            _ -> Nothing
-        _ -> Nothing
-
--- Split concatenated response into header and payload
-splitResponseBytes :: BS.ByteString -> (BS.ByteString, Maybe BS.ByteString)
-splitResponseBytes bytes =
-    -- Implementation would parse the length prefix and split accordingly
-    -- This is a simplified example
-    case parseRequestFrame bytes of
-        Right (header, rest) ->
-            if BS.null rest
-                then (header, Nothing)
-                else case parseRequestFrame rest of
-                    Right (payload, _) -> (header, Just payload)
-                    _ -> (header, Nothing)
-        _ -> (bytes, Nothing)
-
 -- | Helper function to work with singletons
-withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a
-withSPhase sp f = TenM $ \_ st -> do
-    let (TenM g) = f sp
-    g sp st
+-- | Extract the privilege tier from a singleton
+fromSing :: SPrivilegeTier t -> PrivilegeTier
+fromSing SDaemon = Daemon
+fromSing SBuilder = Builder
 
-fromSing :: SingI a => Sing a -> a
-fromSing s = fromSing' s where fromSing' :: Sing a -> a
-                               fromSing' _ = sing
+class CanBuildDerivation (t :: PrivilegeTier) where
+  buildDerivation :: Derivation -> TenM 'Build t BuildResult
+
+class CanQueryBuildStatus (t :: PrivilegeTier) where
+  getBuildStatus :: BuildId -> TenM 'Build t BuildStatus
+
+-- Database transaction function signatures
+withTransaction :: (CanAccessDatabase t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withReadTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withWriteTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+
+-- Database operation signatures
+dbExecute :: (CanExecuteStatement t) => Database t -> Query -> [SQLData] -> TenM p t Int64
+dbQuery :: (CanExecuteQuery t) => Database t -> Query -> [SQLData] -> TenM p t [a]
 
 -- | Get the default path for the Ten database
--- Pure function to calculate a path - accessible from any privilege tier
+-- This function computes a path but doesn't interact with the filesystem
 defaultDBPath :: FilePath -> FilePath
 defaultDBPath storeDir = storeDir </> "var/ten/db/ten.db"
 
@@ -1331,7 +1331,7 @@ liftBuilderIO action = TenM $ \_ st -> do
         _ -> throwError $ PrivilegeError "Cannot run builder IO operation in daemon context"
 
 -- | Store a derivation in the store (Daemon privilege)
-storeDerivationDaemon :: (CanAccessStore 'Daemon ~ 'True) => Derivation -> TenM 'Eval 'Daemon StorePath
+storeDerivationDaemon :: Derivation -> TenM 'Eval 'Daemon StorePath
 storeDerivationDaemon deriv = do
     env <- ask
 
@@ -1387,7 +1387,7 @@ storeDerivationBuilder deriv = do
         _ -> throwError $ PrivilegeError "Cannot store derivation in builder context without daemon connection"
 
 -- | Read a derivation from the store (Daemon context with direct store access)
-readDerivationDaemon :: (CanAccessStore 'Daemon ~ 'True) => StorePath -> TenM p 'Daemon (Either BuildError Derivation)
+readDerivationDaemon :: StorePath -> TenM p 'Daemon (Either BuildError Derivation)
 readDerivationDaemon path = do
     env <- ask
     let fullPath = storePathToFilePath path env
@@ -1416,7 +1416,7 @@ readDerivationBuilder path = do
                 reqPayload = Nothing
             }
 
-            -- Send request and wait for response with proper lifting
+            -- Send request and wait for response
             response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
 
             case response of
@@ -1429,7 +1429,7 @@ readDerivationBuilder path = do
         _ -> return $ Left $ PrivilegeError "Cannot read derivation in builder context without daemon connection"
 
 -- | Store a build result (Daemon context with direct store access)
-storeBuildResultDaemon :: (CanAccessStore 'Daemon ~ 'True) => BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
+storeBuildResultDaemon :: BuildId -> BuildResult -> TenM 'Build 'Daemon StorePath
 storeBuildResultDaemon buildId result = do
     env <- ask
 
@@ -1460,7 +1460,7 @@ storeBuildResultDaemon buildId result = do
     return storePath
 
 -- | Read a build result from the store (Daemon context with direct store access)
-readBuildResultDaemon :: (CanAccessStore 'Daemon ~ 'True) => StorePath -> TenM p 'Daemon (Either BuildError BuildResult)
+readBuildResultDaemon :: StorePath -> TenM p 'Daemon (Either BuildError BuildResult)
 readBuildResultDaemon path = do
     env <- ask
     let fullPath = storePathToFilePath path env
@@ -1489,7 +1489,7 @@ readBuildResultBuilder path = do
                 reqPayload = Nothing
             }
 
-            -- Send request and wait for response with proper lifting
+            -- Send request and wait for response
             response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
 
             case response of
@@ -1704,7 +1704,7 @@ deserializeDaemonResponse bs mPayload =
                             Nothing -> Left "Missing derivation content"
                             Just content ->
                                 case deserializeDerivation content of
-                                    Left err -> Left $ "Invalid derivation: " <> T.pack (show err)
+                                    Left err -> Left $ "Invalid derivation: " <> buildErrorToText err
                                     Right drv -> Right $ DerivationResponse drv
 
                     Just (Aeson.String "derivation-stored") -> do
@@ -1722,7 +1722,7 @@ deserializeDaemonResponse bs mPayload =
                                 Nothing -> Left "Missing derivation content"
                                 Just content ->
                                     case deserializeDerivation content of
-                                        Left err -> Left $ "Invalid derivation: " <> T.pack (show err)
+                                        Left err -> Left $ "Invalid derivation: " <> buildErrorToText err
                                         Right drv -> Right $ DerivationRetrievedResponse (Just drv)
                             else Right $ DerivationRetrievedResponse Nothing
 
@@ -1798,7 +1798,7 @@ deserializeDaemonResponse bs mPayload =
                             Nothing -> Left "Missing derivation content"
                             Just content ->
                                 case deserializeDerivation content of
-                                    Left err -> Left $ "Invalid derivation: " <> T.pack (show err)
+                                    Left err -> Left $ "Invalid derivation: " <> buildErrorToText err
                                     Right drv -> Right $ EvalResponse drv
 
                     Just (Aeson.String "error") -> do
@@ -2138,34 +2138,15 @@ decodeMessage bs =
         -- For now, just return a placeholder
         Right $ Response respId respStatus respMessage respData (if hasPayload then Just BS.empty else Nothing)
 
-    parseError :: Aeson.Value -> Either Text BuildError
-    parseError = Aeson.withObject "BuildError" $ \o -> do
-        errType <- o Aeson..: "errorType"
-        msg <- o Aeson..: "message"
-        case errType of
-            "eval" -> return $ EvalError msg
-            "build" -> return $ BuildFailed msg
-            "store" -> return $ StoreError msg
-            "sandbox" -> return $ SandboxError msg
-            "input" -> return $ InputNotFound (T.unpack msg)
-            "hash" -> return $ HashError msg
-            "graph" -> return $ GraphError msg
-            "resource" -> return $ ResourceError msg
-            "daemon" -> return $ DaemonError msg
-            "auth" -> return $ AuthError msg
-            "cycle" -> return $ CyclicDependency msg
-            "serialization" -> return $ SerializationError msg
-            "recursion" -> return $ RecursionLimit msg
-            "network" -> return $ NetworkError msg
-            "parse" -> return $ ParseError msg
-            "db" -> return $ DBError msg
-            "gc" -> return $ GCError msg
-            "phase" -> return $ PhaseError msg
-            "privilege" -> return $ PrivilegeError msg
-            "protocol" -> return $ ProtocolError msg
-            "internal" -> return $ InternalError msg
-            "config" -> return $ ConfigError msg
-            _ -> Left $ "Unknown error type: " <> errType
+
+-- | Receive a request from the handle
+receiveRequest :: Handle -> IO (Either BuildError Request)
+receiveRequest handle = do
+    msgResult <- receiveMessage handle
+    case msgResult of
+        Left err -> return $ Left err
+        Right (RequestMessage req) -> return $ Right req
+        Right _ -> return $ Left $ ProtocolError "Expected request message, got something else"
 
 -- | Generate a new unique build ID
 newBuildId :: TenM p t BuildId
@@ -2272,7 +2253,7 @@ privilegeError :: Text -> BuildError
 privilegeError = PrivilegeError
 
 -- | Spawn a builder process with proper process isolation - privileged operation
-spawnBuilderProcess :: (CanDropPrivileges 'Daemon ~ 'True) => FilePath -> [String] -> Map Text Text -> TenM 'Build 'Daemon ProcessID
+spawnBuilderProcess :: FilePath -> [String] -> Map Text Text -> TenM 'Build 'Daemon ProcessID
 spawnBuilderProcess programPath args env = do
     -- Placeholder implementation - would include Linux namespace isolation
     pid <- liftIO $ forkProcess $ do
@@ -2285,6 +2266,7 @@ spawnBuilderProcess programPath args env = do
         -- 6. Execute the builder program
 
         -- For now, just execute the program
+        --ENVIRONMENT VARIABLE CONVERSION
         executeFile programPath True args (Just $ map (\(k, v) -> (T.unpack k, T.unpack v)) $ Map.toList env)
 
     return pid
@@ -2354,52 +2336,6 @@ timeout micros action = do
 -- | Hash a ByteString
 hashByteString :: BS.ByteString -> Digest SHA256
 hashByteString = Crypto.hash
-
--- | Type class for database access capabilities
-class CanAccessDatabase (t :: PrivilegeTier) where
-    -- | Get database connection, creating if needed
-    getDatabaseConn :: TenM p t (Database t)
-
-    -- | Run an action with a database connection
-    withDatabaseAccess :: (Database t -> TenM p t a) -> TenM p t a
-
--- | Type class for transaction management
-class CanManageTransactions (t :: PrivilegeTier) where
-    -- | Execute action within a transaction with specified mode
-    withTransaction :: Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-
-    -- | Execute action within a read-only transaction
-    withReadTransaction :: Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-
-    -- | Execute action within a read-write transaction
-    withWriteTransaction :: Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-
--- | Type class for query execution
-class CanExecuteQuery (t :: PrivilegeTier) where
-    -- | Execute a query with parameters and return results
-    dbQuery :: (FromRow r) => Database t -> Query -> [SQLData] -> TenM p t [r]
-
-    -- | Execute a simple query without parameters
-    dbQuery_ :: (FromRow r) => Database t -> Query -> TenM p t [r]
-
--- | Type class for statement execution
-class CanExecuteStatement (t :: PrivilegeTier) where
-    -- | Execute a statement with parameters and return affected rows
-    dbExecute :: Database t -> Query -> [SQLData] -> TenM p t Int64
-
-    -- | Execute a statement with parameters (discard result)
-    dbExecute_ :: Database t -> Query -> [SQLData] -> TenM p t ()
-
-    -- | Execute a simple statement without parameters
-    dbExecuteSimple_ :: Database t -> Query -> TenM p t ()
-
--- | Type class for schema management
-class CanManageSchema (t :: PrivilegeTier) where
-    -- | Get the current schema version
-    getSchemaVersion :: Database t -> TenM p t Int
-
-    -- | Update the schema version
-    updateSchemaVersion :: Database t -> Int -> TenM p t ()
 
 -- | Serialize a derivation to a ByteString for cross-boundary transmission
 serializeDerivation :: Derivation -> BS.ByteString
@@ -2785,3 +2721,151 @@ instance Aeson.FromJSON BuildStatusUpdate where
                 _ -> fail $ "Unknown build status: " ++ T.unpack state
 
 -- JSON instances for GCStatusInfo
+instance Aeson.ToJSON GCStatusInfo where
+    toJSON GCStatusInfo{..} = Aeson.object [
+        "running" Aeson..= gcRunning,
+        "owner" Aeson..= gcOwner,
+        "lockTime" Aeson..= gcLockTime
+        ]
+
+instance Aeson.FromJSON GCStatusInfo where
+    parseJSON = Aeson.withObject "GCStatusInfo" $ \v -> do
+        gcRunning <- v Aeson..: "running"
+        gcOwner <- v Aeson..:? "owner"
+        gcLockTime <- v Aeson..:? "lockTime"
+        return GCStatusInfo{..}
+
+-- JSON instances for DaemonStatus
+instance Aeson.ToJSON DaemonStatus where
+    toJSON DaemonStatus{..} = Aeson.object [
+        "status" Aeson..= daemonStatus,
+        "uptime" Aeson..= daemonUptime,
+        "activeBuilds" Aeson..= daemonActiveBuilds,
+        "completedBuilds" Aeson..= daemonCompletedBuilds,
+        "failedBuilds" Aeson..= daemonFailedBuilds,
+        "gcRoots" Aeson..= daemonGcRoots,
+        "storeSize" Aeson..= daemonStoreSize,
+        "storePaths" Aeson..= daemonStorePaths
+        ]
+
+instance Aeson.FromJSON DaemonStatus where
+    parseJSON = Aeson.withObject "DaemonStatus" $ \v -> do
+        daemonStatus <- v Aeson..: "status"
+        daemonUptime <- v Aeson..: "uptime"
+        daemonActiveBuilds <- v Aeson..: "activeBuilds"
+        daemonCompletedBuilds <- v Aeson..: "completedBuilds"
+        daemonFailedBuilds <- v Aeson..: "failedBuilds"
+        daemonGcRoots <- v Aeson..: "gcRoots"
+        daemonStoreSize <- v Aeson..: "storeSize"
+        daemonStorePaths <- v Aeson..: "storePaths"
+        return DaemonStatus{..}
+
+-- JSON instances for BuildResult
+instance Aeson.ToJSON BuildResult where
+    toJSON BuildResult{..} = Aeson.object [
+        "outputs" Aeson..= Set.map storePathToText brOutputPaths,
+        "exitCode" Aeson..= encodeExitCode brExitCode,
+        "log" Aeson..= brLog,
+        "references" Aeson..= Set.map storePathToText brReferences
+        ]
+      where
+        encodeExitCode ExitSuccess = Aeson.object [
+            "code" Aeson..= (0 :: Int),
+            "success" Aeson..= True
+            ]
+        encodeExitCode (ExitFailure code) = Aeson.object [
+            "code" Aeson..= code,
+            "success" Aeson..= False
+            ]
+
+-- Add this after the GCStats definition:
+instance Aeson.FromJSON GCStats where
+    parseJSON = Aeson.withObject "GCStats" $ \v -> do
+        gcTotal <- v Aeson..: "total"
+        gcLive <- v Aeson..: "live"
+        gcCollected <- v Aeson..: "collected"
+        gcBytes <- v Aeson..: "bytes"
+        gcElapsedTime <- v Aeson..: "elapsedTime"
+        return GCStats{..}
+
+-- Add this after the DaemonConfig definition:
+instance Aeson.FromJSON DaemonConfig where
+    parseJSON = Aeson.withObject "DaemonConfig" $ \v -> do
+        daemonSocketPath <- v Aeson..: "socketPath"
+        daemonStorePath <- v Aeson..: "storePath"
+        daemonStateFile <- v Aeson..: "stateFile"
+        daemonLogFile <- v Aeson..:? "logFile"
+        daemonLogLevel <- v Aeson..: "logLevel"
+        daemonGcInterval <- v Aeson..:? "gcInterval"
+        daemonUser <- v Aeson..:? "user"
+        daemonGroup <- v Aeson..:? "group"
+        daemonAllowedUsers <- v Aeson..: "allowedUsers"
+        daemonMaxJobs <- v Aeson..: "maxJobs"
+        daemonForeground <- v Aeson..: "foreground"
+        daemonTmpDir <- v Aeson..: "tmpDir"
+        return DaemonConfig{..}
+
+-- For BuildError, let's implement the parseError function:
+parseError :: Aeson.Value -> Either Text BuildError
+parseError (Aeson.Object o) = do
+    errType <- maybe (Left "Missing error type") Right $
+               AKeyMap.lookup "type" o >>= Aeson.parseMaybe Aeson.parseJSON
+    msg <- maybe (Left "Missing error message") Right $
+          AKeyMap.lookup "message" o >>= Aeson.parseMaybe Aeson.parseJSON
+
+    case errType of
+        "eval" -> Right $ EvalError msg
+        "build" -> Right $ BuildFailed msg
+        "store" -> Right $ StoreError msg
+        "sandbox" -> Right $ SandboxError msg
+        "input" -> Right $ InputNotFound (T.unpack msg)
+        "hash" -> Right $ HashError msg
+        "graph" -> Right $ GraphError msg
+        "resource" -> Right $ ResourceError msg
+        "daemon" -> Right $ DaemonError msg
+        "auth" -> Right $ AuthError msg
+        "cycle" -> Right $ CyclicDependency msg
+        "serialization" -> Right $ SerializationError msg
+        "recursion" -> Right $ RecursionLimit msg
+        "network" -> Right $ NetworkError msg
+        "parse" -> Right $ ParseError msg
+        "db" -> Right $ DBError msg
+        "gc" -> Right $ GCError msg
+        "phase" -> Right $ PhaseError msg
+        "privilege" -> Right $ PrivilegeError msg
+        "protocol" -> Right $ ProtocolError msg
+        "internal" -> Right $ InternalError msg
+        "config" -> Right $ ConfigError msg
+        _ -> Left $ "Unknown error type: " <> errType
+
+parseError _ = Left "Error value is not an object"
+
+parseExitCode :: Aeson.Value -> Parser ExitCode
+parseExitCode = Aeson.withObject "ExitCode" $ \o -> do
+    codeType <- o Aeson..: "type" :: Parser Text
+    if codeType == "success"
+        then return ExitSuccess
+        else do
+            code <- o Aeson..: "code"
+            return $ ExitFailure code
+
+instance Aeson.FromJSON BuildResult where
+    parseJSON = Aeson.withObject "BuildResult" $ \v -> do
+        outputTexts <- v Aeson..: "outputs" :: Parser [Text]
+        exitCodeObj <- v Aeson..: "exitCode"
+        log <- v Aeson..: "log"
+        referenceTexts <- v Aeson..: "references" :: Parser [Text]
+
+        -- Parse exit code
+        exitCode <- parseExitCode exitCodeObj
+
+        -- Parse store paths with validation
+        let outputs = Set.fromList $ catMaybes $ map parseStorePath outputTexts
+        let references = Set.fromList $ catMaybes $ map parseStorePath referenceTexts
+
+        return $ BuildResult
+            { brOutputPaths = outputs
+            , brExitCode = exitCode
+            , brLog = log
+            , brReferences = references
+            }
