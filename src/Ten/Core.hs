@@ -242,6 +242,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Unique (Unique, newUnique, hashUnique)
+import Data.Scientific (toBoundedInteger)
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
@@ -258,7 +259,6 @@ import System.Directory
 import System.FilePath
 import qualified System.Process as Process
 import System.Exit
-import Data.Unique (Unique, hashUnique)
 import Data.Proxy (Proxy(..))
 import Network.Socket (Socket, SockAddr(..), socketToHandle, close)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdin,
@@ -550,6 +550,59 @@ instance Binary.Binary StorePath where
             then return path
             else fail $ "Invalid store path format during deserialization: " ++
                        T.unpack hash ++ "-" ++ T.unpack name
+
+extractRequestIdFromBytes :: ByteString -> Maybe Int
+extractRequestIdFromBytes headerBytes =
+    case Aeson.eitherDecodeStrict headerBytes of
+        Left _ -> Nothing
+        Right val -> case Aeson.fromJSON val of
+            Aeson.Error _ -> Nothing
+            Aeson.Success obj -> do
+                -- Extract the "id" field from the JSON object
+                case AKeyMap.lookup "id" obj of
+                    Just (Aeson.Number reqId) ->
+                        -- Convert Scientific to Int
+                        case toBoundedInteger reqId of
+                            Just n -> Just n
+                            Nothing -> Nothing
+                    _ -> Nothing
+
+splitResponseBytes :: ByteString -> (ByteString, Maybe ByteString)
+splitResponseBytes rawBytes =
+    -- Check if there's enough data for a header
+    if BS.length rawBytes < 4
+        then (rawBytes, Nothing)
+        else do
+            -- Extract header length from first 4 bytes
+            let (lenBytes, rest) = BS.splitAt 4 rawBytes
+                headerLen = fromIntegral $ -- Convert 4 bytes to header length
+                    (fromIntegral (BS.index lenBytes 0) :: Word32) `shiftL` 24 .|.
+                    (fromIntegral (BS.index lenBytes 1) :: Word32) `shiftL` 16 .|.
+                    (fromIntegral (BS.index lenBytes 2) :: Word32) `shiftL` 8 .|.
+                    (fromIntegral (BS.index lenBytes 3) :: Word32)
+
+            -- Split header and check for payload
+            if BS.length rest < headerLen
+                then (rawBytes, Nothing)
+                else do
+                    let (header, payloadPart) = BS.splitAt headerLen rest
+
+                    -- If there's more data, it's a payload with its own length prefix
+                    if BS.length payloadPart >= 4
+                        then do
+                            -- Extract payload length
+                            let (payloadLenBytes, payloadRest) = BS.splitAt 4 payloadPart
+                                payloadLen = fromIntegral $ -- Parse payload length
+                                    (fromIntegral (BS.index payloadLenBytes 0) :: Word32) `shiftL` 24 .|.
+                                    (fromIntegral (BS.index payloadLenBytes 1) :: Word32) `shiftL` 16 .|.
+                                    (fromIntegral (BS.index payloadLenBytes 2) :: Word32) `shiftL` 8 .|.
+                                    (fromIntegral (BS.index payloadLenBytes 3) :: Word32)
+
+                            -- Return payload if complete
+                            if BS.length payloadRest >= payloadLen
+                                then (header, Just $ BS.take payloadLen payloadRest)
+                                else (header, Nothing)
+                        else (header, Nothing)
 
 -- | Convert StorePath to a standard text representation
 storePathToText :: StorePath -> Text
