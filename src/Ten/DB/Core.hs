@@ -17,7 +17,7 @@ module Ten.DB.Core (
     Database(..),
     DBError(..),
     TransactionMode(..),
-    Only(..),  -- Re-export the Only type needed by modules like Ten.GC
+    Only(..),
 
     -- Type classes for database operations
     HasStoreOps(..),
@@ -379,11 +379,11 @@ instance HasGCOps 'Daemon where
 instance HasSchemaOps 'Daemon where
     getSchemaVersion db = withReadTransaction db $ \db' -> do
         -- Check if the version table exists
-        hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';"
+        hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
         case hasVersionTable of
-            [Only count] | count > 0 -> do
+            [Only (count :: Int)] | count > 0 -> do
                 -- Table exists, get the version
-                results <- query_ db' "SELECT version FROM SchemaVersion LIMIT 1;"
+                results <- query_ db' "SELECT version FROM SchemaVersion LIMIT 1;" :: TenM p 'Daemon [Only Int]
                 case results of
                     [Only version] -> return version
                     _ -> return 0  -- No version record found
@@ -391,9 +391,9 @@ instance HasSchemaOps 'Daemon where
 
     updateSchemaVersion db version = withWriteTransaction db $ \db' -> do
         -- Check if the version table exists
-        hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';"
+        hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
         case hasVersionTable of
-            [Only count] | count > 0 -> do
+            [Only (count :: Int)] | count > 0 -> do
                 -- Table exists, update the version
                 execute_ db' "UPDATE SchemaVersion SET version = ?, updated_at = CURRENT_TIMESTAMP" [version]
             _ -> do
