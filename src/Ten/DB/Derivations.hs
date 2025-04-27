@@ -223,9 +223,12 @@ instance CanStoreDerivation 'Daemon where
                     _ -> throwError $ DBError "Failed to retrieve derivation ID"
             else do
                 -- Insert new derivation
-                derivId <- tenExecute db
+                liftIO $ SQLite.execute (dbConn db)
                     "INSERT INTO Derivations (hash, store_path, timestamp) VALUES (?, ?, strftime('%s','now'))"
                     (derivHash derivation, storePathToText storePath)
+
+                -- Get the last inserted row ID
+                derivId <- liftIO $ SQLite.lastInsertRowId (dbConn db)
 
                 -- Register the derivation path as valid
                 registerValidPath storePath (Just storePath)
@@ -436,31 +439,7 @@ instance CanRetrieveDerivation 'Eval 'Daemon where
                     Right drv -> return $ Just drv
             _ -> throwError $ DBError "Multiple derivations with same hash - database corruption"
 
-    retrieveDerivationByHash hash = do
-        env <- ask
-        let dbPath = defaultDBPath (storeLocation env)
-
-        -- Get database connection
-        db <- getDatabaseConn
-
-        -- Query for store path
-        storePaths <- tenQuery db
-            "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-            (Only hash) :: TenM 'Eval 'Daemon [Only Text]
-
-        -- Get the derivation
-        case storePaths of
-            [Only pathText] ->
-                case parseStorePath pathText of
-                    Just sp -> do
-                        -- Validate the path after extraction
-                        validatedPath <- validateAndLogPath sp
-                        readDerivationFromStore validatedPath
-                    Nothing -> do
-                        -- Log invalid path
-                        logMsg 1 $ "Invalid store path in database: " <> pathText
-                        return Nothing
-            _ -> return Nothing
+    retrieveDerivationByHash hash = retrieveDerivation hash
 
     getDerivationForOutput outputPath = do
         db <- getDatabaseConn
@@ -536,31 +515,7 @@ instance CanRetrieveDerivation 'Build 'Daemon where
                     Right drv -> return $ Just drv
             _ -> throwError $ DBError "Multiple derivations with same hash - database corruption"
 
-    retrieveDerivationByHash hash = do
-        env <- ask
-        let dbPath = defaultDBPath (storeLocation env)
-
-        -- Get database connection
-        db <- getDatabaseConn
-
-        -- Query for store path
-        storePaths <- tenQuery db
-            "SELECT store_path FROM Derivations WHERE hash = ? LIMIT 1"
-            (Only hash) :: TenM 'Build 'Daemon [Only Text]
-
-        -- Get the derivation
-        case storePaths of
-            [Only pathText] ->
-                case parseStorePath pathText of
-                    Just sp -> do
-                        -- Validate the path after extraction
-                        validatedPath <- validateAndLogPath sp
-                        readDerivationFromStore validatedPath
-                    Nothing -> do
-                        -- Log invalid path
-                        logMsg 1 $ "Invalid store path in database: " <> pathText
-                        return Nothing
-            _ -> return Nothing
+    retrieveDerivationByHash hash = retrieveDerivation hash
 
     getDerivationForOutput outputPath = do
         db <- getDatabaseConn
@@ -1135,7 +1090,7 @@ instance CanQueryDerivations 'Daemon where
     listRegisteredDerivations = do
         db <- getDatabaseConn
 
-        derivInfos <- tenQuery_ db "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
+        derivInfos <- liftIO $ SQLite.query_ (dbConn db) "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC"
 
         -- Validate paths
         validateAndLogDerivationInfos derivInfos
@@ -1510,3 +1465,35 @@ readDerivationFile env path = do
             return $ case Deriv.deserializeDerivation content of
                      Left err -> Left $ "Failed to deserialize derivation: " <> T.pack (show err)
                      Right drv -> Right drv
+
+-- | Helper function to get a database connection
+getDatabaseConn :: TenM p 'Daemon (Database 'Daemon)
+getDatabaseConn = do
+    env <- ask
+    let dbPath = defaultDBPath (storeLocation env)
+
+    -- In a real implementation, this would use a connection pool
+    -- For simplicity, we're creating a new connection each time
+    conn <- liftIO $ SQLite.open dbPath
+    liftIO $ SQLite.execute_ conn "PRAGMA foreign_keys = ON"
+
+    -- Return the database connection wrapped in our Database type
+    return $ Database conn dbPath True 5000 3 sDaemon
+
+-- | Execute a query against the database
+tenExecute :: (SQLite.ToRow q) => Database 'Daemon -> Query -> q -> TenM p 'Daemon ()
+tenExecute db query params = do
+    -- For a real implementation, this would handle retries and error cases
+    liftIO $ SQLite.execute (dbConn db) query params
+
+-- | Execute a query against the database and return results
+tenQuery :: (SQLite.ToRow q, SQLite.FromRow r) => Database 'Daemon -> Query -> q -> TenM p 'Daemon [r]
+tenQuery db query params = do
+    -- For a real implementation, this would handle retries and error cases
+    liftIO $ SQLite.query (dbConn db) query params
+
+-- | Execute a simple query without parameters and return results
+tenQuery_ :: (SQLite.FromRow r) => Database 'Daemon -> Query -> TenM p 'Daemon [r]
+tenQuery_ db query = do
+    -- For a real implementation, this would handle retries and error cases
+    liftIO $ SQLite.query_ (dbConn db) query

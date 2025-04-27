@@ -141,12 +141,12 @@ class CanRegisterReferences (t :: PrivilegeTier) where
     registerPathReferencesImpl :: Database t -> FilePath -> StorePath -> TenM p t Int
 
 -- | Daemon implementation for reference registration
-instance CanRegisterReferences 'Daemon where
+instance (HasDirectQueryOps 'Daemon) => CanRegisterReferences 'Daemon where
     registerReferenceImpl db from to =
         -- Avoid self-references
         when (from /= to) $
             execute_ db
-                "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
+                (Query "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)")
                 (storePathToText from, storePathToText to)
 
     registerReferencesImpl db referrer references = withTenTransaction db ReadWrite $ \_ -> do
@@ -155,7 +155,7 @@ instance CanRegisterReferences 'Daemon where
             -- Avoid self-references
             when (referrer /= ref) $
                 execute_ db
-                       "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
+                       (Query "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)")
                        (storePathToText referrer, storePathToText ref)
 
     registerPathReferencesImpl db storeDir path = do
@@ -297,10 +297,10 @@ class CanQueryReferences (t :: PrivilegeTier) where
     getReferrersImpl :: Database t -> StorePath -> TenM p t (Set StorePath)
 
 -- | Daemon implementation for reference queries
-instance CanQueryReferences 'Daemon where
+instance (HasDirectQueryOps 'Daemon) => CanQueryReferences 'Daemon where
     getDirectReferencesImpl db path = do
-        results <- tenQuery db
-            "SELECT reference FROM References WHERE referrer = ?"
+        results <- query db
+            (Query "SELECT reference FROM References WHERE referrer = ?")
             (Only (storePathToText path))
 
         -- Parse each store path and return as a set
@@ -309,7 +309,7 @@ instance CanQueryReferences 'Daemon where
 
     getReferencesImpl db path = do
         -- Use recursive CTE to efficiently query the closure
-        let query = "WITH RECURSIVE\n\
+        let queryStr = "WITH RECURSIVE\n\
                     \  closure(path) AS (\n\
                     \    VALUES(?)\n\
                     \    UNION\n\
@@ -318,15 +318,15 @@ instance CanQueryReferences 'Daemon where
                     \  )\n\
                     \SELECT path FROM closure WHERE path != ?"
 
-        results <- tenQuery db query (storePathToText path, storePathToText path)
+        results <- query db (Query queryStr) (storePathToText path, storePathToText path)
 
         -- Parse each store path and return as a set
         return $ Set.fromList $ catMaybes $
             map (\(Only p) -> parseStorePath p) results
 
     getDirectReferrersImpl db path = do
-        results <- tenQuery db
-            "SELECT referrer FROM References WHERE reference = ?"
+        results <- query db
+            (Query "SELECT referrer FROM References WHERE reference = ?")
             (Only (storePathToText path))
 
         -- Parse each store path and return as a set
@@ -335,7 +335,7 @@ instance CanQueryReferences 'Daemon where
 
     getReferrersImpl db path = do
         -- Use recursive CTE to efficiently query the closure
-        let query = "WITH RECURSIVE\n\
+        let queryStr = "WITH RECURSIVE\n\
                     \  closure(path) AS (\n\
                     \    VALUES(?)\n\
                     \    UNION\n\
@@ -344,7 +344,7 @@ instance CanQueryReferences 'Daemon where
                     \  )\n\
                     \SELECT path FROM closure WHERE path != ?"
 
-        results <- tenQuery db query (storePathToText path, storePathToText path)
+        results <- query db (Query queryStr) (storePathToText path, storePathToText path)
 
         -- Parse each store path and return as a set
         return $ Set.fromList $ catMaybes $
@@ -455,7 +455,7 @@ class CanManageReachability (t :: PrivilegeTier) where
     isPathReachableImpl :: Database t -> Set StorePath -> StorePath -> TenM p t Bool
 
 -- | Daemon implementation for reachability operations
-instance CanManageReachability 'Daemon where
+instance (HasDirectQueryOps 'Daemon) => CanManageReachability 'Daemon where
     computeReachablePathsImpl db roots = do
         -- If no roots, return empty set
         if Set.null roots
@@ -463,19 +463,19 @@ instance CanManageReachability 'Daemon where
             else withTenTransaction db ReadWrite $ \_ -> do
                 -- Create temp table
                 executeSimple_ db
-                    "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
+                    (Query "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)")
 
                 -- Clear previous roots
-                executeSimple_ db "DELETE FROM temp_roots"
+                executeSimple_ db (Query "DELETE FROM temp_roots")
 
                 -- Insert all roots
                 forM_ (Set.toList roots) $ \root ->
                     execute_ db
-                           "INSERT INTO temp_roots VALUES (?)"
+                           (Query "INSERT INTO temp_roots VALUES (?)")
                            (Only (storePathToText root))
 
                 -- Use recursive CTE to find all reachable paths
-                let query = "WITH RECURSIVE\n\
+                let queryStr = "WITH RECURSIVE\n\
                             \  reachable(path) AS (\n\
                             \    SELECT path FROM temp_roots\n\
                             \    UNION\n\
@@ -484,7 +484,7 @@ instance CanManageReachability 'Daemon where
                             \  )\n\
                             \SELECT path FROM reachable"
 
-                results <- tenQuery_ db query
+                results <- query_ db (Query queryStr)
 
                 -- Parse each store path and return as a set
                 return $ Set.fromList $ catMaybes $
@@ -500,15 +500,15 @@ instance CanManageReachability 'Daemon where
             else withTenTransaction db ReadWrite $ \_ -> do
                 -- Create temp table
                 executeSimple_ db
-                    "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
+                    (Query "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)")
 
                 -- Clear previous data
-                executeSimple_ db "DELETE FROM temp_closure_start"
+                executeSimple_ db (Query "DELETE FROM temp_closure_start")
 
                 -- Insert all starting paths
                 forM_ (Set.toList startingPaths) $ \path ->
                     execute_ db
-                              "INSERT INTO temp_closure_start VALUES (?)"
+                              (Query "INSERT INTO temp_closure_start VALUES (?)")
                               (Only (storePathToText path))
 
                 -- Use recursive CTE to find the closure
@@ -516,7 +516,7 @@ instance CanManageReachability 'Daemon where
                                  then T.pack $ ", " ++ show depthLimit
                                  else ""
 
-                let query = T.concat [
+                let queryStr = T.concat [
                         "WITH RECURSIVE\n",
                         "  closure(path, depth) AS (\n",
                         "    SELECT path, 0 FROM temp_closure_start\n",
@@ -530,7 +530,7 @@ instance CanManageReachability 'Daemon where
                         "SELECT path FROM closure"
                       ]
 
-                results <- tenQuery_ db (Query query)
+                results <- query_ db (Query queryStr)
 
                 -- Parse each store path and return as a set
                 return $ Set.fromList $ catMaybes $
@@ -543,7 +543,7 @@ instance CanManageReachability 'Daemon where
             else do
                 -- Use SQL to efficiently check reachability
                 let rootValues = rootsToSqlValues (Set.toList roots)
-                let query = "WITH RECURSIVE\n\
+                let queryStr = "WITH RECURSIVE\n\
                             \  reachable(path) AS (\n\
                             \    VALUES " ++ rootValues ++ "\n\
                             \    UNION\n\
@@ -552,7 +552,7 @@ instance CanManageReachability 'Daemon where
                             \  )\n\
                             \SELECT COUNT(*) FROM reachable WHERE path = ?"
 
-                results <- tenQuery db (Query $ T.pack query) (Only (storePathToText path)) :: TenM p 'Daemon [Only Int]
+                results <- query db (Query $ T.pack queryStr) (Only (storePathToText path)) :: TenM p 'Daemon [Only Int]
 
                 case results of
                     [Only count] -> return (count > 0)
@@ -658,7 +658,7 @@ class CanManageGCRoots (t :: PrivilegeTier) where
     getRegisteredRootsImpl :: Database t -> TenM p t (Set StorePath)
 
 -- | Daemon implementation for GC root operations
-instance CanManageGCRoots 'Daemon where
+instance (HasDirectQueryOps 'Daemon) => CanManageGCRoots 'Daemon where
     findGCRootsImpl db storeDir = do
         -- Get roots from the file system (symlinks in gc-roots directory)
         let rootsDir = storeDir </> "gc-roots"
@@ -671,8 +671,8 @@ instance CanManageGCRoots 'Daemon where
         return $ Set.union fsRoots dbRoots
 
     getRegisteredRootsImpl db = do
-        results <- tenQuery_ db
-            "SELECT path FROM GCRoots WHERE active = 1"
+        results <- query_ db
+            (Query "SELECT path FROM GCRoots WHERE active = 1")
 
         -- Parse each store path and return as a set
         return $ Set.fromList $ catMaybes $
@@ -1037,17 +1037,17 @@ class CanManageValidPaths (t :: PrivilegeTier) where
     markPathsAsInvalidImpl :: Database t -> Set StorePath -> TenM p t ()
 
 -- | Daemon implementation for path validity management
-instance CanManageValidPaths 'Daemon where
+instance (HasDirectQueryOps 'Daemon, HasTransactionOps 'Daemon) => CanManageValidPaths 'Daemon where
     markPathsAsValidImpl db paths = withTenTransaction db ReadWrite $ \_ -> do
         forM_ (Set.toList paths) $ \path ->
             execute_ db
-                "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?"
+                (Query "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?")
                 (Only (storePathToText path))
 
     markPathsAsInvalidImpl db paths = withTenTransaction db ReadWrite $ \_ -> do
         forM_ (Set.toList paths) $ \path ->
             execute_ db
-                "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
+                (Query "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?")
                 (Only (storePathToText path))
 
 -- | Builder implementation for path validity management (via protocol)
@@ -1118,20 +1118,20 @@ class CanManageDatabase (t :: PrivilegeTier) where
     cleanupDanglingReferencesImpl :: Database t -> TenM p t Int
 
 -- | Daemon implementation for database management
-instance CanManageDatabase 'Daemon where
+instance (HasDirectQueryOps 'Daemon, HasTransactionOps 'Daemon) => CanManageDatabase 'Daemon where
     vacuumReferenceDbImpl db = do
         -- Remove dangling references
         cleanupDanglingReferences db
 
         -- Analyze tables
-        executeSimple_ db "ANALYZE References"
+        executeSimple_ db (Query "ANALYZE References")
 
         -- Vacuum database
-        executeSimple_ db "VACUUM"
+        executeSimple_ db (Query "VACUUM")
 
     validateReferenceDbImpl db storeDir = do
         -- Count existing references
-        [Only totalRefs] <- tenQuery_ db "SELECT COUNT(*) FROM References" :: TenM p 'Daemon [Only Int]
+        [Only totalRefs] <- query_ db (Query "SELECT COUNT(*) FROM References") :: TenM p 'Daemon [Only Int]
 
         -- Remove references to non-existent paths
         invalid <- cleanupDanglingReferences db
@@ -1141,14 +1141,14 @@ instance CanManageDatabase 'Daemon where
 
     cleanupDanglingReferencesImpl db = withTenTransaction db ReadWrite $ \db' -> do
         -- Find references to paths that don't exist in ValidPaths
-        dangling <- tenQuery_ db'
-            "SELECT referrer, reference FROM References \
-            \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)" :: TenM p 'Daemon [(Text, Text)]
+        dangling <- query_ db'
+            (Query "SELECT referrer, reference FROM References \
+            \WHERE reference NOT IN (SELECT path FROM ValidPaths WHERE is_valid = 1)") :: TenM p 'Daemon [(Text, Text)]
 
         -- Delete these references
         count <- foldM (\acc (from, to) -> do
             execute_ db'
-                "DELETE FROM References WHERE referrer = ? AND reference = ?"
+                (Query "DELETE FROM References WHERE referrer = ? AND reference = ?")
                 (from, to)
             return $! acc + 1) 0 dangling
 

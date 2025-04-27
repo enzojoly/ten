@@ -174,10 +174,10 @@ class HasStoreOps (t :: PrivilegeTier) where
 -- | Base typeclass for derivation operations (common to both Daemon and Builder)
 class HasDerivationOps (t :: PrivilegeTier) where
     -- | Store a derivation
-    storeDerivation :: Database t -> Derivation -> TenM p t StorePath
+    dbStoreDerivation :: Database t -> Derivation -> TenM p t StorePath
 
     -- | Retrieve a derivation by store path
-    retrieveDerivation :: Database t -> StorePath -> TenM p t (Maybe Derivation)
+    dbRetrieveDerivation :: Database t -> StorePath -> TenM p t (Maybe Derivation)
 
 -- | Base typeclass for build operations (common to both Daemon and Builder)
 class HasBuildOps (t :: PrivilegeTier) where
@@ -267,7 +267,7 @@ instance HasStoreOps 'Daemon where
 
 -- | HasDerivationOps instance for Daemon (direct database access)
 instance HasDerivationOps 'Daemon where
-    storeDerivation db drv = withTenWriteTransaction db $ \db' -> do
+    dbStoreDerivation db drv = withTenWriteTransaction db $ \db' -> do
         -- Serialize the derivation
         let serialized = serializeDerivation drv
         let contentHash = hashByteString serialized
@@ -294,7 +294,7 @@ instance HasDerivationOps 'Daemon where
 
         return storePath
 
-    retrieveDerivation db path = withTenReadTransaction db $ \db' -> do
+    dbRetrieveDerivation db path = withTenReadTransaction db $ \db' -> do
         -- Check if derivation exists
         pathExists <- query db' "SELECT 1 FROM Derivations WHERE store_path = ?" [storePathToText path]
         if null (pathExists :: [Only Int])
@@ -572,14 +572,14 @@ instance HasStoreOps 'Builder where
 
 -- | HasDerivationOps instance for Builder (protocol-based)
 instance HasDerivationOps 'Builder where
-    storeDerivation db drv = do
+    dbStoreDerivation db drv = do
         respEither <- sendDbRequest (StoreDerivationRequest drv)
         case respEither of
             Left err -> throwError err
             Right (StoreDerivationResponse path) -> return path
             Right _ -> throwError $ toBuilderError $ DBProtocolError "Unexpected response type"
 
-    retrieveDerivation db path = do
+    dbRetrieveDerivation db path = do
         respEither <- sendDbRequest (RetrieveDerivationRequest path)
         case respEither of
             Left _ -> return Nothing
