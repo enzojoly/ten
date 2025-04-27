@@ -211,8 +211,8 @@ module Ten.Core (
     withStore,
 
     -- Database
-    Database,
-    TransactionMode,
+    Database(..),
+    TransactionMode(..),
 
     -- Time utilities
     getCurrentMillis,
