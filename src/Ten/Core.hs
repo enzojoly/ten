@@ -34,7 +34,6 @@ module Ten.Core (
     BuildStatus(..),
     BuildStrategy(..),
     RunMode(..),
-    runMode,
     DaemonConfig(..),
     UserId(..),
     AuthToken(..),
