@@ -120,8 +120,8 @@ import Database.SQLite.Simple (Connection, Query(..), Only(..), execute, execute
 import qualified Database.SQLite.Simple as SQL
 
 import Ten.Core
-import Ten.DB.Core (CanAccessDatabase(..), CanExecuteStatement(..), CanExecuteQuery(..),
-                    withTenTransaction, withTenReadTransaction, withTenWriteTransaction,
+import Ten.DB.Core (HasDirectQueryOps(..), HasTransactionOps(..),
+                    withTransaction, withReadTransaction, withWriteTransaction,
                     Database, TransactionMode(..))
 
 -- | Type class for basic store access operations
