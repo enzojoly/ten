@@ -210,8 +210,8 @@ module Ten.Core (
     withStore,
 
     -- Database
-    --Database,
-    --TransactionMode,
+    Database,
+    TransactionMode,
 
     -- Time utilities
     getCurrentMillis,
@@ -281,8 +281,8 @@ import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, myThreadId
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Char (isHexDigit)
-import Data.Singletons
-import Data.Singletons.TH
+import Data.Singletons hiding (fromSing)
+import Data.Singletons.TH hiding (fromSing)
 import Data.Kind (Type)
 import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
@@ -1191,15 +1191,6 @@ class CanBuildDerivation (t :: PrivilegeTier) where
 
 class CanQueryBuildStatus (t :: PrivilegeTier) where
   getBuildStatus :: BuildId -> TenM 'Build t BuildStatus
-
--- Database transaction function signatures
-withTransaction :: (CanAccessDatabase t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withReadTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withWriteTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-
--- Database operation signatures
-dbExecute :: (CanExecuteStatement t) => Database t -> Query -> [SQLData] -> TenM p t Int64
-dbQuery :: (CanExecuteQuery t) => Database t -> Query -> [SQLData] -> TenM p t [a]
 
 -- | Get the default path for the Ten database
 -- This function computes a path but doesn't interact with the filesystem
