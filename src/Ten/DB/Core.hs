@@ -39,9 +39,9 @@ module Ten.DB.Core (
     getDatabaseFromEnv,
 
     -- Daemon-only transaction handling
-    withTransaction,
-    withReadTransaction,
-    withWriteTransaction,
+    withTenTransaction,
+    withTenReadTransaction,
+    withTenWriteTransaction,
 
     -- Utility functions
     retryOnBusy,
@@ -225,14 +225,15 @@ class HasDirectQueryOps (t :: PrivilegeTier) where
 
 -- | Daemon-only typeclass for transaction management
 class HasTransactionOps (t :: PrivilegeTier) where
+
     -- | Execute an action within a transaction
-    withTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
+    withTenTransaction :: Database t -> TransactionMode -> (Database t -> TenM p t a) -> TenM p t a
 
     -- | Execute an action within a read-only transaction
-    withReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withTenReadTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
 
     -- | Execute an action within a read-write transaction
-    withWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
+    withTenWriteTransaction :: Database t -> (Database t -> TenM p t a) -> TenM p t a
 
 -- | Bracket-like function that works in the TenM monad
 bracketTenM :: TenM p t a -> (a -> TenM p t b) -> (a -> TenM p t c) -> TenM p t c
@@ -249,16 +250,16 @@ bracketTenM acquire release action = do
 
 -- | HasStoreOps instance for Daemon (direct database access)
 instance HasStoreOps 'Daemon where
-    registerPath db path = withWriteTransaction db $ \db' -> do
+    registerPath db path = withTenWriteTransaction db $ \db' -> do
         -- Insert into ValidPaths table
         execute_ db' "INSERT OR REPLACE INTO ValidPaths (path, hash, registration_time) VALUES (?, ?, strftime('%s','now'))"
             (storePathToText path, T.unpack (storePathToText path))
 
-    pathExists db path = withReadTransaction db $ \db' -> do
+    pathExists db path = withTenReadTransaction db $ \db' -> do
         results <- query db' "SELECT 1 FROM ValidPaths WHERE path = ? AND is_valid = 1" [storePathToText path]
         return $ not (null (results :: [Only Int]))
 
-    getAllPaths db = withReadTransaction db $ \db' -> do
+    getAllPaths db = withTenReadTransaction db $ \db' -> do
         results <- query_ db' "SELECT path FROM ValidPaths WHERE is_valid = 1"
         return $ map (\(Only p) -> case parseStorePath p of
                                      Just path -> path
@@ -266,7 +267,7 @@ instance HasStoreOps 'Daemon where
 
 -- | HasDerivationOps instance for Daemon (direct database access)
 instance HasDerivationOps 'Daemon where
-    storeDerivation db drv = withWriteTransaction db $ \db' -> do
+    storeDerivation db drv = withTenWriteTransaction db $ \db' -> do
         -- Serialize the derivation
         let serialized = serializeDerivation drv
         let contentHash = hashByteString serialized
@@ -293,7 +294,7 @@ instance HasDerivationOps 'Daemon where
 
         return storePath
 
-    retrieveDerivation db path = withReadTransaction db $ \db' -> do
+    retrieveDerivation db path = withTenReadTransaction db $ \db' -> do
         -- Check if derivation exists
         pathExists <- query db' "SELECT 1 FROM Derivations WHERE store_path = ?" [storePathToText path]
         if null (pathExists :: [Only Int])
@@ -316,7 +317,7 @@ instance HasDerivationOps 'Daemon where
 
 -- | HasBuildOps instance for Daemon (direct database access)
 instance HasBuildOps 'Daemon where
-    registerBuildResult db buildId result = withWriteTransaction db $ \db' -> do
+    registerBuildResult db buildId result = withTenWriteTransaction db $ \db' -> do
         -- Serialize the build result
         let json = Aeson.encode result
         let contentHash = hashByteString (LBS.toStrict json)
@@ -337,7 +338,7 @@ instance HasBuildOps 'Daemon where
 
         return storePath
 
-    getBuildResult db path = withReadTransaction db $ \db' -> do
+    getBuildResult db path = withTenReadTransaction db $ \db' -> do
         -- Check if path exists
         exists <- pathExists db' path
         if not exists
@@ -360,15 +361,15 @@ instance HasBuildOps 'Daemon where
 
 -- | HasGCOps instance for Daemon (direct database access)
 instance HasGCOps 'Daemon where
-    createGCRoot db path name = withWriteTransaction db $ \db' -> do
+    createGCRoot db path name = withTenWriteTransaction db $ \db' -> do
         execute_ db' "INSERT OR REPLACE INTO GCRoots (path, name, type, timestamp, active) VALUES (?, ?, 'registry', strftime('%s','now'), 1)"
             (storePathToText path, name)
 
-    removeGCRoot db path name = withWriteTransaction db $ \db' -> do
+    removeGCRoot db path name = withTenWriteTransaction db $ \db' -> do
         execute_ db' "UPDATE GCRoots SET active = 0 WHERE path = ? AND name = ?"
             (storePathToText path, name)
 
-    listGCRoots db onlyActive = withReadTransaction db $ \db' -> do
+    listGCRoots db onlyActive = withTenReadTransaction db $ \db' -> do
         let query = if onlyActive
                       then "SELECT name FROM GCRoots WHERE active = 1"
                       else "SELECT name FROM GCRoots"
@@ -377,7 +378,7 @@ instance HasGCOps 'Daemon where
 
 -- | HasSchemaOps instance for Daemon (direct database access)
 instance HasSchemaOps 'Daemon where
-    getSchemaVersion db = withReadTransaction db $ \db' -> do
+    getSchemaVersion db = withTenReadTransaction db $ \db' -> do
         -- Check if the version table exists
         hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
         case hasVersionTable of
@@ -389,7 +390,7 @@ instance HasSchemaOps 'Daemon where
                     _ -> return 0  -- No version record found
             _ -> return 0  -- Table doesn't exist
 
-    updateSchemaVersion db version = withWriteTransaction db $ \db' -> do
+    updateSchemaVersion db version = withTenWriteTransaction db $ \db' -> do
         -- Check if the version table exists
         hasVersionTable <- query_ db' "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='SchemaVersion';" :: TenM p 'Daemon [Only Int]
         case hasVersionTable of
@@ -427,7 +428,7 @@ instance HasDirectQueryOps 'Daemon where
 
 -- | HasTransactionOps instance for Daemon (direct transaction management)
 instance HasTransactionOps 'Daemon where
-    withTransaction db mode action =
+    withTenTransaction db mode action =
         -- Start transaction with appropriate mode
         let beginStmt = case mode of
                 ReadOnly -> "BEGIN TRANSACTION READONLY;"
@@ -452,8 +453,8 @@ instance HasTransactionOps 'Daemon where
                 liftIO $ rollbackOnError db
                 throwError e)
 
-    withReadTransaction db = withTransaction db ReadOnly
-    withWriteTransaction db = withTransaction db ReadWrite
+    withTenReadTransaction db = withTenTransaction db ReadOnly
+    withTenWriteTransaction db = withTenTransaction db ReadWrite
 
 -- Builder instances for protocol-based operations
 
@@ -707,7 +708,7 @@ rollbackOnError db = catch
 initializeSchema :: Database 'Daemon -> IO ()
 initializeSchema db = do
     -- Use IO-level transaction for initial schema setup
-    withTransactionIO db Exclusive $ \_ -> do
+    withTenTransactionIO db Exclusive $ \_ -> do
         -- Create schema version tracking table
         SQLite.execute_ (dbConn db) "CREATE TABLE IF NOT EXISTS SchemaVersion (version INTEGER NOT NULL, updated_at TEXT NOT NULL);"
 
@@ -762,8 +763,8 @@ initializeSchema db = do
         return ()
 
 -- | Helper function for direct IO-level transactions
-withTransactionIO :: Database 'Daemon -> TransactionMode -> (Database 'Daemon -> IO a) -> IO a
-withTransactionIO db mode action = do
+withTenTransactionIO :: Database 'Daemon -> TransactionMode -> (Database 'Daemon -> IO a) -> IO a
+withTenTransactionIO db mode action = do
     -- Start transaction with appropriate mode
     let beginStmt = case mode of
             ReadOnly -> "BEGIN TRANSACTION READONLY;"

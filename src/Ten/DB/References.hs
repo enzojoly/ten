@@ -145,7 +145,7 @@ instance CanRegisterReferences 'Daemon where
     registerReferenceImpl db from to =
         -- Avoid self-references
         when (from /= to) $
-            tenExecute_ db
+            execute_ db
                 "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
                 (storePathToText from, storePathToText to)
 
@@ -154,7 +154,7 @@ instance CanRegisterReferences 'Daemon where
         forM_ (Set.toList references) $ \ref ->
             -- Avoid self-references
             when (referrer /= ref) $
-                tenExecute_ db
+                execute_ db
                        "INSERT OR IGNORE INTO References (referrer, reference) VALUES (?, ?)"
                        (storePathToText referrer, storePathToText ref)
 
@@ -462,15 +462,15 @@ instance CanManageReachability 'Daemon where
             then return Set.empty
             else withTenTransaction db ReadWrite $ \_ -> do
                 -- Create temp table
-                tenExecuteSimple_ db
+                executeSimple_ db
                     "CREATE TEMP TABLE IF NOT EXISTS temp_roots (path TEXT PRIMARY KEY)"
 
                 -- Clear previous roots
-                tenExecuteSimple_ db "DELETE FROM temp_roots"
+                executeSimple_ db "DELETE FROM temp_roots"
 
                 -- Insert all roots
                 forM_ (Set.toList roots) $ \root ->
-                    tenExecute_ db
+                    execute_ db
                            "INSERT INTO temp_roots VALUES (?)"
                            (Only (storePathToText root))
 
@@ -499,15 +499,15 @@ instance CanManageReachability 'Daemon where
             then return Set.empty
             else withTenTransaction db ReadWrite $ \_ -> do
                 -- Create temp table
-                tenExecuteSimple_ db
+                executeSimple_ db
                     "CREATE TEMP TABLE IF NOT EXISTS temp_closure_start (path TEXT PRIMARY KEY)"
 
                 -- Clear previous data
-                tenExecuteSimple_ db "DELETE FROM temp_closure_start"
+                executeSimple_ db "DELETE FROM temp_closure_start"
 
                 -- Insert all starting paths
                 forM_ (Set.toList startingPaths) $ \path ->
-                    tenExecute_ db
+                    execute_ db
                               "INSERT INTO temp_closure_start VALUES (?)"
                               (Only (storePathToText path))
 
@@ -1040,13 +1040,13 @@ class CanManageValidPaths (t :: PrivilegeTier) where
 instance CanManageValidPaths 'Daemon where
     markPathsAsValidImpl db paths = withTenTransaction db ReadWrite $ \_ -> do
         forM_ (Set.toList paths) $ \path ->
-            tenExecute_ db
+            execute_ db
                 "UPDATE ValidPaths SET is_valid = 1 WHERE path = ?"
                 (Only (storePathToText path))
 
     markPathsAsInvalidImpl db paths = withTenTransaction db ReadWrite $ \_ -> do
         forM_ (Set.toList paths) $ \path ->
-            tenExecute_ db
+            execute_ db
                 "UPDATE ValidPaths SET is_valid = 0 WHERE path = ?"
                 (Only (storePathToText path))
 
@@ -1124,10 +1124,10 @@ instance CanManageDatabase 'Daemon where
         cleanupDanglingReferences db
 
         -- Analyze tables
-        tenExecuteSimple_ db "ANALYZE References"
+        executeSimple_ db "ANALYZE References"
 
         -- Vacuum database
-        tenExecuteSimple_ db "VACUUM"
+        executeSimple_ db "VACUUM"
 
     validateReferenceDbImpl db storeDir = do
         -- Count existing references
@@ -1147,7 +1147,7 @@ instance CanManageDatabase 'Daemon where
 
         -- Delete these references
         count <- foldM (\acc (from, to) -> do
-            tenExecute_ db'
+            execute_ db'
                 "DELETE FROM References WHERE referrer = ? AND reference = ?"
                 (from, to)
             return $! acc + 1) 0 dangling

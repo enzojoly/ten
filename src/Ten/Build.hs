@@ -48,9 +48,9 @@ module Ten.Build (
     CanManageBuildStatus(..),
 
     -- Transaction helpers
-    withTransaction,
-    withReadTransaction,
-    withWriteTransaction
+    withTenTransaction,
+    withTenReadTransaction,
+    withTenWriteTransaction
 ) where
 
 import Control.Concurrent
@@ -171,14 +171,14 @@ class CanManageBuildStatus (t :: PrivilegeTier) where
     updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build t ()
 
 -- | Transaction helpers with proper privilege constraints
-withTransaction :: (CanAccessDatabase t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withTransaction db mode logFn action = withTenTransaction db mode (\db' -> action)
+withTenTransaction :: (CanAccessDatabase t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withTenTransaction db mode logFn action = withTenTransaction db mode (\db' -> action)
 
-withReadTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withReadTransaction db logFn = withTransaction db ReadOnly logFn
+withTenReadTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withTenReadTransaction db logFn = withTenTransaction db ReadOnly logFn
 
-withWriteTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withWriteTransaction db logFn = withTransaction db ReadWrite logFn
+withTenWriteTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
+withTenWriteTransaction db logFn = withTenTransaction db ReadWrite logFn
 
 -- | Daemon instance for building derivations
 instance CanBuildDerivation 'Daemon where
@@ -948,7 +948,7 @@ collectBuildResultDaemon deriv buildDir = do
     db <- DB.getDatabaseConn
 
     -- Process in a transaction for atomicity
-    withWriteTransaction db (logMsg 2) $ do
+    withTenWriteTransaction db (logMsg 2) $ do
         -- Process each expected output
         outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
 
