@@ -264,6 +264,8 @@ import Network.Socket (Socket, SockAddr(..), socketToHandle, close)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdin,
                  openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError)
+import Database.SQLite.Simple (Connection, Query(..), ToRow(..), FromRow(..), SQLData, Only(..))
+import Data.Int (Int64)
 import qualified System.Posix.User as User
 import System.Posix.Files (fileExist, getFileStatus, isRegularFile, setFileMode)
 import qualified System.Posix.IO as PosixIO
@@ -2437,7 +2439,7 @@ deserializeDerivation bs =
 
     parseEnvMap :: Aeson.Value -> Parser (Map Text Text)
     parseEnvMap = Aeson.withObject "Environment" $ \o ->
-        return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- KeyMap.toList o]
+        return $ Map.fromList [(Key.toText k, v) | (k, Aeson.String v) <- AKeyMap.toList o]
 
 -- | Serialize BuildResult to ByteString
 serializeBuildResult :: BuildResult -> BS.ByteString
