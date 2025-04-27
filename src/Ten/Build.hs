@@ -72,11 +72,11 @@ import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, file
 import qualified System.Posix.User as User
 import System.Posix.Process (ProcessStatus(..), getProcessStatus, forkProcess, executeFile, getProcessID)
 import System.Posix.Signals (signalProcess, sigKILL, sigTERM, installHandler, Handler(..))
-import System.Posix.Types (ProcessID, FileMode, UserID, GroupID)
+import System.Posix.Types (ProcessID, FileMode, UserID, GroupID, Fd)
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
                        defaultFileFlags, OpenMode(..), OpenFileFlags(..),
-                       exclusive, fdToHandle, dup2)
-import Foreign.C.Error (Errno(..), getErrno)
+                       exclusive, fdToHandle)
+import Foreign.C.Error (Errno(..), getErrno, throwErrnoIfMinus1_, throwErrno)
 import Foreign.C (CInt(..))
 import GHC.IO.Handle.FD (handleToFd)
 import System.Timeout (timeout)
@@ -100,6 +100,14 @@ import Ten.DB.Derivations
 import Ten.DB.References
 import Ten.Daemon.Protocol
 import Ten.Daemon.Client
+
+-- Foreign imports for system calls
+foreign import ccall unsafe "unistd.h dup2"
+    c_dup2 :: CInt -> CInt -> IO CInt
+
+-- | Safe wrapper for dup2
+dup2 :: Fd -> Fd -> IO ()
+dup2 oldfd newfd = throwErrnoIfMinus1_ "dup2" $ c_dup2 (fromIntegral oldfd) (fromIntegral newfd)
 
 -- | Result of a build operation
 data BuildResult = BuildResult
@@ -686,13 +694,11 @@ runBuilder env = do
 
 -- | Set process group ID
 setpgid :: ProcessID -> ProcessID -> IO ()
-setpgid childPid pgid = do
-    -- Use the C function via FFI
-    let result = c_setpgid (fromIntegral childPid) (fromIntegral pgid)
-    return ()
+setpgid childPid pgid =
+    throwErrnoIfMinus1_ "setpgid" $ c_setpgid (fromIntegral childPid) (fromIntegral pgid)
 
 -- | FFI declaration for setpgid
-foreign import ccall unsafe "setpgid"
+foreign import ccall unsafe "unistd.h setpgid"
     c_setpgid :: CInt -> CInt -> IO CInt
 
 -- | Prepare a clean environment for the builder
@@ -714,13 +720,35 @@ resetSignalHandlers = do
 -- | Close all unused file descriptors (except stdin, stdout, stderr)
 closeUnusedFileDescriptors :: IO ()
 closeUnusedFileDescriptors = do
-    -- We'll implement a simplified version that works on Linux
-    -- Ideally, we'd scan /proc/self/fd for complete coverage
-    -- For now, we'll close a reasonable range of file descriptors
-    forM_ [3..1024] $ \fd -> do
-        -- Try to close each FD, ignoring errors
-        catch (closeFd (fromIntegral fd)) (\(_ :: SomeException) -> return ())
+    -- We'll try to use /proc/self/fd if available for more accurate FD scanning
+    procFdExists <- doesDirectoryExist "/proc/self/fd"
+
+    if procFdExists
+        then do
+            -- Get list of open file descriptors from /proc
+            fds <- try $ listDirectory "/proc/self/fd"
+            case fds of
+                Right fdList -> do
+                    -- Convert to integers and filter out 0, 1, 2
+                    let fdInts = filter (> 2) $ catMaybes $ map readMaybe fdList
+                    -- Close each FD
+                    forM_ fdInts $ \fd ->
+                        catch (closeFd (fromIntegral fd)) (\(_ :: SomeException) -> return ())
+                Left (_ :: SomeException) ->
+                    -- Fallback to closing a reasonable range
+                    forM_ [3..1024] $ \fd ->
+                        catch (closeFd (fromIntegral fd)) (\(_ :: SomeException) -> return ())
+        else
+            -- If /proc is not available, close a reasonable range
+            forM_ [3..1024] $ \fd ->
+                catch (closeFd (fromIntegral fd)) (\(_ :: SomeException) -> return ())
+
     return ()
+  where
+    readMaybe :: String -> Maybe Int
+    readMaybe s = case reads s of
+        [(x, "")] -> Just x
+        _ -> Nothing
 
 -- | Set up a builder executable in the sandbox
 setupBuilder :: StorePath -> BS.ByteString -> FilePath -> TenM 'Build 'Daemon FilePath
