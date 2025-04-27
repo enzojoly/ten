@@ -40,9 +40,8 @@ module Ten.Daemon.Protocol (
     DaemonRequest(..),
 
     -- Database operation request types
-    DBQueryRequest(..),
-    DBExecuteRequest(..),
-    DBTransactionRequest(..),
+    DBQueryParams(..),
+    DBExecuteParams(..),
     TransactionMode(..),
 
     -- Serialization
@@ -117,6 +116,7 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Word (Word8, Word32, Word64)
+import Data.Int (Int64)
 import GHC.Generics (Generic)
 import Network.Socket (Socket, close, socketToHandle)
 import System.IO (Handle, IOMode(..), hClose, hFlush, hSetBuffering, BufferMode(..))
@@ -133,9 +133,9 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Unique (Unique, hashUnique)
 import qualified Data.ByteString.Lazy.Char8 as LC8
 import qualified Data.ByteString.Char8 as C8
-import Data.Int (Int64)
 
 import Ten.Derivation
+import Ten.DB.Core (TransactionMode(..))
 
 -- Import Ten.Core types and functions
 import Ten.Core (
@@ -160,7 +160,6 @@ import Ten.Core (
     DerivationOutputMappingResponse(..),
     GCRequestParams(..),
     GCStatusRequestParams(..),
-    TransactionMode(..),
 
     -- Protocol utilities moved to Core
     parseRequestFrame,
@@ -315,19 +314,13 @@ renderBuildId (BuildIdFromInt n) = "build-" <> T.pack (show n)
 -- | Database query parameters
 data DBQueryParams = DBQueryParams {
     dbQueryStatement :: Text,
-    dbQueryParams :: [Aeson.Value]
+    dbQueryParams :: [BS.ByteString]
 } deriving (Show, Eq)
 
 -- | Database execute parameters
 data DBExecuteParams = DBExecuteParams {
     dbExecuteStatement :: Text,
-    dbExecuteParams :: [Aeson.Value]
-} deriving (Show, Eq)
-
--- | Database transaction parameters
-data DBTransactionParams = DBTransactionParams {
-    dbTransactionMode :: TransactionMode,
-    dbTransactionAction :: Text  -- Identifier for the transaction action
+    dbExecuteParams :: [BS.ByteString]
 } deriving (Show, Eq)
 
 -- | Daemon request types for protocol communication
@@ -359,8 +352,8 @@ data DaemonRequest
     | StatusRequest
     | ConfigRequest
     -- DB operation request types
-    | DBQueryOp Text [BS.ByteString]
-    | DBExecuteOp Text [BS.ByteString]
+    | DBQueryRequest DBQueryParams
+    | DBExecuteRequest DBExecuteParams
     | DBTransactionBeginRequest TransactionMode
     | DBTransactionCommitRequest
     | DBTransactionRollbackRequest
@@ -430,8 +423,8 @@ requestCapabilities = \case
     AddGCRootRequest _ _ _ -> Set.singleton StoreAccess
     RemoveGCRootRequest _ -> Set.singleton StoreAccess
     BuildDerivationRequest _ _ -> Set.fromList [DerivationBuild, StoreAccess]
-    DBQueryRequest _ _ -> Set.singleton DatabaseAccess
-    DBExecuteRequest _ _ -> Set.singleton DatabaseAccess
+    DBQueryRequest _ -> Set.singleton DatabaseAccess
+    DBExecuteRequest _ -> Set.singleton DatabaseAccess
     DBTransactionBeginRequest _ -> Set.singleton DatabaseAccess
     DBTransactionCommitRequest -> Set.singleton DatabaseAccess
     DBTransactionRollbackRequest -> Set.singleton DatabaseAccess
@@ -658,21 +651,25 @@ serializeDaemonRequest req =
                 "type" .= ("config" :: Text)
             ], Nothing)
 
-        DBQueryRequest query params ->
+        DBQueryRequest params ->
             (LBS.toStrict $ Aeson.encode $ Aeson.object [
                 "type" .= ("db-query" :: Text),
-                "query" .= query,
-                "params" .= T.pack (show params),
-                "hasContent" .= True
-            ], Just (BS.concat params))
+                "query" .= dbQueryStatement params,
+                "params" .= T.pack (show (dbQueryParams params)),
+                "hasContent" .= not (null (dbQueryParams params))
+            ], if null (dbQueryParams params)
+                  then Nothing
+                  else Just (BS.concat (dbQueryParams params)))
 
-        DBExecuteRequest query params ->
+        DBExecuteRequest params ->
             (LBS.toStrict $ Aeson.encode $ Aeson.object [
                 "type" .= ("db-execute" :: Text),
-                "query" .= query,
-                "params" .= T.pack (show params),
-                "hasContent" .= isJust (if null params then Nothing else Just params)
-            ], if null params then Nothing else Just (BS.concat params))
+                "query" .= dbExecuteStatement params,
+                "params" .= T.pack (show (dbExecuteParams params)),
+                "hasContent" .= not (null (dbExecuteParams params))
+            ], if null (dbExecuteParams params)
+                  then Nothing
+                  else Just (BS.concat (dbExecuteParams params)))
 
         DBTransactionBeginRequest mode ->
             (LBS.toStrict $ Aeson.encode $ Aeson.object [
@@ -971,9 +968,11 @@ deserializeDaemonRequest bs mPayload =
                             _ -> Left "Missing or invalid query"
 
                         -- Parameters are in the payload
-                        case mPayload of
-                            Nothing -> Right $ DBQueryRequest query []
-                            Just payload -> Right $ DBQueryRequest query [payload]
+                        let params = case mPayload of
+                                         Just payload -> [payload]
+                                         Nothing -> []
+
+                        Right $ DBQueryRequest (DBQueryParams query params)
 
                     Just (Aeson.String "db-execute") -> do
                         query <- case KeyMap.lookup "query" obj of
@@ -981,9 +980,11 @@ deserializeDaemonRequest bs mPayload =
                             _ -> Left "Missing or invalid query"
 
                         -- Parameters are in the payload
-                        case mPayload of
-                            Nothing -> Right $ DBExecuteRequest query []
-                            Just payload -> Right $ DBExecuteRequest query [payload]
+                        let params = case mPayload of
+                                         Just payload -> [payload]
+                                         Nothing -> []
+
+                        Right $ DBExecuteRequest (DBExecuteParams query params)
 
                     Just (Aeson.String "db-begin-transaction") -> do
                         modeStr <- case KeyMap.lookup "mode" obj of
@@ -1567,11 +1568,11 @@ requestToText = \case
     ConfigRequest ->
         "Get daemon configuration"
 
-    DBQueryRequest query _ ->
-        "Execute DB query: " <> query
+    DBQueryRequest params ->
+        "Execute DB query: " <> dbQueryStatement params
 
-    DBExecuteRequest query _ ->
-        "Execute DB statement: " <> query
+    DBExecuteRequest params ->
+        "Execute DB statement: " <> dbExecuteStatement params
 
     DBTransactionBeginRequest mode ->
         "Begin transaction: " <> case mode of
@@ -1733,9 +1734,6 @@ deserializeQueryResults bs =
 getRowsAffected :: DaemonResponse -> Maybe Int64
 getRowsAffected (SuccessResponse) = Just 0  -- Default for successful operations
 getRowsAffected _ = Nothing
-
--- Type alias for consistency
-type Int64 = Int
 
 instance Aeson.ToJSON GCStats where
     toJSON GCStats{..} = Aeson.object [
