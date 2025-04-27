@@ -45,12 +45,7 @@ module Ten.Build (
     -- Type classes for privilege-aware operations
     CanBuildDerivation(..),
     CanBuildStrategy(..),
-    CanManageBuildStatus(..),
-
-    -- Transaction helpers
-    withTenTransaction,
-    withTenReadTransaction,
-    withTenWriteTransaction
+    CanManageBuildStatus(..)
 ) where
 
 import Control.Concurrent
@@ -115,12 +110,10 @@ import qualified Ten.Graph as Graph
 import Ten.DB.Core
 import qualified Ten.DB.Core as DB
 import Ten.DB.Derivations
-import qualified Ten.DB.Derivations as DB
+import qualified Ten.DB.Derivations as DBDeriv
 import Ten.DB.References
-import qualified Ten.DB.References as DB
-import Ten.Daemon.Protocol
+import qualified Ten.DB.References as DBRef
 import qualified Ten.Daemon.Protocol as Protocol
-import Ten.Daemon.Client
 import qualified Ten.Daemon.Client as Client
 
 -- Foreign imports for system calls
@@ -170,16 +163,6 @@ class CanManageBuildStatus (t :: PrivilegeTier) where
     -- | Update build status in store
     updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build t ()
 
--- | Transaction helpers with proper privilege constraints
-withTenTransaction :: (CanAccessDatabase t) => Database t -> TransactionMode -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withTenTransaction db mode logFn action = withTenTransaction db mode (\db' -> action)
-
-withTenReadTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withTenReadTransaction db logFn = withTenTransaction db ReadOnly logFn
-
-withTenWriteTransaction :: (CanAccessDatabase t) => Database t -> (Text -> TenM p t ()) -> TenM p t a -> TenM p t a
-withTenWriteTransaction db logFn = withTenTransaction db ReadWrite logFn
-
 -- | Daemon instance for building derivations
 instance CanBuildDerivation 'Daemon where
     buildDerivation deriv = do
@@ -187,7 +170,7 @@ instance CanBuildDerivation 'Daemon where
         logMsg 1 $ "Building derivation: " <> derivName deriv
 
         -- Serialize and store the derivation in the store
-        derivPath <- storeDerivationDaemon deriv
+        derivPath <- Core.storeDerivationDaemon deriv
 
         -- Get current build ID
         bid <- gets currentBuildId
@@ -195,7 +178,7 @@ instance CanBuildDerivation 'Daemon where
         -- Register the derivation in the database
         env <- ask
         withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-            liftIO $ registerDerivationFile db deriv derivPath
+            liftIO $ DBDeriv.registerDerivationFile db deriv derivPath
 
         -- First instantiate the derivation
         Derivation.instantiateDerivation deriv
@@ -230,7 +213,7 @@ instance CanBuildDerivation 'Builder where
         }
 
         -- Send request and wait for response
-        response <- liftIO $ sendRequestSync daemonConn request (3600 * 1000000) -- 1 hour timeout
+        response <- liftIO $ Client.sendRequestSync daemonConn request (3600 * 1000000) -- 1 hour timeout
 
         case response of
             Left err -> throwError err
@@ -395,7 +378,7 @@ instance CanManageBuildStatus 'Builder where
         }
 
         -- Send request and wait for response
-        response <- liftIO $ sendRequestSync daemonConn request 10000000
+        response <- liftIO $ Client.sendRequestSync daemonConn request 10000000
         case response of
             Left err -> throwError err
             Right (BuildStatusResponse update) -> return (buildStatus update)
@@ -416,38 +399,7 @@ instance CanManageBuildStatus 'Builder where
         }
 
         -- Send request (fire and forget)
-        void $ liftIO $ sendRequest daemonConn request
-
--- | Store a derivation in daemon context (privileged operation)
-storeDerivationDaemon :: Derivation -> TenM 'Build 'Daemon StorePath
-storeDerivationDaemon deriv = do
-    env <- ask
-
-    -- Serialize the derivation
-    let serialized = Core.serializeDerivation deriv
-
-    -- Calculate a hash for the content
-    let contentHash = hashByteString serialized
-    let hashHex = T.pack $ show contentHash
-
-    -- Determine store path
-    let name = derivName deriv <> ".drv"
-    let storePath = StorePath hashHex name
-
-    -- Write to the store
-    let fullPath = storePathToFilePath storePath env
-
-    -- Create parent directories
-    liftIO $ createDirectoryIfMissing True (takeDirectory fullPath)
-
-    -- Write the file with proper permissions
-    liftIO $ BS.writeFile fullPath serialized
-    liftIO $ setFileMode fullPath 0o444  -- Read-only for everyone
-
-    logMsg 1 $ "Stored derivation at " <> storePathToText storePath
-
-    -- Return the store path
-    return storePath
+        void $ liftIO $ Client.sendRequest daemonConn request
 
 -- | Find derivation objects for dependencies (daemon operation)
 findDependencyDerivations :: [StorePath] -> TenM 'Build 'Daemon (Map String Derivation)
@@ -457,7 +409,7 @@ findDependencyDerivations paths = do
     -- Use the database to look up derivations for the provided output paths
     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Use the database to look up derivations for the provided output paths
-        result <- DB.findDerivationsByOutputs paths
+        result <- DBDeriv.findDerivationsByOutputs paths
 
         -- If any lookup failed, throw an error
         when (Map.size result /= length paths) $ do
@@ -492,7 +444,7 @@ buildWithSandboxDaemon deriv config = do
     Sandbox.withSandbox inputs config $ \buildDir -> do
         -- Get the builder path in the store
         let builderPath = derivBuilder deriv
-        builderContent <- Store.readFromStore builderPath
+        builderContent <- Store.readStoreContent builderPath
 
         -- Set up builder with proper permissions
         execPath <- setupBuilder builderPath builderContent buildDir
@@ -945,31 +897,31 @@ collectBuildResultDaemon deriv buildDir = do
     env <- ask
 
     -- Process each expected output with database connection
-    db <- DB.getDatabaseConn
+    db <- DB.getDatabaseFromEnv
 
     -- Process in a transaction for atomicity
-    withTenWriteTransaction db (logMsg 2) $ do
+    withTenWriteTransaction db $ \db' -> do
         -- Process each expected output
-        outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs deriv)
+        outputPaths <- foldM (processOutput db' outDir) Set.empty (Set.toList $ derivOutputs deriv)
 
         -- Register all input-output references
         -- Get derivation path in the store
         let derivStorePath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
 
         -- Register each output in the database
-        derivId <- DB.storeDerivation deriv derivStorePath
+        derivId <- DBDeriv.storeDerivation deriv derivStorePath
 
         forM_ (Set.toList outputPaths) $ \outputPath -> do
             -- 1. Register the derivation as a reference for this output
-            DB.addDerivationReference outputPath derivStorePath
+            DBRef.addDerivationReference outputPath derivStorePath
 
             -- 2. Register all input references for this output
             forM_ (Set.toList $ derivInputs deriv) $ \input -> do
-                DB.addDerivationReference outputPath (inputPath input)
+                DBRef.addDerivationReference outputPath (inputPath input)
 
             -- 3. Scan the output file for additional references
-            refs <- DB.scanFileForStoreReferences $ storePathToFilePath outputPath env
-            DB.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
+            refs <- Store.scanFileForStoreReferences $ storePathToFilePath outputPath env
+            DBRef.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
 
         -- Add output proof
         addProof OutputProof
@@ -1138,8 +1090,8 @@ handleReturnedDerivation result = do
 
             -- Store the inner derivation in the content store - in appropriate context
             derivPath <- case tier of
-                Daemon -> storeDerivationDaemon innerDrv
-                Builder -> DB.storeDerivation innerDrv
+                Daemon -> Core.storeDerivationDaemon innerDrv
+                Builder -> DBDeriv.storeDerivation innerDrv
 
             -- Check for cycles
             chain <- gets buildChain
