@@ -136,34 +136,34 @@ ensureSchema db = do
 createTables :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 createTables db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Create Derivations table
-    DBCore.ExecuteSimple_ db derivationsTableDef
+    DBCore.executeSimple_ db derivationsTableDef
 
     -- Create Outputs table
-    DBCore.ExecuteSimple_ db outputsTableDef
+    DBCore.executeSimple_ db outputsTableDef
 
     -- Create References table
-    DBCore.ExecuteSimple_ db referencesTableDef
+    DBCore.executeSimple_ db referencesTableDef
 
     -- Create ValidPaths table
-    DBCore.ExecuteSimple_ db validPathsTableDef
+    DBCore.executeSimple_ db validPathsTableDef
 
 -- | Create all indices for performance
 createIndices :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
 createIndices db = DBCore.withTransaction db DBCore.Exclusive $ \_ -> do
     -- Derivations indices
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_derivations_hash ON Derivations(hash);"
 
     -- Outputs indices
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_path ON Outputs(path);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_outputs_derivation ON Outputs(derivation_id);"
 
     -- References indices
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_referrer ON References(referrer);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_references_reference ON References(reference);"
 
     -- ValidPaths indices
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
-    DBCore.ExecuteSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_hash ON ValidPaths(hash);"
+    DBCore.executeSimple_ db "CREATE INDEX IF NOT EXISTS idx_validpaths_deriver ON ValidPaths(deriver);"
 
 -- | Validate the schema is correct
 validateSchema :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon ()
@@ -230,7 +230,7 @@ ensureColumnExists db tableName columnName = do
 -- | Check if a table exists
 tableExists :: DBCore.Database 'Daemon -> Text -> TenM 'Build 'Daemon Bool
 tableExists db tableName = do
-    results <- DBCore.tenQuery db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName] :: TenM 'Build 'Daemon [DBCore.Only Int]
+    results <- DBCore.query db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?" [tableName] :: TenM 'Build 'Daemon [DBCore.Only Int]
     case results of
         [DBCore.Only count] -> return $ count > 0
         _ -> return False
@@ -247,14 +247,14 @@ columnExists db tableName columnName = do
             let pragmaQuery = Query $ "PRAGMA table_info(" <> tableName <> ")"
             catchError
                 (do
-                    rows <- DBCore.tenQuery_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
+                    rows <- DBCore.query_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
                     return $ any (\(_, name, _, _, _, _) -> name == columnName) rows)
                 (\_ -> return False)
 
 -- | Check if an index exists
 indexExists :: DBCore.Database 'Daemon -> Text -> TenM 'Build 'Daemon Bool
 indexExists db indexName = do
-    results <- DBCore.tenQuery db "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName] :: TenM 'Build 'Daemon [DBCore.Only Int]
+    results <- DBCore.query db "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?" [indexName] :: TenM 'Build 'Daemon [DBCore.Only Int]
     case results of
         [DBCore.Only count] -> return $ count > 0
         _ -> return False
@@ -263,17 +263,17 @@ indexExists db indexName = do
 getSchemaElements :: DBCore.Database 'Daemon -> TenM 'Build 'Daemon [SchemaElement]
 getSchemaElements db = do
     -- Get all tables
-    tables <- DBCore.tenQuery_ db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    tables <- DBCore.query_ db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         :: TenM 'Build 'Daemon [[Text]]
     let tableElements = map (Table . head) tables
 
     -- Get all indices
-    indices <- DBCore.tenQuery_ db "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+    indices <- DBCore.query_ db "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
         :: TenM 'Build 'Daemon [[Text]]
     let indexElements = map (Index . head) indices
 
     -- Get all triggers
-    triggers <- DBCore.tenQuery_ db "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
+    triggers <- DBCore.query_ db "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
         :: TenM 'Build 'Daemon [[Text]]
     let triggerElements = map (Trigger . head) triggers
 
@@ -288,7 +288,7 @@ getSchemaElements db = do
         let pragmaQuery = Query $ "PRAGMA table_info(" <> tableName <> ")"
         catchError
             (do
-                cols <- DBCore.tenQuery_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
+                cols <- DBCore.query_ db pragmaQuery :: TenM 'Build 'Daemon [(Int, Text, Text, Int, Maybe Text, Int)]
                 return $ map (\(_, name, _, _, _, _) -> Column tableName name) cols)
             (\_ -> return [])
 
@@ -328,10 +328,10 @@ migrations = [
             createTables db
             createIndices db,
         migrationDown = \db -> do
-            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS Outputs;"
-            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS References;"
-            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS ValidPaths;"
-            DBCore.ExecuteSimple_ db "DROP TABLE IF EXISTS Derivations;"
+            DBCore.executeSimple_ db "DROP TABLE IF EXISTS Outputs;"
+            DBCore.executeSimple_ db "DROP TABLE IF EXISTS References;"
+            DBCore.executeSimple_ db "DROP TABLE IF EXISTS ValidPaths;"
+            DBCore.executeSimple_ db "DROP TABLE IF EXISTS Derivations;"
     }
 
     -- Add new migrations here as the schema evolves
