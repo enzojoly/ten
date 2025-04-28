@@ -169,7 +169,7 @@ instance CanBuildDerivation 'Daemon where
         logMsg 1 $ "Building derivation: " <> derivName deriv
 
         -- Serialize and store the derivation in the store
-        derivPath <- Core.storeDerivationDaemon deriv
+        derivPath <- Core.storeDerivationInBuildDaemon deriv
 
         -- Get current build ID
         bid <- gets currentBuildId

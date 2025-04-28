@@ -105,6 +105,8 @@ module Ten.Core (
     -- Process boundary primitives
     storeDerivationDaemon,
     storeDerivationBuilder,
+    storeDerivationInBuildDaemon,
+    storeDerivationInBuildBuilder,
     readDerivationDaemon,
     readDerivationBuilder,
     storeBuildResultDaemon,
@@ -1429,6 +1431,52 @@ storeDerivationBuilder deriv = do
             -- Send request and wait for response
             response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
 
+            case response of
+                Left err -> throwError err
+                Right (DerivationStoredResponse path) -> return path
+                Right resp -> throwError $ StoreError $ "Unexpected response: " <> T.pack (show resp)
+        _ -> throwError $ PrivilegeError "Cannot store derivation in builder context without daemon connection"
+
+-- | Store a derivation in the store during build phase (Daemon privilege)
+storeDerivationInBuildDaemon :: Derivation -> TenM 'Build 'Daemon StorePath
+storeDerivationInBuildDaemon deriv = do
+    env <- ask
+    -- Serialize the derivation
+    let serialized = serializeDerivation deriv
+    -- Calculate a hash for the content
+    let contentHash = hashByteString serialized
+    let hashHex = T.pack $ show contentHash
+    -- Determine store path
+    let name = derivName deriv <> ".drv"
+    let storePath = StorePath hashHex name
+    -- Write to the store
+    let fullPath = storePathToFilePath storePath env
+    -- Create parent directories
+    liftIO $ createDirectoryIfMissing True (takeDirectory fullPath)
+    -- Write the file with proper permissions
+    liftIO $ BS.writeFile fullPath serialized
+    liftIO $ setFileMode fullPath 0o444  -- Read-only for everyone
+    logMsg 1 $ "Stored derivation at " <> storePathToText storePath
+    -- Return the store path
+    return storePath
+
+-- | Store a derivation in builder context during build phase
+storeDerivationInBuildBuilder :: Derivation -> TenM 'Build 'Builder StorePath
+storeDerivationInBuildBuilder deriv = do
+    -- Get daemon connection
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            -- Create store request with derivation payload
+            let serialized = serializeDerivation deriv
+            let request = Request {
+                reqId = 0,  -- Will be set by sendRequest
+                reqType = "store-derivation",
+                reqParams = Map.singleton "name" (derivName deriv <> ".drv"),
+                reqPayload = Just serialized
+            }
+            -- Send request and wait for response
+            response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
             case response of
                 Left err -> throwError err
                 Right (DerivationStoredResponse path) -> return path
