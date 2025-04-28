@@ -162,69 +162,38 @@ class CanManageBuildStatus (t :: PrivilegeTier) where
     -- | Update build status in store
     updateBuildStatus :: BuildId -> BuildStatus -> TenM 'Build t ()
 
--- | Daemon instance for building derivations
 instance CanBuildDerivation 'Daemon where
-    buildDerivation deriv = do
-        -- Log start of build
-        logMsg 1 $ "Building derivation: " <> derivName deriv
+  buildDerivation deriv = do
+    -- Log start of build
+    logMsg 1 $ "Building derivation: " <> derivName deriv
 
-        -- Serialize and store the derivation in the store
-        derivPath <- Core.storeDerivationInBuildDaemon deriv
+    -- Use database through withDatabase pattern
+    withDatabase (defaultDBPath . storeLocation =<< ask) 5000 $ \db -> do
+      -- Register derivation in DB
+      derivPath <- storeDerivationInBuildDaemon deriv
+      derivId <- DB.withTenWriteTransaction db $ \dbConn -> do
+        DBDeriv.registerDerivationFile dbConn deriv derivPath
 
-        -- Get current build ID
-        bid <- gets currentBuildId
+      -- Handle build strategy
+      case derivStrategy deriv of
+        ApplicativeStrategy -> buildApplicativeStrategy deriv
+        MonadicStrategy -> buildMonadicStrategy deriv
 
-        -- Register the derivation in the database
-        env <- ask
-        -- Create database connection with proper privileges
-        db <- liftIO $ DB.initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
-
-        -- Use proper transaction handling and ensure cleanup
-        derivId <- DB.withTenWriteTransaction db $ \dbConn -> do
-            DBDeriv.registerDerivationFile deriv derivPath
-
-        -- Clean up connection
-        liftIO $ DB.closeDatabaseDaemon db
-
-        -- First instantiate the derivation
-        Derivation.instantiateDerivation deriv
-
-        -- Select build strategy based on derivation
-        case derivStrategy deriv of
-            ApplicativeStrategy -> do
-                logMsg 2 $ "Using applicative (parallel) build strategy for " <> derivName deriv
-                buildApplicativeStrategy deriv
-            MonadicStrategy -> do
-                logMsg 2 $ "Using monadic (sequential) build strategy for " <> derivName deriv
-                buildMonadicStrategy deriv
-
--- | Builder instance for building derivations via protocol
 instance CanBuildDerivation 'Builder where
-    buildDerivation deriv = do
-        -- Log start of build
-        logMsg 1 $ "Building derivation via daemon: " <> derivName deriv
-
-        -- Send build request to daemon
-        daemonConn <- getDaemonConnection
-
-        -- Create build request with derivation payload
-        let serialized = Derivation.serializeDerivation deriv
-        let request = Request {
-            reqId = 0,  -- Will be set by sendRequest
-            reqType = "build-derivation",
-            reqParams = Map.fromList [
-                ("hasDerivation", "true")
-            ],
-            reqPayload = Just serialized
-        }
-
-        -- Send request and wait for response
-        response <- liftIO $ Client.sendRequestSync daemonConn request (3600 * 1000000) -- 1 hour timeout
-
-        case response of
-            Left err -> throwError err
-            Right (BuildResultResponse result) -> return result
-            Right resp -> throwError $ BuildFailed $ "Unexpected response from daemon: " <> T.pack (show resp)
+  buildDerivation deriv = do
+    -- Use protocol to communicate with daemon
+    daemonConn <- getDaemonConnection
+    let request = Request {
+      reqId = 0,
+      reqType = "build-derivation",
+      reqParams = Map.fromList [("hasDerivation", "true")],
+      reqPayload = Just (Derivation.serializeDerivation deriv)
+    }
+    response <- liftIO $ sendRequestSync daemonConn request (3600 * 1000000)
+    case response of
+      Left err -> throwError err
+      Right (BuildResultResponse result) -> return result
+      Right resp -> throwError $ BuildFailed $ "Unexpected response: " <> T.pack (show resp)
 
 -- | Daemon instance for building with specific strategies
 instance CanBuildStrategy 'Daemon where
@@ -561,8 +530,34 @@ buildWithSandboxDaemon deriv config = do
                             , Core.brMetadata = Map.singleton "returnDerivation" (T.pack $ Sandbox.returnDerivationPath buildDir)
                             }
                     else do
-                        -- Collect normal build results
-                        outputs <- collectBuildResultDaemon deriv buildDir
+                        -- Use withDatabase for database operations
+                        env <- ask
+                        outputs <- withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                            -- Collect normal build results within transaction
+                            DB.withTenWriteTransaction db $ \txDb -> do
+                                -- Process each expected output
+                                outputPaths <- processOutputs txDb buildDir deriv
+
+                                -- Register all input-output references
+                                let derivStorePath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
+
+                                -- Register derivation in database
+                                derivId <- DBDeriv.storeDerivation txDb deriv derivStorePath
+
+                                -- Register references for all outputs
+                                forM_ (Set.toList outputPaths) $ \outputPath -> do
+                                    -- Register derivation as a reference
+                                    DBDeriv.addDerivationReference txDb outputPath derivStorePath
+
+                                    -- Register input references
+                                    forM_ (Set.toList $ derivInputs deriv) $ \input -> do
+                                        DBDeriv.addDerivationReference txDb outputPath (inputPath input)
+
+                                    -- Scan for additional references
+                                    refs <- Store.scanFileForStoreReferences $ storePathToFilePath outputPath env
+                                    DBDeriv.bulkRegisterReferences txDb $ map (\ref -> (outputPath, ref)) $ Set.toList refs
+
+                                return outputPaths
 
                         -- Add build proof
                         addProof BuildProof
@@ -575,6 +570,83 @@ buildWithSandboxDaemon deriv config = do
                             , Core.brReferences = Set.empty
                             , Core.brMetadata = Map.empty
                             }
+
+-- Helper function to process outputs (extracted from collectBuildResultDaemon)
+processOutputs :: Database 'Daemon -> FilePath -> Derivation -> TenM 'Build 'Daemon (Set StorePath)
+processOutputs db buildDir drv = do
+    env <- ask
+    let outDir = buildDir </> "out"
+
+    -- Verify the output directory exists
+    outDirExists <- liftIO $ doesDirectoryExist outDir
+    unless outDirExists $ throwError $
+        BuildFailed $ "Output directory not created: " <> T.pack outDir
+
+    -- List directory contents for debugging
+    outFiles <- liftIO $ listDirectory outDir
+    logMsg 2 $ "Output directory contents: " <> T.pack (show outFiles)
+
+    -- Process each expected output
+    outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs drv)
+
+    -- Add output proof
+    addProof OutputProof
+
+    return outputPaths
+
+-- Process a single output, adding it to the store
+processOutput :: Database 'Daemon -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build 'Daemon (Set StorePath)
+processOutput db outDir accPaths output = do
+    env <- ask
+    let outputFile = outDir </> T.unpack (outputName output)
+
+    -- Normalize and validate path
+    let outputFile' = normalise outputFile
+
+    -- Security check - make sure output is within the build directory
+    let buildPath = normalise outDir
+    unless (buildPath `isPrefixOf` outputFile') $
+        throwError $ BuildFailed $ "Output path escapes build directory: " <> T.pack outputFile'
+
+    exists <- liftIO $ doesPathExist outputFile'
+
+    logMsg 2 $ "Checking for output: " <> outputName output <>
+               " at " <> T.pack outputFile' <>
+               " (exists: " <> T.pack (show exists) <> ")"
+
+    if exists
+        then do
+            -- Handle file or directory appropriately
+            isDir <- liftIO $ doesDirectoryExist outputFile'
+            outputPath <- if isDir
+                then do
+                    -- For directories, create a tarball
+                    let tarballPath = outputFile' <> ".tar.gz"
+                    liftIO $ createTarball outputFile' tarballPath
+
+                    -- Read the tarball and add it to the store
+                    content <- liftIO $ BS.readFile tarballPath
+                    Store.addToStore sDaemon (outputName output <> ".tar.gz") content
+                else do
+                    -- For regular files, read directly
+                    content <- liftIO $ BS.readFile outputFile'
+                    Store.addToStore sDaemon (outputName output) content
+
+            -- Register this as a valid path in the database
+            let derivPath = StorePath (derivHash drv) (derivName drv <> ".drv")
+            DBDeriv.registerValidPath db outputPath (Just derivPath)
+
+            -- Return updated set
+            return $ Set.insert outputPath accPaths
+        else if isReturnContinuationDerivation (derivName drv) (derivArgs drv) (derivEnv drv)
+            then do
+                -- For return-continuation builds, outputs might not be created
+                -- Return the predicted output path anyway
+                let outputPath' = outputPath output
+                return $ Set.insert outputPath' accPaths
+            else
+                throwError $ BuildFailed $
+                    "Expected output not produced: " <> outputName output
 
 -- | Run a builder process with proper privilege handling
 runBuilder :: BuilderEnv -> TenM 'Build 'Daemon (Either Text (ExitCode, String, String))
@@ -1097,44 +1169,30 @@ checkForReturnedDerivation buildDir = do
             return Nothing
 
 -- | Handle a returned derivation
-handleReturnedDerivation :: Core.BuildResult -> TenM 'Build t Derivation
+handleReturnedDerivation :: BuildResult -> TenM 'Build t Derivation
 handleReturnedDerivation result = do
-    -- Get the returned derivation path
-    let returnPath = T.unpack $ Core.brMetadata result Map.! "returnDerivation"
+  -- Get returned derivation path from metadata
+  let returnPath = T.unpack $ brMetadata result Map.! "returnDerivation"
 
-    -- Normalize and validate path
-    let returnPath' = normalise returnPath
+  -- Read and deserialize
+  content <- liftIO $ BS.readFile returnPath
+  case Derivation.deserializeDerivation content of
+    Left err -> throwError $ SerializationError $
+      "Failed to deserialize returned derivation: " <> buildErrorToText err
+    Right innerDrv -> do
+      -- Add proof that we successfully got a returned derivation
+      addProof RecursionProof
 
-    -- Read and deserialize
-    content <- liftIO $ BS.readFile returnPath'
-    case Core.deserializeDerivation content of
-        Left err -> throwError $ SerializationError $
-            "Failed to deserialize returned derivation: " <> Core.buildErrorToText err
-        Right innerDrv -> do
-            -- Add proof that we successfully got a returned derivation
-            addProof RecursionProof
+      -- Store the inner derivation using type class method
+      void $ storeDerivationInBuild innerDrv
 
-            -- Get current environment (Daemon or Builder)
-            env <- ask
-            let tier = currentPrivilegeTier env
+      -- Check for cycles
+      isCyclicResult <- detectRecursionCycle innerDrv
+      when isCyclicResult $
+        throwError $ CyclicDependency $
+          "Cyclic dependency detected in returned derivation: " <> derivName innerDrv
 
-            -- Store the inner derivation in the content store - in appropriate context
-            derivPath <- case tier of
-                Daemon -> Core.storeDerivationInBuildDaemon innerDrv
-                Builder -> do
-                    -- For Builder tier, we need to get a database connection first
-                    db <- liftIO $ initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
-                    path <- DBDeriv.storeDerivation innerDrv
-                    liftIO $ closeDatabaseDaemon db
-                    return path
-
-            -- Check for cycles - extract boolean from monadic context
-            isCyclicResult <- Graph.detectRecursionCycle innerDrv
-            when isCyclicResult $
-                throwError $ CyclicDependency $
-                    "Cyclic dependency detected in returned derivation: " <> derivName innerDrv
-
-            return innerDrv
+      return innerDrv
 
 -- | Build a graph of derivations
 buildDerivationGraph :: BuildGraph -> TenM 'Build t (Map Text Core.BuildResult)
@@ -1292,6 +1350,12 @@ getDaemonConnection = do
     case runMode env of
         ClientMode conn -> return conn
         _ -> throwError $ DaemonError "No daemon connection available"
+
+withDatabase :: FilePath -> Int -> (Database 'Daemon -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
+withDatabase dbPath timeout action = do
+  db <- liftIO $ DB.initDatabaseDaemon sDaemon dbPath timeout
+  result <- action db `finally` liftIO (DB.closeDatabaseDaemon db)
+  return result
 
 -- Helper function for ignoring exceptions during cleanup
 ignoreException :: SomeException -> IO ()
