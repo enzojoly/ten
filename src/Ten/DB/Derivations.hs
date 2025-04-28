@@ -54,10 +54,10 @@ import Database.SQLite.Simple.FromRow
 import Database.SQLite.Simple.ToRow
 import Database.SQLite.Simple.ToField
 import Database.SQLite.Simple.FromField
-import System.FilePath ((</>), takeFileName)
+import System.FilePath ((</>), takeFileName, takeDirectory)
 import System.Directory (doesFileExist, createDirectoryIfMissing)
 import System.IO (withFile, IOMode(..))
-import System.Posix.Files (getFileStatus, fileSize)
+import System.Posix.Files (getFileStatus, fileSize, setFileMode)
 import Data.List (intercalate, isPrefixOf)
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
@@ -85,6 +85,7 @@ data PathInfo = PathInfo {
     pathInfoRegistrationTime :: UTCTime, -- ^ When it was registered
     pathInfoIsValid :: Bool             -- ^ Whether path is still valid
 } deriving (Show, Eq)
+
 
 -- Helper function to parse StorePath from a database field without validation
 parseStorePathField :: RowParser StorePath
@@ -195,18 +196,54 @@ daemonResponseMeta (Right response) =
 
 -- | Type class for derivation storage operations
 class CanStoreDerivation (t :: PrivilegeTier) where
-    -- | Store a derivation in the database
-    storeDerivation :: Derivation -> StorePath -> TenM p t Int64
+    -- | Store a derivation in the content-addressed store and return its path
+    storeDerivation :: Derivation -> TenM p t StorePath
 
-    -- | Register a derivation file in the database with proper reference tracking
+    -- | Register a derivation in the database and return its database ID
+    registerDerivationInDB :: Derivation -> StorePath -> TenM p t Int64
+
+    -- | Register a derivation file with its dependencies
     registerDerivationFile :: Derivation -> StorePath -> TenM p t Int64
-
-    -- | Register a derivation with all its outputs in a single transaction
-    registerDerivationWithOutputs :: Derivation -> StorePath -> TenM p t Int64
 
 -- | Daemon instance for storing derivations - direct database access
 instance CanStoreDerivation 'Daemon where
-    storeDerivation derivation storePath = do
+    -- This should store the derivation in the content store, not just register in DB
+    storeDerivation derivation = do
+        env <- ask
+
+        -- Serialize the derivation
+        let serialized = Deriv.serializeDerivation derivation
+
+        -- Calculate hash for the content
+        let contentHashDigest = hashByteString serialized
+        let contentHash = T.pack $ show contentHashDigest
+
+        -- Create store path
+        let name = derivName derivation <> ".drv"
+        let storePath = StorePath contentHash name
+
+        -- Create full file path
+        let filePath = storePathToFilePath storePath env
+
+        -- Check if the path already exists
+        exists <- liftIO $ doesFileExist filePath
+        if exists
+            then return storePath
+            else do
+                -- Create directory structure if needed
+                liftIO $ createDirectoryIfMissing True (takeDirectory filePath)
+
+                -- Write content to file
+                liftIO $ BS.writeFile filePath serialized
+
+                -- Set correct permissions (read-only for all)
+                liftIO $ setFileMode filePath 0o444
+
+                -- Return the store path
+                return storePath
+
+    -- This registers in the database, returns ID
+    registerDerivationInDB derivation storePath = do
         db <- getDatabaseConn
 
         -- Check if derivation already exists
@@ -239,8 +276,8 @@ instance CanStoreDerivation 'Daemon where
         db <- getDatabaseConn
 
         withTenWriteTransaction db $ \txDb -> do
-            -- Store in database
-            derivId <- storeDerivation derivation storePath
+            -- Register in database first
+            derivId <- registerDerivationInDB derivation storePath
 
             -- Register outputs
             outputPaths <- forM (Set.toList $ derivOutputs derivation) $ \output -> do
@@ -268,55 +305,19 @@ instance CanStoreDerivation 'Daemon where
 
             return derivId
 
-    registerDerivationWithOutputs derivation storePath = do
-        db <- getDatabaseConn
-
-        withTenWriteTransaction db $ \txDb -> do
-            -- Register the derivation
-            derivId <- storeDerivation derivation storePath
-
-            -- Get all outputs and inputs for reference tracking
-            let outputs = Set.map outputPath $ derivOutputs derivation
-            let inputs = Set.map inputPath $ derivInputs derivation
-
-            -- Register all outputs
-            forM_ (Set.toList $ derivOutputs derivation) $ \output -> do
-                let outPath = outputPath output
-                registerDerivationOutput derivId (outputName output) outPath
-
-                -- Register this as a valid path
-                registerValidPath outPath (Just storePath)
-
-            -- Register all input references
-            forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-                addDerivationReference storePath (inputPath input)
-
-            -- Register references from outputs to inputs (direct dependencies)
-            forM_ (Set.toList outputs) $ \outPath -> do
-                -- Reference from output to derivation
-                addDerivationReference outPath storePath
-
-                -- References from output to each input
-                forM_ (Set.toList inputs) $ \input -> do
-                    addDerivationReference outPath input
-
-            return derivId
-
 -- | Builder implementation of CanStoreDerivation via protocol
 instance CanStoreDerivation 'Builder where
-    storeDerivation derivation storePath = do
+    -- Store the derivation in the content store
+    storeDerivation derivation = do
         env <- ask
         case runMode env of
             ClientMode conn -> do
                 -- Create store request with derivation payload
                 let serialized = Deriv.serializeDerivation derivation
                 let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
+                    reqId = 0,
                     reqType = "store-derivation",
-                    reqParams = Map.fromList [
-                        ("name", derivName derivation <> ".drv"),
-                        ("storePath", storePathToText storePath)
-                    ],
+                    reqParams = Map.singleton "name" (derivName derivation <> ".drv"),
                     reqPayload = Just serialized
                 }
 
@@ -324,17 +325,38 @@ instance CanStoreDerivation 'Builder where
                 response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
                 case response of
                     Left err -> throwError err
-                    Right (DerivationStoredResponse path) ->
+                    Right (DerivationStoredResponse path) -> return path
+                    Right _ -> throwError $ DBError "Unexpected response from daemon"
+
+            _ -> throwError $ privilegeError "Cannot store derivation without daemon connection"
+
+    -- Register in the database
+    registerDerivationInDB derivation storePath = do
+        env <- ask
+        case runMode env of
+            ClientMode conn -> do
+                -- Create request to register in DB
+                let serialized = Deriv.serializeDerivation derivation
+                let request = Request {
+                    reqId = 0,
+                    reqType = "register-derivation-in-db",
+                    reqParams = Map.singleton "storePath" (storePathToText storePath),
+                    reqPayload = Just serialized
+                }
+
+                -- Send request and wait for response
+                response <- liftIO $ sendRequestSync conn request 30000000
+                case response of
+                    Left err -> throwError err
+                    Right response ->
                         -- Extract derivation ID from response metadata
-                        case Map.lookup "derivationId" (daemonResponseMeta response) of
+                        case Map.lookup "derivationId" (daemonResponseMeta (Right response)) of
                             Just idText -> case reads (T.unpack idText) of
                                 [(derivId, "")] -> return derivId
                                 _ -> throwError $ DBError "Invalid derivation ID format"
                             Nothing -> throwError $ DBError "Missing derivation ID in response"
-                    Right (ErrorResponse err) -> throwError err
-                    Right _ -> throwError $ DBError "Unexpected response from daemon"
 
-            _ -> throwError $ privilegeError "Cannot store derivation without daemon connection"
+            _ -> throwError $ privilegeError "Cannot register derivation without daemon connection"
 
     registerDerivationFile derivation storePath = do
         env <- ask
@@ -343,56 +365,25 @@ instance CanStoreDerivation 'Builder where
                 -- Serialize and prepare request
                 let serialized = Deriv.serializeDerivation derivation
                 let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
+                    reqId = 0,
                     reqType = "register-derivation-file",
                     reqParams = Map.singleton "storePath" (storePathToText storePath),
                     reqPayload = Just serialized
                 }
 
                 -- Send request and wait for response
-                response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
+                response <- liftIO $ sendRequestSync conn request 30000000
                 case response of
                     Left err -> throwError err
-                    Right (SuccessResponse) ->
+                    Right response ->
                         -- Extract derivation ID from response metadata
-                        case Map.lookup "derivationId" (daemonResponseMeta response) of
+                        case Map.lookup "derivationId" (daemonResponseMeta (Right response)) of
                             Just idText -> case reads (T.unpack idText) of
                                 [(derivId, "")] -> return derivId
                                 _ -> throwError $ DBError "Invalid derivation ID format"
                             Nothing -> throwError $ DBError "Missing derivation ID in response"
-                    Right (ErrorResponse err) -> throwError err
-                    Right _ -> throwError $ DBError "Unexpected response from daemon"
 
             _ -> throwError $ privilegeError "Cannot register derivation file without daemon connection"
-
-    registerDerivationWithOutputs derivation storePath = do
-        env <- ask
-        case runMode env of
-            ClientMode conn -> do
-                -- Serialize and prepare request
-                let serialized = Deriv.serializeDerivation derivation
-                let request = Request {
-                    reqId = 0,  -- Will be set by sendRequest
-                    reqType = "register-derivation-with-outputs",
-                    reqParams = Map.singleton "storePath" (storePathToText storePath),
-                    reqPayload = Just serialized
-                }
-
-                -- Send request and wait for response
-                response <- liftIO $ sendRequestSync conn request 30000000  -- 30 second timeout
-                case response of
-                    Left err -> throwError err
-                    Right (SuccessResponse) ->
-                        -- Extract derivation ID from response metadata
-                        case Map.lookup "derivationId" (daemonResponseMeta response) of
-                            Just idText -> case reads (T.unpack idText) of
-                                [(derivId, "")] -> return derivId
-                                _ -> throwError $ DBError "Invalid derivation ID format"
-                            Nothing -> throwError $ DBError "Missing derivation ID in response"
-                    Right (ErrorResponse err) -> throwError err
-                    Right _ -> throwError $ DBError "Unexpected response from daemon"
-
-            _ -> throwError $ privilegeError "Cannot register derivation with outputs without daemon connection"
 
 -- | Type class for derivation retrieval operations
 class CanRetrieveDerivation (p :: Phase) (t :: PrivilegeTier) where
@@ -1400,9 +1391,10 @@ instance CanManagePathValidity 'Builder where
 
             _ -> throwError $ privilegeError "Cannot get path info without daemon connection"
 
+
 -- | Helper function to store a derivation in the database (context-aware)
 storeDerivationInDB :: (CanStoreDerivation t) => Derivation -> StorePath -> TenM p t Int64
-storeDerivationInDB drv path = registerDerivationWithOutputs drv path
+storeDerivationInDB = registerDerivationInDB
 
 -- | Helper function to read a derivation from the store - available in both contexts
 readDerivationFromStore :: (CanRetrieveDerivation p t) => StorePath -> TenM p t (Maybe Derivation)

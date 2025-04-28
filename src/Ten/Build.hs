@@ -181,7 +181,7 @@ instance CanBuildDerivation 'Daemon where
 
         -- Use proper transaction handling and ensure cleanup
         _ <- DB.withTenWriteTransaction db $ \dbConn ->
-            liftIO $ DBDeriv.registerDerivationFile dbConn deriv derivPath
+        derivId <- DBDeriv.registerDerivationFile deriv derivPath
 
         -- Clean up connection
         liftIO $ DB.closeDatabaseDaemon db
@@ -377,7 +377,7 @@ instance CanManageBuildStatus 'Daemon where
 
         -- Use proper transaction handling
         _ <- DB.withTenWriteTransaction db $ \dbConn ->
-            liftIO $ DB.execute dbConn
+            DB.execute dbConn
                 "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
                 (T.pack (show buildId), T.pack (show status))
 
@@ -1120,11 +1120,11 @@ handleReturnedDerivation result = do
 
             -- Store the inner derivation in the content store - in appropriate context
             derivPath <- case tier of
-                Daemon -> Core.storeDerivationDaemon innerDrv
+                Daemon -> Core.storeDerivationInBuildDaemon innerDrv
                 Builder -> do
                     -- For Builder tier, we need to get a database connection first
                     db <- liftIO $ initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
-                    path <- DBDeriv.storeDerivation db innerDrv
+                    path <- DBDeriv.storeDerivation innerDrv
                     liftIO $ closeDatabaseDaemon db
                     return path
 
