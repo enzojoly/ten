@@ -484,8 +484,8 @@ buildWithSandboxDaemon derivation config = do
             builderEnvVars = buildEnv,
             builderUid = User.userID builderUser,
             builderGid = User.groupID builderGroup,
-            builderUser = builderUser,
-            builderGroup = builderGroup,
+            builderUser = FromUnix.convertUserEntry builderUser,
+            builderGroup = FromUnix.convertGroupEntry builderGroup,
             builderTimeoutSecs = 3600, -- 1 hour default timeout
             builderIsolation = Sandbox.sandboxUseMountNamespace config && Sandbox.sandboxUseNetworkNamespace config,
             builderTempDir = buildDir </> "tmp",
@@ -542,20 +542,20 @@ buildWithSandboxDaemon derivation config = do
                                 let derivStorePath = StorePath (derivHash derivation) (derivName derivation <> ".drv")
 
                                 -- Register derivation in database
-                                derivId <- DBDeriv.storeDerivation dbConn derivation derivStorePath
+                                derivId <- DBDeriv.storeDerivation derivation derivStorePath
 
                                 -- Register references for all outputs
                                 forM_ (Set.toList outputPaths) $ \outputPath -> do
                                     -- Register derivation as a reference
-                                    DBDeriv.addDerivationReference dbConn outputPath derivStorePath
+                                    DBDeriv.addDerivationReference outputPath derivStorePath
 
                                     -- Register input references
                                     forM_ (Set.toList $ derivInputs derivation) $ \input -> do
-                                        DBDeriv.addDerivationReference dbConn outputPath (inputPath input)
+                                        DBDeriv.addDerivationReference outputPath (inputPath input)
 
                                     -- Scan for additional references
                                     refs <- Store.scanFileForStoreReferences $ storePathToFilePath outputPath env
-                                    DBDeriv.bulkRegisterReferences dbConn $ map (\ref -> (outputPath, ref)) $ Set.toList refs
+                                    DBDeriv.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
 
                                 return outputPaths
 
