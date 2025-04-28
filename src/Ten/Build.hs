@@ -180,8 +180,8 @@ instance CanBuildDerivation 'Daemon where
         db <- liftIO $ DB.initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
 
         -- Use proper transaction handling and ensure cleanup
-        _ <- DB.withTenWriteTransaction db $ \dbConn ->
-        derivId <- DBDeriv.registerDerivationFile deriv derivPath
+        derivId <- DB.withTenWriteTransaction db $ \dbConn -> do
+            DBDeriv.registerDerivationFile deriv derivPath
 
         -- Clean up connection
         liftIO $ DB.closeDatabaseDaemon db
