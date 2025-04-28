@@ -131,7 +131,7 @@ data BuilderEnv = BuilderEnv
     , builderEnvVars :: Map Text Text    -- Environment variables
     , builderUid :: UserID               -- User ID to run as
     , builderGid :: GroupID              -- Group ID to run as
-    , builderUser :: Core.UserInfo.user      -- User entry to run as
+    , builderUser :: Core.UserInfo      -- User entry to run as
     , builderGroup :: User.GroupEntry    -- Group entry to run as
     , builderTimeoutSecs :: Int          -- Timeout in seconds
     , builderIsolation :: Bool           -- Whether to use extra isolation

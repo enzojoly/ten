@@ -36,6 +36,7 @@ module Ten.Core (
     RunMode(..),
     DaemonConfig(..),
     UserId(..),
+    UserInfo,
     AuthToken(..),
 
     -- Protocol Connection types
