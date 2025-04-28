@@ -52,7 +52,7 @@ import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception (try, catch, finally, mask, bracket, throwIO, onException, evaluate, SomeException, ErrorCall(..), handle)
 import Control.Monad
-import Control.Monad.Reader (ask, asks)
+import Control.Monad.Reader (ask, asks, runReaderT)
 import Control.Monad.State (get, modify, gets)
 import Control.Monad.Except (throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
@@ -633,12 +633,12 @@ processOutput db outDir accPaths output = do
                     Store.addToStore sDaemon (outputName output) content
 
             -- Register this as a valid path in the database
-            let derivPath = StorePath (derivHash derivation) (derivName derivation <> ".drv")
+            let derivPath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
             DBDeriv.registerValidPath outputPath (Just derivPath)
 
             -- Return updated set
             return $ Set.insert outputPath accPaths
-        else if isReturnContinuationDerivation (derivName derivation) (derivArgs derivation) (derivEnv derivation)
+        else if isReturnContinuationDerivation (derivName deriv) (derivArgs deriv) (derivEnv deriv)
             then do
                 -- For return-continuation builds, outputs might not be created
                 -- Return the predicted output path anyway
