@@ -384,6 +384,14 @@ currentProtocolVersion = ProtocolVersion 1 0 0
 newtype RequestId = RequestId Int
     deriving (Eq, Ord, Show)
 
+data UserInfo = UserInfo {
+    userUid :: UserID,
+    userGid :: GroupID,
+    user :: Text,
+    userHomeDir :: FilePath,
+    userShell :: FilePath
+} deriving (Show, Eq)
+
 -- | Transaction modes
 data TransactionMode
     = ReadOnly     -- ^ Read-only transaction
@@ -1100,6 +1108,21 @@ createDaemonConnection handle userId authToken priEvidence = do
         connShutdown = shutdownFlag,
         connPrivEvidence = priEvidence
     }
+
+-- Helper functions for user lookups
+getUserInfoByName :: Text -> IO (Either BuildError UserInfo)
+getUserInfoByName name = do
+    result <- try $ User.getUserEntryForName (T.unpack name)
+    case result of
+        Left (e :: SomeException) ->
+            return $ Left $ PrivilegeError $ "Failed to get user entry: " <> T.pack (show e)
+        Right entry -> return $ Right $ UserInfo {
+            userUid = User.userID entry,
+            userGid = User.userGroupID entry,
+            user = T.pack $ User.userName entry,
+            userHomeDir = User.homeDirectory entry,
+            userShell = User.userShell entry
+        }
 
 -- | Helper function to work with singletons
 withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a

@@ -131,7 +131,7 @@ data BuilderEnv = BuilderEnv
     , builderEnvVars :: Map Text Text    -- Environment variables
     , builderUid :: UserID               -- User ID to run as
     , builderGid :: GroupID              -- Group ID to run as
-    , builderUser :: User.UserEntry      -- User entry to run as
+    , builderUser :: Core.UserInfo.user      -- User entry to run as
     , builderGroup :: User.GroupEntry    -- Group entry to run as
     , builderTimeoutSecs :: Int          -- Timeout in seconds
     , builderIsolation :: Bool           -- Whether to use extra isolation
@@ -703,45 +703,44 @@ runBuilder env = do
                 stderrContent <- takeMVar stderrVar
 
                 -- Process exit status
-case exitStatus of
-    Just (Process.Exited exitCode) -> do
-        let exitResult = case exitCode of
-                0 -> ExitSuccess
-                n -> ExitFailure n
-        return (Just pid, Right (exitResult, stdoutContent, stderrContent))
-    Just (Process.Terminated sig _) ->
-        return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
-    Just (Process.Stopped sig) ->
-        return (Just pid, Left $ "Builder stopped by signal: " <> T.pack (show sig))
-    Nothing ->
-        return (Just pid, Left "Builder process disappeared")
+                case exitStatus of
+                    Just (Process.Exited exitCode) -> do
+                        let exitResult = case exitCode of
+                                0 -> ExitSuccess
+                                n -> ExitFailure n
+                        return (Just pid, Right (exitResult, stdoutContent, stderrContent))
+                    Just (Process.Terminated sig _) ->
+                        return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
+                    Just (Process.Stopped sig) ->
+                        return (Just pid, Left $ "Builder stopped by signal: " <> T.pack (show sig))
+                    Nothing ->
+                        return (Just pid, Left "Builder process disappeared")
 
--- Apply timeout if configured (this should be outside the case statement)
-do
-    result <- if builderTimeoutSecs env > 0
-        then do
-            -- Run builder with timeout
-            timeoutResult <- SystemTimeout.timeout (builderTimeoutSecs env * 1000000) timeoutAction
-            case timeoutResult of
-                Nothing -> do
-                    -- Timeout occurred, cleanup and return error
-                    cleanup
-                    return (Nothing, Left "Build timed out")
-                Just r -> return r
-        else do
-            -- Run without timeout
-            r <- timeoutAction `onException` cleanup
-            return r
+        -- Apply timeout if configured
+        if builderTimeoutSecs env > 0
+            then do
+                -- Run builder with timeout
+                timeoutResult <- SystemTimeout.timeout (builderTimeoutSecs env * 1000000) timeoutAction
+                case timeoutResult of
+                    Nothing -> do
+                        -- Timeout occurred, cleanup and return error
+                        cleanup
+                        return (Nothing, Left "Build timed out")
+                    Just r -> return r
+            else do
+                -- Run without timeout
+                r <- timeoutAction `onException` cleanup
+                return r
 
--- Close the pipes (should be done by cleanup, but ensure it's done)
-liftIO $ do
-    handle (\(_ :: SomeException) -> return ()) $ hClose stdoutHandle
-    handle (\(_ :: SomeException) -> return ()) $ hClose stderrHandle
-    handle (\(_ :: SomeException) -> return ()) $ closeFd stdoutWrite
-    handle (\(_ :: SomeException) -> return ()) $ closeFd stderrWrite
+    -- Close the pipes (should be done by cleanup, but ensure it's done)
+    liftIO $ do
+        handle (\(_ :: SomeException) -> return ()) $ hClose stdoutHandle
+        handle (\(_ :: SomeException) -> return ()) $ hClose stderrHandle
+        handle (\(_ :: SomeException) -> return ()) $ closeFd stdoutWrite
+        handle (\(_ :: SomeException) -> return ()) $ closeFd stderrWrite
 
--- Return the result
-return result
+    -- Return the result
+    return result
 
 -- | Set process group ID
 setpgid :: ProcessID -> ProcessID -> IO ()
