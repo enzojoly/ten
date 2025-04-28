@@ -263,6 +263,7 @@ import System.Directory
 import System.FilePath
 import qualified System.Process as Process
 import System.Exit
+import System.Posix.User
 import Data.Proxy (Proxy(..))
 import Network.Socket (Socket, SockAddr(..), socketToHandle, close)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdin,
