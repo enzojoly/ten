@@ -360,7 +360,7 @@ instance CanManageBuildStatus 'Builder where
 
         -- Create build status request
         let request = Request {
-            reqId = 0,
+            reqId = 0,  -- Will be set by sendRequest
             reqType = "build-status",
             reqParams = Map.singleton "buildId" (Protocol.renderBuildId buildId),
             reqPayload = Nothing
@@ -378,7 +378,7 @@ instance CanManageBuildStatus 'Builder where
 
         -- Create status update request
         let request = Request {
-            reqId = 0,
+            reqId = 0,  -- Will be set by sendRequest
             reqType = "update-build-status",
             reqParams = Map.fromList [
                 ("buildId", Protocol.renderBuildId buildId),
@@ -587,7 +587,7 @@ processOutputs db buildDir derivation = do
     logMsg 2 $ "Output directory contents: " <> T.pack (show outFiles)
 
     -- Process each expected output
-    outputPaths <- foldM (processOutput db outDir) Set.empty (Set.toList $ derivOutputs derivation)
+    outputPaths <- foldM (processOutput db outDir derivation) Set.empty (Set.toList $ derivOutputs derivation)
 
     -- Add output proof
     addProof OutputProof
@@ -595,8 +595,8 @@ processOutputs db buildDir derivation = do
     return outputPaths
 
 -- Process a single output, adding it to the store
-processOutput :: Database 'Daemon -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build 'Daemon (Set StorePath)
-processOutput db outDir accPaths output = do
+processOutput :: Database 'Daemon -> FilePath -> Derivation -> Set StorePath -> DerivationOutput -> TenM 'Build 'Daemon (Set StorePath)
+processOutput db outDir derivation accPaths output = do
     env <- ask
     let outputFile = outDir </> T.unpack (outputName output)
 
@@ -633,12 +633,12 @@ processOutput db outDir accPaths output = do
                     Store.addToStore sDaemon (outputName output) content
 
             -- Register this as a valid path in the database
-            let derivPath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
+            let derivPath = StorePath (derivHash derivation) (derivName derivation <> ".drv")
             DBDeriv.registerValidPath outputPath (Just derivPath)
 
             -- Return updated set
             return $ Set.insert outputPath accPaths
-        else if isReturnContinuationDerivation (derivName deriv) (derivArgs deriv) (derivEnv deriv)
+        else if isReturnContinuationDerivation (derivName derivation) (derivArgs derivation) (derivEnv derivation)
             then do
                 -- For return-continuation builds, outputs might not be created
                 -- Return the predicted output path anyway
@@ -998,7 +998,7 @@ collectBuildResultDaemon derivation buildDir = do
     -- Process in a transaction for atomicity
     outputPaths <- withTenWriteTransaction db $ \dbConn -> do
         -- Process each expected output
-        outputPaths <- foldM (processOutput dbConn outDir) Set.empty (Set.toList $ derivOutputs derivation)
+        outputPaths <- foldM (processOutput dbConn outDir derivation) Set.empty (Set.toList $ derivOutputs derivation)
 
         -- Register all input-output references
         -- Get derivation path in the store
