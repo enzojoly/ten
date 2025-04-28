@@ -176,8 +176,15 @@ instance CanBuildDerivation 'Daemon where
 
         -- Register the derivation in the database
         env <- ask
-        withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-            liftIO $ DBDeriv.registerDerivationFile db deriv derivPath
+        -- Create database connection with proper privileges
+        db <- liftIO $ DB.initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
+
+        -- Use proper transaction handling and ensure cleanup
+        _ <- DB.withTenWriteTransaction db $ \dbConn ->
+            liftIO $ DBDeriv.registerDerivationFile dbConn deriv derivPath
+
+        -- Clean up connection
+        liftIO $ DB.closeDatabaseDaemon db
 
         -- First instantiate the derivation
         Derivation.instantiateDerivation deriv
@@ -323,16 +330,23 @@ instance CanBuildStrategy 'Builder where
 instance CanManageBuildStatus 'Daemon where
     getBuildStatus buildId = do
         env <- ask
-        withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-            results <- query db
+        -- Get database connection with proper privileges
+        db <- liftIO $ DB.initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
+
+        -- Use proper transaction handling
+        results <- DB.withTenReadTransaction db $ \dbConn ->
+            DB.query dbConn
                 "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
                 (Only (T.pack (show buildId))) :: TenM 'Build 'Daemon [Only Text]
 
-            case results of
-                [Only statusText] -> case parseStatus statusText of
-                    Just status -> return status
-                    Nothing -> throwError $ BuildFailed $ "Invalid build status: " <> statusText
-                _ -> throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
+        -- Clean up connection
+        liftIO $ DB.closeDatabaseDaemon db
+
+        case results of
+            [Only statusText] -> case parseStatus statusText of
+                Just status -> return status
+                Nothing -> throwError $ BuildFailed $ "Invalid build status: " <> statusText
+            _ -> throwError $ BuildFailed $ "Cannot find build: " <> T.pack (show buildId)
       where
         parseStatus :: Text -> Maybe BuildStatus
         parseStatus "BuildPending" = Just BuildPending
@@ -358,10 +372,17 @@ instance CanManageBuildStatus 'Daemon where
         -- In a real daemon implementation, this would update a shared TVar
         -- and notify any clients waiting for status updates
         env <- ask
-        withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-            liftIO $ execute db
+        -- Get database connection with proper privileges
+        db <- liftIO $ DB.initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
+
+        -- Use proper transaction handling
+        _ <- DB.withTenWriteTransaction db $ \dbConn ->
+            liftIO $ DB.execute dbConn
                 "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
                 (T.pack (show buildId), T.pack (show status))
+
+        -- Clean up connection
+        liftIO $ DB.closeDatabaseDaemon db
 
 -- | Builder instance for managing build status (via protocol)
 instance CanManageBuildStatus 'Builder where
@@ -406,17 +427,23 @@ findDependencyDerivations paths = do
     env <- ask
 
     -- Use the database to look up derivations for the provided output paths
-    withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-        -- Use the database to look up derivations for the provided output paths
-        result <- DBDeriv.findDerivationsByOutputs paths
+    -- Get database connection with proper privileges
+    db <- liftIO $ DB.initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
 
-        -- If any lookup failed, throw an error
-        when (Map.size result /= length paths) $ do
-            let missingPaths = filter (\p -> not $ any (\(h, d) -> (storeHash p) `T.isInfixOf` (T.pack h)) (Map.toList result)) paths
-            throwError $ StoreError $ "Could not find derivations for outputs: " <>
-                        T.intercalate ", " (map storeName missingPaths)
+    -- Use proper transaction handling
+    result <- DB.withTenReadTransaction db $ \dbConn ->
+        DBDeriv.findDerivationsByOutputs dbConn paths
 
-        return result
+    -- Clean up connection
+    liftIO $ DB.closeDatabaseDaemon db
+
+    -- If any lookup failed, throw an error
+    when (Map.size result /= length paths) $ do
+        let missingPaths = filter (\p -> not $ any (\(h, d) -> (storeHash p) `T.isInfixOf` (T.pack h)) (Map.toList result)) paths
+        throwError $ StoreError $ "Could not find derivations for outputs: " <>
+                    T.intercalate ", " (map storeName missingPaths)
+
+    return result
 
 -- Helper function for determining left values in a Map
 isLeft :: Either a b -> Bool
@@ -877,7 +904,7 @@ getBuildEnvironment env deriv buildDir = do
 
 -- | Collect output files from a build and add them to the store (daemon operation)
 collectBuildResultDaemon :: Derivation -> FilePath -> TenM 'Build 'Daemon (Set StorePath)
-collectBuildResultDaemon deriv buildDir = do
+collectBuildResultDaemon drv buildDir = do
     -- Get the output directory
     let outDir = buildDir </> "out"
 
@@ -893,38 +920,44 @@ collectBuildResultDaemon deriv buildDir = do
     -- Get environment information
     env <- ask
 
-    -- Process each expected output with database connection
-    db <- DB.getDatabaseFromEnv
+    -- Get database connection
+    db <- liftIO $ initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
 
     -- Process in a transaction for atomicity
-    withTenWriteTransaction db $ \db' -> do
+    outputPaths <- withTenWriteTransaction db $ \dbConn -> do
         -- Process each expected output
-        outputPaths <- foldM (processOutput db' outDir) Set.empty (Set.toList $ derivOutputs deriv)
+        outputPaths <- foldM (processOutput dbConn outDir) Set.empty (Set.toList $ derivOutputs drv)
 
         -- Register all input-output references
         -- Get derivation path in the store
-        let derivStorePath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
+        let derivStorePath = StorePath (derivHash drv) (derivName drv <> ".drv")
 
         -- Register each output in the database
-        derivId <- DBDeriv.storeDerivation deriv derivStorePath
+        derivId <- DBDeriv.storeDerivation dbConn deriv derivStorePath
 
         forM_ (Set.toList outputPaths) $ \outputPath -> do
             -- 1. Register the derivation as a reference for this output
-            DBDeriv.addDerivationReference outputPath derivStorePath
+            DBDeriv.addDerivationReference dbConn outputPath derivStorePath
 
             -- 2. Register all input references for this output
-            forM_ (Set.toList $ derivInputs deriv) $ \input -> do
-                DBDeriv.addDerivationReference outputPath (inputPath input)
+            forM_ (Set.toList $ derivInputs drv) $ \input -> do
+                DBDeriv.addDerivationReference dbConn outputPath (inputPath input)
 
             -- 3. Scan the output file for additional references
             refs <- Store.scanFileForStoreReferences $ storePathToFilePath outputPath env
-            DBDeriv.bulkRegisterReferences $ map (\ref -> (outputPath, ref)) $ Set.toList refs
-
-        -- Add output proof
-        addProof OutputProof
+            DBDeriv.bulkRegisterReferences dbConn $ map (\ref -> (outputPath, ref)) $ Set.toList refs
 
         -- Return the set of outputs
         return outputPaths
+
+    -- Clean up database connection
+    liftIO $ closeDatabaseDaemon db
+
+    -- Add output proof
+    addProof OutputProof
+
+    -- Return the set of outputs
+    return outputPaths
   where
     -- Process a single output, adding it to the store
     processOutput :: Database 'Daemon -> FilePath -> Set StorePath -> DerivationOutput -> TenM 'Build 'Daemon (Set StorePath)
@@ -965,12 +998,12 @@ collectBuildResultDaemon deriv buildDir = do
                         Store.addToStore sDaemon (outputName output) content
 
                 -- Register this as a valid path in the database
-                let derivPath = StorePath (derivHash deriv) (derivName deriv <> ".drv")
-                DBDeriv.registerValidPath outputPath (Just derivPath)
+                let derivPath = StorePath (derivHash drv) (derivName drv <> ".drv")
+                DBDeriv.registerValidPath db outputPath (Just derivPath)
 
                 -- Return updated set
                 return $ Set.insert outputPath accPaths
-            else if Derivation.isReturnContinuationDerivation (derivName deriv) (derivArgs deriv) (derivEnv deriv)
+            else if Derivation.isReturnContinuationDerivation (derivName drv) (derivArgs drv) (derivEnv drv)
                 then do
                     -- For return-continuation builds, outputs might not be created
                     -- Return the predicted output path anyway
@@ -1088,12 +1121,16 @@ handleReturnedDerivation result = do
             -- Store the inner derivation in the content store - in appropriate context
             derivPath <- case tier of
                 Daemon -> Core.storeDerivationDaemon innerDrv
-                Builder -> DBDeriv.storeDerivation innerDrv
+                Builder -> do
+                    -- For Builder tier, we need to get a database connection first
+                    db <- liftIO $ initDatabaseDaemon sDaemon (defaultDBPath (storeLocation env)) 5000
+                    path <- DBDeriv.storeDerivation db innerDrv
+                    liftIO $ closeDatabaseDaemon db
+                    return path
 
-            -- Check for cycles
-            chain <- gets buildChain
-            let isCyclic = Graph.detectRecursionCycle innerDrv
-            when isCyclic $
+            -- Check for cycles - extract boolean from monadic context
+            isCyclicResult <- Graph.detectRecursionCycle innerDrv
+            when isCyclicResult $
                 throwError $ CyclicDependency $
                     "Cyclic dependency detected in returned derivation: " <> derivName innerDrv
 
@@ -1103,13 +1140,22 @@ handleReturnedDerivation result = do
 buildDerivationGraph :: BuildGraph -> TenM 'Build t (Map Text Core.BuildResult)
 buildDerivationGraph graph = do
     -- First get dependencies in topological order
-    sorted <- Graph.topologicalSort graph
+    env <- ask
+    let tierSingleton = case currentPrivilegeTier env of
+                          Daemon -> sDaemon
+                          Builder -> sBuilder
 
-    -- Filter for DerivationNode nodes
-    let derivations = mapMaybe getDerivation sorted
+    -- Get evaluation phase result from topological sort
+    evalResult <- liftIO $ runTenDaemonEval (Graph.topologicalSort tierSingleton graph) env (initBuildState Eval (BuildIdFromInt 0))
 
-    -- Build each derivation
-    foldM buildAndCollect Map.empty derivations
+    case evalResult of
+        Left err -> throwError err
+        Right (sorted, _) -> do
+            -- Filter for DerivationNode nodes
+            let derivations = mapMaybe getDerivation sorted
+
+            -- Build each derivation
+            foldM buildAndCollect Map.empty derivations
   where
     getDerivation (DerivationNode drv) = Just drv
     getDerivation _ = Nothing
@@ -1124,13 +1170,21 @@ buildDerivationGraph graph = do
 -- | Build derivations in dependency order
 buildInDependencyOrder :: [Derivation] -> TenM 'Build t [Core.BuildResult]
 buildInDependencyOrder derivations = do
-    -- First check for cycles
-    let cycle = any Graph.detectRecursionCycle derivations
+    -- First check for cycles using a pure function
+    let cycle = any isDerivationCyclic derivations
     when cycle $
         throwError $ CyclicDependency "Cycle detected in build dependencies"
 
     -- Build each derivation in order
     mapM buildDerivation derivations
+  where
+    -- Pure cycle detection function
+    isDerivationCyclic :: Derivation -> Bool
+    isDerivationCyclic d =
+        -- Simple pure implementation for structural cycle detection
+        let outputs = Set.map outputPath (derivOutputs d)
+            inputs = Set.map inputPath (derivInputs d)
+        in not $ Set.null $ Set.intersection outputs inputs
 
 -- | Build dependencies concurrently
 buildDependenciesConcurrently :: [Derivation] -> TenM 'Build 'Daemon (Map String (Either BuildError Core.BuildResult))
