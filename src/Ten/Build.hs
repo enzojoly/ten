@@ -50,7 +50,7 @@ module Ten.Build (
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception (try, catch, finally, mask, bracket, throwIO, onException, evaluate, SomeException, ErrorCall(..))
+import Control.Exception (try, catch, finally, mask, bracket, throwIO, onException, evaluate, SomeException, ErrorCall(..), handle)
 import Control.Monad
 import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (get, modify, gets)
@@ -66,7 +66,7 @@ import qualified Data.Text.IO as TIO
 import qualified Data.Text.Encoding as TE
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
-import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, mapMaybe)
 import Data.Time (getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.List (nub, isPrefixOf, isInfixOf)
@@ -176,7 +176,7 @@ instance CanBuildDerivation 'Daemon where
 
         -- Register the derivation in the database
         env <- ask
-        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
             liftIO $ DBDeriv.registerDerivationFile db deriv derivPath
 
         -- First instantiate the derivation
@@ -239,7 +239,7 @@ instance CanBuildStrategy 'Daemon where
         }
 
         -- Check if we need to build dependencies first
-        missingDeps <- filterM (\path -> not <$> storePathExists path) (Set.toList inputs)
+        missingDeps <- filterM (\path -> not <$> Store.checkStorePathExists path) (Set.toList inputs)
 
         if null missingDeps
             then buildWithSandboxDaemon deriv config
@@ -272,7 +272,7 @@ instance CanBuildStrategy 'Daemon where
         let inputs = Set.map inputPath (derivInputs deriv)
 
         -- Check if all inputs exist
-        missingDeps <- filterM (\path -> not <$> storePathExists path) (Set.toList inputs)
+        missingDeps <- filterM (\path -> not <$> Store.checkStorePathExists path) (Set.toList inputs)
         unless (null missingDeps) $
             throwError $ BuildFailed $ "Missing dependencies: " <>
                          T.intercalate ", " (map storeName missingDeps)
@@ -323,8 +323,8 @@ instance CanBuildStrategy 'Builder where
 instance CanManageBuildStatus 'Daemon where
     getBuildStatus buildId = do
         env <- ask
-        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-            results <- tenQuery db
+        withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+            results <- query db
                 "SELECT status FROM BuildStatus WHERE build_id = ? ORDER BY timestamp DESC LIMIT 1"
                 (Only (T.pack (show buildId))) :: TenM 'Build 'Daemon [Only Text]
 
@@ -358,7 +358,7 @@ instance CanManageBuildStatus 'Daemon where
         -- In a real daemon implementation, this would update a shared TVar
         -- and notify any clients waiting for status updates
         env <- ask
-        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
             liftIO $ tenExecute db
                 "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
                 (T.pack (show buildId), T.pack (show status))
@@ -372,7 +372,7 @@ instance CanManageBuildStatus 'Builder where
         let request = Request {
             reqId = 0,
             reqType = "build-status",
-            reqParams = Map.singleton "buildId" (renderBuildId buildId),
+            reqParams = Map.singleton "buildId" (Protocol.renderBuildId buildId),
             reqPayload = Nothing
         }
 
@@ -391,7 +391,7 @@ instance CanManageBuildStatus 'Builder where
             reqId = 0,
             reqType = "update-build-status",
             reqParams = Map.fromList [
-                ("buildId", renderBuildId buildId),
+                ("buildId", Protocol.renderBuildId buildId),
                 ("status", T.pack $ show status)
             ],
             reqPayload = Nothing
@@ -406,7 +406,7 @@ findDependencyDerivations paths = do
     env <- ask
 
     -- Use the database to look up derivations for the provided output paths
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
         -- Use the database to look up derivations for the provided output paths
         result <- DBDeriv.findDerivationsByOutputs paths
 
@@ -1057,7 +1057,7 @@ checkForReturnedDerivation buildDir = do
             content <- liftIO $ BS.readFile returnPath'
             case Core.deserializeDerivation content of
                 Left err -> do
-                    logMsg 1 $ "Error deserializing returned derivation: " <> err
+                    logMsg 1 $ "Error deserializing returned derivation: " <> Core.buildErrorToText err
                     return Nothing
                 Right drv -> return $ Just drv
         else
@@ -1076,7 +1076,7 @@ handleReturnedDerivation result = do
     content <- liftIO $ BS.readFile returnPath'
     case Core.deserializeDerivation content of
         Left err -> throwError $ SerializationError $
-            "Failed to deserialize returned derivation: " <> err
+            "Failed to deserialize returned derivation: " <> Core.buildErrorToText err
         Right innerDrv -> do
             -- Add proof that we successfully got a returned derivation
             addProof RecursionProof
@@ -1092,7 +1092,7 @@ handleReturnedDerivation result = do
 
             -- Check for cycles
             chain <- gets buildChain
-            let isCyclic = Graph.detectRecursionCycle (innerDrv : chain)
+            let isCyclic = Graph.detectRecursionCycle innerDrv
             when isCyclic $
                 throwError $ CyclicDependency $
                     "Cyclic dependency detected in returned derivation: " <> derivName innerDrv
@@ -1125,7 +1125,7 @@ buildDerivationGraph graph = do
 buildInDependencyOrder :: [Derivation] -> TenM 'Build t [Core.BuildResult]
 buildInDependencyOrder derivations = do
     -- First check for cycles
-    let cycle = Graph.detectRecursionCycle derivations
+    let cycle = any Graph.detectRecursionCycle derivations
     when cycle $
         throwError $ CyclicDependency "Cycle detected in build dependencies"
 
