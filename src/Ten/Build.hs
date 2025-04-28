@@ -359,7 +359,7 @@ instance CanManageBuildStatus 'Daemon where
         -- and notify any clients waiting for status updates
         env <- ask
         withTenDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-            liftIO $ tenExecute db
+            liftIO $ execute db
                 "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
                 (T.pack (show buildId), T.pack (show status))
 
@@ -1025,7 +1025,7 @@ verifyBuildResult deriv result = do
                     let allOutputsPresent = expectedOutputNames `Set.isSubsetOf` actualOutputNames
 
                     -- Check that each output exists in the store
-                    validOutputs <- forM (Set.toList (Core.brOutputPaths result)) storePathExists
+                    validOutputs <- forM (Set.toList (Core.brOutputPaths result)) Store.checkStorePathExists
 
                     -- Return True if all checks pass
                     return $ allOutputsPresent && and validOutputs
