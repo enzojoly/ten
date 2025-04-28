@@ -709,40 +709,39 @@ case exitStatus of
                 0 -> ExitSuccess
                 n -> ExitFailure n
         return (Just pid, Right (exitResult, stdoutContent, stderrContent))
-
     Just (Process.Terminated sig _) ->
         return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
-
     Just (Process.Stopped sig) ->
         return (Just pid, Left $ "Builder stopped by signal: " <> T.pack (show sig))
-
     Nothing ->
         return (Just pid, Left "Builder process disappeared")
 
-        -- Apply timeout if configured
-        if builderTimeoutSecs env > 0
-            then do
-                -- Run builder with timeout
-                timeoutResult <- SystemTimeout.timeout (builderTimeoutSecs env * 1000000) timeoutAction
-                case timeoutResult of
-                    Nothing -> do
-                        -- Timeout occurred, cleanup and return error
-                        cleanup
-                        return (Nothing, Left "Build timed out")
-                    Just result -> result
-            else
-                -- Run without timeout
-                timeoutAction `onException` cleanup
+-- Apply timeout if configured (this should be outside the case statement)
+do
+    result <- if builderTimeoutSecs env > 0
+        then do
+            -- Run builder with timeout
+            timeoutResult <- SystemTimeout.timeout (builderTimeoutSecs env * 1000000) timeoutAction
+            case timeoutResult of
+                Nothing -> do
+                    -- Timeout occurred, cleanup and return error
+                    cleanup
+                    return (Nothing, Left "Build timed out")
+                Just r -> return r
+        else do
+            -- Run without timeout
+            r <- timeoutAction `onException` cleanup
+            return r
 
-    -- Close the pipes (should be done by cleanup, but ensure it's done)
-    liftIO $ do =
-        hClose stdoutHandle `catch` ignoreException
-        hClose stderrHandle `catch` ignoreException
-        closeFd stdoutWrite `catch` ignoreException
-        closeFd stderrWrite `catch` ignoreException
+-- Close the pipes (should be done by cleanup, but ensure it's done)
+liftIO $ do
+    handle (\(_ :: SomeException) -> return ()) $ hClose stdoutHandle
+    handle (\(_ :: SomeException) -> return ()) $ hClose stderrHandle
+    handle (\(_ :: SomeException) -> return ()) $ closeFd stdoutWrite
+    handle (\(_ :: SomeException) -> return ()) $ closeFd stderrWrite
 
-    -- Return the result
-    return result
+-- Return the result
+return result
 
 -- | Set process group ID
 setpgid :: ProcessID -> ProcessID -> IO ()
