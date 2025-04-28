@@ -36,7 +36,8 @@ module Ten.Core (
     RunMode(..),
     DaemonConfig(..),
     UserId(..),
-    UserInfo,
+    UserEntry(..),
+    GroupEntry(..),
     AuthToken(..),
 
     -- Protocol Connection types
@@ -385,13 +386,22 @@ currentProtocolVersion = ProtocolVersion 1 0 0
 newtype RequestId = RequestId Int
     deriving (Eq, Ord, Show)
 
-data UserInfo = UserInfo {
-    userUid :: UserID,
-    userGid :: GroupID,
-    user :: Text,
-    userHomeDir :: FilePath,
-    userShell :: FilePath
-} deriving (Show, Eq)
+data UserEntry = UserEntry {
+    userName :: String,
+    userPassword :: String,
+    userID :: UserID,
+    userGroupID :: GroupID,
+    userGecos :: String,
+    homeDirectory :: String,
+    userShell :: String
+}
+
+data GroupEntry = GroupEntry {
+    groupName :: String,
+    groupPassword :: String,
+    groupID :: GroupID,
+    groupMembers :: [String]
+}
 
 -- | Transaction modes
 data TransactionMode
@@ -1028,7 +1038,7 @@ data BuildEnv = BuildEnv
     , verbosity :: Int                   -- Logging verbosity level
     , allowedPaths :: Set FilePath       -- Paths accessible during build
     , runMode :: RunMode                 -- Current running mode
-    , userName :: Maybe Text             -- Current user name (for daemon mode)
+    , nameOfUser :: Maybe Text             -- Current user name (for daemon mode)
     , buildStrategy :: BuildStrategy     -- How to build derivations
     , maxRecursionDepth :: Int           -- Maximum allowed derivation recursion
     , maxConcurrentBuilds :: Maybe Int   -- Maximum concurrent builds
@@ -1109,21 +1119,6 @@ createDaemonConnection handle userId authToken priEvidence = do
         connShutdown = shutdownFlag,
         connPrivEvidence = priEvidence
     }
-
--- Helper functions for user lookups
-getUserInfoByName :: Text -> IO (Either BuildError UserInfo)
-getUserInfoByName name = do
-    result <- try $ User.getUserEntryForName (T.unpack name)
-    case result of
-        Left (e :: SomeException) ->
-            return $ Left $ PrivilegeError $ "Failed to get user entry: " <> T.pack (show e)
-        Right entry -> return $ Right $ UserInfo {
-            userUid = User.userID entry,
-            userGid = User.userGroupID entry,
-            user = T.pack $ User.userName entry,
-            userHomeDir = User.homeDirectory entry,
-            userShell = User.userShell entry
-        }
 
 -- | Helper function to work with singletons
 withSPhase :: SPhase p -> (forall q. SPhase q -> TenM q t a) -> TenM p t a
@@ -1266,7 +1261,7 @@ initBuildEnv wd sp = BuildEnv
     , verbosity = 1
     , allowedPaths = Set.empty
     , runMode = StandaloneMode
-    , userName = Nothing
+    , nameOfUser = Nothing
     , buildStrategy = MonadicStrategy
     , maxRecursionDepth = 100
     , maxConcurrentBuilds = Nothing
@@ -1284,7 +1279,7 @@ initClientEnv wd sp conn = (initBuildEnv wd sp)
 initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
 initDaemonEnv wd sp user = (initBuildEnv wd sp)
     { runMode = DaemonMode
-    , userName = user
+    , nameOfUser = user
     , currentPrivilegeTier = Daemon  -- Daemon runs in Daemon privilege tier
     }
 
