@@ -389,6 +389,15 @@ currentProtocolVersion = ProtocolVersion 1 0 0
 newtype RequestId = RequestId Int
     deriving (Eq, Ord, Show)
 
+runBuilderFromDaemon :: TenM 'Build 'Builder a -> TenM 'Build 'Daemon (Either BuildError a)
+runBuilderFromDaemon builderAction = do
+    env <- ask
+    buildState <- get
+    result <- liftIO $ runTenBuilderBuild builderAction env buildState
+    return $ case result of
+        Left err -> Left err
+        Right (val, _) -> Right val  -- Extract just the value, discard the state
+
 data UserEntry = UserEntry {
     userName :: String,
     userPassword :: String,
