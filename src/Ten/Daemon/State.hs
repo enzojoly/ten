@@ -135,7 +135,8 @@ import System.IO.Unsafe (unsafePerformIO)
 -- File system and IO imports
 import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, removeFile)
 import System.FilePath (takeDirectory, (</>), takeFileName, normalise)
-import System.IO (Handle, withFile, IOMode(..), hClose, hPutStrLn, stderr, stdout, hFlush, BufferMode(..), hSetBuffering)
+import System.IO (Handle, withFile, IOMode(..), hClose, hPutStrLn, stderr, stdout, hFlush, BufferMode(..), hSetBuffering,
+                 SeekMode(AbsoluteSeek))
 import System.IO.Error (isDoesNotExistError, catchIOError)
 
 -- POSIX-specific imports
@@ -166,11 +167,11 @@ import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                 storePathToText, storePathToFilePath,
                 -- Add these types directly from Core:
                 Derivation(..), DerivationInput(..), DerivationOutput(..), BuildResult(..),
-                -- Access AbsoluteSeek via System.IO:
                 fromSing, sing)
 import qualified Ten.Core as Core
 import Ten.Derivation (derivationEquals)
 import qualified Ten.Graph as Graph
+import Unsafe.Coerce (unsafeCoerce)  -- For explicit privilege casting
 
 -- | State errors
 data StateError
@@ -356,15 +357,13 @@ initDaemonState st stateFile maxJobs maxHistory = do
     -- Ensure the lock directory exists
     ensureLockDirExists gcLockPath
 
-    -- Set up maintenance thread (only for Daemon privilege)
+    -- Set up privilege-specific operations
     case fromSing st of
-        Daemon -> setupMaintenanceThread state
-        Builder -> return () -- Builder can't set up maintenance
-
-    -- Set up signal handlers (only for Daemon privilege)
-    case fromSing st of
-        Daemon -> setupSignalHandlers state
-        Builder -> return () -- Builder can't set up signal handlers
+        Daemon -> do
+            let daemonState = unsafeCoerce state :: DaemonState 'Daemon
+            setupMaintenanceThread daemonState
+            setupSignalHandlers daemonState
+        Builder -> return () -- Builder can't set up maintenance or signal handlers
 
     return state
 
@@ -424,7 +423,7 @@ loadStateFromFile st stateFile maxJobs maxHistory = do
             result <- try $ do
                 content <- BS.readFile stateFile
                 case Aeson.eitherDecodeStrict content of
-                    Left err -> throwIO $ StateError $ StateFormatError $ T.pack err
+                    Left err -> throwIO $ StateFormatError $ T.pack err
                     Right stateData -> do
                         -- Initialize a new state
                         state <- initDaemonState st stateFile maxJobs maxHistory
@@ -613,7 +612,7 @@ queueBuild state buildId derivation owner priority timestamp dependencies tier =
     queueSize <- atomically $ length <$> readTVar (bqEntries $ dsBuildQueue state)
 
     if queueSize >= bqMaxPending (dsBuildQueue state)
-        then throwIO $ StateError $ StateResourceError "Build queue is full"
+        then throwIO $ StateResourceError "Build queue is full"
         else do
             -- Create a queue entry with privilege tier information
             let entry = BuildQueueEntry {
@@ -643,11 +642,11 @@ unregisterBuild state buildId = do
     case mBuild of
         Nothing -> do
             -- Check if it's in the queue
-            entries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
+            entries <- readTVarIO (bqEntries $ dsBuildQueue state)
             let queueEntry = filter (\e -> bqBuildId e == buildId) entries
 
             if null queueEntry
-                then throwIO $ StateError $ StateBuildNotFound buildId
+                then throwIO $ StateBuildNotFound buildId
                 else do
                     -- Remove from queue
                     atomically $ modifyTVar' (bqEntries $ dsBuildQueue state) $
@@ -660,11 +659,11 @@ unregisterBuild state buildId = do
 
             -- Builder can't cancel Daemon-initiated builds
             when (stateTier == Builder && buildTier == Daemon) $
-                throwIO $ StateError $ StatePrivilegeError
+                throwIO $ StatePrivilegeError
                     "Builder privilege tier cannot cancel Daemon-initiated builds"
 
             -- Cancel the build thread if it's running
-            threadRef <- atomically $ readTVar (abThread build)
+            threadRef <- readTVarIO (abThread build)
             case threadRef of
                 Just thread -> cancel thread
                 Nothing -> return ()
@@ -712,7 +711,7 @@ updateBuildStatus state buildId status = do
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
 
     case mBuild of
-        Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
+        Nothing -> throwIO $ StateBuildNotFound buildId
         Just build -> do
             -- Verify privilege tier - we can only update builds initiated at our tier or lower
             let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -720,7 +719,7 @@ updateBuildStatus state buildId status = do
 
             -- Builder can't update Daemon-initiated builds
             when (stateTier == Builder && buildTier == Daemon) $
-                throwIO $ StateError $ StatePrivilegeError
+                throwIO $ StatePrivilegeError
                     "Builder privilege tier cannot update Daemon-initiated builds"
 
             -- Update the status and timestamp
@@ -736,7 +735,7 @@ appendBuildLog state buildId logText = do
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
 
     case mBuild of
-        Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
+        Nothing -> throwIO $ StateBuildNotFound buildId
         Just build -> do
             -- Verify privilege tier - we can only append to builds initiated at our tier or lower
             let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -744,7 +743,7 @@ appendBuildLog state buildId logText = do
 
             -- Builder can't append to Daemon-initiated builds
             when (stateTier == Builder && buildTier == Daemon) $
-                throwIO $ StateError $ StatePrivilegeError
+                throwIO $ StatePrivilegeError
                     "Builder privilege tier cannot append to logs of Daemon-initiated builds"
 
             -- Append to the log
@@ -759,17 +758,17 @@ getBuildStatus state buildId = do
     case mBuild of
         Nothing -> do
             -- Check if it's a completed build
-            completedBuilds <- atomically $ readTVar (dsCompletedBuilds state)
+            completedBuilds <- readTVarIO (dsCompletedBuilds state)
             case Map.lookup buildId completedBuilds of
                 Just _ -> return BuildCompleted
                 Nothing -> do
                     -- Check if it's a failed build
-                    failedBuilds <- atomically $ readTVar (dsFailedBuilds state)
+                    failedBuilds <- readTVarIO (dsFailedBuilds state)
                     case Map.lookup buildId failedBuilds of
                         Just _ -> return BuildFailed'
-                        Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
+                        Nothing -> throwIO $ StateBuildNotFound buildId
 
-        Just build -> atomically $ readTVar (abStatus build)
+        Just build -> readTVarIO (abStatus build)
 
 -- | Get a build's log
 getBuildLog :: DaemonState t -> BuildId -> IO Text
@@ -782,22 +781,22 @@ getBuildLog state buildId = do
             -- Check if it's a completed or failed build
             -- In a real implementation, we would store the logs persistently
             -- For now, just return a message
-            completedBuilds <- atomically $ readTVar (dsCompletedBuilds state)
-            failedBuilds <- atomically $ readTVar (dsFailedBuilds state)
+            completedBuilds <- readTVarIO (dsCompletedBuilds state)
+            failedBuilds <- readTVarIO (dsFailedBuilds state)
 
             if Map.member buildId completedBuilds
                 then return "Build completed successfully. Log no longer available."
                 else if Map.member buildId failedBuilds
                     then return "Build failed. Log no longer available."
-                    else throwIO $ StateError $ StateBuildNotFound buildId
+                    else throwIO $ StateBuildNotFound buildId
 
-        Just build -> atomically $ readTVar (abLogBuffer build)
+        Just build -> readTVarIO (abLogBuffer build)
 
 -- | List active builds
 listActiveBuilds :: DaemonState t -> IO [(BuildId, Derivation, BuildStatus, UTCTime, Double)]
 listActiveBuilds state = do
     -- Get all active builds
-    activeBuilds <- atomically $ readTVar (dsActiveBuilds state)
+    activeBuilds <- readTVarIO (dsActiveBuilds state)
 
     -- Get the privilege tier of the state
     let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -811,8 +810,8 @@ listActiveBuilds state = do
     mapM collectBuildInfo (Map.toList filteredBuilds)
   where
     collectBuildInfo (buildId, build) = do
-        status <- atomically $ readTVar (abStatus build)
-        updateTime <- atomically $ readTVar (abUpdateTime build)
+        status <- readTVarIO (abStatus build)
+        updateTime <- readTVarIO (abUpdateTime build)
 
         -- Calculate progress
         progress <- calculateBuildProgress build
@@ -823,7 +822,7 @@ listActiveBuilds state = do
 listQueuedBuilds :: DaemonState t -> IO [(BuildId, Derivation, Int, UTCTime)]
 listQueuedBuilds state = do
     -- Get all queued builds
-    queueEntries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
+    queueEntries <- readTVarIO (bqEntries $ dsBuildQueue state)
 
     -- Get the privilege tier of the state
     let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -844,7 +843,7 @@ registerReturnedDerivation state buildId innerDerivation = do
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
 
     case mBuild of
-        Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
+        Nothing -> throwIO $ StateBuildNotFound buildId
         Just build -> do
             -- Verify privilege tier - we can only register for builds initiated at our tier or lower
             let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -852,7 +851,7 @@ registerReturnedDerivation state buildId innerDerivation = do
 
             -- Builder can't register for Daemon-initiated builds
             when (stateTier == Builder && buildTier == Daemon) $
-                throwIO $ StateError $ StatePrivilegeError
+                throwIO $ StatePrivilegeError
                     "Builder privilege tier cannot register derivations for Daemon-initiated builds"
 
             -- Check for cycle
@@ -881,7 +880,7 @@ getDerivationChain state buildId = do
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
 
     case mBuild of
-        Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
+        Nothing -> throwIO $ StateBuildNotFound buildId
         Just build -> do
             -- Verify privilege tier - we can only get chains for builds initiated at our tier or lower
             let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -889,10 +888,10 @@ getDerivationChain state buildId = do
 
             -- Builder can't get chains for Daemon-initiated builds
             when (stateTier == Builder && buildTier == Daemon) $
-                throwIO $ StateError $ StatePrivilegeError
+                throwIO $ StatePrivilegeError
                     "Builder privilege tier cannot access derivation chains for Daemon-initiated builds"
 
-            atomically $ readTVar (abDerivationChain build)
+            readTVarIO (abDerivationChain build)
 
 -- | Check if a derivation is in a build's chain
 isDerivationInChain :: DaemonState t -> BuildId -> Derivation -> IO Bool
@@ -958,7 +957,7 @@ isPathReachable state path = do
 -- | Get all reachable paths
 getReachablePaths :: DaemonState t -> IO (Set StorePath)
 getReachablePaths state = do
-    atomically $ readTVar (dsReachablePaths state)
+    readTVarIO (dsReachablePaths state)
 
 -- | Register a derivation's build graph
 registerDerivationGraph :: DaemonState t -> Derivation -> Graph.BuildGraph -> IO ()
@@ -1111,7 +1110,7 @@ acquireGCLock state = do
 
     case result of
         Left err ->
-            throwIO $ StateError $ StateLockError $ "Failed to acquire GC lock: " <> err
+            throwIO $ StateLockError $ "Failed to acquire GC lock: " <> err
         Right (fd, pid) -> do
             -- Record the lock state in memory too
             atomically $ do
@@ -1178,7 +1177,7 @@ updateSystemStats state = do
 -- | Get daemon statistics
 getDaemonStats :: DaemonState t -> IO DaemonStats
 getDaemonStats state = do
-    atomically $ readTVar (dsDaemonStats state)
+    readTVarIO (dsDaemonStats state)
 
 -- | Capture current system statistics
 captureSystemStats :: IO DaemonStats
@@ -1437,8 +1436,8 @@ setupMaintenanceThread state = do
     -- Store the thread
     atomically $ writeTVar (dsMaintenanceThread state) (Just thread)
 
--- | Maintenance loop - requires CanModifyStore privilege
-maintenanceLoop :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
+-- | Maintenance loop - requires CanModifyStore and CanAccessStore privileges
+maintenanceLoop :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 maintenanceLoop state = do
     -- Run forever
     forever $ do
@@ -1463,8 +1462,8 @@ scheduledMaintenance state = do
     -- Save state to file
     saveStateToFile state
 
--- | Set up signal handlers - requires Daemon privileges
-setupSignalHandlers :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
+-- | Set up signal handlers - requires CanModifyStore and CanAccessStore privileges
+setupSignalHandlers :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 setupSignalHandlers state = do
     -- Handle SIGTERM to gracefully shut down
     void $ installHandler sigTERM (Catch $ handleTermSignal state) Nothing
@@ -1475,7 +1474,7 @@ setupSignalHandlers state = do
     -- Handle SIGHUP for config reload
     void $ installHandler sigHUP (Catch $ handleHupSignal state) Nothing
 
--- | Handle SIGTERM signal - requires CanModifyStore privilege
+-- | Handle SIGTERM signal - requires store access and modification privileges
 handleTermSignal :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 handleTermSignal state = do
     -- Save state
@@ -1498,7 +1497,7 @@ handleTermSignal state = do
     putStrLn "Shutdown complete."
     exitImmediately 0
 
--- | Handle SIGHUP signal - requires CanModifyStore privilege
+-- | Handle SIGHUP signal - requires store access and modification privileges
 handleHupSignal :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 handleHupSignal state = do
     -- Save and reload state
@@ -1535,7 +1534,7 @@ captureStatus state buildId = do
     mBuild <- atomically $ Map.lookup buildId <$> readTVar (dsActiveBuilds state)
 
     case mBuild of
-        Nothing -> throwIO $ StateError $ StateBuildNotFound buildId
+        Nothing -> throwIO $ StateBuildNotFound buildId
         Just build -> do
             -- Verify privilege tier - we can only capture status for builds initiated at our tier or lower
             let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -1543,14 +1542,14 @@ captureStatus state buildId = do
 
             -- Builder can't capture status for Daemon-initiated builds
             when (stateTier == Builder && buildTier == Daemon) $
-                throwIO $ StateError $ StatePrivilegeError
+                throwIO $ StatePrivilegeError
                     "Builder privilege tier cannot capture status of Daemon-initiated builds"
 
             -- Get status
-            status <- atomically $ readTVar (abStatus build)
+            status <- readTVarIO (abStatus build)
 
             -- Get update time
-            updateTime <- atomically $ readTVar (abUpdateTime build)
+            updateTime <- readTVarIO (abUpdateTime build)
 
             -- Calculate progress
             progress <- calculateBuildProgress build
@@ -1561,7 +1560,7 @@ captureStatus state buildId = do
 calculateBuildProgress :: ActiveBuild -> IO Double
 calculateBuildProgress build = do
     -- Get the status
-    status <- atomically $ readTVar (abStatus build)
+    status <- readTVarIO (abStatus build)
 
     case status of
         BuildPending -> return 0.0
