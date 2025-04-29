@@ -91,7 +91,7 @@ import qualified Data.Text.IO as TIO
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, addUTCTime)
 import Data.Time.Format (formatTime, defaultTimeLocale)
 import Network.Socket (Socket, SockAddr(..), socketToHandle, socket, Family(..), SocketType(..), setSocketOption,
-                       SocketOption(..), bind, listen, close, accept, withFdSocket, setCloseOnExecIfNeeded)
+                       SocketOption(..), bind, listen, close, accept, withFdSocket, setCloseOnExecIfNeeded, connect)
 import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMissing, getHomeDirectory,
                         removeFile, getPermissions, setPermissions, removePathForcibly)
 import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
@@ -120,6 +120,7 @@ import System.Process (readProcess, createProcess, proc, waitForProcess, CreateP
 
 import Ten.Core
 import qualified Ten.Store as Store
+import qualified Ten.Sandbox as Sandbox (SandboxConfig(..))
 import qualified Ten.Daemon.Protocol as Protocol
 
 -- | Main daemon context with privilege tracking phantom type
@@ -632,13 +633,13 @@ spawnBuilder context derivation buildId = do
     buildDir <- createBuildDirectory config buildId
 
     -- Create sandbox configuration
-    let sandboxConfig = defaultSandboxConfig {
-            sandboxUser = fromMaybe "nobody" (daemonUser config),
-            sandboxGroup = fromMaybe "nogroup" (daemonGroup config),
-            sandboxAllowNetwork = False,  -- Restrict network access
-            sandboxPrivileged = False,    -- Run as unprivileged user
-            sandboxUseMountNamespace = True,
-            sandboxUseNetworkNamespace = True
+    let sandboxConfig = Sandbox.defaultSandboxConfig {
+            Sandbox.sandboxUser = fromMaybe "nobody" (daemonUser config),
+            Sandbox.sandboxGroup = fromMaybe "nogroup" (daemonGroup config),
+            Sandbox.sandboxAllowNetwork = False,  -- Restrict network access
+            Sandbox.sandboxPrivileged = False,    -- Run as unprivileged user
+            Sandbox.sandboxUseMountNamespace = True,
+            Sandbox.sandboxUseNetworkNamespace = True
         }
 
     -- Log build start
@@ -1252,7 +1253,7 @@ dropPrivileges context config = do
                                 exitFailure
                             Right gentry -> do
                                 -- Ensure store permissions are correct before dropping privileges
-                                ensureStorePermissions context config (userID entry) (groupID gentry)
+                                ensureStorePermissions context config (Sandbox.userID entry) (Sandbox.groupID gentry)
 
                                 -- Keep the store root owned by root for security
                                 -- But ensure the daemon can read/write store contents
@@ -1260,17 +1261,17 @@ dropPrivileges context config = do
                                 -- Create a /nix/var/nix/daemon directory owned by daemon user
                                 let daemonDir = daemonStorePath config </> "var/ten/daemon"
                                 createDirectoryIfMissing True daemonDir
-                                setOwnerAndGroup daemonDir (userID entry) (groupID gentry)
+                                setOwnerAndGroup daemonDir (Sandbox.userID entry) (Sandbox.groupID gentry)
                                 setFileMode daemonDir 0o700  -- Only the daemon user can access this
 
                                 -- Set supplementary groups first
                                 try $ setGroups [] -- Clear supplementary groups
 
                                 -- Set group ID (must be done before dropping user privileges)
-                                try $ setGroupID (groupID gentry)
+                                try $ setGroupID (Sandbox.groupID gentry)
 
                                 -- Finally set user ID
-                                try $ setUserID (userID entry)
+                                try $ setUserID (Sandbox.userID entry)
 
                                 -- Verify the change
                                 newUid <- getEffectiveUserID
@@ -1293,10 +1294,10 @@ dropPrivileges context config = do
                         exitFailure
                     Right entry -> do
                         -- Use user's primary group
-                        let primaryGid = groupID entry
+                        let primaryGid = Sandbox.groupID entry
 
                         -- Ensure store permissions are correct before dropping privileges
-                        ensureStorePermissions context config (userID entry) primaryGid
+                        ensureStorePermissions context config (Sandbox.userID entry) primaryGid
 
                         -- Set supplementary groups first
                         try $ setGroups [] -- Clear supplementary groups
@@ -1305,7 +1306,7 @@ dropPrivileges context config = do
                         try $ setGroupID primaryGid
 
                         -- Finally set user ID
-                        try $ setUserID (userID entry)
+                        try $ setUserID (Sandbox.userID entry)
 
                         -- Verify the change
                         newUid <- getEffectiveUserID
@@ -1677,7 +1678,7 @@ daemonize action = do
             mapM_ closeFd [stdInput, stdOutput, stdError]
 
             -- Open /dev/null for stdin, stdout, stderr
-            devNull <- openFd "/dev/null" ReadWrite Nothing defaultFileFlags
+            devNull <- openFd "/dev/null" Ten.Core.ReadWrite Nothing defaultFileFlags
             dupTo devNull stdInput
             dupTo devNull stdOutput
             dupTo devNull stdError
@@ -1708,9 +1709,9 @@ safeGetUserUID username = do
                     -- Ultimate fallback to current user if even nobody doesn't exist
                     getRealUserID
                 Right entry ->
-                    return $ userID entry
+                    return $ Sandbox.userID entry
         Right entry ->
-            return $ userID entry
+            return $ Sandbox.userID entry
 
 -- | Safely get a group's GID with fallback options
 safeGetGroupGID :: String -> IO GroupID
@@ -1730,18 +1731,18 @@ safeGetGroupGID groupname = do
                             -- Ultimate fallback to current group
                             getDefaultGroupID
                         Right entry ->
-                            return $ groupID entry
+                            return $ Sandbox.groupID entry
                 Right entry ->
-                    return $ groupID entry
+                    return $ Sandbox.groupID entry
         Right entry ->
-            return $ groupID entry
+            return $ Sandbox.groupID entry
 
 -- | Get the default group ID for the current user
 getDefaultGroupID :: IO GroupID
 getDefaultGroupID = do
     uid <- getRealUserID
     entry <- getUserEntryForName "nobody" -- Fallback when can't get entry for current user
-    return $ groupID entry
+    return $ Sandbox.groupID entry
 
 -- | Helper function to remove a file if it exists
 removeFileIfExists :: FilePath -> IO ()
