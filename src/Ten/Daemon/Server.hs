@@ -306,8 +306,8 @@ setSocketOptions sock = do
     setSocketOption sock RecvTimeOut 5000
 
     -- Set socket to close-on-exec using the file descriptor
-    let fd = fdSocket sock
-    setCloseOnExecIfNeeded fd
+    fd <- liftIO $ fdSocket sock  -- Properly sequence the IO action
+    liftIO $ setCloseOnExecIfNeeded fd
 
 -- | Stop the server
 stopServer :: ServerControl -> IO ()
@@ -678,7 +678,8 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                         -- Apply rate limiting
                         -- Get the rate limiter from the appropriate source
                         -- Note: This is a TVar (Map SockAddr (Int, UTCTime)) passed from above
-                        allowed <- liftIO $ checkRequestRateLimit rateLimiter clientAddr
+                        let control = ServerControl{..}  -- Get ServerControl record from scope
+                        allowed <- liftIO $ checkRequestRateLimit (scRateLimiter control) clientAddr
 
                         if not allowed then do
                             -- Rate limit exceeded
@@ -758,9 +759,11 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 -- | Process a client request with proper privilege tier
 processRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
                -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
-processRequest st request state config permissions = do
+processRequest st request state config permissions =
+  catchError
     -- Dispatch to the appropriate handler based on privilege tier
-    dispatchRequest st request state config permissions `catch` \(e :: SomeException) -> do
+    (dispatchRequest st request state config permissions)
+    (\err -> return $ Core.ErrorResponse $ Core.DaemonError $ "Request processing error: " <> T.pack (displayException err))
         -- Convert any errors to ErrorResponse
         case fromException e of
             Just ThreadKilled -> return $ Core.ErrorResponse $ Core.DaemonError "Thread killed"
@@ -1056,14 +1059,14 @@ authenticateClient handle authDbVar rateLimiter addr securityLog = do
     mapCapToPermissions caps = concat $ map capToPerms $ Set.toList caps
 
     -- Map each capability to corresponding permissions
-    capToPerms :: DaemonCapability -> [Permission]
-    capToPerms StoreAccess = [PermModifyStore]
-    capToPerms SandboxCreation = [PermBuild]
-    capToPerms GarbageCollection = [PermRunGC]
-    capToPerms DerivationRegistration = [PermStoreDerivation]
-    capToPerms DerivationBuild = [PermBuild, PermCancelBuild]
-    capToPerms StoreQuery = [PermQueryStore, PermQueryDerivation]
-    capToPerms BuildQuery = [PermQueryBuild]
+    capToPerms :: Protocol.DaemonCapability -> [Permission]
+    capToPerms Protocol.StoreAccess = [PermModifyStore]
+    capToPerms Protocol.SandboxCreation = [PermBuild]
+    capToPerms Protocol.GarbageCollection = [PermRunGC]
+    capToPerms Protocol.DerivationRegistration = [PermStoreDerivation]
+    capToPerms Protocol.DerivationBuild = [PermBuild, PermCancelBuild]
+    capToPerms Protocol.StoreQuery = [PermQueryStore, PermQueryDerivation]
+    capToPerms Protocol.BuildQuery = [PermQueryBuild]
     capToPerms _ = []
 
 -- | Check authentication rate limit
