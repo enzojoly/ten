@@ -146,8 +146,9 @@ import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode,
 import System.Posix.Files.ByteString (createLink, removeLink)
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
                        OpenMode(..), defaultFileFlags, FdOption(..),
-                       OpenFileFlags(..), trunc, fdToHandle, WriteLock(..),
-                       AbsoluteSeek(..), Unlock(..))
+                       OpenFileFlags(..), trunc, fdToHandle,
+                       LockRequest(WriteLock, Unlock))
+import System.Posix.Types (FileOffset)
 import System.Posix.Process (getProcessID, forkProcess, executeFile,
                            getProcessStatus, ProcessStatus(..), exitImmediately)
 import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit)
@@ -1046,7 +1047,7 @@ acquireGCLockFile lockPath = do
                 hFlush handle
 
                 -- Set exclusive lock (non-blocking)
-                setLock fd (WriteLock, AbsoluteSeek, 0, 0)
+                setLock fd (WriteLock, 0, 0)
 
                 -- Return file descriptor and PID
                 return (fd, pid)
@@ -1060,7 +1061,7 @@ acquireGCLockFile lockPath = do
 releaseGCLockFile :: FilePath -> Fd -> IO ()
 releaseGCLockFile lockPath fd = do
     -- Release the lock
-    setLock fd (Unlock, AbsoluteSeek, 0, 0)
+    setLock fd (Unlock, 0, 0)
 
     -- Close the file descriptor
     closeFd fd
@@ -1570,19 +1571,6 @@ calculateBuildProgress build = do
         BuildFailed' -> return 1.0
 
 -- Utility functions and helpers
-
--- | Generate a unique identifier
-newUnique :: IO Integer
-newUnique = do
-    -- Get the current time as microseconds
-    now <- getCurrentTime
-    let micros = floor $ 1000000 * realToFrac (diffUTCTime now (read "1970-01-01 00:00:00 UTC"))
-
-    -- Add some randomness
-    r <- randomIO :: IO Int
-
-    -- Combine time and random number
-    return $ micros * 1000 + fromIntegral (r `mod` 1000)
 
 -- | Random number generation
 randomIO :: IO Int
