@@ -142,9 +142,11 @@ import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode,
                           setOwnerAndGroup, fileMode, ownerReadMode, ownerWriteMode,
                           ownerExecuteMode, groupReadMode, groupWriteMode, groupExecuteMode)
 import System.Posix.Files.ByteString (createLink, removeLink)
-import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock, fdToHandle,
-                       OpenMode(..), defaultFileFlags, FdOption(..))
-import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
+import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
+                       OpenMode(..), defaultFileFlags, FdOption(..),
+                       OpenFileFlags(..), trunc)
+import System.Posix.Process (getProcessID, forkProcess, executeFile,
+                           getProcessStatus, ProcessStatus(..), exitImmediately)
 import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit)
 import System.Posix.Signals (installHandler, Handler(..), sigTERM, sigHUP, sigUSR1, sigINT,
                            signalProcess, Signal, blockSignals, unblockSignals, SignalSet,
@@ -500,7 +502,7 @@ populateState state jsonData = do
         return gcStats
 
 -- | Save daemon state to a file - requires daemon privilege for file operations
-saveStateToFile :: (CanAccessStore t ~ 'True) => DaemonState t -> IO ()
+saveStateToFile :: (CanAccessStore t ~ 'True, CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 saveStateToFile state = do
     -- Create the directory if it doesn't exist
     createDirectoryIfMissing True (takeDirectory (dsStateFilePath state))
@@ -1458,13 +1460,13 @@ scheduledMaintenance state = do
 setupSignalHandlers :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
 setupSignalHandlers state = do
     -- Handle SIGTERM to gracefully shut down
-    void $ installHandler Signals.sigTERM (Catch $ handleTermSignal state) Nothing
+    void $ installHandler sigTERM (Catch $ handleTermSignal state) Nothing
 
     -- Handle SIGINT (Ctrl+C)
-    void $ installHandler Signals.sigINT (Catch $ handleTermSignal state) Nothing
+    void $ installHandler sigINT (Catch $ handleTermSignal state) Nothing
 
     -- Handle SIGHUP for config reload
-    void $ installHandler Signals.sigHUP (Catch $ handleHupSignal state) Nothing
+    void $ installHandler sigHUP (Catch $ handleHupSignal state) Nothing
 
 -- | Handle SIGTERM signal - requires CanModifyStore privilege
 handleTermSignal :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
