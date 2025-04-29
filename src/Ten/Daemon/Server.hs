@@ -717,22 +717,40 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                             -- Continue processing
                                             processLoop
 
-    -- Start processing loop with proper privilege context
-    res <- liftIO $ catch (runTenM processLoop (sing @'Build) st) $ \(e :: SomeException) -> do
-        -- Log error unless it's a normal disconnect
-        now <- getCurrentTime
-        case fromException e of
-            Just ThreadKilled -> return (Right ())  -- Normal shutdown, not an error
-            _ -> do
-                hPutStrLn securityLog $ formatLogEntry now "ERROR" $
-                     "Error handling client " ++ show clientAddr ++ ": " ++ displayException e
-                return (Left $ Core.DaemonError $ T.pack $ displayException e)
+    -- Get current environment and state for proper execution
+    env <- ask
+    state <- get
 
-        -- Cancel the idle timeout
-        cancelTimeout idleTimeout
-        return (Right ())
+    -- Run the monad stack properly to get an IO action
+    res <- liftIO $ do
+        result <- try $ runExceptT $ runStateT (runReaderT (runTenM processLoop (sing @'Build) st) env) state
+        case result of
+            -- Handle IO exceptions first
+            Left (e :: SomeException) -> do
+                now <- getCurrentTime
+                case fromException e of
+                    Just ThreadKilled ->
+                        -- Normal shutdown, not an error
+                        return (Right ())
+                    _ -> do
+                        -- Log unexpected errors
+                        hPutStrLn securityLog $ formatLogEntry now "ERROR" $
+                            "Error handling client " ++ show clientAddr ++ ": " ++ displayException e
+                        return (Left $ Core.DaemonError $ T.pack $ displayException e)
 
-    -- Handle the result
+            -- Handle domain errors from ExceptT
+            Right (Left err) ->
+                return (Left err)
+
+            -- Handle successful execution
+            Right (Right (_, _)) ->
+                return (Right ())
+
+        `finally` do
+            -- Always cancel the idle timeout, regardless of outcome
+            cancelTimeout idleTimeout
+
+    -- Handle the result in the TenM monad
     case res of
         Left err -> throwError err
         Right _ -> return ()
@@ -741,13 +759,11 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 processRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
                -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 processRequest st request state config permissions =
-  catchError
-    -- Dispatch to the appropriate handler based on privilege tier
+    catchError
     (dispatchRequest st request state config permissions)
-    (\e ->
-        case fromException e of
-            Just ThreadKilled -> return $ Core.ErrorResponse $ Core.DaemonError "Thread killed"
-            _ -> return $ Core.ErrorResponse $ Core.DaemonError $ "Request processing error: " <> T.pack (displayException e))
+    (\(e :: BuildError) ->
+        -- Handle domain-specific errors directly
+        return $ Core.ErrorResponse $ e)
 
 -- | Dispatch a request to the appropriate handler based on privilege tier
 dispatchRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
