@@ -503,6 +503,11 @@ instance Aeson.ToJSON BuildError where
     toJSON (InternalError msg) = Aeson.object [ "type" Aeson..= ("internal" :: Text), "message" Aeson..= msg ]
     toJSON (ConfigError msg) = Aeson.object [ "type" Aeson..= ("config" :: Text), "message" Aeson..= msg ]
 
+instance Aeson.FromJSON BuildError where
+    parseJSON val = case parseError val of
+        Left err -> fail $ T.unpack err
+        Right buildErr -> return buildErr
+
 instance Exception BuildError
 
 -- | Convert BuildError to Text for easier handling across module boundaries

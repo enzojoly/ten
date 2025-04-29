@@ -483,15 +483,17 @@ populateState state jsonData = do
             atomically $ writeTVar (dsGCStats state) gcStats
   where
     extractCompletedBuilds = Aeson.withObject "StateData" $ \v -> do
-        completedObj <- v Aeson..: "completedBuilds"
-        -- Convert from Aeson object to Map BuildId value manually
-        let completedList = map (\(k, v) -> (read (T.unpack (Key.toText k)) :: BuildId, v)) (KeyMap.toList completedObj)
+        completedObj <- v Aeson..: "completedBuilds" :: Aeson.Parser (Aeson.KeyMap.KeyMap Aeson.Value)
+        let completedList = map (\(k, v) ->
+                (read (T.unpack (Key.toText k)) :: BuildId,
+                v :: Aeson.Value)) (KeyMap.toList completedObj)
         return $ Map.fromList completedList
 
     extractFailedBuilds = Aeson.withObject "StateData" $ \v -> do
-        failedObj <- v Aeson..: "failedBuilds"
-        -- Convert from Aeson object to Map BuildId value manually
-        let failedList = map (\(k, v) -> (read (T.unpack (Key.toText k)) :: BuildId, v)) (KeyMap.toList failedObj)
+        failedObj <- v Aeson..: "failedBuilds" :: Aeson.Parser (Aeson.KeyMap.KeyMap Aeson.Value)
+        let failedList = map (\(k, v) ->
+                (read (T.unpack (Key.toText k)) :: BuildId,
+                 v :: Aeson.Value)) (KeyMap.toList failedObj)
         return $ Map.fromList failedList
 
     extractReachablePaths = Aeson.withObject "StateData" $ \v -> do
