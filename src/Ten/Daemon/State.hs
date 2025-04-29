@@ -152,29 +152,15 @@ import System.Posix.Signals (installHandler, Handler(..), sigTERM, sigHUP, sigUS
 import System.Posix.User (getUserEntryForID, getUserEntryForName, getGroupEntryForName,
                          setUserID, setGroupID, getEffectiveUserID, getRealUserID, userID, groupID)
 
--- Ten core imports
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
-                Derivation(..), DerivationInput(..), DerivationOutput(..),
                 UserId(..), AuthToken(..), BuildState(..), BuildStrategy(..),
                 Phase(..), PrivilegeTier(..), SPrivilegeTier(..), BuildEnv(..),
                 runTen, getGCLockPath, ensureLockDirExists,
                 CanAccessStore, CanCreateSandbox, CanModifyStore, CanDropPrivileges, CanAccessDatabase,
-                storePathToText, storePathToFilePath)
-
--- Ten module imports
+                storePathToText, storePathToFilePath,
+                -- Add these types directly from Core:
+                Derivation(..), DerivationInput(..), DerivationOutput(..), BuildResult(..))
 import qualified Ten.Derivation as Derivation (derivationEquals, hashDerivation)
-import Ten.Build (BuildResult(..))
-import qualified Ten.Graph as Graph
-
--- Import Ten modules
-import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), UserId(..),
-                 AuthToken(..), BuildState(..), BuildStrategy(..), Phase(..), PrivilegeTier(..),
-                 SPrivilegeTier(..), BuildEnv(..), runTen, Phase(..), getGCLockPath, ensureLockDirExists,
-                 CanAccessStore, CanCreateSandbox, CanModifyStore, CanDropPrivileges, CanAccessDatabase,
-                 storePathToText, storePathToFilePath)
-import Ten.Derivation (Derivation, DerivationInput, DerivationOutput,
-                      derivationEquals, derivHash, hashDerivation)
-import Ten.Build (BuildResult(..))
 import qualified Ten.Graph as Graph
 
 -- | State errors
