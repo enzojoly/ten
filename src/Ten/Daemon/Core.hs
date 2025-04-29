@@ -633,7 +633,7 @@ spawnBuilder context derivation buildId = do
     buildDir <- createBuildDirectory config buildId
 
     -- Create sandbox configuration
-    let sandboxConfig = Sandbox.defaultSandboxConfig {
+    let sandboxConfig = Sandbox.SandboxConfig {
             Sandbox.sandboxUser = fromMaybe "nobody" (daemonUser config),
             Sandbox.sandboxGroup = fromMaybe "nogroup" (daemonGroup config),
             Sandbox.sandboxAllowNetwork = False,  -- Restrict network access
