@@ -111,8 +111,8 @@ import Control.Monad (when, unless, forM, forM_, void, foldM, forever)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
-import qualified Data.Aeson.Key as Aeson
-import qualified Data.Aeson.KeyMap as Aeson.KeyMap
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Char8 as BC
@@ -485,13 +485,13 @@ populateState state jsonData = do
     extractCompletedBuilds = Aeson.withObject "StateData" $ \v -> do
         completedObj <- v Aeson..: "completedBuilds"
         -- Convert from Aeson object to Map BuildId value manually
-        let completedList = map (\(k, v) -> (read (T.unpack (Aeson.Key.toText k)) :: BuildId, v)) (Aeson.KeyMap.toList completedObj)
+        let completedList = map (\(k, v) -> (read (T.unpack (Key.toText k)) :: BuildId, v)) (KeyMap.toList completedObj)
         return $ Map.fromList completedList
 
     extractFailedBuilds = Aeson.withObject "StateData" $ \v -> do
         failedObj <- v Aeson..: "failedBuilds"
         -- Convert from Aeson object to Map BuildId value manually
-        let failedList = map (\(k, v) -> (read (T.unpack (Aeson.Key.toText k)) :: BuildId, v)) (Aeson.KeyMap.toList failedObj)
+        let failedList = map (\(k, v) -> (read (T.unpack (Key.toText k)) :: BuildId, v)) (KeyMap.toList failedObj)
         return $ Map.fromList failedList
 
     extractReachablePaths = Aeson.withObject "StateData" $ \v -> do
@@ -502,12 +502,12 @@ populateState state jsonData = do
         derivsObj <- v Aeson..: "knownDerivations"
         -- Convert from Aeson object to Map Text Derivation manually
         let derivsList = map (\(k, v) ->
-                (Aeson.Key.toText k,
+                (Key.toText k,
                 case Aeson.encode v of
                     lbs -> case Core.deserializeDerivation (LBS.toStrict lbs) of
                         Right drv -> Just drv
                         _ -> Nothing))
-              (Aeson.KeyMap.toList derivsObj)
+              (KeyMap.toList derivsObj)
         return $ Map.fromList $ catMaybes $ map (\(k, mv) -> case mv of
                                                     Just v -> Just (k, v)
                                                     Nothing -> Nothing)
@@ -1086,7 +1086,7 @@ acquireGCLockFile lockPath = do
             -- Create the lock file with our PID
             result <- try $ do
                 -- Open or create the file
-                fd <- openFd lockPath ReadWrite (defaultFileFlags {trunc = True, mode = Just 0o644})
+                fd <- openFd lockPath ReadWrite (defaultFileFlags {trunc = True, creat = Just 0o644})
 
                 -- Write our PID to it
                 handle <- fdToHandle fd
