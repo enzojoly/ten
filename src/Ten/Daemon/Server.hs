@@ -515,9 +515,12 @@ acceptClients serverSocket clients shutdownFlag state config
                     -- Re-run in the runTen context
                     env <- ask
                     state <- get
-                    void $ runTen sBuild sDaemon (acceptClients serverSocket clients shutdownFlag state config
-                                  authDbVar rateLimiter securityLog accessLog)
-                                  env state
+                    buildId <- BuildId <$> newUnique
+                    let buildState = initBuildState Build buildId
+                    void $ runTen sBuild sDaemon
+                      (acceptClients serverSocket clients shutdownFlag state config
+                                    authDbVar rateLimiter securityLog accessLog)
+  env buildState
 
 -- | Helper to run client handler with proper environment and privileges
 runClientHandler :: Socket -> Handle -> ActiveClients -> DaemonState 'Daemon -> DaemonConfig
