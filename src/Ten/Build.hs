@@ -1073,7 +1073,9 @@ buildDerivationGraph graph = do
     env <- ask
     let tierSingleton = case currentPrivilegeTier env of
                           Daemon -> sDaemon
-                          Builder -> sBuilder
+                          -- This case should be unreachable due to earlier privilege checks
+                          -- But we provide a safe failure just in case
+                          _ -> error "Critical security error: unprivileged operation attempted to acquire daemon privileges"
 
     -- Get evaluation phase result from topological sort
     evalResult <- liftIO $ runTenDaemonEval (Graph.topologicalSort tierSingleton graph) env (initBuildState Eval (BuildIdFromInt 0))
