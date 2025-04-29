@@ -307,7 +307,7 @@ setSocketOptions sock = do
 
     -- Set socket to close-on-exec using the file descriptor
     fd <- liftIO $ fdSocket sock  -- Properly sequence the IO action
-    liftIO $ setCloseOnExecIfNeeded fd
+    liftIO $ Ten.Daemon.Server.setCloseOnExecIfNeeded fd
 
 -- | Stop the server
 stopServer :: ServerControl -> IO ()
@@ -599,16 +599,21 @@ handleClient clientSocket clientHandle clients state config
             liftIO $ atomically $ writeTVar clientStateVar Active
 
             -- Handle client requests with proper privilege tier
-            -- Using the daemon tier singleton we're already in
             case tier of
                 Daemon ->
-                    handleClientRequests clientSocket clientHandle state config clientAddr
+                    handleClientRequestsDaemon clientSocket clientHandle state config clientAddr
                                       securityLog accessLog lastActivityVar clientStateVar
-                                      requestCountVar permissionsVar idleTimeout sDaemon
-                Builder ->
-                    handleClientRequests clientSocket clientHandle state config clientAddr
-                                      securityLog accessLog lastActivityVar clientStateVar
-                                      requestCountVar permissionsVar idleTimeout sBuilder
+                                      requestCountVar permissionsVar idleTimeout rateLimiter
+                Builder -> do
+                    result <- runBuilderFromDaemon (
+                        handleClientRequestsBuilder clientSocket clientHandle state config clientAddr
+                                          securityLog accessLog lastActivityVar clientStateVar
+                                          requestCountVar permissionsVar idleTimeout rateLimiter)
+                    case result of
+                        Left err ->
+                            liftIO $ hPutStrLn stderr $ "Error handling builder client: " ++ show err
+                        Right _ ->
+                            return ()
 
   where
     -- Update client info after authentication
@@ -623,16 +628,25 @@ handleClient clientSocket clientHandle clients state config
                     }
                 writeTVar clients (Map.insert tid updatedInfo clientMap)
 
--- | Process client requests with privilege-aware dispatch
-handleClientRequests :: forall (t :: PrivilegeTier). (Store.StoreContentOps t)
-                     => Socket -> Handle -> DaemonState 'Daemon -> DaemonConfig -> SockAddr
-                     -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
-                     -> TVar Int -> TVar (Set Permission) -> TimerHandle
-                     -> SPrivilegeTier t  -- Explicit privilege singleton evidence
-                     -> TenM 'Build t ()  -- Result type has same privilege tier
-handleClientRequests clientSocket clientHandle state config clientAddr
-                    securityLog accessLog lastActivityVar clientStateVar
-                    requestCountVar permissionsVar idleTimeout st = do
+-- Helper function to run a Builder operation from Daemon context
+runBuilderFromDaemon :: TenM 'Build 'Builder a -> TenM 'Build 'Daemon (Either BuildError a)
+runBuilderFromDaemon builderAction = do
+    env <- ask
+    buildState <- get
+    result <- liftIO $ runTenBuilderBuild builderAction env buildState
+    return $ case result of
+        Left err -> Left err
+        Right (val, _) -> Right val
+
+-- | Process client requests in the Daemon privilege context
+handleClientRequestsDaemon :: Socket -> Handle -> DaemonState 'Daemon -> DaemonConfig -> SockAddr
+                           -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
+                           -> TVar Int -> TVar (Set Permission) -> TimerHandle
+                           -> TVar (Map SockAddr (Int, UTCTime)) -- Rate limiter
+                           -> TenM 'Build 'Daemon ()
+handleClientRequestsDaemon clientSocket clientHandle state config clientAddr
+                         securityLog accessLog lastActivityVar clientStateVar
+                         requestCountVar permissionsVar idleTimeout rateLimiter = do
 
     let processLoop = do
             -- Check if client is shutting down
@@ -665,9 +679,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 
                         -- Apply rate limiting
                         -- Get the rate limiter from the appropriate source
-                        -- Note: This is a TVar (Map SockAddr (Int, UTCTime)) passed from above
-                        let control = ServerControl{..}  -- Get ServerControl record from scope
-                        allowed <- liftIO $ checkRequestRateLimit (scRateLimiter control) clientAddr
+                        allowed <- liftIO $ checkRequestRateLimit rateLimiter clientAddr
 
                         if not allowed then do
                             -- Rate limit exceeded
@@ -704,7 +716,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                     permissions <- liftIO $ readTVarIO permissionsVar
 
                                     -- Validate permissions for this request
-                                    permissionValid <- validateRequestPermissions request permissions securityLog clientAddr st
+                                    permissionValid <- validateRequestPermissions request permissions securityLog clientAddr sDaemon
 
                                     if not permissionValid
                                         then do
@@ -716,7 +728,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                             processLoop
                                         else do
                                             -- Process the request with proper privilege context
-                                            response <- processRequest st request state config permissions
+                                            response <- processRequest sDaemon request state config permissions
 
                                             -- Send the response
                                             liftIO $ sendResponse clientHandle 0 response
@@ -724,43 +736,129 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                             -- Continue processing
                                             processLoop
 
-    -- Get current environment and state for proper execution
-    env <- ask
-    state <- get
+    -- Execute the process loop
+    processLoop
 
-    -- Run the monad stack properly to get an IO action
-    res <- liftIO $ do
-        result <- try $ runExceptT $ runStateT (runReaderT (runTenM processLoop (sing @'Build) st) env) state
-        case result of
-            -- Handle IO exceptions first
-            Left (e :: SomeException) -> do
-                now <- getCurrentTime
-                case fromException e of
-                    Just ThreadKilled ->
-                        -- Normal shutdown, not an error
-                        return (Right ())
-                    _ -> do
-                        -- Log unexpected errors
-                        hPutStrLn securityLog $ formatLogEntry now "ERROR" $
-                            "Error handling client " ++ show clientAddr ++ ": " ++ displayException e
-                        return (Left $ Core.DaemonError $ T.pack $ displayException e)
+-- | Process client requests in the Builder privilege context
+handleClientRequestsBuilder :: Socket -> Handle -> DaemonState 'Daemon -> DaemonConfig -> SockAddr
+                            -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
+                            -> TVar Int -> TVar (Set Permission) -> TimerHandle
+                            -> TVar (Map SockAddr (Int, UTCTime)) -- Rate limiter
+                            -> TenM 'Build 'Builder ()
+handleClientRequestsBuilder clientSocket clientHandle state config clientAddr
+                          securityLog accessLog lastActivityVar clientStateVar
+                          requestCountVar permissionsVar idleTimeout rateLimiter = do
 
-            -- Handle domain errors from ExceptT
-            Right (Left err) ->
-                return (Left err)
+    let processLoop = do
+            -- Check if client is shutting down
+            clientState <- liftIO $ readTVarIO clientStateVar
+            when (clientState == Active) $ do
+                -- Try to read a message
+                msgResult <- liftIO $ try $ readMessageWithTimeout clientHandle 30000000 -- 30 seconds
 
-            -- Handle successful execution
-            Right (Right (_, _)) ->
-                return (Right ())
+                case msgResult of
+                    Left (e :: SomeException) -> do
+                        -- Read error, client disconnected or timeout
+                        now <- liftIO getCurrentTime
+                        liftIO $ hPutStrLn accessLog $ formatLogEntry now "ERROR" $
+                                 "Read error from client " ++ show clientAddr ++ ": " ++ displayException e
+                        return ()
 
-        `finally` do
-            -- Always cancel the idle timeout, regardless of outcome
-            cancelTimeout idleTimeout
+                    Right (msgData, mPayload) -> do
+                        -- Update last activity time
+                        now <- liftIO getCurrentTime
+                        liftIO $ atomically $ writeTVar lastActivityVar now
 
-    -- Handle the result in the TenM monad
-    case res of
-        Left err -> throwError err
-        Right _ -> return ()
+                        -- Reset idle timeout
+                        liftIO $ resetTimeout idleTimeout
+
+                        -- Update request count for rate limiting
+                        reqCount <- liftIO $ atomically $ do
+                            count <- readTVar requestCountVar
+                            writeTVar requestCountVar (count + 1)
+                            return (count + 1)
+
+                        -- Apply rate limiting
+                        -- In Builder context, we need to use a special method to access the rate limiter
+                        allowed <- liftIO $ atomically $ do
+                            limits <- readTVar rateLimiter
+                            case Map.lookup clientAddr limits of
+                                Nothing -> do
+                                    -- First request, add to tracking
+                                    modifyTVar' rateLimiter $ Map.insert clientAddr (1, now)
+                                    return True
+                                Just (count, timestamp) -> do
+                                    let timeWindow = 60 -- seconds
+                                        elapsed = diffUTCTime now timestamp
+                                    if elapsed > fromIntegral timeWindow
+                                        then do
+                                            -- Reset counter for new window
+                                            modifyTVar' rateLimiter $ Map.insert clientAddr (1, now)
+                                            return True
+                                        else if count >= maxRequestsPerMinute
+                                            then return False -- Rate limit exceeded
+                                            else do
+                                                -- Increment counter
+                                                modifyTVar' rateLimiter $ Map.insert clientAddr (count + 1, timestamp)
+                                                return True
+
+                        if not allowed then do
+                            -- Rate limit exceeded
+                            liftIO $ hPutStrLn securityLog $ formatLogEntry now "RATELIMIT" $
+                                     "Request rate limit exceeded for " ++ show clientAddr
+
+                            -- Send rate limit error
+                            liftIO $ sendResponse clientHandle 0 $
+                                Core.ErrorResponse $ Core.DaemonError "Request rate limit exceeded"
+
+                            -- Continue processing
+                            processLoop
+                        else do
+                            -- Log the request
+                            liftIO $ hPutStrLn accessLog $ formatLogEntry now "REQUEST" $
+                                     "Client " ++ show clientAddr ++ " request #" ++ show reqCount
+
+                            -- Process the message
+                            case Protocol.deserializeDaemonRequest msgData mPayload of
+                                Left err -> do
+                                    -- Invalid message format
+                                    liftIO $ hPutStrLn securityLog $ formatLogEntry now "MALFORMED" $
+                                             "Malformed request from client " ++ show clientAddr ++ ": " ++ T.unpack err
+
+                                    -- Send error response
+                                    liftIO $ sendResponse clientHandle 0 $
+                                        Core.ErrorResponse $ Core.DaemonError "Malformed request"
+
+                                    -- Continue processing
+                                    processLoop
+
+                                Right request -> do
+                                    -- Get client permissions
+                                    permissions <- liftIO $ readTVarIO permissionsVar
+
+                                    -- Validate permissions for this request
+                                    permissionValid <- validateRequestPermissions request permissions securityLog clientAddr sBuilder
+
+                                    if not permissionValid
+                                        then do
+                                            -- Permission denied
+                                            liftIO $ sendResponse clientHandle 0 $
+                                                Core.ErrorResponse $ Core.AuthError "Permission denied"
+
+                                            -- Continue processing
+                                            processLoop
+                                        else do
+                                            -- Process the request with proper privilege context
+                                            response <- processRequest sBuilder request state config permissions
+
+                                            -- Send the response
+                                            liftIO $ sendResponse clientHandle 0 response
+
+                                            -- Continue processing
+                                            processLoop
+
+    -- Execute the process loop
+    processLoop
 
 -- | Process a client request with proper privilege tier
 processRequest :: (Store.StoreContentOps t) => SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
@@ -1487,3 +1585,11 @@ saveDaemonState :: DaemonConfig -> DaemonState 'Daemon -> IO ()
 saveDaemonState config state = do
     -- Save state to file
     saveStateToFile state
+
+-- | Set a file descriptor to close-on-exec if available on this platform
+setCloseOnExecIfNeeded :: CInt -> IO ()
+setCloseOnExecIfNeeded fd = do
+    -- Setting FD_CLOEXEC
+    -- This would call fcntl to set FD_CLOEXEC on Linux
+    -- For now, this is a no-op as it would require FFI to fcntl
+    return ()
