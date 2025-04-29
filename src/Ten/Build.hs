@@ -1168,7 +1168,7 @@ buildDependenciesConcurrently derivations = do
         readTVarIO resultMap
 
 -- | Wait for dependencies to complete
-waitForDependencies :: Set BuildId -> TenM 'Build t ()
+waitForDependencies :: (CanManageBuildStatus t) => Set BuildId -> TenM 'Build t ()
 waitForDependencies depIds = do
     -- Get max wait time
     maxWaitTime <- asks (\e -> 60 * 60)  -- Default to 1 hour
