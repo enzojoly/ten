@@ -94,7 +94,7 @@ import Data.Time.Format (formatTime, defaultTimeLocale)
 import Network.Socket (Socket, SockAddr(..), socketToHandle, socket, Family(..), SocketType(..), setSocketOption,
                        SocketOption(..), bind, listen, close, accept, withFdSocket, setCloseOnExecIfNeeded, connect)
 import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMissing, getHomeDirectory,
-                        removeFile, getPermissions, setPermissions, removePathForcibly)
+                        removeFile, getPermissions, setPermissions, removePathForcibly, setCurrentDirectory)
 import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
 import System.Exit (ExitCode(..), exitSuccess, exitFailure, exitWith)
 import System.FilePath ((</>), takeDirectory, takeFileName)
@@ -1792,10 +1792,6 @@ createSession :: IO ProcessID
 createSession = do
     -- This would actually call setsid() via FFI
     getProcessID
-
--- | Set current directory
-setCurrentDirectory :: FilePath -> IO ()
-setCurrentDirectory = Directory.setCurrentDirectory
 
 -- | Initialize the store
 initializeStore :: FilePath -> IO ()
