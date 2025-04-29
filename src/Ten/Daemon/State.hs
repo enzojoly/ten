@@ -377,7 +377,7 @@ withDaemonState st f state = f st state
 asDaemonState :: DaemonState t -> IO (DaemonState 'Daemon)
 asDaemonState state = case dsPrivilegeEvidence state of
     SDaemon -> return state
-    SBuilder -> throwIO $ StateError $ StatePrivilegeError "Cannot treat Builder state as Daemon state"
+    SBuilder -> throwIO $ StatePrivilegeError "Cannot treat Builder state as Daemon state"
 
 -- | Convert state to builder privilege tier (always safe since we can drop privileges)
 asBuilderState :: DaemonState t -> DaemonState 'Builder
@@ -1039,7 +1039,7 @@ acquireGCLockFile lockPath = do
             -- Create the lock file with our PID
             result <- try $ do
                 -- Open or create the file
-                fd <- openFd lockPath ReadWrite (Just 0o644) defaultFileFlags {trunc = True}
+                fd <- openFd lockPath ReadWrite (Just 0o644) (defaultFileFlags {trunc = True})
 
                 -- Write our PID to it
                 handle <- fdToHandle fd
@@ -1047,7 +1047,7 @@ acquireGCLockFile lockPath = do
                 hFlush handle
 
                 -- Set exclusive lock (non-blocking)
-                setLock fd (WriteLock, 0, 0)
+                setLock fd (WriteLock, AbsoluteSeek, 0, 0)
 
                 -- Return file descriptor and PID
                 return (fd, pid)
@@ -1061,7 +1061,7 @@ acquireGCLockFile lockPath = do
 releaseGCLockFile :: FilePath -> Fd -> IO ()
 releaseGCLockFile lockPath fd = do
     -- Release the lock
-    setLock fd (Unlock, 0, 0)
+    setLock fd (Unlock, AbsoluteSeek, 0, 0)
 
     -- Close the file descriptor
     closeFd fd
@@ -1195,7 +1195,7 @@ captureSystemStats = do
     memoryUsage <- getMemoryUsage
 
     -- Try to get store size
-    (storeSize, storeEntries) <- (0, 0) -- In a real implementation, query the store
+    let (storeSize, storeEntries) = (0, 0)
 
     -- Try to get load averages
     loadAvg <- getLoadAverages
@@ -1429,7 +1429,7 @@ cleanupStaleBuilds state = do
                         unregisterBuild state buildId
 
 -- | Setup periodic maintenance - requires CanModifyStore privilege
-setupMaintenanceThread :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
+setupMaintenanceThread :: DaemonState 'Daemon -> IO ()
 setupMaintenanceThread state = do
     -- Create a thread that runs maintenance tasks periodically
     thread <- async $ maintenanceLoop state
