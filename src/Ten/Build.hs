@@ -167,7 +167,8 @@ instance CanBuildDerivation 'Daemon where
     logMsg 1 $ "Building derivation: " <> derivName derivation
 
     -- Use database through withDatabase pattern
-    withDatabase (defaultDBPath . storeLocation =<< ask) 5000 $ \db -> do
+    env <- ask
+    withDatabase (defaultDBPath $ storeLocation env) 5000 $ \db -> do
       -- Register derivation in DB
       derivPath <- storeDerivationInBuildDaemon derivation
       derivId <- DB.withTenWriteTransaction db $ \conn -> do
@@ -299,7 +300,7 @@ instance CanManageBuildStatus 'Daemon where
     getBuildStatus buildId = do
         env <- ask
         -- Get database connection with proper privileges
-        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        withDatabase (defaultDBPath $ storeLocation env) 5000 $ \db -> do
             -- Use proper transaction handling
             results <- DB.withTenReadTransaction db $ \conn ->
                 DB.query conn
@@ -337,7 +338,7 @@ instance CanManageBuildStatus 'Daemon where
         -- and notify any clients waiting for status updates
         env <- ask
         -- Use withDatabase for transaction management
-        withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+        withDatabase (defaultDBPath $ storeLocation env) 5000 $ \db -> do
             -- Use proper transaction handling
             DB.withTenWriteTransaction db $ \conn -> do
                 void $ DB.execute
@@ -388,7 +389,7 @@ findDependencyDerivations paths = do
     env <- ask
 
     -- Use the database to look up derivations for the provided output paths
-    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+    withDatabase (defaultDBPath $ storeLocation env) 5000 $ \db -> do
         -- Use proper transaction handling
         result <- DB.withTenReadTransaction db $ \conn ->
             DBDeriv.findDerivationsByOutputs paths
@@ -515,7 +516,7 @@ buildWithSandboxDaemon derivation config = do
                     else do
                         -- Use withDatabase for database operations
                         env <- ask
-                        outputs <- withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
+                        outputs <- withDatabase (defaultDBPath $ storeLocation env) 5000 $ \db -> do
                             -- Collect normal build results within transaction
                             DB.withTenWriteTransaction db $ \conn -> do
                                 -- Process each expected output
@@ -788,8 +789,8 @@ runBuilder env = do
                 case exitStatus of
                     Just (Process.Exited exitCode) -> do
                         let exitResult = case exitCode of
-                                0 -> ExitSuccess
-                                n -> ExitFailure (fromIntegral n)
+                                ExitSuccess -> ExitSuccess
+                                ExitFailure n -> ExitFailure n
                         return (Just pid, Right (exitResult, stdoutContent, stderrContent))
                     Just (Process.Terminated sig _) ->
                         return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
@@ -970,7 +971,8 @@ createTarball sourceDir targetFile = do
         _ -> throwIO $ userError $ "Failed to create tarball: " ++ stderr
 
 -- | Verify that a build result matches the expected outputs
-verifyBuildResult :: Derivation -> Core.BuildResult -> TenM 'Build t Bool
+verifyBuildResult :: forall (t :: PrivilegeTier). (StoreAccessOps t) =>
+                    Derivation -> Core.BuildResult -> TenM 'Build t Bool
 verifyBuildResult derivation result = do
     -- First check exit code
     if Core.brExitCode result /= ExitSuccess
@@ -1041,7 +1043,9 @@ checkForReturnedDerivation buildDir = do
             return Nothing
 
 -- | Handle a returned derivation
-handleReturnedDerivation :: BuildResult -> TenM 'Build t Derivation
+handleReturnedDerivation :: forall (t :: PrivilegeTier).
+                           (CanStoreBuildDerivation t, SingI t) =>
+                           BuildResult -> TenM 'Build t Derivation
 handleReturnedDerivation result = do
   -- Get returned derivation path from metadata
   let returnPath = T.unpack $ brMetadata result Map.! "returnDerivation"
@@ -1067,7 +1071,8 @@ handleReturnedDerivation result = do
       return innerDrv
 
 -- | Build a graph of derivations
-buildDerivationGraph :: BuildGraph -> TenM 'Build t (Map Text Core.BuildResult)
+buildDerivationGraph :: forall (t :: PrivilegeTier). (CanBuildDerivation t) =>
+                       BuildGraph -> TenM 'Build t (Map Text Core.BuildResult)
 buildDerivationGraph graph = do
     -- First get dependencies in topological order
     env <- ask
@@ -1100,7 +1105,8 @@ buildDerivationGraph graph = do
         return $ Map.insert drvId result results
 
 -- | Build derivations in dependency order
-buildInDependencyOrder :: [Derivation] -> TenM 'Build t [Core.BuildResult]
+buildInDependencyOrder :: forall (t :: PrivilegeTier). (CanBuildDerivation t) =>
+                         [Derivation] -> TenM 'Build t [Core.BuildResult]
 buildInDependencyOrder derivations = do
     -- First check for cycles using a pure function
     let cycle = any isDerivationCyclic derivations
@@ -1177,26 +1183,26 @@ waitForDependencies depIds = do
         when (isNothing result) $
             throwError $ BuildFailed "Timeout waiting for dependencies to complete"
   where
-    checkDependencies :: Set BuildId -> TenM 'Build t Bool
-    checkDependencies deps = do
-        env <- ask
-        let tier = currentPrivilegeTier env
-
-        statuses <- forM (Set.toList deps) $ \bid -> do
-            -- Use the appropriate instance based on privilege tier
-            status <- getBuildStatus bid
-            return $ case status of
-                BuildCompleted -> True
-                _ -> False
-        return $ and statuses
-
     waitForDeps :: Set BuildId -> IO ()
     waitForDeps deps = do
         -- Wait a bit between checks
         threadDelay (10 * 1000000)  -- 10 seconds
 
+-- | Check if dependencies are complete
+checkDependencies :: forall (t :: PrivilegeTier). (CanManageBuildStatus t) =>
+                    Set BuildId -> TenM 'Build t Bool
+checkDependencies deps = do
+    statuses <- forM (Set.toList deps) $ \bid -> do
+        -- Use the appropriate instance based on privilege tier
+        status <- getBuildStatus bid
+        return $ case status of
+            BuildCompleted -> True
+            _ -> False
+    return $ and statuses
+
 -- | Report build progress
-reportBuildProgress :: BuildId -> Float -> TenM 'Build t ()
+reportBuildProgress :: forall (t :: PrivilegeTier). (CanManageBuildStatus t) =>
+                      BuildId -> Float -> TenM 'Build t ()
 reportBuildProgress buildId progress = do
     -- Log progress
     logMsg 2 $ "Build progress for " <> T.pack (show buildId) <> ": " <>
@@ -1207,7 +1213,8 @@ reportBuildProgress buildId progress = do
     updateBuildStatus buildId (BuildRunning progress)
 
 -- | Report build status
-reportBuildStatus :: BuildId -> BuildStatus -> TenM 'Build t ()
+reportBuildStatus :: forall (t :: PrivilegeTier). (CanManageBuildStatus t) =>
+                    BuildId -> BuildStatus -> TenM 'Build t ()
 reportBuildStatus buildId status = do
     -- Log status change
     logMsg 2 $ "Build status for " <> T.pack (show buildId) <> ": " <>
@@ -1231,15 +1238,20 @@ withDatabase dbPath timeout action = do
   -- Initialize database with daemon privileges
   db <- liftIO $ DB.initDatabaseDaemon sDaemon dbPath timeout
 
-  -- Run the action with proper error handling
-  TenM $ \sp st -> do
-    env <- ask
-    let innerAction = runTenM (action db) sp st
+  -- Run the action with proper error handling and ensure cleanup
+  bracketTenM (return db) (\db' -> liftIO $ DB.closeDatabaseDaemon db') action
 
-    -- Use properly sequenced monadic operations
-    result <- innerAction >>= \r -> return r
-    liftIO $ DB.closeDatabaseDaemon db
-    return result
+-- | Like bracket but for the TenM monad
+bracketTenM :: TenM 'Build 'Daemon a -> (a -> TenM 'Build 'Daemon b) -> (a -> TenM 'Build 'Daemon c) -> TenM 'Build 'Daemon c
+bracketTenM acquire release action = do
+  resource <- acquire
+  result <- catchError (action resource) $ \e -> do
+    -- On error, still release the resource, then rethrow
+    _ <- release resource
+    throwError e
+  -- Release the resource and return the result
+  _ <- release resource
+  return result
 
 -- Helper function for ignoring exceptions during cleanup
 ignoreException :: SomeException -> IO ()
