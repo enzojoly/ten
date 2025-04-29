@@ -558,10 +558,10 @@ captureStateData state = do
     return $ Aeson.object [
             "version" .= ("1.0" :: Text),
             "timestamp" .= timestamp,
-            "completedBuilds" .= Aeson.object [Aeson.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList completedBuilds],
-            "failedBuilds" .= Aeson.object [Aeson.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList failedBuilds],
+            "completedBuilds" .= Aeson.object [Key.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList completedBuilds],
+            "failedBuilds" .= Aeson.object [Key.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList failedBuilds],
             "reachablePaths" .= reachablePaths,
-            "knownDerivations" .= Aeson.object [Aeson.fromText k .= encodeDerivation v | (k, v) <- Map.toList knownDerivations],
+            "knownDerivations" .= Aeson.object [Key.fromText k .= encodeDerivation v | (k, v) <- Map.toList knownDerivations],
             "lastGC" .= lastGC,
             "gcStats" .= gcStats
         ]
@@ -1282,7 +1282,7 @@ getLoadAverages = do
 -- | Check if there are pending builds
 hasPendingBuilds :: DaemonState t -> IO Bool
 hasPendingBuilds state = do
-    queueEntries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
+    queueEntries <- readTVarIO (bqEntries $ dsBuildQueue state)
 
     -- Get the privilege tier of the state
     let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -1297,7 +1297,7 @@ hasPendingBuilds state = do
 -- | Check if a specific build is active
 hasActiveBuild :: DaemonState t -> BuildId -> IO Bool
 hasActiveBuild state buildId = do
-    activeBuilds <- atomically $ readTVar (dsActiveBuilds state)
+    activeBuilds <- readTVarIO (dsActiveBuilds state)
 
     -- Check if the build exists
     case Map.lookup buildId activeBuilds of
@@ -1328,7 +1328,7 @@ getNextBuildToSchedule state = do
         then return Nothing
         else do
             -- Get queue entries
-            queueEntries <- atomically $ readTVar (bqEntries $ dsBuildQueue state)
+            queueEntries <- readTVarIO (bqEntries $ dsBuildQueue state)
 
             -- Get the privilege tier of the state
             let stateTier = fromSing $ dsPrivilegeEvidence state
@@ -1410,8 +1410,8 @@ tryScheduleNextBuild state = do
 pruneCompletedBuilds :: DaemonState t -> IO ()
 pruneCompletedBuilds state = do
     -- Get current completed and failed builds
-    completedBuilds <- atomically $ readTVar (dsCompletedBuilds state)
-    failedBuilds <- atomically $ readTVar (dsFailedBuilds state)
+    completedBuilds <- readTVarIO (dsCompletedBuilds state)
+    failedBuilds <- readTVarIO (dsFailedBuilds state)
 
     -- Check if we need to prune
     when (Map.size completedBuilds > dsMaxCompletedBuilds state) $ do
@@ -1443,7 +1443,7 @@ cleanupStaleBuilds state = do
     now <- getCurrentTime
 
     -- Get all active builds
-    activeBuilds <- atomically $ readTVar (dsActiveBuilds state)
+    activeBuilds <- readTVarIO (dsActiveBuilds state)
 
     -- Check each build for staleness
     forM_ (Map.toList activeBuilds) $ \(buildId, build) -> do
@@ -1465,7 +1465,7 @@ cleanupStaleBuilds state = do
 
                 Nothing -> do
                     -- Check for last update time
-                    lastUpdate <- atomically $ readTVar (abUpdateTime build)
+                    lastUpdate <- readTVarIO (abUpdateTime build)
                     let idleTime = diffUTCTime now lastUpdate
 
                     -- If idle for more than 1 hour, consider it stale
@@ -1530,13 +1530,13 @@ handleTermSignal state = do
     saveStateToFile state
 
     -- Cancel maintenance thread
-    mThread <- atomically $ readTVar (dsMaintenanceThread state)
+    mThread <- readTVarIO (dsMaintenanceThread state)
     case mThread of
         Just thread -> cancel thread
         Nothing -> return ()
 
     -- Release GC lock if we have it
-    mOwner <- atomically $ readTVar (dsGCLockOwner state)
+    mOwner <- readTVarIO (dsGCLockOwner state)
     case mOwner of
         Just _ -> releaseGCLock state
         Nothing -> return ()
