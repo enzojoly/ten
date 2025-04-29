@@ -88,15 +88,15 @@ import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
 import System.Exit (exitSuccess, exitFailure, ExitCode(..))
 import System.FilePath ((</>), takeDirectory, takeFileName, takeExtension)
 import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, stdin, hClose,
-                  hSetBuffering, BufferMode(..), hFlush, Handle, openFile)
+                  hSetBuffering, BufferMode(..), hFlush, hGetContents, Handle, openFile)
 import System.Console.GetOpt
-import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName, realUserID,
-                         UserEntry(..), setUserID, userID)
+import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName,
+                         setUserID, userID)
 import System.Posix.Files (fileExist, setFileMode)
 import System.Posix.Process (getProcessID, executeFile, exitImmediately)
 import System.Posix.Signals (installHandler, Handler(..), signalProcess, sigTERM)
 import System.Process (createProcess, proc, waitForProcess, readProcessWithExitCode)
-import System.Random (randomIO)
+import System.Random (randomRIO)
 import Text.Read (readMaybe)
 
 import Ten.Core
@@ -106,9 +106,7 @@ import Ten.Build
 import Ten.GC
 import Ten.Hash
 import Ten.DB.Core
-import Ten.DB.Derivations
-import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, daemonSocketPath)
-import Ten.Daemon.Client (isDaemonRunning, startDaemonIfNeeded, UserCredentials(..))
+import Ten.Daemon.Protocol (getDefaultSocketPath)
 import qualified Ten.Daemon.Client as DaemonClient
 
 -- | CLI commands
@@ -378,11 +376,11 @@ runCommand cmd options = do
     storePath <- resolveStorePath options
 
     -- Canonicalize paths for security
-    canonicalStorePath <- canonicalizePath storePath
+    canonicalStorePath <- canonicalizePath storePath `catch` \(_ :: SomeException) -> return storePath
 
     -- Resolve work directory
     workDir <- case optWorkDir options of
-        Just dir -> canonicalizePath dir
+        Just dir -> canonicalizePath dir `catch` \(_ :: SomeException) -> return dir
         Nothing -> getDefaultWorkDir
 
     -- Create directories if needed
@@ -523,11 +521,11 @@ checkDaemonAvailable :: Options -> IO Bool
 checkDaemonAvailable opts = do
     -- Determine socket path
     socketPath <- case optDaemonSocket opts of
-        Just path -> canonicalizePath path
+        Just path -> canonicalizePath path `catch` \(_ :: SomeException) -> return path
         Nothing -> getDefaultSocketPath
 
     -- Check if daemon is running
-    daemonRunning <- isDaemonRunning socketPath
+    daemonRunning <- DaemonClient.isDaemonRunning socketPath
 
     -- Return True if running or auto-start is enabled
     return daemonRunning
@@ -537,16 +535,16 @@ runWithDaemon :: Command -> Options -> BuildEnv -> IO ()
 runWithDaemon cmd opts env = do
     -- Determine socket path
     socketPath <- case optDaemonSocket opts of
-        Just path -> canonicalizePath path
+        Just path -> canonicalizePath path `catch` \(_ :: SomeException) -> return path
         Nothing -> getDefaultSocketPath
 
     -- Check if daemon is running
-    daemonRunning <- isDaemonRunning socketPath
+    daemonRunning <- DaemonClient.isDaemonRunning socketPath
 
     -- Start daemon if needed and auto-start is enabled
     unless daemonRunning $ do
         putStrLn "Daemon not running. Starting daemon..."
-        startDaemonResult <- try $ startDaemonIfNeeded socketPath
+        startDaemonResult <- try $ DaemonClient.startDaemonIfNeeded socketPath
         case startDaemonResult of
             Left (e :: SomeException) -> do
                 hPutStrLn stderr $ "Error starting daemon: " ++ show e
@@ -584,7 +582,7 @@ waitForDaemonStart _ 0 = do
     hPutStrLn stderr "Timed out waiting for daemon to start."
     return ()
 waitForDaemonStart socketPath retries = do
-    running <- isDaemonRunning socketPath
+    running <- DaemonClient.isDaemonRunning socketPath
     if running
         then return ()
         else do
@@ -602,10 +600,10 @@ executeDaemonCommand st cmd opts conn = case cmd of
             return False
 
         -- Build a file using daemon
-        buildResult <- DaemonClient.buildFile st conn file
+        buildResult <- DaemonClient.buildFile conn file
         case buildResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right buildResult -> do
                 -- Show build result
@@ -620,10 +618,10 @@ executeDaemonCommand st cmd opts conn = case cmd of
             return False
 
         -- Evaluate a file using daemon
-        evalResult <- DaemonClient.evalFile st conn file
+        evalResult <- DaemonClient.evalFile conn file
         case evalResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right derivation -> do
                 -- Show derivation
@@ -643,10 +641,10 @@ executeDaemonCommand st cmd opts conn = case cmd of
         if proceed
             then do
                 -- Run garbage collection via protocol (daemon privilege required)
-                gcResult <- DaemonClient.requestGarbageCollection st conn (optForce opts)
+                gcResult <- DaemonClient.requestGarbageCollection conn (optForce opts)
                 case gcResult of
                     Left err -> do
-                        TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                        TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                         return False
                     Right stats -> do
                         putStrLn $ "Garbage collection completed successfully."
@@ -670,17 +668,17 @@ executeDaemonCommand st cmd opts conn = case cmd of
 
         -- Show info about a store path
         infoResult <- try $ do
-            let storePath = parseStorePath path
+            let storePath = parseStorePath T.pack path
             case storePath of
                 Nothing -> return $ Left $ StoreError "Invalid store path format"
-                Just sp -> DaemonClient.verifyStorePath st conn path
+                Just sp -> DaemonClient.verifyStorePath conn path
 
         case infoResult of
             Left (e :: SomeException) -> do
                 TIO.hPutStrLn stderr $ "Error: " <> T.pack (show e)
                 return False
             Right (Left err) -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right (Right isValid) -> do
                 putStrLn $ "Path: " ++ path
@@ -705,10 +703,10 @@ executeStoreCommand st storeCmd conn opts = case storeCmd of
             return False
 
         -- Add file to store (via daemon protocol)
-        addResult <- DaemonClient.requestAddToStore st conn file
+        addResult <- DaemonClient.requestAddToStore conn file
         case addResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right path -> do
                 putStrLn $ "File added to store: " ++ file
@@ -717,10 +715,10 @@ executeStoreCommand st storeCmd conn opts = case storeCmd of
 
     StoreVerify path -> do
         -- Verify store path (can run in builder context)
-        verifyResult <- DaemonClient.verifyStorePath st conn path
+        verifyResult <- DaemonClient.verifyStorePath conn path
         case verifyResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right isValid -> do
                 putStrLn $ "Path: " ++ path
@@ -738,7 +736,7 @@ executeStoreCommand st storeCmd conn opts = case storeCmd of
         storePathResult <- getStorePathForFile file
         case storePathResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right storePath -> do
                 putStrLn $ "Store path for " ++ file ++ ":"
@@ -758,10 +756,10 @@ executeStoreCommand st storeCmd conn opts = case storeCmd of
         if proceed
             then do
                 -- Run garbage collection via protocol (daemon privilege required)
-                gcResult <- DaemonClient.requestGarbageCollection st conn (optForce opts)
+                gcResult <- DaemonClient.requestGarbageCollection conn (optForce opts)
                 case gcResult of
                     Left err -> do
-                        TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                        TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                         return False
                     Right stats -> do
                         putStrLn "Garbage collection completed successfully."
@@ -774,10 +772,10 @@ executeStoreCommand st storeCmd conn opts = case storeCmd of
 
     StoreList -> do
         -- List store contents (readable operation, works in builder context)
-        listResult <- DaemonClient.listStore st conn
+        listResult <- DaemonClient.listStore conn
         case listResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right paths -> do
                 putStrLn $ "Store contains " ++ show (length paths) ++ " items:"
@@ -796,10 +794,10 @@ executeDerivationCommand st derivCmd conn opts = case derivCmd of
             return False
 
         -- Query derivation info (read operation, works in builder context)
-        derivInfoResult <- DaemonClient.getDerivationInfo st conn path
+        derivInfoResult <- DaemonClient.getDerivationInfo conn path
         case derivInfoResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right drv -> do
                 -- Display derivation information
@@ -814,10 +812,10 @@ executeDerivationCommand st derivCmd conn opts = case derivCmd of
             return False
 
         -- Query which derivation produced this output (read operation)
-        derivResult <- DaemonClient.queryDeriver st conn outputPath
+        derivResult <- DaemonClient.queryDeriver conn outputPath
         case derivResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right drvInfo -> do
                 -- Display the derivation info
@@ -834,10 +832,10 @@ executeDerivationCommand st derivCmd conn opts = case derivCmd of
             return False
 
         -- Store the derivation file (uses daemon protocol)
-        storeResult <- DaemonClient.requestStoreDerivation st conn file
+        storeResult <- DaemonClient.requestStoreDerivation conn file
         case storeResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right path -> do
                 putStrLn $ "Derivation stored at: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
@@ -851,10 +849,10 @@ executeDerivationCommand st derivCmd conn opts = case derivCmd of
             return False
 
         -- Register the derivation file (uses daemon protocol)
-        registerResult <- DaemonClient.requestRegisterDerivation st conn file
+        registerResult <- DaemonClient.requestRegisterDerivation conn file
         case registerResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right (path, outputs) -> do
                 putStrLn $ "Derivation registered at: " ++ T.unpack (storeHash path) ++ "-" ++ T.unpack (storeName path)
@@ -865,10 +863,10 @@ executeDerivationCommand st derivCmd conn opts = case derivCmd of
 
     ListDerivations -> do
         -- List all registered derivations (read operation)
-        listResult <- DaemonClient.listDerivations st conn
+        listResult <- DaemonClient.listDerivations conn
         case listResult of
             Left err -> do
-                TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+                TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
                 return False
             Right drvs -> do
                 putStrLn $ "Found " ++ show (length drvs) ++ " registered derivations:"
@@ -958,7 +956,7 @@ dispatchCommand st sp handler env state = do
     -- Process result
     case result of
         Left err -> do
-            TIO.hPutStrLn stderr $ "Error: " <> T.pack (show err)
+            TIO.hPutStrLn stderr $ "Error: " <> buildErrorToText err
             return False
         Right _ -> return True
 
@@ -1166,7 +1164,7 @@ handleStore st = \case
         -- Parse the store path
         if not (checkValidStorePath path)
             then throwError $ StoreError $ "Invalid store path format: " <> T.pack path
-            else case parseStorePath path of
+            else case parseStorePath T.pack path of
                 Just storePath -> do
                     -- Verify the path (read operation, works in any context)
                     valid <- verifyStorePath st storePath
@@ -1221,7 +1219,7 @@ handleDerivation st = \case
             then throwError $ StoreError $ "Invalid store path format: " <> T.pack path
             else do
                 -- Get the store path
-                let storePath = case parseStorePath path of
+                let storePath = case parseStorePath T.pack path of
                         Just sp -> sp
                         Nothing -> error "Invalid store path format"
 
@@ -1240,7 +1238,7 @@ handleDerivation st = \case
             then throwError $ StoreError $ "Invalid store path format: " <> T.pack outputPath
             else do
                 -- Get the store path
-                let storePath = case parseStorePath outputPath of
+                let storePath = case parseStorePath T.pack outputPath of
                         Just sp -> sp
                         Nothing -> error "Invalid store path format"
 
@@ -1350,7 +1348,7 @@ handleInfo st path = do
     -- Parse the store path
     if not (checkValidStorePath path)
         then throwError $ StoreError $ "Invalid store path format: " <> T.pack path
-        else case parseStorePath path of
+        else case parseStorePath T.pack path of
             Just storePath -> do
                 -- Check if the path exists in the store
                 exists <- storePathExists st storePath
@@ -1412,7 +1410,7 @@ handleDaemon st = \case
     DaemonStart -> do
         -- Check if daemon is already running
         socketPath <- liftIO getDefaultSocketPath
-        running <- liftIO $ isDaemonRunning socketPath
+        running <- liftIO $ DaemonClient.isDaemonRunning socketPath
 
         if running
             then liftIO $ putStrLn "Daemon is already running"
@@ -1429,7 +1427,7 @@ handleDaemon st = \case
     DaemonStop -> do
         -- Check if daemon is running
         socketPath <- liftIO getDefaultSocketPath
-        running <- liftIO $ isDaemonRunning socketPath
+        running <- liftIO $ DaemonClient.isDaemonRunning socketPath
 
         if running
             then do
@@ -1447,7 +1445,7 @@ handleDaemon st = \case
     DaemonStatus -> do
         -- Check if daemon is running
         socketPath <- liftIO getDefaultSocketPath
-        running <- liftIO $ isDaemonRunning socketPath
+        running <- liftIO $ DaemonClient.isDaemonRunning socketPath
 
         if running
             then do
@@ -1477,18 +1475,17 @@ handleDaemon st = \case
                 throwError $ DaemonError "Failed to restart daemon"
 
     DaemonConfig -> do
-        -- Show daemon configuration
-        config <- liftIO getDefaultConfig
+        -- Show daemon configuration from env
+        env <- ask
 
-        -- Show full configuration (daemon privilege)
+        -- Show basic configuration
         liftIO $ do
             putStrLn "Daemon configuration:"
-            putStrLn $ "  Socket: " ++ daemonSocketPath config
-            putStrLn $ "  Store: " ++ daemonStorePath config
-            putStrLn $ "  State file: " ++ daemonStateFile config
-            putStrLn $ "  GC interval: " ++ maybe "None" show (daemonGcInterval config)
-            putStrLn $ "  User: " ++ maybe "None" T.unpack (daemonUser config)
-            putStrLn $ "  Allowed users: " ++ intercalate ", " (map T.unpack $ Set.toList $ daemonAllowedUsers config)
+            socketPath <- getDefaultSocketPath
+            let storeLoc = storeLocation env
+            putStrLn $ "  Socket: " ++ socketPath
+            putStrLn $ "  Store: " ++ storeLoc
+            putStrLn $ "  Work dir: " ++ workDir env
 
 -- | List all store paths
 listStorePaths :: TenM 'Build t [FilePath]
@@ -1573,7 +1570,7 @@ showVersion = do
     putStrLn "Copyright (C) 2025"
     putStrLn "License: MIT"
 
--- | Helper to run a daemon command
+-- | Helper function to run a daemon command
 daemonCommand :: SPrivilegeTier 'Daemon -> [String] -> IO ExitCode
 daemonCommand st args = do
     -- Find the daemon executable
@@ -1601,13 +1598,6 @@ daemonCommand st args = do
         Right (_, _, _, processHandle) -> do
             -- Wait for daemon to finish (for commands like status, not start)
             waitForProcess processHandle
-
--- | Parse a store path from a string
-parseStorePath :: FilePath -> Maybe StorePath
-parseStorePath path =
-    case break (== '-') (takeFileName path) of
-        (hash, '-':name) -> Just $ StorePath (T.pack hash) (T.pack name)
-        _ -> Nothing
 
 -- | Convert command to string representation
 commandToString :: Command -> String
@@ -1774,7 +1764,9 @@ showDerivation drv = do
 getUserCredentials :: FilePath -> IO UserCredentials
 getUserCredentials socketPath = do
     -- Get username from current user
-    username <- getUserName
+    uid <- getEffectiveUserID
+    entry <- getUserEntryForID uid
+    let username = T.pack $ userName entry
 
     -- Get or generate an authentication token
     token <- getStoredToken socketPath username `catch` \(_ :: SomeException) -> do
@@ -1783,7 +1775,8 @@ getUserCredentials socketPath = do
 
     return $ UserCredentials {
         username = username,
-        token = token
+        token = token,
+        requestedTier = Builder  -- Always request builder tier by default
     }
 
 -- | Get stored token from token file if it exists
@@ -1810,32 +1803,14 @@ getStoredToken socketPath username = do
 generateRandomToken :: IO Text
 generateRandomToken = do
     -- Create a random token with proper entropy
-    r1 <- (randomIO :: IO Int)
-    r2 <- (randomIO :: IO Int)
-    r3 <- (randomIO :: IO Int)
+    r1 <- (randomRIO (1000000, 9999999) :: IO Int)
+    r2 <- (randomRIO (1000000, 9999999) :: IO Int)
+    r3 <- (randomRIO (1000000, 9999999) :: IO Int)
 
     -- Format as a base64-like string for use in authentication
     let randomChars = ['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9'] ++ ['-', '_']
     let randomString = take 32 $ map (\i -> randomChars !! (abs i `mod` length randomChars)) [r1, r2, r3]
     return $ T.pack $ "ten_token_" ++ randomString
-
--- | Get current username
-getUserName :: IO Text
-getUserName = do
-    -- Try environment variable
-    mUser <- lookupEnv "USER"
-    case mUser of
-        Just user -> return $ T.pack user
-        Nothing -> do
-            -- Try another environment variable
-            mUsername <- lookupEnv "USERNAME"
-            case mUsername of
-                Just username -> return $ T.pack username
-                Nothing -> do
-                    -- Use system call
-                    uid <- getEffectiveUserID
-                    entry <- getUserEntryForID uid
-                    return $ T.pack $ userName entry
 
 -- | Calculate store path for a file
 getStorePathForFile :: FilePath -> IO (Either BuildError StorePath)
@@ -1909,7 +1884,8 @@ requestBuildDerivation st derivation = do
     return $ BuildResult {
         resultExitCode = ExitSuccess,
         resultOutputs = Set.singleton outPath,
-        resultLog = "Build completed via daemon protocol"
+        resultLog = "Build completed via daemon protocol",
+        resultMetadata = Map.empty
     }
 
 -- | Request to add path to store via daemon
@@ -1940,10 +1916,9 @@ requestListDerivations st = do
 -- | Check if content looks like JSON
 isJsonContent :: BS.ByteString -> Bool
 isJsonContent content =
-    let trimmed = BS.dropWhile isSpace content
-    in not (BS.null trimmed) && BS.head trimmed == 123  -- '{' character
-  where
-    isSpace w = w == 32 || w == 9 || w == 10 || w == 13
+    case BS.uncons content of
+        Just (first, _) -> first == 123  -- '{' character (ASCII 123)
+        Nothing -> False
 
 -- | Helper function: list directory contents
 listDirectory :: FilePath -> IO [FilePath]
@@ -1953,14 +1928,7 @@ listDirectory dir = do
 
 -- | Helper function: get directory contents
 getDirectoryContents :: FilePath -> IO [FilePath]
-getDirectoryContents dir = do
-    -- Implement directory listing with proper error handling
-    entries <- try $ System.Directory.getDirectoryContents dir
-    case entries of
-        Left (e :: SomeException) -> do
-            hPutStrLn stderr $ "Error reading directory " ++ dir ++ ": " ++ show e
-            return []
-        Right contents -> return contents
+getDirectoryContents = Directory.getDirectoryContents
 
 -- | Helper function: get derivation output paths
 derivationOutputPaths :: Derivation -> Set StorePath
@@ -1971,11 +1939,17 @@ storePathToFilePath :: StorePath -> String
 storePathToFilePath sp = T.unpack (storeHash sp) ++ "-" ++ T.unpack (storeName sp)
 
 -- | Helper function: raw system call
-rawSystem :: FilePath -> FilePath -> [String] -> IO ExitCode
-rawSystem cmd prog args = do
-    processResult <- try $ createProcess (proc cmd (prog:args))
+rawSystem :: FilePath -> [String] -> [String] -> IO ExitCode
+rawSystem cmd exec args = do
+    processResult <- try $ createProcess (proc cmd (exec:args))
     case processResult of
-        Left (e :: SomeException) ->
+        Left (_ :: SomeException) ->
             return $ ExitFailure 127
-        Right (_, _, _, processHandle) -> do
+        Right (_, _, _, processHandle) ->
             waitForProcess processHandle
+
+-- | Break a stale lock
+breakStaleLock :: SPrivilegeTier 'Daemon -> FilePath -> TenM 'Build 'Daemon ()
+breakStaleLock _ lockPath = do
+    -- Remove the stale lock file
+    liftIO $ removeFile lockPath `catch` \(_ :: SomeException) -> return ()
