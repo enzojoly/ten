@@ -398,7 +398,7 @@ acceptClients :: Socket -> ActiveClients -> TVar Bool -> DaemonState 'Daemon -> 
               -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
               -> Handle -> Handle -> TenM 'Build 'Daemon ()
 acceptClients serverSocket clients shutdownFlag state config
-             authDbVar rateLimiter securityLog accessLog = do
+             authDbVar rateLimiter securityLog accessLog =
     let acceptLoop = do
             -- Check if we should shut down
             shouldShutdown <- liftIO $ readTVarIO shutdownFlag
@@ -498,29 +498,7 @@ acceptClients serverSocket clients shutdownFlag state config
 
                                         -- Continue accepting
                                         acceptLoop
-
-    -- Start the accept loop with error handling
-    liftIO $ catch (runTenM acceptLoop sBuild sDaemon) $ \(e :: SomeException) -> do
-        -- Log error and continue if not intentional shutdown
-        case fromException e of
-            Just ThreadKilled -> return ()  -- Normal shutdown
-            _ -> do
-                now <- getCurrentTime
-                hPutStrLn securityLog $ formatLogEntry now "ERROR" $
-                         "Error in accept loop: " ++ displayException e
-
-                -- Try to restart accept loop unless we're shutting down
-                shouldShutdown <- readTVarIO shutdownFlag
-                unless shouldShutdown $ do
-                    -- Re-run in the runTen context
-                    env <- ask
-                    state <- get
-                    buildId <- BuildId <$> newUnique
-                    let buildState = initBuildState Build buildId
-                    void $ runTen sBuild sDaemon
-                      (acceptClients serverSocket clients shutdownFlag state config
-                                    authDbVar rateLimiter securityLog accessLog)
-  env buildState
+    in acceptLoop
 
 -- | Helper to run client handler with proper environment and privileges
 runClientHandler :: Socket -> Handle -> ActiveClients -> DaemonState 'Daemon -> DaemonConfig
@@ -766,11 +744,10 @@ processRequest st request state config permissions =
   catchError
     -- Dispatch to the appropriate handler based on privilege tier
     (dispatchRequest st request state config permissions)
-    (\err -> return $ Core.ErrorResponse $ Core.DaemonError $ "Request processing error: " <> T.pack (displayException err))
-        -- Convert any errors to ErrorResponse
+    (\e ->
         case fromException e of
             Just ThreadKilled -> return $ Core.ErrorResponse $ Core.DaemonError "Thread killed"
-            _ -> return $ Core.ErrorResponse $ Core.DaemonError $ "Request processing error: " <> T.pack (displayException e)
+            _ -> return $ Core.ErrorResponse $ Core.DaemonError $ "Request processing error: " <> T.pack (displayException e))
 
 -- | Dispatch a request to the appropriate handler based on privilege tier
 dispatchRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
