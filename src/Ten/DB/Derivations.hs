@@ -194,7 +194,7 @@ daemonResponseMeta (Right response) =
         -- Add additional response types as needed
         _ -> Map.empty  -- Default empty metadata for other responses
 
--- | Type class for derivation storage operations
+-- Type class definition - keep this clean
 class CanStoreDerivation (t :: PrivilegeTier) where
     -- | Store a derivation in the content-addressed store and return its path
     storeDerivation :: Derivation -> TenM p t StorePath
@@ -204,6 +204,11 @@ class CanStoreDerivation (t :: PrivilegeTier) where
 
     -- | Register a derivation file with its dependencies
     registerDerivationFile :: Derivation -> StorePath -> TenM p t Int64
+
+-- Then add this as a standalone function OUTSIDE the typeclass
+-- | Register a derivation in the database - convenience wrapper around registerDerivationInDB
+registerDerivation :: CanStoreDerivation 'Daemon => Derivation -> StorePath -> TenM p 'Daemon Int64
+registerDerivation derivation storePath = registerDerivationInDB derivation storePath
 
 -- | Daemon instance for storing derivations - direct database access
 instance CanStoreDerivation 'Daemon where

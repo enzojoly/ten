@@ -94,6 +94,7 @@ import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef)
 import System.FilePath.Posix (normalise, takeDirectory)
 import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
+import Database.SQLite.Simple (Connection)
 import Data.Bits ((.|.), (.&.))
 import Data.Singletons
 import Data.Singletons.TH
@@ -523,7 +524,7 @@ buildWithSandboxDaemon derivation config = do
                                 let derivStorePath = StorePath (derivHash derivation) (derivName derivation <> ".drv")
 
                                 -- Register derivation in database
-                                derivId <- DBDeriv.registerDerivation derivation derivStorePath
+                                derivId <- DBDeriv.registerDerivationFile derivation derivStorePath
 
                                 -- Register references for all outputs
                                 forM_ (Set.toList outputPaths) $ \outputPath -> do

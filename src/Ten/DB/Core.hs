@@ -816,12 +816,3 @@ retryOnBusy db action = retryWithCount 0
                     threadDelay delayMicros
                     retryWithCount (attempt + 1)
                 _ -> throwIO e)
-
--- | Get database connection from the database object (daemon-only)
--- This function is used by all direct database operations
-tenQuery :: (ToRow q, FromRow r) => Database 'Daemon -> Query -> q -> TenM p 'Daemon [r]
-tenQuery db q params = liftIO $ retryOnBusy db $ SQLite.query (dbConn db) q params
-
--- | Execute a statement with parameters
-tenExecute :: (ToRow q) => Database 'Daemon -> Query -> q -> TenM p 'Daemon ()
-tenExecute db q params = liftIO $ retryOnBusy db $ void $ SQLite.execute (dbConn db) q params
