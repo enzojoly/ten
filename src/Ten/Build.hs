@@ -340,7 +340,8 @@ instance CanManageBuildStatus 'Daemon where
         withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
             -- Use proper transaction handling
             DB.withTenWriteTransaction db $ \conn -> do
-                DB.execute conn
+                void $ DB.execute
+                    conn
                     "INSERT OR REPLACE INTO BuildStatus (build_id, status, timestamp) VALUES (?, ?, strftime('%s','now'))"
                     (T.pack (show buildId), T.pack (show status))
 
@@ -518,7 +519,7 @@ buildWithSandboxDaemon derivation config = do
                             -- Collect normal build results within transaction
                             DB.withTenWriteTransaction db $ \conn -> do
                                 -- Process each expected output
-                                outputPaths <- processOutputs conn buildDir derivation
+                                outputPaths <- processOutputs (dbConn conn) buildDir derivation
 
                                 -- Register all input-output references
                                 let derivStorePath = StorePath (derivHash derivation) (derivName derivation <> ".drv")
@@ -554,7 +555,7 @@ buildWithSandboxDaemon derivation config = do
                             }
 
 -- Helper function to process outputs (extracted from collectBuildResultDaemon)
-processOutputs :: Connection -> FilePath -> Derivation -> TenM 'Build 'Daemon (Set StorePath)
+processOutputs :: Database 'Daemon -> FilePath -> Derivation -> TenM 'Build 'Daemon (Set StorePath)
 processOutputs conn buildDir derivation = do
     env <- ask
     let outDir = buildDir </> "out"
@@ -654,7 +655,7 @@ runBuilder env = do
         newPerms <- getFileStatus program
         let newMode = fileMode newPerms
         unless (newMode .&. 0o100 /= 0) $
-            throwError $ BuildFailed $ "Builder program could not be made executable: " <> T.pack program
+            throwError (BuildFailed $ "Builder program could not be made executable: " <> T.pack program)
 
     -- Create temporary directory if it doesn't exist
     liftIO $ createDirectoryIfMissing True (builderTempDir env)
@@ -788,7 +789,7 @@ runBuilder env = do
                     Just (Process.Exited exitCode) -> do
                         let exitResult = case exitCode of
                                 0 -> ExitSuccess
-                                n -> ExitFailure n
+                                n -> ExitFailure (fromIntegral n)
                         return (Just pid, Right (exitResult, stdoutContent, stderrContent))
                     Just (Process.Terminated sig _) ->
                         return (Just pid, Left $ "Builder terminated by signal: " <> T.pack (show sig))
@@ -1072,7 +1073,7 @@ buildDerivationGraph graph = do
     env <- ask
     let tierSingleton = case currentPrivilegeTier env of
                           Daemon -> sDaemon
-                          Builder -> sBuilder
+                          Builder -> sBuild
 
     -- Get evaluation phase result from topological sort
     evalResult <- liftIO $ runTenDaemonEval (Graph.topologicalSort tierSingleton graph) env (initBuildState Eval (BuildIdFromInt 0))
@@ -1234,7 +1235,7 @@ withDatabase dbPath timeout action = do
     let innerAction = runTenM (action db) sp st
 
     -- Use properly sequenced monadic operations
-    result <- runReaderT innerAction env
+    result <- runReaderT innerAction env >>= \r -> return r
     liftIO $ DB.closeDatabaseDaemon db
     return result
 
