@@ -71,7 +71,7 @@ import Control.Concurrent (forkIO, killThread, ThreadId, threadDelay, myThreadId
 import Control.Concurrent.STM
 import Control.Concurrent.Async (Async, async, cancel, wait, waitCatch)
 import Control.Exception (bracket, finally, try, catch, handle, throwIO, onException, mask,
-                          SomeException, Exception, ErrorCall(..), AsyncException(..))
+                          SomeException, Exception, ErrorCall(..), AsyncException(..), fromException)
 import Control.Monad (forever, void, when, unless, forM_, foldM)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
@@ -102,7 +102,7 @@ import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stder
 import System.IO.Error (isDoesNotExistError, isPermissionError)
 import System.Posix.Files (fileExist, getFileStatus, isRegularFile, setFileMode,
                           setOwnerAndGroup, fileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode,
-                          groupReadMode, groupWriteMode, groupExecuteMode)
+                          groupReadMode, groupWriteMode, groupExecuteMode, setFileCreationMask)
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..),
                            exitImmediately)
 import System.Posix.Types (ProcessID, FileMode, GroupID, UserID)
@@ -115,7 +115,7 @@ import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit,
                              ResourceLimits(..), softLimit, hardLimit)
 import System.Posix.User (getEffectiveUserID, getRealUserID,
                          getUserEntryForName, getGroupEntryForName, setUserID, setGroupID,
-                         userID, groupID, setGroups)
+                         setGroups)
 import System.Process (readProcess, createProcess, proc, waitForProcess, CreateProcess(..), StdStream(..), ProcessHandle)
 
 import Ten.Core
@@ -1253,7 +1253,7 @@ dropPrivileges context config = do
                                 exitFailure
                             Right gentry -> do
                                 -- Ensure store permissions are correct before dropping privileges
-                                ensureStorePermissions context config (Sandbox.userID entry) (Sandbox.groupID gentry)
+                                ensureStorePermissions context config (userID entry) (groupID gentry)
 
                                 -- Keep the store root owned by root for security
                                 -- But ensure the daemon can read/write store contents
@@ -1261,17 +1261,17 @@ dropPrivileges context config = do
                                 -- Create a /nix/var/nix/daemon directory owned by daemon user
                                 let daemonDir = daemonStorePath config </> "var/ten/daemon"
                                 createDirectoryIfMissing True daemonDir
-                                setOwnerAndGroup daemonDir (Sandbox.userID entry) (Sandbox.groupID gentry)
+                                setOwnerAndGroup daemonDir (userID entry) (groupID gentry)
                                 setFileMode daemonDir 0o700  -- Only the daemon user can access this
 
                                 -- Set supplementary groups first
                                 try $ setGroups [] -- Clear supplementary groups
 
                                 -- Set group ID (must be done before dropping user privileges)
-                                try $ setGroupID (Sandbox.groupID gentry)
+                                try $ setGroupID (groupID gentry)
 
                                 -- Finally set user ID
-                                try $ setUserID (Sandbox.userID entry)
+                                try $ setUserID (userID entry)
 
                                 -- Verify the change
                                 newUid <- getEffectiveUserID
@@ -1294,10 +1294,10 @@ dropPrivileges context config = do
                         exitFailure
                     Right entry -> do
                         -- Use user's primary group
-                        let primaryGid = Sandbox.groupID entry
+                        let primaryGid = groupID entry
 
                         -- Ensure store permissions are correct before dropping privileges
-                        ensureStorePermissions context config (Sandbox.userID entry) primaryGid
+                        ensureStorePermissions context config (userID entry) primaryGid
 
                         -- Set supplementary groups first
                         try $ setGroups [] -- Clear supplementary groups
@@ -1306,7 +1306,7 @@ dropPrivileges context config = do
                         try $ setGroupID primaryGid
 
                         -- Finally set user ID
-                        try $ setUserID (Sandbox.userID entry)
+                        try $ setUserID (userID entry)
 
                         -- Verify the change
                         newUid <- getEffectiveUserID
@@ -1709,9 +1709,9 @@ safeGetUserUID username = do
                     -- Ultimate fallback to current user if even nobody doesn't exist
                     getRealUserID
                 Right entry ->
-                    return $ Sandbox.userID entry
+                    return $ userID entry
         Right entry ->
-            return $ Sandbox.userID entry
+            return $ userID entry
 
 -- | Safely get a group's GID with fallback options
 safeGetGroupGID :: String -> IO GroupID
@@ -1731,18 +1731,18 @@ safeGetGroupGID groupname = do
                             -- Ultimate fallback to current group
                             getDefaultGroupID
                         Right entry ->
-                            return $ Sandbox.groupID entry
+                            return $ groupID entry
                 Right entry ->
-                    return $ Sandbox.groupID entry
+                    return $ groupID entry
         Right entry ->
-            return $ Sandbox.groupID entry
+            return $ groupID entry
 
 -- | Get the default group ID for the current user
 getDefaultGroupID :: IO GroupID
 getDefaultGroupID = do
     uid <- getRealUserID
     entry <- getUserEntryForName "nobody" -- Fallback when can't get entry for current user
-    return $ Sandbox.groupID entry
+    return $ groupID entry
 
 -- | Helper function to remove a file if it exists
 removeFileIfExists :: FilePath -> IO ()
@@ -1759,17 +1759,6 @@ removeSocketIfExists path = do
     when exists $ do
         -- Try removing the file, ignoring any errors
         try $ removeFile path :: IO (Either SomeException ())
-
--- | Set the file creation mask (umask) to a specific value
-setFileCreationMask :: FileMode -> IO ()
-setFileCreationMask mode = do
-    -- Set umask to mode (POSIX call)
-    _ <- System.Posix.Files.setFileCreationMask mode
-    return ()
-
--- | Helper to convert raw exception to a specialized exception if possible
-fromException :: Exception e => SomeException -> Maybe e
-fromException = Control.Exception.fromException
 
 -- | Helper function to get PID from a process handle
 getPid :: ProcessHandle -> IO (Maybe ProcessID)
@@ -1867,7 +1856,7 @@ updateBuildStatus state buildId status = do
     return ()
 
 -- | Set up sandbox
-setupSandbox :: FilePath -> Text -> TenM 'Build 'Daemon ()
+setupSandbox :: FilePath -> Sandbox.SandboxConfig -> TenM 'Build 'Daemon ()
 setupSandbox dir config = do
     -- This would set up a sandbox in a real implementation
     return ()
