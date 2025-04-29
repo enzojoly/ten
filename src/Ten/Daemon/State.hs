@@ -1624,7 +1624,7 @@ randomIO :: IO Int
 randomIO = do
     now <- getCurrentTime
     let ns :: Integer = floor (realToFrac (diffUTCTime now (read "1970-01-01 00:00:00 UTC")) * 1000000000)
-    return $ fromIntegral (ns `mod` (maxBound :: Int))
+    return $ fromIntegral (ns `mod` toInteger (maxBound :: Int))
 
 -- | Exit successfully
 exitSuccess :: IO a
