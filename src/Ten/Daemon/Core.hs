@@ -72,7 +72,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.Async (Async, async, cancel, wait, waitCatch)
 import Control.Exception (bracket, finally, try, catch, handle, throwIO, onException, mask,
                           SomeException, Exception, ErrorCall(..), AsyncException(..), fromException)
-import Control.Monad (forever, void, when, unless, forM_, foldM)
+import Control.Monad (forever, void, when, unless, forM_, foldM, forM)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
@@ -96,13 +96,14 @@ import System.Directory (doesFileExist, doesDirectoryExist, createDirectoryIfMis
                         removeFile, getPermissions, setPermissions, removePathForcibly)
 import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
 import System.Exit (ExitCode(..), exitSuccess, exitFailure, exitWith)
-import System.FilePath ((</>), takeDirectory)
+import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stderr, stdout, stdin,
-                 openFile, hGetLine, BufferMode(..), hSetBuffering)
+                 openFile, hGetLine, BufferMode(..), hSetBuffering, hGetContents, hPutStr)
 import System.IO.Error (isDoesNotExistError, isPermissionError)
 import System.Posix.Files (fileExist, getFileStatus, isRegularFile, setFileMode,
                           setOwnerAndGroup, fileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode,
-                          groupReadMode, groupWriteMode, groupExecuteMode, setFileCreationMask)
+                          groupReadMode, groupWriteMode, groupExecuteMode, otherReadMode, otherExecuteMode,
+                          setFileCreationMask)
 import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..),
                            exitImmediately)
 import System.Posix.Types (ProcessID, FileMode, GroupID, UserID)
@@ -120,7 +121,7 @@ import System.Process (readProcess, createProcess, proc, waitForProcess, CreateP
 
 import Ten.Core
 import qualified Ten.Store as Store
-import qualified Ten.Sandbox as Sandbox (SandboxConfig(..))
+import qualified Ten.Sandbox as Sandbox
 import qualified Ten.Daemon.Protocol as Protocol
 
 -- | Main daemon context with privilege tracking phantom type
@@ -174,8 +175,8 @@ startDaemon config = do
     (unprivUid, unprivGid) <- if uid == 0
                                then do
                                    -- When running as root, set up unprivileged IDs
-                                   let defaultUser = fromMaybe "nobody" (daemonUser config >>= Just . T.unpack)
-                                   let defaultGroup = fromMaybe "nogroup" (daemonGroup config >>= Just . T.unpack)
+                                   let defaultUser = fromMaybe "nobody" (fmap T.unpack $ daemonUser config)
+                                   let defaultGroup = fromMaybe "nogroup" (fmap T.unpack $ daemonGroup config)
                                    uid' <- safeGetUserUID defaultUser
                                    gid <- safeGetGroupGID defaultGroup
                                    return (uid', gid)
@@ -460,7 +461,7 @@ releaseGCLockIfNeeded context = do
 
                             -- Release the lock with proper privilege context
                             withPrivilegeScope (ctxPrivilegeEvidence context) $ \stEvidence ->
-                                releaseGCLock (ctxState context)
+                                atomically $ releaseGCLock (ctxState context)
 
                             -- Remove the lock file
                             removeFile lockPath `catch` \(_ :: SomeException) -> return ()
@@ -967,7 +968,7 @@ gcWorker context interval = do
                             let env = initDaemonEnv (daemonTmpDir config) storeDir (Just "daemon")
 
                             -- Run GC with appropriate privilege
-                            result <- runTen sBuild stEvidence collectGarbage env (initBuildState Build (BuildIdFromInt 0))
+                            result <- runTen sBuild stEvidence Store.collectGarbage env (initBuildState Build (BuildIdFromInt 0))
 
                             -- Process result
                             case result of
@@ -1143,7 +1144,7 @@ handleSigUsr1 context = do
                             let env = initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (Just "daemon")
 
                             -- Run GC
-                            result <- runTen sBuild stEvidence collectGarbage env (initBuildState Build (BuildIdFromInt 0))
+                            result <- runTen sBuild stEvidence Store.collectGarbage env (initBuildState Build (BuildIdFromInt 0))
 
                             -- Process result
                             case result of
@@ -1193,10 +1194,10 @@ closeLogs Nothing = return ()
 closeLogs (Just handle) = hClose handle
 
 -- | Log a message with timestamp and level
-logMessage :: Maybe Handle -> LogLevel -> LogLevel -> String -> IO ()
+logMessage :: Maybe Handle -> Int -> LogLevel -> String -> IO ()
 logMessage mHandle configLevel level msg = do
     -- Only log if the level is less than or equal to config level
-    when (levelToInt level <= levelToInt configLevel) $ do
+    when (levelToInt level <= configLevel) $ do
         -- Get current time for timestamp
         now <- getCurrentTime
         let timestamp = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Q%z" now
@@ -1325,10 +1326,16 @@ dropPrivileges context config = do
 -- | Execute an action with a privilege transition
 withPrivilegeTransition :: forall s t a. PrivilegeTransition s t -> (SPrivilegeTier t -> IO a) -> SPrivilegeTier s -> IO a
 withPrivilegeTransition transition action stEvidence = do
-    -- Handle privilege transition
+    -- Handle privilege transition based on type-level constraints
     case transition of
         -- We can only drop privileges, never gain them
-        DropPrivilege -> action sBuilder  -- Pass builder evidence
+        DropPrivilege ->
+            -- Convert daemon privilege to builder privilege
+            case (fromSing stEvidence) of
+                Daemon -> action sBuilder
+                Builder ->
+                    -- Already at builder privilege, can't drop further
+                    action sBuilder
 
 -- | Execute a function with privilege scope handling
 withPrivilegeScope :: SPrivilegeTier t -> (forall s. SPrivilegeTier s -> IO a) -> IO a
@@ -1369,12 +1376,14 @@ ensureStorePermissions context config uid gid = do
 
     -- Keep store root owned by root, but writable by daemon group
     setFileMode storeDir (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
-                         groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+                         groupReadMode .|. groupWriteMode .|. groupExecuteMode .|.
+                         otherReadMode .|. otherExecuteMode)
 
     -- Set var/ten group writable
     setOwnerAndGroup (storeDir </> "var/ten") 0 gid
     setFileMode (storeDir </> "var/ten") (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode .|.
-                                         groupReadMode .|. groupWriteMode .|. groupExecuteMode)
+                                         groupReadMode .|. groupWriteMode .|. groupExecuteMode .|.
+                                         otherReadMode .|. otherExecuteMode)
 
     -- Set /nix/var/nix/db group writable
     setOwnerAndGroup (storeDir </> "var/ten/db") uid gid
@@ -1774,32 +1783,6 @@ getPid ph = do
                 _ -> return Nothing
         Right _ -> return Nothing
 
--- | Helper to read process output
-readCreateProcessWithExitCode :: CreateProcess -> String -> IO (ExitCode, String, String)
-readCreateProcessWithExitCode cp stdin = do
-    (Just inh, Just outh, Just errh, ph) <-
-        createProcess cp { std_in = CreatePipe,
-                          std_out = CreatePipe,
-                          std_err = CreatePipe }
-
-    -- Write input to stdin
-    when (not (null stdin)) $ do
-        hPutStr inh stdin
-        hClose inh
-
-    -- Read output and error
-    out <- hGetContents outh
-    err <- hGetContents errh
-
-    -- Wait for process to finish
-    exitCode <- waitForProcess ph
-
-    -- Close handles
-    hClose outh
-    hClose errh
-
-    return (exitCode, out, err)
-
 -- | Change credentials of a process
 changeProcessCredentials :: ProcessID -> UserID -> GroupID -> IO ()
 changeProcessCredentials pid uid gid = do
@@ -1924,7 +1907,7 @@ getDefaultConfig = do
         daemonStorePath = home </> ".ten" </> "store",
         daemonStateFile = home </> ".ten" </> "daemon.state",
         daemonLogFile = Just $ home </> ".ten" </> "logs" </> "daemon.log",
-        daemonLogLevel = LogNormal,
+        daemonLogLevel = 1, -- LogNormal
         daemonGcInterval = Just 3600,
         daemonUser = Nothing,
         daemonGroup = Nothing,
@@ -1934,13 +1917,5 @@ getDefaultConfig = do
         daemonTmpDir = home </> ".ten" </> "tmp"
     }
 
--- | Default sandbox configuration
-defaultSandboxConfig :: Text
-defaultSandboxConfig = "{ sandbox = true; }"
-
 -- | Privilege transition type (for transitioning from one privilege tier to another)
 data PrivilegeTransition s t = DropPrivilege
-
--- | File operations
-(.|.) :: FileMode -> FileMode -> FileMode
-a .|. b = a + b
