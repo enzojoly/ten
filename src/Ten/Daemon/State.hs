@@ -111,6 +111,8 @@ import Control.Monad (when, unless, forM, forM_, void, foldM, forever)
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
+import qualified Data.Aeson.Key as Aeson
+import qualified Data.Aeson.KeyMap as Aeson.KeyMap
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Char8 as BC
@@ -158,19 +160,20 @@ import System.Posix.Signals (installHandler, Handler(..), sigTERM, sigHUP, sigUS
                            emptySignalSet, addSignal)
 import System.Posix.User (getUserEntryForID, getUserEntryForName, getGroupEntryForName,
                          setUserID, setGroupID, getEffectiveUserID, getRealUserID, userID, groupID)
-
+import System.Exit (ExitSuccess)
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                 UserId(..), AuthToken(..), BuildState(..), BuildStrategy(..),
                 Phase(..), PrivilegeTier(..), SPrivilegeTier(..), BuildEnv(..),
+                SingI(..),
                 runTen, getGCLockPath, ensureLockDirExists,
                 CanAccessStore, CanCreateSandbox, CanModifyStore, CanDropPrivileges, CanAccessDatabase,
                 storePathToText, storePathToFilePath,
                 -- Add these types directly from Core:
                 Derivation(..), DerivationInput(..), DerivationOutput(..), BuildResult(..),
                 fromSing, sing)
-import qualified Ten.Core as Core
 import Ten.Derivation (derivationEquals)
 import qualified Ten.Graph as Graph
+import qualified Ten.Core as Core
 import Unsafe.Coerce (unsafeCoerce)  -- For explicit privilege casting
 
 -- | State errors
@@ -480,31 +483,42 @@ populateState state jsonData = do
             atomically $ writeTVar (dsGCStats state) gcStats
   where
     extractCompletedBuilds = Aeson.withObject "StateData" $ \v -> do
-        completedMap <- v .: "completedBuilds"
-        -- In a real implementation, parse the build results properly
-        return completedMap
+        completedObj <- v Aeson..: "completedBuilds"
+        -- Convert from Aeson object to Map BuildId value manually
+        let completedList = map (\(k, v) -> (read (T.unpack (Aeson.Key.toText k)) :: BuildId, v)) (Aeson.KeyMap.toList completedObj)
+        return $ Map.fromList completedList
 
     extractFailedBuilds = Aeson.withObject "StateData" $ \v -> do
-        failedMap <- v .: "failedBuilds"
-        -- In a real implementation, parse the failed builds properly
-        return failedMap
+        failedObj <- v Aeson..: "failedBuilds"
+        -- Convert from Aeson object to Map BuildId value manually
+        let failedList = map (\(k, v) -> (read (T.unpack (Aeson.Key.toText k)) :: BuildId, v)) (Aeson.KeyMap.toList failedObj)
+        return $ Map.fromList failedList
 
     extractReachablePaths = Aeson.withObject "StateData" $ \v -> do
-        paths <- v .: "reachablePaths"
-        -- In a real implementation, parse the paths properly
+        paths <- v Aeson..: "reachablePaths"
         return paths
 
     extractKnownDerivations = Aeson.withObject "StateData" $ \v -> do
-        derivations <- v .: "knownDerivations"
-        -- In a real implementation, parse the derivations properly
-        return derivations
+        derivsObj <- v Aeson..: "knownDerivations"
+        -- Convert from Aeson object to Map Text Derivation manually
+        let derivsList = map (\(k, v) ->
+                (Aeson.Key.toText k,
+                case Aeson.encode v of
+                    lbs -> case Core.deserializeDerivation (LBS.toStrict lbs) of
+                        Right drv -> Just drv
+                        _ -> Nothing))
+              (Aeson.KeyMap.toList derivsObj)
+        return $ Map.fromList $ catMaybes $ map (\(k, mv) -> case mv of
+                                                    Just v -> Just (k, v)
+                                                    Nothing -> Nothing)
+                                derivsList
 
     extractLastGC = Aeson.withObject "StateData" $ \v -> do
-        lastGC <- v .: "lastGC"
+        lastGC <- v Aeson..: "lastGC"
         return lastGC
 
     extractGCStats = Aeson.withObject "StateData" $ \v -> do
-        gcStats <- v .: "gcStats"
+        gcStats <- v Aeson..: "gcStats"
         return gcStats
 
 -- | Save daemon state to a file - requires daemon privilege for file operations
@@ -537,17 +551,51 @@ captureStateData state = do
             gcStats <- readTVar (dsGCStats state)
             return (completedBuilds, failedBuilds, reachablePaths, knownDerivations, lastGC, gcStats)
 
+    -- Get current timestamp
+    timestamp <- getCurrentTime
+
     -- Build the state data object
     return $ Aeson.object [
             "version" .= ("1.0" :: Text),
-            "timestamp" .= getCurrentTime,
-            "completedBuilds" .= completedBuilds,
-            "failedBuilds" .= failedBuilds,
+            "timestamp" .= timestamp,
+            "completedBuilds" .= Aeson.object [Aeson.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList completedBuilds],
+            "failedBuilds" .= Aeson.object [Aeson.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList failedBuilds],
             "reachablePaths" .= reachablePaths,
-            "knownDerivations" .= knownDerivations,
+            "knownDerivations" .= Aeson.object [Aeson.fromText k .= encodeDerivation v | (k, v) <- Map.toList knownDerivations],
             "lastGC" .= lastGC,
             "gcStats" .= gcStats
         ]
+
+-- Helper to convert a Derivation to Aeson.Value
+encodeDerivation :: Derivation -> Aeson.Value
+encodeDerivation drv =
+    let bs = Core.serializeDerivation drv
+        -- Try to convert to JSON, fallback to encoded string if that fails
+        jsonVal = case Aeson.decodeStrict bs of
+            Just val -> val
+            Nothing -> Aeson.String (TE.decodeUtf8 bs)
+    in jsonVal
+
+-- Helper to encode a StorePath
+encodeStorePath :: StorePath -> Aeson.Value
+encodeStorePath (StorePath hash name) = Aeson.object
+    [ "hash" .= hash
+    , "name" .= name
+    ]
+
+-- Helper to encode DerivationInput
+encodeDerivationInput :: DerivationInput -> Aeson.Value
+encodeDerivationInput (DerivationInput path name) = Aeson.object
+    [ "path" .= encodeStorePath path
+    , "name" .= name
+    ]
+
+-- Helper to encode DerivationOutput
+encodeDerivationOutput :: DerivationOutput -> Aeson.Value
+encodeDerivationOutput (DerivationOutput name path) = Aeson.object
+    [ "name" .= name
+    , "path" .= encodeStorePath path
+    ]
 
 -- | Register a new build - available for both privilege tiers
 registerBuild :: DaemonState t -> Derivation -> UserId -> Int -> Maybe Int -> IO BuildId
@@ -1495,7 +1543,7 @@ handleTermSignal state = do
 
     -- Exit
     putStrLn "Shutdown complete."
-    exitImmediately 0
+    exitImmediately ExitSuccess
 
 -- | Handle SIGHUP signal - requires store access and modification privileges
 handleHupSignal :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
@@ -1575,11 +1623,11 @@ calculateBuildProgress build = do
 randomIO :: IO Int
 randomIO = do
     now <- getCurrentTime
-    let ns = floor (realToFrac (diffUTCTime now (read "1970-01-01 00:00:00 UTC")) * 1000000000)
-    return $ fromIntegral (ns `mod` maxBound)
+    let ns :: Integer = floor (realToFrac (diffUTCTime now (read "1970-01-01 00:00:00 UTC")) * 1000000000)
+    return $ fromIntegral (ns `mod` (maxBound :: Int))
 
 -- | Exit successfully
 exitSuccess :: IO a
 exitSuccess = do
     -- Exit the process with success status
-    System.Posix.Process.exitImmediately 0
+    System.Posix.Process.exitImmediately ExitSuccess
