@@ -160,7 +160,7 @@ import System.Posix.Signals (installHandler, Handler(..), sigTERM, sigHUP, sigUS
                            emptySignalSet, addSignal)
 import System.Posix.User (getUserEntryForID, getUserEntryForName, getGroupEntryForName,
                          setUserID, setGroupID, getEffectiveUserID, getRealUserID, userID, groupID)
-import System.Exit (ExitSuccess)
+import System.Exit (ExitCode(..))
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                 UserId(..), AuthToken(..), BuildState(..), BuildStrategy(..),
                 Phase(..), PrivilegeTier(..), SPrivilegeTier(..), BuildEnv(..),
