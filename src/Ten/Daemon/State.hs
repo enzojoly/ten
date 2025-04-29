@@ -100,48 +100,71 @@ module Ten.Daemon.State (
     calculateBuildProgress
 ) where
 
-import Control.Concurrent
+-- Standard libraries
+import Control.Concurrent (forkIO, killThread, ThreadId, threadDelay, myThreadId, MVar, newMVar, takeMVar, putMVar, withMVar)
 import Control.Concurrent.STM
-import Control.Concurrent.Async (Async, async, cancel)
-import Control.Exception (Exception, throwIO, try, catch, finally, bracket, SomeException, IOException)
+import Control.Concurrent.Async (Async, async, cancel, wait, waitCatch)
+import Control.Exception (Exception, throwIO, try, catch, finally, bracket, mask, SomeException, IOException, ErrorCall(..))
 import Control.Monad (when, unless, forM, forM_, void, foldM)
+
+-- Data structure imports
 import Data.Aeson ((.:), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
+import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.List (sort, sortOn, sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust, isNothing, catMaybes)
+import Data.Ord (comparing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, addUTCTime)
-import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, removeFile)
-import System.FilePath (takeDirectory, (</>))
-import System.IO (Handle, withFile, IOMode(..), hClose, hPutStrLn, stderr, stdout, hFlush)
-import System.IO.Error (isDoesNotExistError, catchIOError)
-import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit)
-import System.Posix.Signals (installHandler, Handler(..), sigTERM)
-import System.Posix.Process (getProcessID, signalProcess)
-import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode)
-import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock, fdToHandle,
-                       OpenMode(..), defaultFileFlags, Fd, FdOption(..))
-import System.Posix.Types (ProcessID)
-import qualified System.Posix.Signals as Signals
-import System.Posix.Sysconf (getSysconfVar, SysconfVar(..))
-import System.Posix.Memory (sysconfPageSize)
-import Data.Ord (comparing)
-import System.Posix.Signals (Signal)
-import System.Posix.Files.ByteString (createLink, removeLink)
-import qualified Data.ByteString.Char8 as BC
+import Data.Kind (Type)
 import Data.Singletons
 import Data.Singletons.TH
-import Data.Kind (Type)
+
+-- File system and IO imports
+import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, removeFile)
+import System.FilePath (takeDirectory, (</>), takeFileName, normalise)
+import System.IO (Handle, withFile, IOMode(..), hClose, hPutStrLn, stderr, stdout, hFlush, BufferMode(..), hSetBuffering)
+import System.IO.Error (isDoesNotExistError, catchIOError)
+
+-- POSIX-specific imports
+import System.Posix.Types (ProcessID, Fd, FileMode, UserID, GroupID)
+import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode,
+                          setOwnerAndGroup, fileMode, ownerReadMode, ownerWriteMode,
+                          ownerExecuteMode, groupReadMode, groupWriteMode, groupExecuteMode)
+import System.Posix.Files.ByteString (createLink, removeLink)
+import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock, fdToHandle,
+                       OpenMode(..), defaultFileFlags, FdOption(..))
+import System.Posix.Process (getProcessID, forkProcess, executeFile, getProcessStatus, ProcessStatus(..))
+import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit)
+import System.Posix.Signals (installHandler, Handler(..), sigTERM, sigHUP, sigUSR1, sigINT,
+                           signalProcess, Signal, blockSignals, unblockSignals, SignalSet,
+                           emptySignalSet, addSignal)
+import System.Posix.User (getUserEntryForID, getUserEntryForName, getGroupEntryForName,
+                         setUserID, setGroupID, getEffectiveUserID, getRealUserID, userID, groupID)
+
+-- Ten core imports
+import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
+                Derivation(..), DerivationInput(..), DerivationOutput(..),
+                UserId(..), AuthToken(..), BuildState(..), BuildStrategy(..),
+                Phase(..), PrivilegeTier(..), SPrivilegeTier(..), BuildEnv(..),
+                runTen, getGCLockPath, ensureLockDirExists,
+                CanAccessStore, CanCreateSandbox, CanModifyStore, CanDropPrivileges, CanAccessDatabase,
+                storePathToText, storePathToFilePath)
+
+-- Ten module imports
+import qualified Ten.Derivation as Derivation (derivationEquals, hashDerivation)
+import Ten.Build (BuildResult(..))
+import qualified Ten.Graph as Graph
 
 -- Import Ten modules
 import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..), UserId(..),
