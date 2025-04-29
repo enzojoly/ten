@@ -756,7 +756,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
         Right _ -> return ()
 
 -- | Process a client request with proper privilege tier
-processRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
+processRequest :: (Store.StoreContentOps t) => SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
                -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 processRequest st request state config permissions =
     catchError
