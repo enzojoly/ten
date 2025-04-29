@@ -479,34 +479,29 @@ data BuildError
     deriving (Show, Eq)
 
 
-instance Aeson.FromJSON BuildError where
-    parseJSON = Aeson.withObject "BuildError" $ \o -> do
-        errType <- o Aeson..: "type"
-        msg <- o Aeson..: "message"
-        case errType of
-            "eval" -> return $ EvalError msg
-            "build" -> return $ BuildFailed msg
-            "store" -> return $ StoreError msg
-            "sandbox" -> return $ SandboxError msg
-            "input" -> return $ InputNotFound (T.unpack msg)
-            "hash" -> return $ HashError msg
-            "graph" -> return $ GraphError msg
-            "resource" -> return $ ResourceError msg
-            "daemon" -> return $ DaemonError msg
-            "auth" -> return $ AuthError msg
-            "cycle" -> return $ CyclicDependency msg
-            "serialization" -> return $ SerializationError msg
-            "recursion" -> return $ RecursionLimit msg
-            "network" -> return $ NetworkError msg
-            "parse" -> return $ ParseError msg
-            "db" -> return $ DBError msg
-            "gc" -> return $ GCError msg
-            "phase" -> return $ PhaseError msg
-            "privilege" -> return $ PrivilegeError msg
-            "protocol" -> return $ ProtocolError msg
-            "internal" -> return $ InternalError msg
-            "config" -> return $ ConfigError msg
-            _ -> fail $ "Unknown error type: " <> T.unpack errType
+instance Aeson.ToJSON BuildError where
+    toJSON (EvalError msg) = Aeson.object [ "type" Aeson..= ("eval" :: Text), "message" Aeson..= msg ]
+    toJSON (BuildFailed msg) = Aeson.object [ "type" Aeson..= ("build" :: Text), "message" Aeson..= msg ]
+    toJSON (StoreError msg) = Aeson.object [ "type" Aeson..= ("store" :: Text), "message" Aeson..= msg ]
+    toJSON (SandboxError msg) = Aeson.object [ "type" Aeson..= ("sandbox" :: Text), "message" Aeson..= msg ]
+    toJSON (InputNotFound path) = Aeson.object [ "type" Aeson..= ("input" :: Text), "message" Aeson..= T.pack path ]
+    toJSON (HashError msg) = Aeson.object [ "type" Aeson..= ("hash" :: Text), "message" Aeson..= msg ]
+    toJSON (GraphError msg) = Aeson.object [ "type" Aeson..= ("graph" :: Text), "message" Aeson..= msg ]
+    toJSON (ResourceError msg) = Aeson.object [ "type" Aeson..= ("resource" :: Text), "message" Aeson..= msg ]
+    toJSON (DaemonError msg) = Aeson.object [ "type" Aeson..= ("daemon" :: Text), "message" Aeson..= msg ]
+    toJSON (AuthError msg) = Aeson.object [ "type" Aeson..= ("auth" :: Text), "message" Aeson..= msg ]
+    toJSON (CyclicDependency msg) = Aeson.object [ "type" Aeson..= ("cycle" :: Text), "message" Aeson..= msg ]
+    toJSON (SerializationError msg) = Aeson.object [ "type" Aeson..= ("serialization" :: Text), "message" Aeson..= msg ]
+    toJSON (RecursionLimit msg) = Aeson.object [ "type" Aeson..= ("recursion" :: Text), "message" Aeson..= msg ]
+    toJSON (NetworkError msg) = Aeson.object [ "type" Aeson..= ("network" :: Text), "message" Aeson..= msg ]
+    toJSON (ParseError msg) = Aeson.object [ "type" Aeson..= ("parse" :: Text), "message" Aeson..= msg ]
+    toJSON (DBError msg) = Aeson.object [ "type" Aeson..= ("db" :: Text), "message" Aeson..= msg ]
+    toJSON (GCError msg) = Aeson.object [ "type" Aeson..= ("gc" :: Text), "message" Aeson..= msg ]
+    toJSON (PhaseError msg) = Aeson.object [ "type" Aeson..= ("phase" :: Text), "message" Aeson..= msg ]
+    toJSON (PrivilegeError msg) = Aeson.object [ "type" Aeson..= ("privilege" :: Text), "message" Aeson..= msg ]
+    toJSON (ProtocolError msg) = Aeson.object [ "type" Aeson..= ("protocol" :: Text), "message" Aeson..= msg ]
+    toJSON (InternalError msg) = Aeson.object [ "type" Aeson..= ("internal" :: Text), "message" Aeson..= msg ]
+    toJSON (ConfigError msg) = Aeson.object [ "type" Aeson..= ("config" :: Text), "message" Aeson..= msg ]
 
 instance Exception BuildError
 
@@ -1902,7 +1897,7 @@ deserializeDaemonResponse bs mPayload =
                     Just (Aeson.String "error") -> do
                         errObj <- maybe (Left "Missing error") Right $
                             AKeyMap.lookup "error" obj
-                        case parseError errObj of
+                        case parseErrorDirectly errObj of
                             Left err -> Left $ "Invalid error: " <> err
                             Right err -> Right $ ErrorResponse err
 
@@ -2902,6 +2897,40 @@ instance Aeson.FromJSON DaemonConfig where
         daemonForeground <- v Aeson..: "foreground"
         daemonTmpDir <- v Aeson..: "tmpDir"
         return DaemonConfig{..}
+
+parseErrorDirectly :: Aeson.Value -> Either Text BuildError
+parseErrorDirectly = \case
+    Aeson.Object o -> do
+        errType <- maybe (Left "Missing error type") Right $
+                  AKeyMap.lookup "type" o >>= Aeson.parseMaybe Aeson.parseJSON
+        msg <- maybe (Left "Missing error message") Right $
+              AKeyMap.lookup "message" o >>= Aeson.parseMaybe Aeson.parseJSON
+
+        case errType of
+            "eval" -> Right $ EvalError msg
+            "build" -> Right $ BuildFailed msg
+            "store" -> Right $ StoreError msg
+            "sandbox" -> Right $ SandboxError msg
+            "input" -> Right $ InputNotFound (T.unpack msg)
+            "hash" -> Right $ HashError msg
+            "graph" -> Right $ GraphError msg
+            "resource" -> Right $ ResourceError msg
+            "daemon" -> Right $ DaemonError msg
+            "auth" -> Right $ AuthError msg
+            "cycle" -> Right $ CyclicDependency msg
+            "serialization" -> Right $ SerializationError msg
+            "recursion" -> Right $ RecursionLimit msg
+            "network" -> Right $ NetworkError msg
+            "parse" -> Right $ ParseError msg
+            "db" -> Right $ DBError msg
+            "gc" -> Right $ GCError msg
+            "phase" -> Right $ PhaseError msg
+            "privilege" -> Right $ PrivilegeError msg
+            "protocol" -> Right $ ProtocolError msg
+            "internal" -> Right $ InternalError msg
+            "config" -> Right $ ConfigError msg
+            _ -> Left $ "Unknown error type: " <> errType
+    _ -> Left "Error value is not an object"
 
 -- For BuildError, let's implement the parseError function:
 parseError :: Aeson.Value -> Either Text BuildError
