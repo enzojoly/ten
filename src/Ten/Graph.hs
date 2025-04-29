@@ -16,6 +16,7 @@ module Ten.Graph (
     addNode,
     addEdge,
     addDerivation,
+    BuildGraph(..),
 
     -- Graph validation
     validateGraph,
