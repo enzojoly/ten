@@ -101,7 +101,7 @@ import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stder
                  openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError, catchIOError)
 import System.Posix.Files (setFileMode, getFileStatus, accessTime, modificationTime, fileSize)
-import System.Posix.Types (FileMode, ProcessID, UserID, GroupID)
+import System.Posix.Types (FileMode, ProcessID, UserID, GroupID, Fd)
 import System.Posix.User (setUserID, setGroupID, getEffectiveUserID, getRealUserID,
                           getUserEntryForName, groupID, userID, getUserEntryForID)
 import System.Posix.Process (getProcessID)
@@ -113,6 +113,7 @@ import qualified Data.ByteArray as BA
 import Data.Singletons
 import Data.Singletons.TH
 import Data.Kind (Type)
+import Foreign.C.Types (CInt(..))
 
 import Ten.Core
 import qualified Ten.Core as Core
@@ -268,8 +269,8 @@ startServer serverSocket state config = do
         let env = initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (daemonUser config)
             buildState = initBuildState Build (BuildIdFromInt 0)
 
-        -- Run the accept loop with daemon privileges
-        result <- runTen sDaemon (acceptClients serverSocket clients shutdownFlag state config
+        -- Run the accept loop with daemon privileges in Build phase
+        result <- runTen sBuild sDaemon (acceptClients serverSocket clients shutdownFlag state config
                                 authDbVar rateLimiter securityLog accessLog)
                   env buildState
 
@@ -304,8 +305,9 @@ setSocketOptions sock = do
     setSocketOption sock SendTimeOut 5000
     setSocketOption sock RecvTimeOut 5000
 
-    -- Set socket to close-on-exec
-    setCloseOnExecIfNeeded sock
+    -- Set socket to close-on-exec using the file descriptor
+    let fd = fdSocket sock
+    setCloseOnExecIfNeeded fd
 
 -- | Stop the server
 stopServer :: ServerControl -> IO ()
@@ -498,20 +500,24 @@ acceptClients serverSocket clients shutdownFlag state config
                                         acceptLoop
 
     -- Start the accept loop with error handling
-    acceptLoop `catch` \(e :: SomeException) -> do
+    liftIO $ catch (runTenM acceptLoop sBuild sDaemon) $ \(e :: SomeException) -> do
         -- Log error and continue if not intentional shutdown
         case fromException e of
             Just ThreadKilled -> return ()  -- Normal shutdown
             _ -> do
-                now <- liftIO getCurrentTime
-                liftIO $ hPutStrLn securityLog $ formatLogEntry now "ERROR" $
+                now <- getCurrentTime
+                hPutStrLn securityLog $ formatLogEntry now "ERROR" $
                          "Error in accept loop: " ++ displayException e
 
                 -- Try to restart accept loop unless we're shutting down
-                shouldShutdown <- liftIO $ readTVarIO shutdownFlag
-                unless shouldShutdown $
-                    acceptClients serverSocket clients shutdownFlag state config
-                                  authDbVar rateLimiter securityLog accessLog
+                shouldShutdown <- readTVarIO shutdownFlag
+                unless shouldShutdown $ do
+                    -- Re-run in the runTen context
+                    env <- ask
+                    state <- get
+                    void $ runTen sBuild sDaemon (acceptClients serverSocket clients shutdownFlag state config
+                                  authDbVar rateLimiter securityLog accessLog)
+                                  env state
 
 -- | Helper to run client handler with proper environment and privileges
 runClientHandler :: Socket -> Handle -> ActiveClients -> DaemonState 'Daemon -> DaemonConfig
@@ -530,8 +536,8 @@ runClientHandler clientSocket clientHandle clients state config
     -- Get daemon environment
     let env = initDaemonEnv (daemonTmpDir config) (daemonStorePath config) (daemonUser config)
 
-    -- Run client handler with daemon privilege - will transition to builder privilege after auth
-    result <- runTen sDaemon (handleClient clientSocket clientHandle clients state config
+    -- Run client handler with daemon privilege in Build phase
+    result <- runTen sBuild sDaemon (handleClient clientSocket clientHandle clients state config
                               authDbVar rateLimiter securityLog accessLog
                               lastActivityVar clientStateVar requestCountVar
                               permissionsVar privilegeTierVar clientAddr)
@@ -611,19 +617,11 @@ handleClient clientSocket clientHandle clients state config
             -- Set client state to active
             liftIO $ atomically $ writeTVar clientStateVar Active
 
-            -- Handle client requests with proper privilege transition
-            case tier of
-                Daemon ->
-                    -- Continue processing with Daemon privileges
-                    handleClientRequests clientSocket clientHandle state config clientAddr
-                                        securityLog accessLog lastActivityVar clientStateVar
-                                        requestCountVar permissionsVar idleTimeout sDaemon
-
-                Builder ->
-                    -- Drop privileges to Builder tier with a transition
-                        handleClientRequests clientSocket clientHandle state config clientAddr
-                                           securityLog accessLog lastActivityVar clientStateVar
-                                           requestCountVar permissionsVar idleTimeout sDaemon
+            -- Handle client requests with proper privilege tier
+            -- Using the daemon tier singleton we're already in
+            handleClientRequests clientSocket clientHandle state config clientAddr
+                                securityLog accessLog lastActivityVar clientStateVar
+                                requestCountVar permissionsVar idleTimeout sDaemon
 
   where
     -- Update client info after authentication
@@ -678,7 +676,9 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                             return (count + 1)
 
                         -- Apply rate limiting
-                        allowed <- liftIO $ checkRequestRateLimit (scRateLimiter st) clientAddr
+                        -- Get the rate limiter from the appropriate source
+                        -- Note: This is a TVar (Map SockAddr (Int, UTCTime)) passed from above
+                        allowed <- liftIO $ checkRequestRateLimit rateLimiter clientAddr
 
                         if not allowed then do
                             -- Rate limit exceeded
@@ -735,17 +735,25 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                             -- Continue processing
                                             processLoop
 
-    -- Start processing loop
-    processLoop `catch` \(e :: SomeException) -> do
+    -- Start processing loop with proper privilege context
+    res <- liftIO $ catch (runTenM processLoop (sing @'Build) st) $ \(e :: SomeException) -> do
         -- Log error unless it's a normal disconnect
-        now <- liftIO getCurrentTime
+        now <- getCurrentTime
         case fromException e of
-            Just ThreadKilled -> return ()  -- Normal shutdown
-            _ -> liftIO $ hPutStrLn securityLog $ formatLogEntry now "ERROR" $
+            Just ThreadKilled -> return (Right ())  -- Normal shutdown, not an error
+            _ -> do
+                hPutStrLn securityLog $ formatLogEntry now "ERROR" $
                      "Error handling client " ++ show clientAddr ++ ": " ++ displayException e
+                return (Left $ Core.DaemonError $ T.pack $ displayException e)
 
         -- Cancel the idle timeout
-        liftIO $ cancelTimeout idleTimeout
+        cancelTimeout idleTimeout
+        return (Right ())
+
+    -- Handle the result
+    case res of
+        Left err -> throwError err
+        Right _ -> return ()
 
 -- | Process a client request with proper privilege tier
 processRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
@@ -1027,20 +1035,36 @@ authenticateClient handle authDbVar rateLimiter addr securityLog = do
                     -- Get auth database
                     authDb <- readTVarIO authDbVar
 
-                    -- Authenticate
-                    authResult <- authenticateUser authDb (authUser content) (authToken content)
+                    -- Create client info for logging
+                    let clientInfo = T.pack $ show addr
+
+                    -- Authenticate with proper auth function parameters
+                    authResult <- authenticateUser authDb (authUser content) (authToken content) clientInfo (authRequestedTier content)
 
                     case authResult of
-                        Left err -> return $ Left err
-                        Right (userId, token, permissions) -> do
-                            -- Determine privilege tier based on permissions
-                            let tier = if PermAdmin `Set.member` permissions
-                                      then Daemon
-                                      else Builder
-
+                        Left err -> return $ Left $ T.pack $ show err
+                        Right (_, userId, token, tier, caps) -> do
+                            -- Convert capabilities to permissions
+                            let permissions = Set.fromList $ mapCapToPermissions caps
                             return $ Right (userId, token, permissions, tier)
 
                 Right _ -> return $ Left "Expected authentication message"
+
+  where
+    -- Map protocol capabilities to internal permissions
+    mapCapToPermissions :: Set DaemonCapability -> [Permission]
+    mapCapToPermissions caps = concat $ map capToPerms $ Set.toList caps
+
+    -- Map each capability to corresponding permissions
+    capToPerms :: DaemonCapability -> [Permission]
+    capToPerms StoreAccess = [PermModifyStore]
+    capToPerms SandboxCreation = [PermBuild]
+    capToPerms GarbageCollection = [PermRunGC]
+    capToPerms DerivationRegistration = [PermStoreDerivation]
+    capToPerms DerivationBuild = [PermBuild, PermCancelBuild]
+    capToPerms StoreQuery = [PermQueryStore, PermQueryDerivation]
+    capToPerms BuildQuery = [PermQueryBuild]
+    capToPerms _ = []
 
 -- | Check authentication rate limit
 checkAuthRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
@@ -1237,7 +1261,7 @@ handleEvalRequest st path content info state perms = do
     -- For now, create a minimal derivation
     let drv = Core.Derivation {
             Core.derivName = "evaluated-" <> path,
-            Core.derivHash = Hash.hashByteString $ fromMaybe BS.empty content,
+            Core.derivHash = T.pack $ show $ Hash.hashByteString $ fromMaybe BS.empty content,
             Core.derivBuilder = Core.StorePath "0000000000000000000000000000000000000000" "bash",
             Core.derivArgs = ["-c", "echo 'hello'"],
             Core.derivInputs = Set.empty,
