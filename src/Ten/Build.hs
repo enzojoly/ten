@@ -519,7 +519,7 @@ buildWithSandboxDaemon derivation config = do
                             -- Collect normal build results within transaction
                             DB.withTenWriteTransaction db $ \conn -> do
                                 -- Process each expected output
-                                outputPaths <- processOutputs (dbConn conn) buildDir derivation
+                                outputPaths <- processOutputs conn buildDir derivation
 
                                 -- Register all input-output references
                                 let derivStorePath = StorePath (derivHash derivation) (derivName derivation <> ".drv")
@@ -570,7 +570,7 @@ processOutputs conn buildDir derivation = do
     logMsg 2 $ "Output directory contents: " <> T.pack (show outFiles)
 
     -- Process each expected output
-    outputPaths <- foldM (processOutput conn outDir derivation) Set.empty (Set.toList $ derivOutputs derivation)
+    outputPaths <- foldM (processOutput (dbConn conn) outDir derivation) Set.empty (Set.toList $ derivOutputs derivation)
 
     -- Add output proof
     addProof OutputProof
@@ -655,7 +655,7 @@ runBuilder env = do
         newPerms <- getFileStatus program
         let newMode = fileMode newPerms
         unless (newMode .&. 0o100 /= 0) $
-            throwError (BuildFailed $ "Builder program could not be made executable: " <> T.pack program)
+            throwIO $ userError $ T.unpack $ "Builder program could not be made executable: " <> T.pack program
 
     -- Create temporary directory if it doesn't exist
     liftIO $ createDirectoryIfMissing True (builderTempDir env)
@@ -1073,7 +1073,7 @@ buildDerivationGraph graph = do
     env <- ask
     let tierSingleton = case currentPrivilegeTier env of
                           Daemon -> sDaemon
-                          Builder -> sBuild
+                          Builder -> sBuilder
 
     -- Get evaluation phase result from topological sort
     evalResult <- liftIO $ runTenDaemonEval (Graph.topologicalSort tierSingleton graph) env (initBuildState Eval (BuildIdFromInt 0))
@@ -1235,7 +1235,7 @@ withDatabase dbPath timeout action = do
     let innerAction = runTenM (action db) sp st
 
     -- Use properly sequenced monadic operations
-    result <- runReaderT innerAction env >>= \r -> return r
+    result <- innerAction >>= \r -> return r
     liftIO $ DB.closeDatabaseDaemon db
     return result
 
