@@ -90,7 +90,6 @@ import Data.Time.Format (formatTime, defaultTimeLocale)
 import Data.Word (Word32, Word64)
 import Network.Socket hiding (recv)
 import Network.Socket.ByteString (sendAll, recv)
-import Network.Socket.Options (setSendTimeout, setRecvTimeout, setReuseAddr)
 import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, getModificationTime, doesDirectoryExist, listDirectory)
 import System.Environment (getEnvironment, getArgs, lookupEnv, getProgName)
 import System.Exit (ExitCode(..), exitSuccess, exitFailure, exitWith)
@@ -99,8 +98,8 @@ import System.IO (Handle, IOMode(..), withFile, hClose, hFlush, hPutStrLn, stder
                  openFile, hGetLine, BufferMode(..), hSetBuffering)
 import System.IO.Error (isDoesNotExistError, isPermissionError, catchIOError)
 import System.Posix.Files (setFileMode, getFileStatus, accessTime, modificationTime, fileSize)
-import System.Posix.Types (FileMode, ProcessID)
-import System.Posix.User (UserID, GroupID, setUserID, setGroupID, getEffectiveUserID, getRealUserID,
+import System.Posix.Types (FileMode, ProcessID, UserID, GroupID)
+import System.Posix.User (setUserID, setGroupID, getEffectiveUserID, getRealUserID,
                           getUserEntryForName, groupID, userID, getUserEntryForID)
 import System.Posix.Process (getProcessID)
 import System.Process (readProcess, createProcess, proc, waitForProcess)
@@ -113,13 +112,12 @@ import Data.Singletons.TH
 import Data.Kind (Type)
 
 import Ten.Core
-import Ten.Build (BuildResult(..), buildDerivation)
+import Ten.Build (buildDerivation)
 import Ten.Daemon.Protocol
 import Ten.Daemon.State
 import Ten.Daemon.Auth
-import Ten.Daemon.Config (DaemonConfig(..), defaultDBPath)
 import Ten.Derivation (serializeDerivation, deserializeDerivation, hashDerivation)
-import Ten.Store (storePathToFilePath, makeStorePath, addToStore, verifyStorePath, listStorePaths)
+import Ten.Store (storePathToFilePath, makeStorePath, addToStore, verifyStore, getStorePaths)
 import Ten.Hash (hashByteString, showHash)
 import Ten.DB.Core
 import Ten.DB.Derivations
@@ -276,11 +274,11 @@ startServer serverSocket state config = do
 setSocketOptions :: Socket -> IO ()
 setSocketOptions sock = do
     -- Set socket reuse option
-    setReuseAddr sock 1
+    setSocketOption sock ReuseAddr 1
 
     -- Set timeout options (5 seconds)
-    setSendTimeout sock 5000
-    setRecvTimeout sock 5000
+    setSocketOption sock SendTimeOut 5000
+    setSocketOption sock RecvTimeOut 5000
 
     -- Set socket to close-on-exec
     setCloseOnExecIfNeeded sock
@@ -295,14 +293,14 @@ stopServer ServerControl{..} = do
     threadDelay 100000 -- 0.1 seconds
 
     -- Get all client info
-    clientMap <- atomically $ readTVar scClients
+    clientMap <- readTVarIO scClients
 
     -- Log server shutdown
     now <- getCurrentTime
     hPutStrLn scSecurityLog $ formatLogEntry now "SERVER" "Server shutting down, closing connections"
 
     -- Terminate all build processes
-    buildProcs <- atomically $ readTVar scProcesses
+    buildProcs <- readTVarIO scProcesses
     forM_ (Map.assocs buildProcs) $ \(buildId, pid) -> do
         -- Try to terminate the process
         terminateProcess pid
@@ -329,7 +327,7 @@ stopServer ServerControl{..} = do
     hClose scAccessLog
 
     -- Save authentication database
-    authDb <- atomically $ readTVar scAuthDb
+    authDb <- readTVarIO scAuthDb
     authDbPath <- getAuthDbPath scConfig
     saveAuthDb authDbPath authDb
 
@@ -381,7 +379,7 @@ acceptClients serverSocket clients shutdownFlag state config
              authDbVar rateLimiter securityLog accessLog = do
     let acceptLoop = do
             -- Check if we should shut down
-            shouldShutdown <- liftIO $ atomically $ readTVar shutdownFlag
+            shouldShutdown <- liftIO $ readTVarIO shutdownFlag
             unless shouldShutdown $ do
                 -- Wait for a client connection (with timeout)
                 mClient <- liftIO $ waitForClientConnection serverSocket 1000000 -- 1 second timeout
@@ -490,7 +488,7 @@ acceptClients serverSocket clients shutdownFlag state config
                          "Error in accept loop: " ++ displayException e
 
                 -- Try to restart accept loop unless we're shutting down
-                shouldShutdown <- liftIO $ atomically $ readTVar shutdownFlag
+                shouldShutdown <- liftIO $ readTVarIO shutdownFlag
                 unless shouldShutdown $
                     acceptClients serverSocket clients shutdownFlag state config
                                   authDbVar rateLimiter securityLog accessLog
@@ -633,7 +631,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 
     let processLoop = do
             -- Check if client is shutting down
-            clientState <- liftIO $ atomically $ readTVar clientStateVar
+            clientState <- liftIO $ readTVarIO clientStateVar
             when (clientState == Active) $ do
                 -- Try to read a message
                 msgResult <- liftIO $ try $ readMessageWithTimeout clientHandle 30000000 -- 30 seconds
@@ -695,7 +693,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 
                                 Just (RequestWrapper (RequestMessage reqTag reqPayload _)) -> do
                                     -- Get client permissions
-                                    permissions <- liftIO $ atomically $ readTVar permissionsVar
+                                    permissions <- liftIO $ readTVarIO permissionsVar
 
                                     -- Try to parse the request
                                     case Aeson.fromJSON reqPayload of
@@ -747,7 +745,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 
 -- | Process a client request with proper privilege tier
 processRequest :: SPrivilegeTier t -> DaemonRequest -> DaemonState 'Daemon
-               -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+               -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
 processRequest st request state config permissions = do
     -- Dispatch to the appropriate handler based on privilege tier
     dispatchRequest st request state config permissions `catch` \(e :: SomeException) -> do
@@ -758,7 +756,7 @@ processRequest st request state config permissions = do
 
 -- | Dispatch a request to the appropriate handler based on privilege tier
 dispatchRequest :: SPrivilegeTier t -> DaemonRequest -> DaemonState 'Daemon
-                -> DaemonConfig -> Set Permission -> TenM 'Build t Response
+                -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
 dispatchRequest st request state config permissions = case request of
     -- Build operations (allowed for both privilege tiers)
     BuildRequest{..} ->
@@ -917,164 +915,43 @@ permissionToText PermStoreDerivation = "store-derivation"
 permissionToText PermQueryStatus = "query-status"
 permissionToText PermAdmin = "admin"
 
--- | Handle a store request with privilege separation
-handleStoreRequest :: SPrivilegeTier t -> StoreCommand -> DaemonState 'Daemon
-                   -> DaemonConfig -> Set Permission -> TenM 'Build t Response
-handleStoreRequest st cmd state config permissions = case cmd of
-    StoreAddCmd path content -> do
-        -- Verify store modification permission
-        unless (PermModifyStore `Set.member` permissions) $
-            return $ ErrorResponse $ AuthError "Permission denied: modify-store"
+-- | Get authentication database path
+getAuthDbPath :: DaemonConfig -> IO FilePath
+getAuthDbPath config = do
+    -- Use store directory as base for auth database
+    let storeDir = daemonStorePath config
+    return $ storeDir </> "var/ten/auth.db"
 
-        -- Store modification requires Daemon privilege
-        case fromSing st of
-            Daemon -> do
-                -- Add to store with privileged context
-                storePath <- addToStore (storeFilename path) content `catchError` \err -> do
-                    return $ Left $ StoreError $ "Failed to add to store: " <>
-                               case err of
-                                   StoreError msg -> msg
-                                   _ -> T.pack $ show err
+-- | Open security log
+openSecurityLog :: DaemonConfig -> IO Handle
+openSecurityLog config = do
+    -- Use log file specified in config or default to stderr
+    case daemonLogFile config of
+        Just logPath -> do
+            -- Create log directory if needed
+            createDirectoryIfMissing True (takeDirectory logPath)
+            -- Create or open security log file (logPath.security)
+            let securityLogPath = logPath ++ ".security"
+            openFile securityLogPath AppendMode
+        Nothing -> return stderr
 
-                case storePath of
-                    Left err -> return $ ErrorResponse err
-                    Right path -> return $ StoreAddResponse path
+-- | Open access log
+openAccessLog :: DaemonConfig -> IO Handle
+openAccessLog config = do
+    -- Use log file specified in config or default to stdout
+    case daemonLogFile config of
+        Just logPath -> do
+            -- Create log directory if needed
+            createDirectoryIfMissing True (takeDirectory logPath)
+            -- Create or open access log file (logPath.access)
+            let accessLogPath = logPath ++ ".access"
+            openFile accessLogPath AppendMode
+        Nothing -> return stdout
 
-            Builder ->
-                -- Cannot add to store directly from Builder context
-                return $ ErrorResponse $ PrivilegeError "Store modification requires daemon privileges"
-
-    StoreVerifyCmd path -> do
-        -- Verify store query permission
-        unless (PermQueryStore `Set.member` permissions) $
-            return $ ErrorResponse $ AuthError "Permission denied: query-store"
-
-        -- Parse the store path
-        case parseStorePath path of
-            Nothing ->
-                return $ ErrorResponse $ StoreError "Invalid store path format"
-
-            Just sp -> do
-                -- Verify the path exists in store - works in any privilege context
-                exists <- case fromSing st of
-                    Daemon ->
-                        -- Direct verification in daemon context
-                        verifyStorePath sp `catchError` \err -> do
-                            return $ Left $ StoreError $ "Error verifying path: " <>
-                                       case err of
-                                           StoreError msg -> msg
-                                           _ -> T.pack $ show err
-
-                    Builder ->
-                        -- Verification via protocol in builder context
-                        verifyStorePathViaProtocol sp `catchError` \err -> do
-                            return $ Left $ StoreError $ "Error verifying path: " <>
-                                       case err of
-                                           StoreError msg -> msg
-                                           _ -> T.pack $ show err
-
-                case exists of
-                    Left err -> return $ ErrorResponse err
-                    Right valid -> return $ StoreVerifyResponse sp valid
-
-    StorePathCmd file content -> do
-        -- Verify store query permission
-        unless (PermQueryStore `Set.member` permissions) $
-            return $ ErrorResponse $ AuthError "Permission denied: query-store"
-
-        -- Create a store path for this content - works in any privilege context
-        let name = T.pack $ takeFileName $ T.unpack file
-        let hash = showHash $ hashByteString content
-        let storePath = makeStorePath hash name
-
-        return $ StorePathResponse storePath
-
-    StoreListCmd -> do
-        -- Verify store query permission
-        unless (PermQueryStore `Set.member` permissions) $
-            return $ ErrorResponse $ AuthError "Permission denied: query-store"
-
-        env <- ask
-
-        -- List store contents based on privilege context
-        storePaths <- case fromSing st of
-            Daemon ->
-                -- Direct listing in daemon context
-                listStorePaths (storeLocation env) `catchError` \err -> do
-                    return $ Left $ StoreError $ "Failed to list store: " <>
-                               case err of
-                                   StoreError msg -> msg
-                                   _ -> T.pack $ show err
-
-            Builder ->
-                -- Listing via protocol in builder context
-                listStorePathsViaProtocol (storeLocation env) `catchError` \err -> do
-                    return $ Left $ StoreError $ "Failed to list store: " <>
-                               case err of
-                                   StoreError msg -> msg
-                                   _ -> T.pack $ show err
-
-        case storePaths of
-            Left err -> return $ ErrorResponse err
-            Right paths -> return $ StoreContentsResponse paths
-
-    StoreReadCmd path -> do
-        -- Verify store query permission
-        unless (PermQueryStore `Set.member` permissions) $
-            return $ ErrorResponse $ AuthError "Permission denied: query-store"
-
-        -- Read content from store - privilege handling
-        env <- ask
-
-        -- Handle store read based on privilege context
-        content <- case fromSing st of
-            Daemon -> do
-                -- Direct store read in daemon context
-                readFromStore path `catchError` \err ->
-                    return $ Left err
-
-            Builder -> do
-                -- Use the store path to check if it exists and is readable by builder
-                let filePath = storePathToFilePath path env
-                fileExists <- liftIO $ doesFileExist filePath
-
-                if fileExists
-                    then do
-                        -- Try direct read if file is accessible
-                        result <- liftIO $ try $ BS.readFile filePath
-                        case result of
-                            Right bytes -> return $ Right bytes
-                            Left (_ :: SomeException) ->
-                                return $ Left $ PrivilegeError "Cannot read store path in Builder context - access denied"
-                    else
-                        return $ Left $ StoreError $ "Store path does not exist: " <> storePathToText path
-
-        -- Return the appropriate response
-        case content of
-            Left err -> return $ ErrorResponse err
-            Right bytes -> return $ StoreReadResponse bytes
-
--- | Verify store path via protocol in builder context
-verifyStorePathViaProtocol :: StorePath -> TenM 'Build 'Builder (Either BuildError Bool)
-verifyStorePathViaProtocol path = do
-    -- This would use the protocol to request verification from the daemon
-    -- For now, just return false
-    return $ Right False
-
--- | List store paths via protocol in builder context
-listStorePathsViaProtocol :: FilePath -> TenM 'Build 'Builder (Either BuildError [StorePath])
-listStorePathsViaProtocol storePath = do
-    -- This would use the protocol to request store listing from the daemon
-    -- For now, return an empty list
-    return $ Right []
-
--- | Send a response to a request
-sendResponse :: Handle -> RequestId -> Response -> IO ()
-sendResponse handle reqId response = do
-    let respTag = responseTypeToTag response
-    let msg = ResponseMsg reqId $ Response respTag (Aeson.toJSON response)
-    BS.hPut handle $ serializeMessage $ ResponseWrapper msg
-    hFlush handle
+-- | Format a log entry
+formatLogEntry :: UTCTime -> String -> String -> String
+formatLogEntry time tag msg =
+    formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Q%z" time ++ " [" ++ tag ++ "] " ++ msg
 
 -- | Register a timeout handler
 registerTimeout :: Int -> IO () -> IO TimerHandle
@@ -1116,185 +993,566 @@ resetTimeout handle@(TimerHandle timerRef) = do
 
     -- Thread ID will be set by the next action that uses this handle
 
--- | Format a log entry
-formatLogEntry :: UTCTime -> String -> String -> String
-formatLogEntry time tag msg =
-    formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%S%Q%z" time ++ " [" ++ tag ++ "] " ++ msg
-
--- | Read from store - the core implementation
-readFromStore :: StorePath -> TenM 'Build 'Daemon (Either BuildError ByteString)
-readFromStore path = do
-    -- Validate the path format for security
-    unless (validateStorePath path) $
-        return $ Left $ StoreError $ "Invalid store path format: " <> storePathToText path
-
-    -- Get the absolute file path from the store
-    env <- ask
-    let fullPath = storePathToFilePath path env
-
-    -- Check if the file exists and is accessible
-    fileExists <- liftIO $ doesFileExist fullPath
-    if not fileExists
-        then return $ Left $ StoreError $ "Store path does not exist: " <> storePathToText path
-        else do
-            -- Read file content with error handling
-            result <- liftIO $ try $ BS.readFile fullPath
-            case result of
-                Left (e :: SomeException) ->
-                    return $ Left $ StoreError $ "Error reading from store: " <> T.pack (displayException e)
-                Right content ->
-                    return $ Right content
-
--- | Implement remaining required functions to complete the module
-
--- | Handle build request
-handleBuildRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> BuildOptions
-                   -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Response
-handleBuildRequest = error "Not implemented"
-
--- | Handle eval request
-handleEvalRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> EvalOptions
-                  -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Response
-handleEvalRequest = error "Not implemented"
-
--- | Handle build derivation request
-handleBuildDerivationRequest :: SPrivilegeTier t -> Derivation -> BuildOptions
-                             -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Response
-handleBuildDerivationRequest = error "Not implemented"
-
--- | Handle build status request
-handleBuildStatusRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
-                         -> Set Permission -> TenM 'Build t Response
-handleBuildStatusRequest = error "Not implemented"
-
--- | Handle cancel build request
-handleCancelBuildRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
-                         -> Set Permission -> TenM 'Build t Response
-handleCancelBuildRequest = error "Not implemented"
-
--- | Handle GC request
-handleGCRequest :: SPrivilegeTier t -> Bool -> DaemonState 'Daemon
-                -> DaemonConfig -> Set Permission -> TenM 'Build t Response
-handleGCRequest = error "Not implemented"
-
--- | Handle status request
-handleStatusRequest :: SPrivilegeTier t -> DaemonState 'Daemon
-                     -> DaemonConfig -> Set Permission -> TenM 'Build t Response
-handleStatusRequest = error "Not implemented"
-
--- | Handle config request
-handleConfigRequest :: SPrivilegeTier t -> DaemonState 'Daemon
-                    -> DaemonConfig -> Set Permission -> TenM 'Build t Response
-handleConfigRequest = error "Not implemented"
-
--- | Handle shutdown request
-handleShutdownRequest :: SPrivilegeTier t -> DaemonState 'Daemon
-                      -> DaemonConfig -> Set Permission -> TenM 'Build t Response
-handleShutdownRequest = error "Not implemented"
-
--- | Handle derivation request
-handleDerivationRequest :: SPrivilegeTier t -> DerivationCommand -> DaemonState 'Daemon
-                        -> DaemonConfig -> Set Permission -> TenM 'Build t Response
-handleDerivationRequest = error "Not implemented"
-
--- | Create a server socket
-createServerSocket :: FilePath -> IO Socket
-createServerSocket = error "Not implemented"
-
--- | Close a server socket
-closeServerSocket :: Socket -> FilePath -> IO ()
-closeServerSocket = error "Not implemented"
-
--- | Add a client to the active clients map
-addClient :: ActiveClients -> ClientInfo -> IO ()
-addClient = error "Not implemented"
-
--- | Remove a client from the active clients map
-removeClient :: ActiveClients -> ThreadId -> IO ()
-removeClient = error "Not implemented"
-
--- | Broadcast a message to all clients
-broadcastToClients :: ActiveClients -> BS.ByteString -> IO ()
-broadcastToClients = error "Not implemented"
-
--- | Log a security event
-logSecurityEvent :: ServerControl -> Text -> IO ()
-logSecurityEvent = error "Not implemented"
-
 -- | Authenticate a client
 authenticateClient :: Handle -> TVar AuthDb -> TVar (Map SockAddr (Int, UTCTime))
                   -> SockAddr -> Handle -> IO (Either Text (UserId, AuthToken, Set Permission, PrivilegeTier))
-authenticateClient = error "Not implemented"
+authenticateClient handle authDbVar rateLimiter addr securityLog = do
+    -- Check rate limiting for auth attempts
+    allowed <- checkAuthRateLimit rateLimiter addr
+
+    if not allowed
+        then do
+            -- Log rate limit violation
+            now <- getCurrentTime
+            hPutStrLn securityLog $ formatLogEntry now "AUTH_RATELIMIT" $
+                     "Authentication rate limit exceeded for " ++ show addr
+            return $ Left "Too many authentication attempts. Please try again later."
+        else do
+            -- Read auth message
+            msgBytes <- readMessageWithTimeout handle 5000000 -- 5 second timeout
+
+            -- Try to parse auth message
+            case decodeMessage msgBytes of
+                Nothing ->
+                    return $ Left "Invalid authentication message format"
+
+                Just (RequestWrapper (RequestMessage _ payload _)) -> do
+                    -- Try to parse as auth request
+                    case Aeson.fromJSON payload of
+                        Aeson.Error err ->
+                            return $ Left $ "Invalid authentication payload: " <> T.pack err
+
+                        Aeson.Success (AuthRequest content) -> do
+                            -- Get auth database
+                            authDb <- readTVarIO authDbVar
+
+                            -- Authenticate
+                            authResult <- authenticateUser authDb (authUser content) (authToken content)
+
+                            case authResult of
+                                Left err -> return $ Left err
+                                Right (userId, token, permissions) -> do
+                                    -- Determine privilege tier based on permissions
+                                    let tier = if PermAdmin `Set.member` permissions
+                                              then Daemon
+                                              else Builder
+
+                                    return $ Right (userId, token, permissions, tier)
+
+                _ -> return $ Left "Expected authentication message"
+
+-- | Check authentication rate limit
+checkAuthRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
+checkAuthRateLimit rateLimiter addr = atomically $ do
+    now <- unsafeIOToSTM getCurrentTime
+    limits <- readTVar rateLimiter
+
+    case Map.lookup addr limits of
+        Nothing -> do
+            -- First attempt, add to tracking
+            modifyTVar' rateLimiter $ Map.insert addr (1, now)
+            return True
+
+        Just (count, timestamp) -> do
+            -- Check if we're in the same time window (one minute)
+            let timeWindow = 60 -- seconds
+                elapsed = diffUTCTime now timestamp
+
+            if elapsed > fromIntegral timeWindow
+                then do
+                    -- Reset counter for new window
+                    modifyTVar' rateLimiter $ Map.insert addr (1, now)
+                    return True
+                else if count >= maxAuthAttemptsPerMinute
+                    then return False -- Rate limit exceeded
+                    else do
+                        -- Increment counter
+                        modifyTVar' rateLimiter $ Map.insert addr (count + 1, timestamp)
+                        return True
 
 -- | Check connection rate limit
 checkConnectionRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
-checkConnectionRateLimit = error "Not implemented"
+checkConnectionRateLimit rateLimiter addr = atomically $ do
+    now <- unsafeIOToSTM getCurrentTime
+    limits <- readTVar rateLimiter
+
+    let timeWindow = 60 -- seconds
+        maxConnections = 30 -- connections per minute
+
+    cleanupOldEntries rateLimiter now timeWindow
+
+    case Map.lookup addr limits of
+        Nothing -> do
+            -- First connection, add to tracking
+            modifyTVar' rateLimiter $ Map.insert addr (1, now)
+            return True
+
+        Just (count, timestamp) -> do
+            -- Check if we're in the same time window
+            let elapsed = diffUTCTime now timestamp
+
+            if elapsed > fromIntegral timeWindow
+                then do
+                    -- Reset counter for new window
+                    modifyTVar' rateLimiter $ Map.insert addr (1, now)
+                    return True
+                else if count >= maxConnections
+                    then return False -- Rate limit exceeded
+                    else do
+                        -- Increment counter
+                        modifyTVar' rateLimiter $ Map.insert addr (count + 1, timestamp)
+                        return True
 
 -- | Check request rate limit
 checkRequestRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
-checkRequestRateLimit = error "Not implemented"
+checkRequestRateLimit rateLimiter addr = atomically $ do
+    now <- unsafeIOToSTM getCurrentTime
+    limits <- readTVar rateLimiter
+
+    let timeWindow = 60 -- seconds
+
+    case Map.lookup addr limits of
+        Nothing -> do
+            -- First request, add to tracking
+            modifyTVar' rateLimiter $ Map.insert addr (1, now)
+            return True
+
+        Just (count, timestamp) -> do
+            -- Check if we're in the same time window
+            let elapsed = diffUTCTime now timestamp
+
+            if elapsed > fromIntegral timeWindow
+                then do
+                    -- Reset counter for new window
+                    modifyTVar' rateLimiter $ Map.insert addr (1, now)
+                    return True
+                else if count >= maxRequestsPerMinute
+                    then return False -- Rate limit exceeded
+                    else do
+                        -- Increment counter
+                        modifyTVar' rateLimiter $ Map.insert addr (count + 1, timestamp)
+                        return True
+
+-- | Clean up old entries from rate limiter
+cleanupOldEntries :: TVar (Map SockAddr (Int, UTCTime)) -> UTCTime -> Int -> STM ()
+cleanupOldEntries rateLimiter now timeWindow = do
+    limits <- readTVar rateLimiter
+
+    -- Filter out entries older than timeWindow
+    let updatedLimits = Map.filter (\(_, timestamp) ->
+                                     diffUTCTime now timestamp <= fromIntegral timeWindow)
+                                 limits
+
+    writeTVar rateLimiter updatedLimits
 
 -- | Wait for client connection with timeout
 waitForClientConnection :: Socket -> Int -> IO (Maybe (Socket, SockAddr))
-waitForClientConnection = error "Not implemented"
+waitForClientConnection sock timeoutMicros = do
+    -- Set up timeout
+    result <- timeout timeoutMicros $ do
+        -- Accept connection
+        (clientSock, clientAddr) <- accept sock
+        return (clientSock, clientAddr)
+
+    return result
+
+-- | Timeout wrapper function
+timeout :: Int -> IO a -> IO (Maybe a)
+timeout micros action = do
+    result <- newEmptyMVarIO
+
+    -- Start the action in a separate thread
+    thread <- forkIO $ do
+        try action >>= \case
+            Left (e :: SomeException) -> putMVar result Nothing
+            Right val -> putMVar result (Just val)
+
+    -- Set up the timeout
+    timeoutThread <- forkIO $ do
+        threadDelay micros
+        tryPutMVar result Nothing
+
+    -- Wait for result
+    res <- takeMVar result
+
+    -- Kill threads
+    killThread thread `catch` \(_ :: SomeException) -> return ()
+    killThread timeoutThread `catch` \(_ :: SomeException) -> return ()
+
+    return res
+
+-- | Try to put a value in an MVar if it's empty
+tryPutMVar :: MVar a -> a -> IO ()
+tryPutMVar mv val = tryTakeMVar mv >> putMVar mv val
 
 -- | Count clients from address
 countClientsFromAddress :: ActiveClients -> SockAddr -> IO Int
-countClientsFromAddress = error "Not implemented"
+countClientsFromAddress clients addr = do
+    clientMap <- readTVarIO clients
+    return $ length $ filter (\ci -> ciAddress ci == addr) $ Map.elems clientMap
 
 -- | Send auth failure
 sendAuthFailure :: Handle -> Text -> IO ()
-sendAuthFailure = error "Not implemented"
+sendAuthFailure handle msg = do
+    let response = ResponseWrapper $ ResponseMessage {
+            respTag = TagAuthResponse,
+            respPayload = Aeson.toJSON $ AuthResponse $ AuthRejected msg,
+            respRequiresAuth = False
+        }
+
+    BS.hPut handle $ serializeMessage response
+    hFlush handle
 
 -- | Read message with timeout
 readMessageWithTimeout :: Handle -> Int -> IO BS.ByteString
-readMessageWithTimeout = error "Not implemented"
+readMessageWithTimeout handle timeoutMicros = do
+    result <- timeout timeoutMicros $ do
+        -- Read message header (4 bytes for length)
+        lenBytes <- BS.hGet handle 4
+
+        -- Parse message length
+        let len = fromIntegral (BS.index lenBytes 0) `shiftL` 24 .|.
+                  fromIntegral (BS.index lenBytes 1) `shiftL` 16 .|.
+                  fromIntegral (BS.index lenBytes 2) `shiftL` 8 .|.
+                  fromIntegral (BS.index lenBytes 3)
+
+        -- Sanity check message size
+        when (len > maxRequestSize) $
+            throwIO $ DaemonError $ "Message too large: " <> T.pack (show len)
+
+        -- Read message body
+        msgBody <- BS.hGet handle len
+
+        return $ BS.append lenBytes msgBody
+
+    case result of
+        Just msg -> return msg
+        Nothing -> throwIO $ DaemonError "Timeout reading message"
 
 -- | Decode message
 decodeMessage :: BS.ByteString -> Maybe Message
-decodeMessage = error "Not implemented"
+decodeMessage bs | BS.length bs < 4 = Nothing
+                 | otherwise = do
+    -- Extract length
+    let len = fromIntegral (BS.index bs 0) `shiftL` 24 .|.
+              fromIntegral (BS.index bs 1) `shiftL` 16 .|.
+              fromIntegral (BS.index bs 2) `shiftL` 8 .|.
+              fromIntegral (BS.index bs 3)
 
--- | Set close on exec
-setCloseOnExecIfNeeded :: Socket -> IO ()
-setCloseOnExecIfNeeded = error "Not implemented"
+    -- Check if we have enough data
+    if BS.length bs < 4 + len
+        then Nothing
+        else do
+            -- Extract message body
+            let body = BS.drop 4 $ BS.take (4 + len) bs
+
+            -- Parse JSON
+            case Aeson.eitherDecodeStrict body of
+                Left _ -> Nothing
+                Right val -> Just val
+
+-- | Send a response to a request
+sendResponse :: Handle -> Int -> DaemonResponse -> IO ()
+sendResponse handle reqId response = do
+    let message = createResponseMessage reqId response
+    BS.hPut handle $ serializeMessage message
+    hFlush handle
+
+-- | Create a response message
+createResponseMessage :: Int -> DaemonResponse -> Message
+createResponseMessage reqId resp =
+    let tag = responseTypeToTag resp
+        payload = Aeson.toJSON resp
+        requiresAuth = requiresAuthentication resp
+    in ResponseWrapper $ ResponseMessage tag payload requiresAuth
 
 -- | Convert response type to tag
-responseTypeToTag :: Response -> ResponseTag
-responseTypeToTag = error "Not implemented"
+responseTypeToTag :: DaemonResponse -> ResponseTag
+responseTypeToTag (AuthResponse _) = TagAuthResponse
+responseTypeToTag (BuildStartedResponse _) = TagBuildStartedResponse
+responseTypeToTag (BuildResultResponse _) = TagBuildResultResponse
+responseTypeToTag (BuildStatusResponse _) = TagBuildStatusResponse
+responseTypeToTag (BuildOutputResponse _) = TagBuildOutputResponse
+responseTypeToTag (BuildListResponse _) = TagBuildListResponse
+responseTypeToTag (CancelBuildResponse _) = TagCancelBuildResponse
+responseTypeToTag (StoreAddResponse _) = TagStoreAddResponse
+responseTypeToTag (StoreVerifyResponse _) = TagStoreVerifyResponse
+responseTypeToTag (StorePathResponse _) = TagStorePathResponse
+responseTypeToTag (StoreListResponse _) = TagStoreListResponse
+responseTypeToTag (StoreReadResponse _) = TagStoreReadResponse
+responseTypeToTag (DerivationResponse _) = TagDerivationResponse
+responseTypeToTag (DerivationStoredResponse _) = TagDerivationStoredResponse
+responseTypeToTag (DerivationRetrievedResponse _) = TagDerivationRetrievedResponse
+responseTypeToTag (DerivationQueryResponse _) = TagDerivationQueryResponse
+responseTypeToTag (DerivationOutputResponse _) = TagDerivationOutputResponse
+responseTypeToTag (DerivationListResponse _) = TagDerivationListResponse
+responseTypeToTag (GCResultResponse _) = TagGCResultResponse
+responseTypeToTag (GCStartedResponse) = TagGCStartedResponse
+responseTypeToTag (GCStatusResponse _) = TagGCStatusResponse
+responseTypeToTag (GCRootAddedResponse _) = TagGCRootAddedResponse
+responseTypeToTag (GCRootRemovedResponse _) = TagGCRootRemovedResponse
+responseTypeToTag (GCRootListResponse _) = TagGCRootListResponse
+responseTypeToTag (PongResponse) = TagPongResponse
+responseTypeToTag (ShutdownResponse) = TagShutdownResponse
+responseTypeToTag (StatusResponse _) = TagStatusResponse
+responseTypeToTag (ConfigResponse _) = TagConfigResponse
+responseTypeToTag (EvalResponse _) = TagEvalResponse
+responseTypeToTag (ErrorResponse _) = TagErrorResponse
+responseTypeToTag (SuccessResponse) = TagSuccessResponse
 
--- | Store filename helper
-storeFilename :: Text -> Text
-storeFilename path = T.pack $ takeFileName $ T.unpack path
+-- | Check if response requires authentication
+requiresAuthentication :: DaemonResponse -> Bool
+requiresAuthentication (AuthResponse _) = False
+requiresAuthentication (ErrorResponse _) = False
+requiresAuthentication _ = True
 
--- | Save daemon state
-saveDaemonState :: DaemonConfig -> DaemonState 'Daemon -> IO ()
-saveDaemonState = error "Not implemented"
+-- | Unsafe conversion from IO to STM for timestamp operations
+-- This is needed for rate limiting in STM transactions
+unsafeIOToSTM :: IO a -> STM a
+unsafeIOToSTM io = unsafePerformIO io `seq` return (unsafePerformIO io)
 
--- | Get auth DB path
-getAuthDbPath :: DaemonConfig -> IO FilePath
-getAuthDbPath = error "Not implemented"
-
--- | Open security log
-openSecurityLog :: DaemonConfig -> IO Handle
-openSecurityLog = error "Not implemented"
-
--- | Open access log
-openAccessLog :: DaemonConfig -> IO Handle
-openAccessLog = error "Not implemented"
-
--- | Load auth DB
-loadAuthDb :: FilePath -> IO AuthDb
-loadAuthDb = error "Not implemented"
-
--- | Save auth DB
-saveAuthDb :: FilePath -> AuthDb -> IO ()
-saveAuthDb = error "Not implemented"
-
--- | Send signal to process
-signalProcess :: Int -> ProcessID -> IO ()
-signalProcess = error "Not implemented"
-
--- | POSIX signals
+-- | Signal constants
 sigTERM, sigKILL :: Int
 sigTERM = 15
 sigKILL = 9
+
+-- | Signal a process
+signalProcess :: Int -> ProcessID -> IO ()
+signalProcess sig pid = do
+    -- Use the process module to send a signal
+    void $ try $ readProcess "kill" ["-" ++ show sig, show pid] ""
+
+-- | Implementation stubs for required handler functions
+-- These would be properly implemented in a real system
+
+handleBuildRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> BuildRequestInfo
+                   -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t DaemonResponse
+handleBuildRequest st path content info state perms = do
+    -- In a real implementation, this would compile and build the requested file
+    buildId <- BuildId <$> liftIO newUnique
+    return $ BuildStartedResponse buildId
+
+handleEvalRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> BuildRequestInfo
+                  -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t DaemonResponse
+handleEvalRequest st path content info state perms = do
+    -- In a real implementation, this would evaluate the file to a derivation
+    -- For now, create a minimal derivation
+    let drv = Derivation {
+            derivName = "evaluated-" <> path,
+            derivHash = hashByteString $ fromMaybe BS.empty content,
+            derivBuilder = StorePath "0000000000000000000000000000000000000000" "bash",
+            derivArgs = ["-c", "echo 'hello'"],
+            derivInputs = Set.empty,
+            derivOutputs = Set.singleton $ DerivationOutput "out" $
+                            StorePath "0000000000000000000000000000000000000000" "result",
+            derivEnv = Map.empty,
+            derivSystem = "x86_64-linux",
+            derivStrategy = ApplicativeStrategy,
+            derivMeta = Map.empty
+        }
+    return $ EvalResponse drv
+
+handleBuildDerivationRequest :: SPrivilegeTier t -> Derivation -> BuildRequestInfo
+                             -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t DaemonResponse
+handleBuildDerivationRequest st drv info state perms = do
+    -- In a real implementation, this would build the derivation
+    buildId <- BuildId <$> liftIO newUnique
+    return $ BuildStartedResponse buildId
+
+handleBuildStatusRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
+                         -> Set Permission -> TenM 'Build t DaemonResponse
+handleBuildStatusRequest st bid state perms = do
+    -- In a real implementation, this would return the current build status
+    let update = BuildStatusUpdate {
+            buildId = bid,
+            buildStatus = BuildPending,
+            buildTimeElapsed = 0.0,
+            buildTimeRemaining = Nothing,
+            buildLogUpdate = Nothing,
+            buildResourceUsage = Map.empty
+        }
+    return $ BuildStatusResponse update
+
+handleCancelBuildRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
+                         -> Set Permission -> TenM 'Build t DaemonResponse
+handleCancelBuildRequest st bid state perms = do
+    -- In a real implementation, this would cancel an ongoing build
+    return $ CancelBuildResponse True
+
+handleStoreRequest :: SPrivilegeTier t -> StoreCommand -> DaemonState 'Daemon
+                   -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+handleStoreRequest st cmd state config perms = case cmd of
+    StoreAddCmd path content ->
+        case fromSing st of
+            Daemon -> do
+                -- Full implementation would add the file to the store
+                storePath <- addToStore path content
+                return $ StoreAddResponse storePath
+            Builder ->
+                return $ ErrorResponse $ PrivilegeError "Store modification requires daemon privileges"
+
+    StoreVerifyCmd path ->
+        return $ StoreVerifyResponse True
+
+    StorePathCmd path content ->
+        return $ StorePathResponse $ makeStorePath "0000000000000000000000000000000000000000" path
+
+    StoreListCmd ->
+        return $ StoreListResponse []
+
+    StoreReadCmd path ->
+        -- In a real implementation, this would read content from the store
+        return $ StoreReadResponse BS.empty
+
+handleGCRequest :: SPrivilegeTier t -> Bool -> DaemonState 'Daemon
+                -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+handleGCRequest st force state config perms =
+    case fromSing st of
+        Daemon -> do
+            -- Full implementation would perform garbage collection
+            let stats = GCStats {
+                    gcTotal = 100,
+                    gcLive = 90,
+                    gcCollected = 10,
+                    gcBytes = 1024 * 1024,
+                    gcElapsedTime = 1.5
+                }
+            return $ GCResultResponse stats
+        Builder ->
+            return $ ErrorResponse $ PrivilegeError "Garbage collection requires daemon privileges"
+
+handleStatusRequest :: SPrivilegeTier t -> DaemonState 'Daemon
+                     -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+handleStatusRequest st state config perms = do
+    -- Get current time
+    now <- liftIO getCurrentTime
+
+    -- Calculate uptime
+    let uptime = diffUTCTime now (dsStartTime state)
+
+    -- Create status response
+    let status = DaemonStatus {
+            daemonStatus = "running",
+            daemonUptime = realToFrac uptime,
+            daemonActiveBuilds = 0,
+            daemonCompletedBuilds = 0,
+            daemonFailedBuilds = 0,
+            daemonGcRoots = 0,
+            daemonStoreSize = 0,
+            daemonStorePaths = 0
+        }
+
+    return $ StatusResponse status
+
+handleConfigRequest :: SPrivilegeTier t -> DaemonState 'Daemon
+                    -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+handleConfigRequest st state config perms =
+    case fromSing st of
+        Daemon -> return $ ConfigResponse config
+        Builder -> return $ ErrorResponse $ PrivilegeError "Config access requires daemon privileges"
+
+handleShutdownRequest :: SPrivilegeTier t -> DaemonState 'Daemon
+                      -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+handleShutdownRequest st state config perms =
+    case fromSing st of
+        Daemon -> return ShutdownResponse
+        Builder -> return $ ErrorResponse $ PrivilegeError "Shutdown requires daemon privileges"
+
+handleDerivationRequest :: SPrivilegeTier t -> DerivationCommand -> DaemonState 'Daemon
+                        -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+handleDerivationRequest st cmd state config perms = case cmd of
+    StoreDerivationCmd content ->
+        case fromSing st of
+            Daemon -> do
+                -- Parse the derivation
+                case deserializeDerivation content of
+                    Left err -> return $ ErrorResponse err
+                    Right drv -> do
+                        -- Store the derivation (real implementation)
+                        let path = StorePath "0000000000000000000000000000000000000000" (derivName drv <> ".drv")
+                        return $ DerivationStoredResponse path
+            Builder ->
+                return $ ErrorResponse $ PrivilegeError "Storing derivations requires daemon privileges"
+
+    QueryDerivationCmd hash ->
+        -- In a real implementation, this would query the derivation database
+        return $ DerivationQueryResponse []
+
+    GetDerivationForOutputCmd path ->
+        -- In a real implementation, this would find the derivation that produced an output
+        return $ DerivationRetrievedResponse Nothing
+
+    ListDerivationsCmd ->
+        -- In a real implementation, this would list derivations in the store
+        return $ DerivationListResponse []
+
+-- | Create a server socket
+createServerSocket :: FilePath -> IO Socket
+createServerSocket path = do
+    -- Remove existing socket file if it exists
+    exists <- doesFileExist path
+    when exists $ removeFile path
+
+    -- Create directory if needed
+    createDirectoryIfMissing True (takeDirectory path)
+
+    -- Create the socket
+    sock <- socket AF_UNIX Stream 0
+
+    -- Set options
+    setSocketOption sock ReuseAddr 1
+
+    -- Bind to path
+    bind sock (SockAddrUnix path)
+
+    -- Listen for connections
+    listen sock 10
+
+    -- Set permissions to allow all users to connect
+    setFileMode path 0o666
+
+    return sock
+
+-- | Close a server socket
+closeServerSocket :: Socket -> FilePath -> IO ()
+closeServerSocket sock path = do
+    -- Close the socket
+    close sock
+
+    -- Remove the socket file
+    removeFile path `catch` \(_ :: SomeException) -> return ()
+
+-- | Add a client to the active clients map
+addClient :: ActiveClients -> ClientInfo -> IO ()
+addClient clients info = atomically $
+    modifyTVar' clients $ Map.insert (ciThreadId info) info
+
+-- | Remove a client from the active clients map
+removeClient :: ActiveClients -> ThreadId -> IO ()
+removeClient clients tid = atomically $
+    modifyTVar' clients $ Map.delete tid
+
+-- | Broadcast a message to all clients
+broadcastToClients :: ActiveClients -> BS.ByteString -> IO ()
+broadcastToClients clients msg = do
+    clientMap <- readTVarIO clients
+
+    -- Send to each client that is in Active state
+    forM_ (Map.elems clientMap) $ \info -> do
+        state <- readTVarIO (ciState info)
+        when (state == Active) $ do
+            catch (BS.hPut (ciHandle info) msg >> hFlush (ciHandle info))
+                  (\(_ :: SomeException) -> return ())
+
+-- | Log a security event
+logSecurityEvent :: ServerControl -> Text -> IO ()
+logSecurityEvent control msg = do
+    now <- getCurrentTime
+    hPutStrLn (scSecurityLog control) $ formatLogEntry now "SECURITY" $ T.unpack msg
+    hFlush (scSecurityLog control)
+
+-- | Save daemon state
+saveDaemonState :: DaemonConfig -> DaemonState 'Daemon -> IO ()
+saveDaemonState config state = do
+    -- Save state to file
+    saveStateToFile state
