@@ -105,7 +105,7 @@ import Control.Concurrent (forkIO, killThread, ThreadId, threadDelay, myThreadId
 import Control.Concurrent.STM
 import Control.Concurrent.Async (Async, async, cancel, wait, waitCatch)
 import Control.Exception (Exception, throwIO, try, catch, finally, bracket, mask, SomeException, IOException, ErrorCall(..))
-import Control.Monad (when, unless, forM, forM_, void, foldM)
+import Control.Monad (when, unless, forM, forM_, void, foldM, forever)
 
 -- Data structure imports
 import Data.Aeson ((.:), (.=))
@@ -129,6 +129,8 @@ import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, addUTCTime)
 import Data.Kind (Type)
 import Data.Singletons
 import Data.Singletons.TH
+import Data.Unique (Unique, newUnique)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- File system and IO imports
 import System.Directory (doesFileExist, createDirectoryIfMissing, renameFile, removeFile)
@@ -144,7 +146,8 @@ import System.Posix.Files (fileExist, getFileStatus, fileSize, setFileMode,
 import System.Posix.Files.ByteString (createLink, removeLink)
 import System.Posix.IO (openFd, createFile, closeFd, setLock, getLock,
                        OpenMode(..), defaultFileFlags, FdOption(..),
-                       OpenFileFlags(..), trunc)
+                       OpenFileFlags(..), trunc, fdToHandle, WriteLock(..),
+                       AbsoluteSeek(..), Unlock(..))
 import System.Posix.Process (getProcessID, forkProcess, executeFile,
                            getProcessStatus, ProcessStatus(..), exitImmediately)
 import System.Posix.Resource (ResourceLimit(..), Resource(..), getResourceLimit, setResourceLimit)
@@ -161,8 +164,11 @@ import Ten.Core (BuildId(..), BuildStatus(..), BuildError(..), StorePath(..),
                 CanAccessStore, CanCreateSandbox, CanModifyStore, CanDropPrivileges, CanAccessDatabase,
                 storePathToText, storePathToFilePath,
                 -- Add these types directly from Core:
-                Derivation(..), DerivationInput(..), DerivationOutput(..), BuildResult(..))
-import qualified Ten.Derivation as Derivation (derivationEquals, hashDerivation)
+                Derivation(..), DerivationInput(..), DerivationOutput(..), BuildResult(..),
+                -- Access AbsoluteSeek via System.IO:
+                fromSing, sing)
+import qualified Ten.Core as Core
+import Ten.Derivation (derivationEquals)
 import qualified Ten.Graph as Graph
 
 -- | State errors
@@ -175,7 +181,7 @@ data StateError
     | StateFormatError Text
     | StateVersionError Text
     | StateResourceError Text
-    | StatePrivilegeError Text  -- New: error when privilege constraints violated
+    | StatePrivilegeError Text  -- Error when privilege constraints violated
     deriving (Show, Eq)
 
 instance Exception StateError
@@ -1405,7 +1411,7 @@ cleanupStaleBuilds state = do
                     let timeoutTime = addUTCTime (fromIntegral timeout) (abStartTime build)
                     when (now > timeoutTime) $ do
                         -- Mark as failed and remove
-                        let err = BuildError $ BuildFailed "Build timed out"
+                        let err = Core.BuildFailed "Build timed out"
                         atomically $ putTMVar (abResult build) (Left err)
                         unregisterBuild state buildId
 
@@ -1417,7 +1423,7 @@ cleanupStaleBuilds state = do
                     -- If idle for more than 1 hour, consider it stale
                     when (idleTime > 3600) $ do
                         -- Mark as failed and remove
-                        let err = BuildError $ BuildFailed "Build stalled or crashed"
+                        let err = Core.BuildFailed "Build stalled or crashed"
                         atomically $ putTMVar (abResult build) (Left err)
                         unregisterBuild state buildId
 
@@ -1442,7 +1448,7 @@ maintenanceLoop state = do
         threadDelay (60 * 1000 * 1000)  -- 60 seconds
 
 -- | Run scheduled maintenance tasks - requires CanModifyStore privilege
-scheduledMaintenance :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
+scheduledMaintenance :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 scheduledMaintenance state = do
     -- Update system stats
     updateSystemStats state
@@ -1469,7 +1475,7 @@ setupSignalHandlers state = do
     void $ installHandler sigHUP (Catch $ handleHupSignal state) Nothing
 
 -- | Handle SIGTERM signal - requires CanModifyStore privilege
-handleTermSignal :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
+handleTermSignal :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 handleTermSignal state = do
     -- Save state
     putStrLn "Received termination signal, shutting down..."
@@ -1489,10 +1495,10 @@ handleTermSignal state = do
 
     -- Exit
     putStrLn "Shutdown complete."
-    exitSuccess
+    exitImmediately 0
 
 -- | Handle SIGHUP signal - requires CanModifyStore privilege
-handleHupSignal :: (CanModifyStore t ~ 'True) => DaemonState t -> IO ()
+handleHupSignal :: (CanModifyStore t ~ 'True, CanAccessStore t ~ 'True) => DaemonState t -> IO ()
 handleHupSignal state = do
     -- Save and reload state
     putStrLn "Received HUP signal, reloading..."
