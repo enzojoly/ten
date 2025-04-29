@@ -600,9 +600,15 @@ handleClient clientSocket clientHandle clients state config
 
             -- Handle client requests with proper privilege tier
             -- Using the daemon tier singleton we're already in
-            handleClientRequests clientSocket clientHandle state config clientAddr
-                                securityLog accessLog lastActivityVar clientStateVar
-                                requestCountVar permissionsVar idleTimeout sDaemon
+            case tier of
+                Daemon ->
+                    handleClientRequests clientSocket clientHandle state config clientAddr
+                                      securityLog accessLog lastActivityVar clientStateVar
+                                      requestCountVar permissionsVar idleTimeout sDaemon
+                Builder ->
+                    handleClientRequests clientSocket clientHandle state config clientAddr
+                                      securityLog accessLog lastActivityVar clientStateVar
+                                      requestCountVar permissionsVar idleTimeout sBuilder
 
   where
     -- Update client info after authentication
@@ -618,7 +624,8 @@ handleClient clientSocket clientHandle clients state config
                 writeTVar clients (Map.insert tid updatedInfo clientMap)
 
 -- | Process client requests with privilege-aware dispatch
-handleClientRequests :: Socket -> Handle -> DaemonState 'Daemon -> DaemonConfig -> SockAddr
+handleClientRequests :: forall (t :: PrivilegeTier). (Store.StoreContentOps t)
+                     => Socket -> Handle -> DaemonState 'Daemon -> DaemonConfig -> SockAddr
                      -> Handle -> Handle -> TVar UTCTime -> TVar ClientState
                      -> TVar Int -> TVar (Set Permission) -> TimerHandle
                      -> SPrivilegeTier t  -- Explicit privilege singleton evidence
@@ -766,7 +773,6 @@ processRequest st request state config permissions =
         return $ Core.ErrorResponse $ e)
 
 -- | Dispatch a request to the appropriate handler based on privilege tier
--- Note: We've added the Store.StoreContentOps constraint to fix the error
 dispatchRequest :: forall (t :: PrivilegeTier). (Store.StoreContentOps t)
                 => SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
                 -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
