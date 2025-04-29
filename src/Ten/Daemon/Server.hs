@@ -63,7 +63,7 @@ module Ten.Daemon.Server (
 import Control.Concurrent (ThreadId, forkIO, forkFinally, myThreadId, killThread, threadDelay, MVar, newEmptyMVar, putMVar, takeMVar, newMVar, readMVar, withMVar)
 import Control.Concurrent.STM
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
-import Control.Exception (bracket, finally, try, catch, handle, throwIO, SomeException, AsyncException(..),
+import Control.Exception (bracket, finally, try, catch, throwIO, SomeException, AsyncException(..),
                           displayException, fromException, ErrorCall(..))
 import Control.Monad (forever, void, when, unless, forM_, foldM, forM)
 import Control.Monad.IO.Class (liftIO)
@@ -367,7 +367,7 @@ stopServer ServerControl{..} = do
 terminateProcess :: ProcessID -> IO ()
 terminateProcess pid = do
     -- Try to send SIGTERM
-    void $ try $ signalProcess sigTERM pid
+    void $ try @SomeException $ signalProcess sigTERM pid
 
     -- Give it a moment to shut down
     threadDelay 1000000  -- 1 second
@@ -375,7 +375,7 @@ terminateProcess pid = do
     -- If still running, force kill with SIGKILL
     stillRunning <- isProcessRunning pid
     when stillRunning $ do
-        void $ try $ signalProcess sigKILL pid
+        void $ try @SomeException $ signalProcess sigKILL pid
 
 -- | Check if a process is running
 isProcessRunning :: ProcessID -> IO Bool
@@ -1243,7 +1243,7 @@ sigKILL = 9
 signalProcess :: Int -> ProcessID -> IO ()
 signalProcess sig pid = do
     -- Use the process module to send a signal
-    void $ try $ readProcess "kill" ["-" ++ show sig, show pid] ""
+    void $ try @SomeException $ readProcess "kill" ["-" ++ show sig, show pid] ""
 
 -- | Handler implementations
 handleBuildRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> Core.BuildRequestInfo
@@ -1300,7 +1300,9 @@ handleCancelBuildRequest st bid state perms = do
     -- In a real implementation, this would cancel an ongoing build
     return $ Core.CancelBuildResponse True
 
-handleStoreRequest :: SPrivilegeTier t -> StoreCommand -> DaemonState 'Daemon
+handleStoreRequest :: forall (t :: PrivilegeTier).
+                      (Store.StoreContentOps t)
+                   => SPrivilegeTier t -> StoreCommand -> DaemonState 'Daemon
                    -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleStoreRequest st cmd state config perms = case cmd of
     StoreAddCmd path content ->
