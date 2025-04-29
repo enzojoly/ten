@@ -115,6 +115,7 @@ import Ten.Core
 import qualified Ten.Core as Core
 import Ten.Build (buildDerivation)
 import Ten.Daemon.Protocol
+import qualified Ten.Daemon.Protocol as Protocol
 import Ten.Daemon.State
 import Ten.Daemon.Auth
 import Ten.Derivation (serializeDerivation, deserializeDerivation, hashDerivation)
@@ -143,88 +144,6 @@ data Permission
     | PermQueryStatus  -- Permission to query daemon status
     | PermAdmin        -- Administrative permission (implies all others)
     deriving (Show, Eq, Ord)
-
--- | Message wrapper for requests
-data RequestWrapper = RequestWrapper RequestMessage
-
--- | Request message structure
-data RequestMessage = RequestMessage
-    { reqTag :: RequestTag
-    , reqPayload :: Aeson.Value
-    , reqRequiresAuth :: Bool
-    }
-
--- | Response tag types for categorizing responses
-data ResponseTag
-    = TagAuthResponse
-    | TagBuildStartedResponse
-    | TagBuildResultResponse
-    | TagBuildStatusResponse
-    | TagBuildOutputResponse
-    | TagBuildListResponse
-    | TagCancelBuildResponse
-    | TagStoreAddResponse
-    | TagStoreVerifyResponse
-    | TagStorePathResponse
-    | TagStoreListResponse
-    | TagStoreReadResponse
-    | TagDerivationResponse
-    | TagDerivationStoredResponse
-    | TagDerivationRetrievedResponse
-    | TagDerivationQueryResponse
-    | TagDerivationOutputResponse
-    | TagDerivationListResponse
-    | TagGCResultResponse
-    | TagGCStartedResponse
-    | TagGCStatusResponse
-    | TagGCRootAddedResponse
-    | TagGCRootRemovedResponse
-    | TagGCRootListResponse
-    | TagPongResponse
-    | TagShutdownResponse
-    | TagStatusResponse
-    | TagConfigResponse
-    | TagEvalResponse
-    | TagErrorResponse
-    | TagSuccessResponse
-
--- | Response message structure
-data ResponseMessage = ResponseMessage
-    { respTag :: ResponseTag
-    , respPayload :: Aeson.Value
-    , respRequiresAuth :: Bool
-    }
-
--- | Request tag type
-data RequestTag
-    = TagAuthRequest
-    | TagBuildRequest
-    | TagEvalRequest
-    | TagBuildDerivationRequest
-    | TagBuildStatusRequest
-    | TagCancelBuildRequest
-    | TagQueryBuildOutputRequest
-    | TagListBuildsRequest
-    | TagStoreAddRequest
-    | TagStoreVerifyRequest
-    | TagStorePathRequest
-    | TagStoreListRequest
-    | TagStoreReadRequest
-    | TagStoreDerivationRequest
-    | TagRetrieveDerivationRequest
-    | TagQueryDerivationRequest
-    | TagGetDerivationForOutputRequest
-    | TagListDerivationsRequest
-    | TagGCRequest
-    | TagGCStatusRequest
-    | TagAddGCRootRequest
-    | TagRemoveGCRootRequest
-    | TagListGCRootsRequest
-    | TagPingRequest
-    | TagShutdownRequest
-    | TagStatusRequest
-    | TagConfigRequest
-    deriving (Show, Eq)
 
 -- | Information about a connected client
 data ClientInfo = ClientInfo {
@@ -463,25 +382,11 @@ isProcessRunning pid = do
         Right () -> return True
 
 -- | Send a shutdown notice to a client
--- | Send a shutdown notice to a client
 sendShutdownNotice :: Handle -> IO ()
 sendShutdownNotice handle = do
-    -- Use the DaemonResponse directly
-    let response = ShutdownResponse
-    -- Use Protocol's serialization method to convert to bytes
-    let (respData, mPayload) = serializeDaemonResponse response
-    -- Use Protocol's frame creation function
-    let framedResp = createResponseFrame respData
-    -- Send the frame
-    BS.hPut handle framedResp
-    -- Send payload if present
-    case mPayload of
-        Just payload -> do
-            let framedPayload = createResponseFrame payload
-            BS.hPut handle framedPayload
-        Nothing -> return ()
-    -- Flush to ensure delivery
-    hFlush handle
+    -- Create a proper ShutdownResponse using Core types
+    let response = Core.ShutdownResponse
+    sendResponse handle 0 response
 
 -- | Main loop to accept client connections with proper privilege evidence
 acceptClients :: Socket -> ActiveClients -> TVar Bool -> DaemonState 'Daemon -> DaemonConfig
@@ -756,7 +661,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                  "Read error from client " ++ show clientAddr ++ ": " ++ displayException e
                         return ()
 
-                    Right msgBytes -> do
+                    Right (msgData, mPayload) -> do
                         -- Update last activity time
                         now <- liftIO getCurrentTime
                         liftIO $ atomically $ writeTVar lastActivityVar now
@@ -780,7 +685,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
 
                             -- Send rate limit error
                             liftIO $ sendResponse clientHandle 0 $
-                                ErrorResponse $ DaemonError "Request rate limit exceeded"
+                                Core.ErrorResponse $ Core.DaemonError "Request rate limit exceeded"
 
                             -- Continue processing
                             processLoop
@@ -790,58 +695,43 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                      "Client " ++ show clientAddr ++ " request #" ++ show reqCount
 
                             -- Process the message
-                            case decodeMessage msgBytes of
-                                Nothing -> do
+                            case Core.deserializeDaemonRequest msgData mPayload of
+                                Left err -> do
                                     -- Invalid message format
                                     liftIO $ hPutStrLn securityLog $ formatLogEntry now "MALFORMED" $
-                                             "Malformed request from client " ++ show clientAddr
+                                             "Malformed request from client " ++ show clientAddr ++ ": " ++ T.unpack err
 
                                     -- Send error response
                                     liftIO $ sendResponse clientHandle 0 $
-                                        ErrorResponse $ DaemonError "Malformed request"
+                                        Core.ErrorResponse $ Core.DaemonError "Malformed request"
 
                                     -- Continue processing
                                     processLoop
 
-                                Just (RequestWrapper (RequestMessage reqTag reqPayload _)) -> do
+                                Right request -> do
                                     -- Get client permissions
                                     permissions <- liftIO $ readTVarIO permissionsVar
 
-                                    -- Try to parse the request
-                                    case Aeson.fromJSON reqPayload of
-                                        Aeson.Error err -> do
-                                            -- Invalid request format
-                                            liftIO $ hPutStrLn securityLog $ formatLogEntry now "INVALID" $
-                                                      "Invalid request format: " ++ err
+                                    -- Validate permissions for this request
+                                    permissionValid <- validateRequestPermissions request permissions securityLog clientAddr st
 
-                                            -- Send error response
+                                    if not permissionValid
+                                        then do
+                                            -- Permission denied
                                             liftIO $ sendResponse clientHandle 0 $
-                                                ErrorResponse $ DaemonError $ "Invalid request format: " <> T.pack err
+                                                Core.ErrorResponse $ Core.AuthError "Permission denied"
 
                                             -- Continue processing
                                             processLoop
+                                        else do
+                                            -- Process the request with proper privilege context
+                                            response <- processRequest st request state config permissions
 
-                                        Aeson.Success request -> do
-                                            -- Validate permissions for this request
-                                            permissionValid <- validateRequestPermissions request permissions securityLog clientAddr st
+                                            -- Send the response
+                                            liftIO $ sendResponse clientHandle 0 response
 
-                                            if not permissionValid
-                                                then do
-                                                    -- Permission denied
-                                                    liftIO $ sendResponse clientHandle 0 $
-                                                        ErrorResponse $ AuthError "Permission denied"
-
-                                                    -- Continue processing
-                                                    processLoop
-                                                else do
-                                                    -- Process the request with proper privilege context
-                                                    response <- processRequest st request state config permissions
-
-                                                    -- Send the response
-                                                    liftIO $ sendResponse clientHandle 0 response
-
-                                                    -- Continue processing
-                                                    processLoop
+                                            -- Continue processing
+                                            processLoop
 
     -- Start processing loop
     processLoop `catch` \(e :: SomeException) -> do
@@ -856,88 +746,88 @@ handleClientRequests clientSocket clientHandle state config clientAddr
         liftIO $ cancelTimeout idleTimeout
 
 -- | Process a client request with proper privilege tier
-processRequest :: SPrivilegeTier t -> DaemonRequest -> DaemonState 'Daemon
-               -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+processRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
+               -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 processRequest st request state config permissions = do
     -- Dispatch to the appropriate handler based on privilege tier
     dispatchRequest st request state config permissions `catch` \(e :: SomeException) -> do
         -- Convert any errors to ErrorResponse
         case fromException e of
-            Just ThreadKilled -> return $ ErrorResponse $ DaemonError "Thread killed"
-            _ -> return $ ErrorResponse $ DaemonError $ "Request processing error: " <> T.pack (displayException e)
+            Just ThreadKilled -> return $ Core.ErrorResponse $ Core.DaemonError "Thread killed"
+            _ -> return $ Core.ErrorResponse $ Core.DaemonError $ "Request processing error: " <> T.pack (displayException e)
 
 -- | Dispatch a request to the appropriate handler based on privilege tier
-dispatchRequest :: SPrivilegeTier t -> DaemonRequest -> DaemonState 'Daemon
-                -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+dispatchRequest :: SPrivilegeTier t -> Protocol.DaemonRequest -> DaemonState 'Daemon
+                -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 dispatchRequest st request state config permissions = case request of
     -- Build operations (allowed for both privilege tiers)
-    BuildRequest path content info ->
+    Protocol.BuildRequest path content info ->
         handleBuildRequest st path content info state permissions
 
-    EvalRequest path content info ->
+    Protocol.EvalRequest path content info ->
         handleEvalRequest st path content info state permissions
 
-    BuildDerivationRequest deriv info ->
+    Protocol.BuildDerivationRequest deriv info ->
         handleBuildDerivationRequest st deriv info state permissions
 
-    BuildStatusRequest bid ->
+    Protocol.BuildStatusRequest bid ->
         handleBuildStatusRequest st bid state permissions
 
-    CancelBuildRequest bid ->
+    Protocol.CancelBuildRequest bid ->
         handleCancelBuildRequest st bid state permissions
 
     -- Store operations (some require Daemon tier)
-    StoreAddRequest path content ->
+    Protocol.StoreAddRequest path content ->
         handleStoreRequest st (StoreAddCmd path content) state config permissions
 
-    StoreVerifyRequest path ->
+    Protocol.StoreVerifyRequest path ->
         handleStoreRequest st (StoreVerifyCmd (storePathToText path)) state config permissions
 
-    StorePathRequest path content ->
+    Protocol.StorePathRequest path content ->
         handleStoreRequest st (StorePathCmd path content) state config permissions
 
-    StoreListRequest ->
+    Protocol.StoreListRequest ->
         handleStoreRequest st StoreListCmd state config permissions
 
-    StoreReadRequest path ->
+    Protocol.StoreReadRequest path ->
         handleStoreRequest st (StoreReadCmd path) state config permissions
 
     -- GC operations (require Daemon tier)
-    GCRequest params ->
-        handleGCRequest st (gcForce params) state config permissions
+    Protocol.GCRequest params ->
+        handleGCRequest st (Core.gcForce params) state config permissions
 
     -- Information requests
-    StatusRequest ->
+    Protocol.StatusRequest ->
         handleStatusRequest st state config permissions
 
-    ConfigRequest ->
+    Protocol.ConfigRequest ->
         handleConfigRequest st state config permissions
 
     -- Administrative operations
-    ShutdownRequest ->
+    Protocol.ShutdownRequest ->
         handleShutdownRequest st state config permissions
 
     -- Derivation operations
-    StoreDerivationRequest content ->
+    Protocol.StoreDerivationRequest content ->
         handleDerivationRequest st (StoreDerivationCmd content) state config permissions
 
-    QueryDerivationRequest qType qVal _ ->
+    Protocol.QueryDerivationRequest qType qVal _ ->
         handleDerivationRequest st (QueryDerivationCmd qVal) state config permissions
 
-    GetDerivationForOutputRequest path ->
+    Protocol.GetDerivationForOutputRequest path ->
         handleDerivationRequest st (GetDerivationForOutputCmd path) state config permissions
 
-    ListDerivationsRequest _ ->
+    Protocol.ListDerivationsRequest _ ->
         handleDerivationRequest st ListDerivationsCmd state config permissions
 
-    PingRequest ->
-        return PongResponse
+    Protocol.PingRequest ->
+        return Core.PongResponse
 
     -- Handle other request types appropriately
-    _ -> return $ ErrorResponse $ DaemonError "Unsupported request type"
+    _ -> return $ Core.ErrorResponse $ Core.DaemonError "Unsupported request type"
 
 -- | Validate permissions for a request with privilege tier context
-validateRequestPermissions :: DaemonRequest -> Set Permission -> Handle -> SockAddr
+validateRequestPermissions :: Protocol.DaemonRequest -> Set Permission -> Handle -> SockAddr
                            -> SPrivilegeTier t -> TenM 'Build t Bool
 validateRequestPermissions request permissions securityLog clientAddr st = do
     -- Determine which permission is required for this request
@@ -963,54 +853,54 @@ validateRequestPermissions request permissions securityLog clientAddr st = do
     return $ hasPermission && tierSufficient
 
 -- | Check if an operation requires the Daemon privilege tier
-operationRequiresDaemonTier :: DaemonRequest -> Bool
+operationRequiresDaemonTier :: Protocol.DaemonRequest -> Bool
 operationRequiresDaemonTier request = case request of
     -- Store modification operations require Daemon tier
-    StoreAddRequest{} -> True
+    Protocol.StoreAddRequest{} -> True
 
     -- GC operations require Daemon tier
-    GCRequest{} -> True
+    Protocol.GCRequest{} -> True
 
     -- Some derivation operations require Daemon tier
-    StoreDerivationRequest{} -> True
+    Protocol.StoreDerivationRequest{} -> True
 
     -- Administrative operations require Daemon tier
-    ShutdownRequest -> True
-    ConfigRequest -> True
+    Protocol.ShutdownRequest -> True
+    Protocol.ConfigRequest -> True
 
     -- Other operations can be performed with Builder tier
     _ -> False
 
 -- | Get the required permission for a request
-getRequiredPermission :: DaemonRequest -> Permission
+getRequiredPermission :: Protocol.DaemonRequest -> Permission
 getRequiredPermission request = case request of
     -- Build-related requests
-    BuildRequest{} -> PermBuild
-    EvalRequest{} -> PermBuild
-    BuildDerivationRequest{} -> PermBuild
-    BuildStatusRequest{} -> PermQueryBuild
-    CancelBuildRequest{} -> PermCancelBuild
+    Protocol.BuildRequest{} -> PermBuild
+    Protocol.EvalRequest{} -> PermBuild
+    Protocol.BuildDerivationRequest{} -> PermBuild
+    Protocol.BuildStatusRequest{} -> PermQueryBuild
+    Protocol.CancelBuildRequest{} -> PermCancelBuild
 
     -- Store-related requests
-    StoreAddRequest{} -> PermModifyStore
-    StoreVerifyRequest{} -> PermQueryStore
-    StorePathRequest{} -> PermQueryStore
-    StoreListRequest -> PermQueryStore
-    StoreReadRequest{} -> PermQueryStore  -- Reading requires query permission
+    Protocol.StoreAddRequest{} -> PermModifyStore
+    Protocol.StoreVerifyRequest{} -> PermQueryStore
+    Protocol.StorePathRequest{} -> PermQueryStore
+    Protocol.StoreListRequest -> PermQueryStore
+    Protocol.StoreReadRequest{} -> PermQueryStore  -- Reading requires query permission
 
     -- Derivation-related requests
-    StoreDerivationRequest{} -> PermStoreDerivation
-    QueryDerivationRequest{} -> PermQueryDerivation
-    GetDerivationForOutputRequest{} -> PermQueryDerivation
-    ListDerivationsRequest{} -> PermQueryDerivation
+    Protocol.StoreDerivationRequest{} -> PermStoreDerivation
+    Protocol.QueryDerivationRequest{} -> PermQueryDerivation
+    Protocol.GetDerivationForOutputRequest{} -> PermQueryDerivation
+    Protocol.ListDerivationsRequest{} -> PermQueryDerivation
 
     -- GC-related requests
-    GCRequest{} -> PermRunGC
+    Protocol.GCRequest{} -> PermRunGC
 
     -- Admin requests
-    StatusRequest -> PermQueryStatus
-    ConfigRequest -> PermAdmin
-    ShutdownRequest -> PermShutdown
+    Protocol.StatusRequest -> PermQueryStatus
+    Protocol.ConfigRequest -> PermAdmin
+    Protocol.ShutdownRequest -> PermShutdown
 
     -- Default to admin permission for anything else
     _ -> PermAdmin
@@ -1124,37 +1014,31 @@ authenticateClient handle authDbVar rateLimiter addr securityLog = do
             return $ Left "Too many authentication attempts. Please try again later."
         else do
             -- Read auth message
-            msgBytes <- readMessageWithTimeout handle 5000000 -- 5 second timeout
+            (msgData, mPayload) <- readMessageWithTimeout handle 5000000 -- 5 second timeout
 
             -- Try to parse auth message
-            case decodeMessage msgBytes of
-                Nothing ->
-                    return $ Left "Invalid authentication message format"
+            case Core.deserializeDaemonRequest msgData mPayload of
+                Left err ->
+                    return $ Left $ "Invalid authentication message format: " <> err
 
-                Just (RequestWrapper (RequestMessage _ payload _)) -> do
-                    -- Try to parse as auth request
-                    case Aeson.fromJSON payload of
-                        Aeson.Error err ->
-                            return $ Left $ "Invalid authentication payload: " <> T.pack err
+                Right (Protocol.AuthRequest content) -> do
+                    -- Get auth database
+                    authDb <- readTVarIO authDbVar
 
-                        Aeson.Success (AuthRequest content) -> do
-                            -- Get auth database
-                            authDb <- readTVarIO authDbVar
+                    -- Authenticate
+                    authResult <- authenticateUser authDb (authUser content) (authToken content)
 
-                            -- Authenticate
-                            authResult <- authenticateUser authDb (authUser content) (authToken content)
+                    case authResult of
+                        Left err -> return $ Left err
+                        Right (userId, token, permissions) -> do
+                            -- Determine privilege tier based on permissions
+                            let tier = if PermAdmin `Set.member` permissions
+                                      then Daemon
+                                      else Builder
 
-                            case authResult of
-                                Left err -> return $ Left err
-                                Right (userId, token, permissions) -> do
-                                    -- Determine privilege tier based on permissions
-                                    let tier = if PermAdmin `Set.member` permissions
-                                              then Daemon
-                                              else Builder
+                            return $ Right (userId, token, permissions, tier)
 
-                                    return $ Right (userId, token, permissions, tier)
-
-                _ -> return $ Left "Expected authentication message"
+                Right _ -> return $ Left "Expected authentication message"
 
 -- | Check authentication rate limit
 checkAuthRateLimit :: TVar (Map SockAddr (Int, UTCTime)) -> SockAddr -> IO Bool
@@ -1284,117 +1168,41 @@ countClientsFromAddress clients addr = do
 -- | Send auth failure
 sendAuthFailure :: Handle -> Text -> IO ()
 sendAuthFailure handle msg = do
-    let response = ResponseWrapper $ ResponseMessage {
-            respTag = TagAuthResponse,
-            respPayload = Aeson.toJSON $ AuthResponse $ AuthRejected msg,
-            respRequiresAuth = False
-        }
-
-    BS.hPut handle $ serializeMessage response
-    hFlush handle
+    let response = Core.AuthResponse $ Core.AuthRejected msg
+    sendResponse handle 0 response
 
 -- | Read message with timeout
-readMessageWithTimeout :: Handle -> Int -> IO BS.ByteString
+readMessageWithTimeout :: Handle -> Int -> IO (BS.ByteString, Maybe BS.ByteString)
 readMessageWithTimeout handle timeoutMicros = do
     result <- Core.timeout timeoutMicros $ do
-        -- Read message header (4 bytes for length)
-        lenBytes <- BS.hGet handle 4
-
-        -- Parse message length
-        let len = fromIntegral (BS.index lenBytes 0) `shiftL` 24 .|.
-                  fromIntegral (BS.index lenBytes 1) `shiftL` 16 .|.
-                  fromIntegral (BS.index lenBytes 2) `shiftL` 8 .|.
-                  fromIntegral (BS.index lenBytes 3)
-
-        -- Sanity check message size
-        when (len > maxRequestSize) $
-            throwIO $ DaemonError $ "Message too large: " <> T.pack (show len)
-
-        -- Read message body
-        msgBody <- BS.hGet handle len
-
-        return $ BS.append lenBytes msgBody
+        -- Use Core's frame reading utility
+        Core.receiveFramedResponse handle
 
     case result of
-        Just msg -> return msg
-        Nothing -> throwIO $ DaemonError "Timeout reading message"
-
--- | Decode message
-decodeMessage :: BS.ByteString -> Maybe Message
-decodeMessage bs | BS.length bs < 4 = Nothing
-                 | otherwise = do
-    -- Extract length
-    let len = fromIntegral (BS.index bs 0) `shiftL` 24 .|.
-              fromIntegral (BS.index bs 1) `shiftL` 16 .|.
-              fromIntegral (BS.index bs 2) `shiftL` 8 .|.
-              fromIntegral (BS.index bs 3)
-
-    -- Check if we have enough data
-    if BS.length bs < 4 + len
-        then Nothing
-        else do
-            -- Extract message body
-            let body = BS.drop 4 $ BS.take (4 + len) bs
-
-            -- Parse JSON
-            case Aeson.eitherDecodeStrict body of
-                Left _ -> Nothing
-                Right val -> Just val
+        Just (msgData, mPayload) -> return (msgData, mPayload)
+        Nothing -> throwIO $ Core.DaemonError "Timeout reading message"
 
 -- | Send a response to a request
-sendResponse :: Handle -> Int -> DaemonResponse -> IO ()
+sendResponse :: Handle -> Int -> Core.DaemonResponse -> IO ()
 sendResponse handle reqId response = do
-    let message = createResponseMessage reqId response
-    BS.hPut handle $ serializeMessage message
+    -- Serialize the response with Core utility
+    let (respData, mPayload) = Core.serializeDaemonResponse response
+
+    -- Create framed response
+    let framedResp = Core.createResponseFrame respData
+
+    -- Send the response
+    BS.hPut handle framedResp
+
+    -- Send payload if present
+    case mPayload of
+        Just payload -> do
+            let framedPayload = Core.createResponseFrame payload
+            BS.hPut handle framedPayload
+        Nothing -> return ()
+
+    -- Ensure data is sent
     hFlush handle
-
--- | Create a response message
-createResponseMessage :: Int -> DaemonResponse -> Message
-createResponseMessage reqId resp =
-    let tag = responseTypeToTag resp
-        payload = Aeson.toJSON resp
-        requiresAuth = requiresAuthentication resp
-    in ResponseWrapper $ ResponseMessage tag payload requiresAuth
-
--- | Convert response type to tag
-responseTypeToTag :: DaemonResponse -> ResponseTag
-responseTypeToTag (AuthResponse _) = TagAuthResponse
-responseTypeToTag (BuildStartedResponse _) = TagBuildStartedResponse
-responseTypeToTag (BuildResultResponse _) = TagBuildResultResponse
-responseTypeToTag (BuildStatusResponse _) = TagBuildStatusResponse
-responseTypeToTag (BuildOutputResponse _) = TagBuildOutputResponse
-responseTypeToTag (BuildListResponse _) = TagBuildListResponse
-responseTypeToTag (CancelBuildResponse _) = TagCancelBuildResponse
-responseTypeToTag (StoreAddResponse _) = TagStoreAddResponse
-responseTypeToTag (StoreVerifyResponse _) = TagStoreVerifyResponse
-responseTypeToTag (StorePathResponse _) = TagStorePathResponse
-responseTypeToTag (StoreListResponse _) = TagStoreListResponse
-responseTypeToTag (StoreReadResponse _) = TagStoreReadResponse
-responseTypeToTag (DerivationResponse _) = TagDerivationResponse
-responseTypeToTag (DerivationStoredResponse _) = TagDerivationStoredResponse
-responseTypeToTag (DerivationRetrievedResponse _) = TagDerivationRetrievedResponse
-responseTypeToTag (DerivationQueryResponse _) = TagDerivationQueryResponse
-responseTypeToTag (DerivationOutputResponse _) = TagDerivationOutputResponse
-responseTypeToTag (DerivationListResponse _) = TagDerivationListResponse
-responseTypeToTag (GCResultResponse _) = TagGCResultResponse
-responseTypeToTag (GCStartedResponse) = TagGCStartedResponse
-responseTypeToTag (GCStatusResponse _) = TagGCStatusResponse
-responseTypeToTag (GCRootAddedResponse _) = TagGCRootAddedResponse
-responseTypeToTag (GCRootRemovedResponse _) = TagGCRootRemovedResponse
-responseTypeToTag (GCRootListResponse _) = TagGCRootListResponse
-responseTypeToTag (PongResponse) = TagPongResponse
-responseTypeToTag (ShutdownResponse) = TagShutdownResponse
-responseTypeToTag (StatusResponse _) = TagStatusResponse
-responseTypeToTag (ConfigResponse _) = TagConfigResponse
-responseTypeToTag (EvalResponse _) = TagEvalResponse
-responseTypeToTag (ErrorResponse _) = TagErrorResponse
-responseTypeToTag (SuccessResponse) = TagSuccessResponse
-
--- | Check if response requires authentication
-requiresAuthentication :: DaemonResponse -> Bool
-requiresAuthentication (AuthResponse _) = False
-requiresAuthentication (ErrorResponse _) = False
-requiresAuthentication _ = True
 
 -- | Unsafe conversion from IO to STM for timestamp operations
 -- This is needed for rate limiting in STM transactions
@@ -1412,144 +1220,105 @@ signalProcess sig pid = do
     -- Use the process module to send a signal
     void $ try $ readProcess "kill" ["-" ++ show sig, show pid] ""
 
--- | Serialize a message for transmission
-serializeMessage :: Message -> BS.ByteString
-serializeMessage message =
-    let encoded = case message of
-            RequestWrapper req ->
-                -- Serialize request header and payload
-                let header = Aeson.encode $ Aeson.object [
-                        "type" Aeson..= ("request" :: Text),
-                        "tag" Aeson..= show (reqTag req),
-                        "requiresAuth" Aeson..= reqRequiresAuth req,
-                        "payload" Aeson..= reqPayload req
-                        ]
-                    headerLen = BS.length $ LBS.toStrict header
-                    lenBytes = BS.pack [
-                        fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
-                        fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
-                        fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
-                        fromIntegral headerLen .&. 0xFF
-                        ]
-                in BS.concat [lenBytes, LBS.toStrict header]
-
-            ResponseWrapper resp ->
-                -- Serialize response header and payload
-                let header = Aeson.encode $ Aeson.object [
-                        "type" Aeson..= ("response" :: Text),
-                        "tag" Aeson..= show (respTag resp),
-                        "requiresAuth" Aeson..= respRequiresAuth resp,
-                        "payload" Aeson..= respPayload resp
-                        ]
-                    headerLen = BS.length $ LBS.toStrict header
-                    lenBytes = BS.pack [
-                        fromIntegral (headerLen `shiftR` 24) .&. 0xFF,
-                        fromIntegral (headerLen `shiftR` 16) .&. 0xFF,
-                        fromIntegral (headerLen `shiftR` 8) .&. 0xFF,
-                        fromIntegral headerLen .&. 0xFF
-                        ]
-                in BS.concat [lenBytes, LBS.toStrict header]
-    in encoded
-
 -- | Handler implementations
-handleBuildRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> BuildRequestInfo
-                   -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t DaemonResponse
+handleBuildRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> Core.BuildRequestInfo
+                   -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleBuildRequest st path content info state perms = do
     -- In a real implementation, this would compile and build the requested file
-    buildId <- BuildId <$> liftIO newUnique
-    return $ BuildStartedResponse buildId
+    buildId <- Core.BuildId <$> liftIO newUnique
+    return $ Core.BuildStartedResponse buildId
 
-handleEvalRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> BuildRequestInfo
-                  -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t DaemonResponse
+handleEvalRequest :: SPrivilegeTier t -> Text -> Maybe BS.ByteString -> Core.BuildRequestInfo
+                  -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleEvalRequest st path content info state perms = do
     -- In a real implementation, this would evaluate the file to a derivation
     -- For now, create a minimal derivation
-    let drv = Derivation {
-            derivName = "evaluated-" <> path,
-            derivHash = Hash.hashByteString $ fromMaybe BS.empty content,
-            derivBuilder = StorePath "0000000000000000000000000000000000000000" "bash",
-            derivArgs = ["-c", "echo 'hello'"],
-            derivInputs = Set.empty,
-            derivOutputs = Set.singleton $ DerivationOutput "out" $
-                            StorePath "0000000000000000000000000000000000000000" "result",
-            derivEnv = Map.empty,
-            derivSystem = "x86_64-linux",
-            derivStrategy = ApplicativeStrategy,
-            derivMeta = Map.empty
+    let drv = Core.Derivation {
+            Core.derivName = "evaluated-" <> path,
+            Core.derivHash = Hash.hashByteString $ fromMaybe BS.empty content,
+            Core.derivBuilder = Core.StorePath "0000000000000000000000000000000000000000" "bash",
+            Core.derivArgs = ["-c", "echo 'hello'"],
+            Core.derivInputs = Set.empty,
+            Core.derivOutputs = Set.singleton $ Core.DerivationOutput "out" $
+                            Core.StorePath "0000000000000000000000000000000000000000" "result",
+            Core.derivEnv = Map.empty,
+            Core.derivSystem = "x86_64-linux",
+            Core.derivStrategy = Core.ApplicativeStrategy,
+            Core.derivMeta = Map.empty
         }
-    return $ EvalResponse drv
+    return $ Core.EvalResponse drv
 
-handleBuildDerivationRequest :: SPrivilegeTier t -> Derivation -> BuildRequestInfo
-                             -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t DaemonResponse
+handleBuildDerivationRequest :: SPrivilegeTier t -> Core.Derivation -> Core.BuildRequestInfo
+                             -> DaemonState 'Daemon -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleBuildDerivationRequest st drv info state perms = do
     -- In a real implementation, this would build the derivation
-    buildId <- BuildId <$> liftIO newUnique
-    return $ BuildStartedResponse buildId
+    buildId <- Core.BuildId <$> liftIO newUnique
+    return $ Core.BuildStartedResponse buildId
 
-handleBuildStatusRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
-                         -> Set Permission -> TenM 'Build t DaemonResponse
+handleBuildStatusRequest :: SPrivilegeTier t -> Core.BuildId -> DaemonState 'Daemon
+                         -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleBuildStatusRequest st bid state perms = do
     -- In a real implementation, this would return the current build status
-    let update = BuildStatusUpdate {
-            buildId = bid,
-            buildStatus = BuildPending,
-            buildTimeElapsed = 0.0,
-            buildTimeRemaining = Nothing,
-            buildLogUpdate = Nothing,
-            buildResourceUsage = Map.empty
+    let update = Core.BuildStatusUpdate {
+            Core.buildId = bid,
+            Core.buildStatus = Core.BuildPending,
+            Core.buildTimeElapsed = 0.0,
+            Core.buildTimeRemaining = Nothing,
+            Core.buildLogUpdate = Nothing,
+            Core.buildResourceUsage = Map.empty
         }
-    return $ BuildStatusResponse update
+    return $ Core.BuildStatusResponse update
 
-handleCancelBuildRequest :: SPrivilegeTier t -> BuildId -> DaemonState 'Daemon
-                         -> Set Permission -> TenM 'Build t DaemonResponse
+handleCancelBuildRequest :: SPrivilegeTier t -> Core.BuildId -> DaemonState 'Daemon
+                         -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleCancelBuildRequest st bid state perms = do
     -- In a real implementation, this would cancel an ongoing build
-    return $ CancelBuildResponse True
+    return $ Core.CancelBuildResponse True
 
 handleStoreRequest :: SPrivilegeTier t -> StoreCommand -> DaemonState 'Daemon
-                   -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+                   -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleStoreRequest st cmd state config perms = case cmd of
     StoreAddCmd path content ->
         case fromSing st of
             Daemon -> do
                 -- Full implementation would add the file to the store
-                storePath <- addToStore path content
-                return $ StoreAddResponse storePath
+                storePath <- Store.addToStore path content
+                return $ Core.StoreAddResponse storePath
             Builder ->
-                return $ ErrorResponse $ PrivilegeError "Store modification requires daemon privileges"
+                return $ Core.ErrorResponse $ Core.PrivilegeError "Store modification requires daemon privileges"
 
     StoreVerifyCmd path ->
-        return $ StoreVerifyResponse True
+        return $ Core.StoreVerifyResponse True
 
     StorePathCmd path content ->
-        return $ StorePathResponse $ makeStorePath "0000000000000000000000000000000000000000" path
+        return $ Core.StorePathResponse $ Store.makeStorePath "0000000000000000000000000000000000000000" path
 
     StoreListCmd ->
-        return $ StoreListResponse []
+        return $ Core.StoreListResponse []
 
     StoreReadCmd path ->
         -- In a real implementation, this would read content from the store
-        return $ StoreReadResponse BS.empty
+        return $ Core.StoreReadResponse BS.empty
 
 handleGCRequest :: SPrivilegeTier t -> Bool -> DaemonState 'Daemon
-                -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+                -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleGCRequest st force state config perms =
     case fromSing st of
         Daemon -> do
             -- Full implementation would perform garbage collection
-            let stats = GCStats {
-                    gcTotal = 100,
-                    gcLive = 90,
-                    gcCollected = 10,
-                    gcBytes = 1024 * 1024,
-                    gcElapsedTime = 1.5
+            let stats = Core.GCStats {
+                    Core.gcTotal = 100,
+                    Core.gcLive = 90,
+                    Core.gcCollected = 10,
+                    Core.gcBytes = 1024 * 1024,
+                    Core.gcElapsedTime = 1.5
                 }
-            return $ GCResultResponse stats
+            return $ Core.GCResultResponse stats
         Builder ->
-            return $ ErrorResponse $ PrivilegeError "Garbage collection requires daemon privileges"
+            return $ Core.ErrorResponse $ Core.PrivilegeError "Garbage collection requires daemon privileges"
 
 handleStatusRequest :: SPrivilegeTier t -> DaemonState 'Daemon
-                     -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+                     -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleStatusRequest st state config perms = do
     -- Get current time
     now <- liftIO getCurrentTime
@@ -1558,60 +1327,60 @@ handleStatusRequest st state config perms = do
     let uptime = diffUTCTime now (dsStartTime state)
 
     -- Create status response
-    let status = DaemonStatus {
-            daemonStatus = "running",
-            daemonUptime = realToFrac uptime,
-            daemonActiveBuilds = 0,
-            daemonCompletedBuilds = 0,
-            daemonFailedBuilds = 0,
-            daemonGcRoots = 0,
-            daemonStoreSize = 0,
-            daemonStorePaths = 0
+    let status = Core.DaemonStatus {
+            Core.daemonStatus = "running",
+            Core.daemonUptime = realToFrac uptime,
+            Core.daemonActiveBuilds = 0,
+            Core.daemonCompletedBuilds = 0,
+            Core.daemonFailedBuilds = 0,
+            Core.daemonGcRoots = 0,
+            Core.daemonStoreSize = 0,
+            Core.daemonStorePaths = 0
         }
 
-    return $ StatusResponse status
+    return $ Core.StatusResponse status
 
 handleConfigRequest :: SPrivilegeTier t -> DaemonState 'Daemon
-                    -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+                    -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleConfigRequest st state config perms =
     case fromSing st of
-        Daemon -> return $ ConfigResponse config
-        Builder -> return $ ErrorResponse $ PrivilegeError "Config access requires daemon privileges"
+        Daemon -> return $ Core.ConfigResponse config
+        Builder -> return $ Core.ErrorResponse $ Core.PrivilegeError "Config access requires daemon privileges"
 
 handleShutdownRequest :: SPrivilegeTier t -> DaemonState 'Daemon
-                      -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+                      -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleShutdownRequest st state config perms =
     case fromSing st of
-        Daemon -> return ShutdownResponse
-        Builder -> return $ ErrorResponse $ PrivilegeError "Shutdown requires daemon privileges"
+        Daemon -> return Core.ShutdownResponse
+        Builder -> return $ Core.ErrorResponse $ Core.PrivilegeError "Shutdown requires daemon privileges"
 
 handleDerivationRequest :: SPrivilegeTier t -> DerivationCommand -> DaemonState 'Daemon
-                        -> DaemonConfig -> Set Permission -> TenM 'Build t DaemonResponse
+                        -> DaemonConfig -> Set Permission -> TenM 'Build t Core.DaemonResponse
 handleDerivationRequest st cmd state config perms = case cmd of
     StoreDerivationCmd content ->
         case fromSing st of
             Daemon -> do
                 -- Parse the derivation
                 case Derivation.deserializeDerivation content of
-                    Left err -> return $ ErrorResponse err
+                    Left err -> return $ Core.ErrorResponse err
                     Right drv -> do
                         -- Store the derivation (real implementation)
-                        let path = StorePath "0000000000000000000000000000000000000000" (derivName drv <> ".drv")
-                        return $ DerivationStoredResponse path
+                        let path = Core.StorePath "0000000000000000000000000000000000000000" (Core.derivName drv <> ".drv")
+                        return $ Core.DerivationStoredResponse path
             Builder ->
-                return $ ErrorResponse $ PrivilegeError "Storing derivations requires daemon privileges"
+                return $ Core.ErrorResponse $ Core.PrivilegeError "Storing derivations requires daemon privileges"
 
     QueryDerivationCmd hash ->
         -- In a real implementation, this would query the derivation database
-        return $ DerivationQueryResponse []
+        return $ Core.DerivationQueryResponse []
 
     GetDerivationForOutputCmd path ->
         -- In a real implementation, this would find the derivation that produced an output
-        return $ DerivationRetrievedResponse Nothing
+        return $ Core.DerivationRetrievedResponse Nothing
 
     ListDerivationsCmd ->
         -- In a real implementation, this would list derivations in the store
-        return $ DerivationListResponse []
+        return $ Core.DerivationListResponse []
 
 -- | Create a server socket
 createServerSocket :: FilePath -> IO Socket
