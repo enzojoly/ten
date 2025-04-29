@@ -108,7 +108,7 @@ import Control.Exception (Exception, throwIO, try, catch, finally, bracket, mask
 import Control.Monad (when, unless, forM, forM_, void, foldM, forever)
 
 -- Data structure imports
-import Data.Aeson ((.:), (.=))
+import Data.Aeson ((.:), (.=), (.:?), (.!=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.Aeson.Key as Key
@@ -128,6 +128,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, addUTCTime)
+import Data.Time.Format (formatTime, defaultTimeLocale)
 import Data.Kind (Type)
 import Data.Singletons
 import Data.Singletons.TH
@@ -483,18 +484,42 @@ populateState state jsonData = do
             atomically $ writeTVar (dsGCStats state) gcStats
   where
     extractCompletedBuilds = Aeson.withObject "StateData" $ \v -> do
-        completedObj <- v Aeson..: "completedBuilds" :: Aeson.Parser (KeyMap.KeyMap Aeson.Value)
-        let completedList = map (\(k, v) ->
-                (read (T.unpack (Key.toText k)) :: BuildId,
-                v :: Aeson.Value)) (KeyMap.toList completedObj)
-        return $ Map.fromList completedList
+        completedObj <- v Aeson..: "completedBuilds" :: Aeson.Parser Aeson.Object
+        foldM (\acc (k, v) -> do
+            buildId <- case reads (T.unpack (Key.toText k)) of
+                [(buildId', "")] -> return buildId'
+                _ -> fail $ "Invalid BuildId format: " ++ T.unpack (Key.toText k)
+
+            result <- Aeson.withObject "CompletedBuild" (\o -> do
+                timestamp <- o .: "timestamp"
+                successful <- o .: "success"
+                if successful
+                    then do
+                        buildResult <- o .: "result"
+                        return (timestamp, Right buildResult)
+                    else do
+                        buildError <- o .: "error"
+                        return (timestamp, Left buildError)
+                ) v
+
+            return $ Map.insert buildId result acc
+            ) Map.empty (KeyMap.toList completedObj)
 
     extractFailedBuilds = Aeson.withObject "StateData" $ \v -> do
-        failedObj <- v Aeson..: "failedBuilds" :: Aeson.Parser (KeyMap.KeyMap Aeson.Value)
-        let failedList = map (\(k, v) ->
-                (read (T.unpack (Key.toText k)) :: BuildId,
-                 v :: Aeson.Value)) (KeyMap.toList failedObj)
-        return $ Map.fromList failedList
+        failedObj <- v Aeson..: "failedBuilds" :: Aeson.Parser Aeson.Object
+        foldM (\acc (k, v) -> do
+            buildId <- case reads (T.unpack (Key.toText k)) of
+                [(buildId', "")] -> return buildId'
+                _ -> fail $ "Invalid BuildId format: " ++ T.unpack (Key.toText k)
+
+            result <- Aeson.withObject "FailedBuild" (\o -> do
+                timestamp <- o .: "timestamp"
+                buildError <- o .: "error"
+                return (timestamp, buildError)
+                ) v
+
+            return $ Map.insert buildId result acc
+            ) Map.empty (KeyMap.toList failedObj)
 
     extractReachablePaths = Aeson.withObject "StateData" $ \v -> do
         paths <- v Aeson..: "reachablePaths"
@@ -560,12 +585,39 @@ captureStateData state = do
     return $ Aeson.object [
             "version" .= ("1.0" :: Text),
             "timestamp" .= timestamp,
-            "completedBuilds" Aeson..= Aeson.object [Key.fromText (T.pack $ show k) Aeson..= (v :: BuildError) | (k, v) <- Map.toList completedBuilds]
-            "failedBuilds" .= Aeson.object [Key.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList failedBuilds],
+            "completedBuilds" .= encodeCompletedBuilds completedBuilds,
+            "failedBuilds" .= encodeFailedBuilds failedBuilds,
             "reachablePaths" .= reachablePaths,
             "knownDerivations" .= Aeson.object [Key.fromText k .= encodeDerivation v | (k, v) <- Map.toList knownDerivations],
             "lastGC" .= lastGC,
             "gcStats" .= gcStats
+        ]
+  where
+    encodeCompletedBuilds :: Map BuildId (UTCTime, Either BuildError BuildResult) -> Aeson.Value
+    encodeCompletedBuilds builds =
+        Aeson.object [Key.fromText (T.pack $ show k) .= encodeBuildResult v | (k, v) <- Map.toList builds]
+
+    encodeFailedBuilds :: Map BuildId (UTCTime, BuildError) -> Aeson.Value
+    encodeFailedBuilds builds =
+        Aeson.object [Key.fromText (T.pack $ show k) .= encodeFailure v | (k, v) <- Map.toList builds]
+
+    encodeBuildResult :: (UTCTime, Either BuildError BuildResult) -> Aeson.Value
+    encodeBuildResult (time, result) = case result of
+        Left err -> Aeson.object [
+                "timestamp" .= time,
+                "success" .= False,
+                "error" .= err
+            ]
+        Right buildResult -> Aeson.object [
+                "timestamp" .= time,
+                "success" .= True,
+                "result" .= buildResult
+            ]
+
+    encodeFailure :: (UTCTime, BuildError) -> Aeson.Value
+    encodeFailure (time, err) = Aeson.object [
+            "timestamp" .= time,
+            "error" .= err
         ]
 
 -- Helper to convert a Derivation to Aeson.Value
