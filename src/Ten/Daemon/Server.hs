@@ -85,6 +85,9 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
+import Data.Unique (newUnique)
+import System.IO.Unsafe (unsafePerformIO)
+import Control.Concurrent (takeMVar, tryTakeMVar)
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime)
 import Data.Time.Format (formatTime, defaultTimeLocale)
 import Data.Word (Word32, Word64)
@@ -238,7 +241,7 @@ startServer serverSocket state config = do
 
     -- Initialize authentication database
     authDbPath <- getAuthDbPath config
-    authDb <- loadAuthDb authDbPath
+    authDb <- loadAuthFile authDbPath
     authDbVar <- newTVarIO authDb
 
     -- Setup log files
@@ -350,7 +353,7 @@ stopServer ServerControl{..} = do
     -- Save authentication database
     authDb <- readTVarIO scAuthDb
     authDbPath <- getAuthDbPath scConfig
-    saveAuthDb authDbPath authDb
+    saveAuthFile authDbPath authDb
 
     -- Save daemon state
     saveDaemonState scConfig scState
@@ -618,10 +621,9 @@ handleClient clientSocket clientHandle clients state config
 
                 Builder ->
                     -- Drop privileges to Builder tier with a transition
-                    withPrivilegeTransition DropPrivilege id $
                         handleClientRequests clientSocket clientHandle state config clientAddr
                                            securityLog accessLog lastActivityVar clientStateVar
-                                           requestCountVar permissionsVar idleTimeout sBuilder
+                                           requestCountVar permissionsVar idleTimeout sDaemon
 
   where
     -- Update client info after authentication
@@ -676,7 +678,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                             return (count + 1)
 
                         -- Apply rate limiting
-                        allowed <- liftIO $ checkRequestRateLimit rateLimiter clientAddr
+                        allowed <- liftIO $ checkRequestRateLimit (scRateLimiter st) clientAddr
 
                         if not allowed then do
                             -- Rate limit exceeded
@@ -695,7 +697,7 @@ handleClientRequests clientSocket clientHandle state config clientAddr
                                      "Client " ++ show clientAddr ++ " request #" ++ show reqCount
 
                             -- Process the message
-                            case Core.deserializeDaemonRequest msgData mPayload of
+                            case Protocol.deserializeDaemonRequest msgData mPayload of
                                 Left err -> do
                                     -- Invalid message format
                                     liftIO $ hPutStrLn securityLog $ formatLogEntry now "MALFORMED" $
@@ -1017,7 +1019,7 @@ authenticateClient handle authDbVar rateLimiter addr securityLog = do
             (msgData, mPayload) <- readMessageWithTimeout handle 5000000 -- 5 second timeout
 
             -- Try to parse auth message
-            case Core.deserializeDaemonRequest msgData mPayload of
+            case Protocol.deserializeDaemonRequest msgData mPayload of
                 Left err ->
                     return $ Left $ "Invalid authentication message format: " <> err
 
@@ -1186,10 +1188,10 @@ readMessageWithTimeout handle timeoutMicros = do
 sendResponse :: Handle -> Int -> Core.DaemonResponse -> IO ()
 sendResponse handle reqId response = do
     -- Serialize the response with Core utility
-    let (respData, mPayload) = Core.serializeDaemonResponse response
+    let (respData, mPayload) = Protocol.serializeDaemonResponse response
 
     -- Create framed response
-    let framedResp = Core.createResponseFrame respData
+    let framedResp = Protocol.createResponseFrame respData
 
     -- Send the response
     BS.hPut handle framedResp
@@ -1197,7 +1199,7 @@ sendResponse handle reqId response = do
     -- Send payload if present
     case mPayload of
         Just payload -> do
-            let framedPayload = Core.createResponseFrame payload
+            let framedPayload = Protocol.createResponseFrame payload
             BS.hPut handle framedPayload
         Nothing -> return ()
 

@@ -350,6 +350,7 @@ data DaemonRequest
     | StoreVerifyRequest StorePath
     | StorePathRequest Text BS.ByteString
     | StoreListRequest
+    | StoreReadRequest StorePath
     | StoreDerivationRequest BS.ByteString
     | RetrieveDerivationRequest StorePath
     | QueryDerivationRequest Text Text (Maybe Int)
