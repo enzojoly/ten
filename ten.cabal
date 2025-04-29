@@ -28,7 +28,6 @@ library
                      , Ten.CLI
     other-modules:    Ten.Daemon.Auth
                      , Ten.Daemon.Client
-                     , Ten.Daemon.Core
                      , Ten.Daemon.Protocol
                      , Ten.Daemon.Server
                      , Ten.Daemon.State
