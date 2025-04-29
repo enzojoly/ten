@@ -499,11 +499,11 @@ populateState state jsonData = do
         return paths
 
     extractKnownDerivations = Aeson.withObject "StateData" $ \v -> do
-        derivsObj <- v Aeson..: "knownDerivations"
+        derivsObj <- v Aeson..: "knownDerivations" :: Aeson.Parser (KeyMap.KeyMap Aeson.Value)
         -- Convert from Aeson object to Map Text Derivation manually
         let derivsList = map (\(k, v) ->
                 (Key.toText k,
-                case Aeson.encode v of
+                case Aeson.encode (v :: Aeson.Value) of
                     lbs -> case Core.deserializeDerivation (LBS.toStrict lbs) of
                         Right drv -> Just drv
                         _ -> Nothing))
@@ -558,7 +558,7 @@ captureStateData state = do
     return $ Aeson.object [
             "version" .= ("1.0" :: Text),
             "timestamp" .= timestamp,
-            "completedBuilds" .= Aeson.object [Key.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList completedBuilds],
+            "completedBuilds" Aeson..= Aeson.object [Key.fromText (T.pack $ show k) Aeson..= (v :: BuildError) | (k, v) <- Map.toList completedBuilds]
             "failedBuilds" .= Aeson.object [Key.fromText (T.pack $ show k) .= v | (k, v) <- Map.toList failedBuilds],
             "reachablePaths" .= reachablePaths,
             "knownDerivations" .= Aeson.object [Key.fromText k .= encodeDerivation v | (k, v) <- Map.toList knownDerivations],
