@@ -1038,7 +1038,7 @@ acquireGCLockFile lockPath = do
             -- Create the lock file with our PID
             result <- try $ do
                 -- Open or create the file
-                fd <- openFd lockPath ReadWrite (Just 0o644) (defaultFileFlags {trunc = True})
+                fd <- openFd lockPath ReadWrite (defaultFileFlags {trunc = True, mode = Just 0o644})
 
                 -- Write our PID to it
                 handle <- fdToHandle fd
@@ -1564,7 +1564,7 @@ calculateBuildProgress build = do
 
     case status of
         BuildPending -> return 0.0
-        BuildRunning progress -> return progress
+        BuildRunning progress -> return (realToFrac progress :: Double)
         BuildRecursing _ -> return 0.5  -- Assume 50% for returned derivations
         BuildCompleted -> return 1.0
         BuildFailed' -> return 1.0
