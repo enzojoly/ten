@@ -290,9 +290,9 @@ parseArgs (cmdStr:args) = do
                     case subcmd of
                         "start" -> Right $ CmdDaemon DaemonStart
                         "stop" -> Right $ CmdDaemon DaemonStop
-                        "status" -> Right $ CmdDaemon DaemonStatus
+                        "status" -> Right $ CmdDaemon Core.DaemonStatus
                         "restart" -> Right $ CmdDaemon DaemonRestart
-                        "config" -> Right $ CmdDaemon DaemonConfig
+                        "config" -> Right $ CmdDaemon Core.DaemonConfig
                         _ -> Left $ "unknown daemon subcommand: " ++ subcmd
         "help" -> Right CmdHelp
         "version" -> Right CmdVersion
@@ -339,7 +339,7 @@ userName :: User.UserEntry -> String
 userName = User.userName
 
 -- | Type alias for daemon connection
-type DaemonConnection = DaemonClient.DaemonConnection 'Builder
+type DaemonConnection = Core.DaemonConnection 'Builder
 type DerivInfoResult = (Text, Text)  -- Simple definition for the CLI module's needs
 
 -- | Main entry point to run a command
@@ -505,9 +505,9 @@ commandToString = \case
     CmdDaemon subcmd -> case subcmd of
         DaemonStart -> "daemon start"
         DaemonStop -> "daemon stop"
-        DaemonStatus -> "daemon status"
+        Core.DaemonStatus -> "daemon status"
         DaemonRestart -> "daemon restart"
-        DaemonConfig -> "daemon config"
+        Core.DaemonConfig -> "daemon config"
     CmdHelp -> "help"
     CmdVersion -> "version"
 
@@ -516,7 +516,7 @@ commandToArgs :: Command -> [String]
 commandToArgs cmd = words (commandToString cmd)
 
 -- | Execute daemon command (via client protocol)
-executeDaemonCommand :: SPrivilegeTier 'Builder -> Command -> Options -> DaemonConnection -> IO Bool
+executeDaemonCommand :: SPrivilegeTier 'Builder -> Command -> Options -> Core.DaemonConnection -> IO Bool
 executeDaemonCommand spt cmd opts conn = do
     -- Create request based on command
     let request = commandToRequest cmd
@@ -556,9 +556,9 @@ executeDaemonCommand spt cmd opts conn = do
             Request 0 "derivation-info" (Map.singleton "path" (T.pack path)) Nothing
         CmdDeriv ListDerivations ->
             Request 0 "list-derivations" Map.empty Nothing
-        CmdDaemon DaemonStatus ->
+        CmdDaemon Core.DaemonStatus ->
             Request 0 "status" Map.empty Nothing
-        CmdDaemon DaemonConfig ->
+        CmdDaemon Core.DaemonConfig ->
             Request 0 "config" Map.empty Nothing
         _ -> error $ "Command not supported via daemon protocol: " ++ show cmd
 
@@ -622,7 +622,7 @@ executeDaemonCommand spt cmd opts conn = do
         | otherwise = show (round $ seconds / 3600) ++ " hours"
 
 -- | Execute store command
-executeStoreCommand :: SPrivilegeTier 'Builder -> StoreCommand -> DaemonConnection -> Options -> IO Bool
+executeStoreCommand :: SPrivilegeTier 'Builder -> StoreCommand -> Core.DaemonConnection -> Options -> IO Bool
 executeStoreCommand spt cmd conn opts = case cmd of
     StoreAdd file -> do
         exists <- doesFileExist file
@@ -774,7 +774,7 @@ executeStoreCommand spt cmd conn opts = case cmd of
         | otherwise = show (bytes `div` (1024 * 1024 * 1024)) ++ " GB"
 
 -- | Execute derivation command
-executeDerivationCommand :: SPrivilegeTier 'Builder -> DerivationCommand -> DaemonConnection -> Options -> IO Bool
+executeDerivationCommand :: SPrivilegeTier 'Builder -> DerivationCommand -> Core.DaemonConnection -> Options -> IO Bool
 executeDerivationCommand spt cmd conn opts = case cmd of
     DerivInfo path -> do
         -- Create derivation-info request
@@ -1178,7 +1178,7 @@ handleDerivation spt cmd = case cmd of
 
             -- Read and deserialize the derivation
             content <- liftIO $ BS.readFile file
-            deriv <- case deserializeDerivation content of
+            deriv <- case Core.deserializeDerivation content of
                 Left err -> throwError err
                 Right drv -> return drv
 
@@ -1197,7 +1197,7 @@ handleDerivation spt cmd = case cmd of
 
             -- Read and deserialize the derivation
             content <- liftIO $ BS.readFile file
-            deriv <- case deserializeDerivation content of
+            deriv <- case Core.deserializeDerivation content of
                 Left err -> throwError err
                 Right drv -> return drv
 
@@ -1336,9 +1336,9 @@ handleDaemon spt cmd = do
     case cmd of
         DaemonStart -> startDaemon
         DaemonStop -> stopDaemon
-        DaemonStatus -> showDaemonStatus
+        Core.DaemonStatus -> showDaemonStatus
         DaemonRestart -> restartDaemon
-        DaemonConfig -> showDaemonConfig
+        Core.DaemonConfig -> showDaemonConfig
   where
     isRunningAsDaemon :: BuildEnv -> Bool
     isRunningAsDaemon env = runMode env == DaemonMode
@@ -1554,7 +1554,7 @@ getDaemonStatus = do
             else return 0
 
     -- Construct status
-    return DaemonStatus {
+    return Core.DaemonStatus {
         daemonStatus = "running",
         daemonUptime = uptime,
         daemonActiveBuilds = activeBuilds,
@@ -1621,8 +1621,8 @@ daemonCommand spt args socket = do
     parseCommandString "store" ("verify":path:_) = Right $ CmdStore (StoreVerify path)
     parseCommandString "store" ("path":file:_) = Right $ CmdStore (CmdStorePath file)
     parseCommandString "store" ("add":file:_) = Right $ CmdStore (StoreAdd file)
-    parseCommandString "daemon" ("status":_) = Right $ CmdDaemon DaemonStatus
-    parseCommandString "daemon" ("config":_) = Right $ CmdDaemon DaemonConfig
+    parseCommandString "daemon" ("status":_) = Right $ CmdDaemon Core.DaemonStatus
+    parseCommandString "daemon" ("config":_) = Right $ CmdDaemon Core.DaemonConfig
     parseCommandString "daemon" ("start":_) = Right $ CmdDaemon DaemonStart
     parseCommandString "daemon" ("stop":_) = Right $ CmdDaemon DaemonStop
     parseCommandString "daemon" ("restart":_) = Right $ CmdDaemon DaemonRestart
@@ -1639,8 +1639,8 @@ daemonCommand spt args socket = do
         Request 0 "store-path" (Map.singleton "path" (T.pack path)) Nothing
     commandToRequest (CmdStore (StoreAdd path)) =
         Request 0 "store-add" (Map.singleton "path" (T.pack path)) Nothing
-    commandToRequest (CmdDaemon DaemonStatus) = Request 0 "status" Map.empty Nothing
-    commandToRequest (CmdDaemon DaemonConfig) = Request 0 "config" Map.empty Nothing
+    commandToRequest (CmdDaemon Core.DaemonStatus) = Request 0 "status" Map.empty Nothing
+    commandToRequest (CmdDaemon Core.DaemonConfig) = Request 0 "config" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonStart) = Request 0 "daemon-start" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonStop) = Request 0 "daemon-stop" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonRestart) = Request 0 "daemon-restart" Map.empty Nothing
@@ -1790,7 +1790,7 @@ requestBuildDerivation spt derivation = do
     case runMode env of
         ClientMode conn -> do
             -- Create build request
-            let derivContent = serializeDerivation derivation
+            let derivContent = Core.serializeDerivation derivation
             let request = Request {
                     reqId = 0,
                     reqType = "build-derivation",
@@ -1886,7 +1886,7 @@ handleBuildDerivationFile spt file = do
     content <- liftIO $ BS.readFile file
 
     -- Deserialize the derivation
-    drv <- case deserializeDerivation content of
+    drv <- case Core.deserializeDerivation content of
         Left err -> throwError err
         Right d -> return d
 
@@ -2022,7 +2022,7 @@ withDatabase dbPath timeout action = do
     return result
 
 -- | Get a daemon connection from the environment
-getDaemonConnection :: TenM p 'Builder DaemonConnection
+getDaemonConnection :: TenM p 'Builder Core.DaemonConnection
 getDaemonConnection = do
     env <- ask
     case runMode env of
