@@ -330,7 +330,7 @@ commandPhase = \case
     CmdEval _ -> Eval                -- Eval command uses Eval phase
     CmdStore _ -> Build              -- Store commands use Build phase
     CmdGC -> Build                   -- GC uses Build phase
-    CmdDeriv _ -> Eval               -- Derivation commands use Eval phase
+    CmdDeriv _ -> Build              -- Changed: Derivation commands use Build phase for consistency
     CmdInfo _ -> Build               -- Info works in Build phase
     CmdDaemon _ -> Build             -- Daemon commands use Build phase
     CmdHelp -> Build                 -- Help works in any phase
@@ -371,7 +371,7 @@ runCommand cmd opts = case commandPrivilege cmd of
         case commandPhase cmd of
             Eval -> do
                 bid <- BuildId <$> newUnique
-                result <- evalTen (handleCommand cmd opts) env'
+                result <- evalTen (handleEvalCommand cmd opts) env'
                 case result of
                     Left err -> do
                         hPutStrLn stderr $ "Error: " ++ show err
@@ -380,7 +380,7 @@ runCommand cmd opts = case commandPrivilege cmd of
 
             Build -> do
                 bid <- BuildId <$> newUnique
-                result <- buildTen (handleCommand cmd opts) env'
+                result <- buildTen (handleBuildCommand cmd opts) env'
                 case result of
                     Left err -> do
                         hPutStrLn stderr $ "Error: " ++ show err
@@ -390,7 +390,7 @@ runCommand cmd opts = case commandPrivilege cmd of
     -- Commands that require daemon privileges
     DaemonRequired -> case optDaemonSocket opts of
         -- If socket specified, use the daemon
-        Just socket -> daemonCommand (commandToString cmd) opts socket
+        Just socket -> void $ daemonCommand (commandToString cmd) opts socket
 
         -- Otherwise, attempt to get daemon privileges
         Nothing -> do
@@ -407,7 +407,7 @@ runCommand cmd opts = case commandPrivilege cmd of
                     case commandPhase cmd of
                         Eval -> do
                             bid <- BuildId <$> newUnique
-                            result <- evalTen (handleCommand cmd opts) env'
+                            result <- evalTen (handleEvalCommand cmd opts) env'
                             case result of
                                 Left err -> do
                                     hPutStrLn stderr $ "Error: " ++ show err
@@ -416,7 +416,7 @@ runCommand cmd opts = case commandPrivilege cmd of
 
                         Build -> do
                             bid <- BuildId <$> newUnique
-                            result <- buildTen (handleCommand cmd opts) env'
+                            result <- buildTen (handleBuildCommand cmd opts) env'
                             case result of
                                 Left err -> do
                                     hPutStrLn stderr $ "Error: " ++ show err
@@ -429,18 +429,26 @@ runCommand cmd opts = case commandPrivilege cmd of
                     hPutStrLn stderr $ "  2. Connect to a running daemon with --daemon option"
                     exitWith (ExitFailure 1)
 
--- | Handler for all commands
-handleCommand :: forall p t. (SingI t) => Command -> Options -> TenM p t ()
-handleCommand cmd opts = case cmd of
-    CmdBuild file -> handleBuild (sing @t) file
-    CmdEval file -> handleEval (sing @t) file
-    CmdGC -> handleGC (sing @t) True
-    CmdStore subcmd -> handleStore (sing @t) subcmd
-    CmdDeriv subcmd -> handleDerivation (sing @t) subcmd
-    CmdInfo path -> handleInfo (sing @t) path
-    CmdDaemon subcmd -> handleDaemon (sing @t) subcmd
+-- | Handler for Build phase commands
+handleBuildCommand :: Command -> Options -> TenM 'Build 'Builder ()
+handleBuildCommand cmd opts = case cmd of
+    CmdBuild file -> handleBuild sBuilder file
+    CmdGC -> handleGC sBuilder True
+    CmdStore subcmd -> handleStore sBuilder subcmd
+    CmdDeriv subcmd -> handleDerivation sBuilder subcmd
+    CmdInfo path -> handleInfo sBuilder path
+    CmdDaemon subcmd -> handleDaemon sBuilder subcmd
     CmdHelp -> showHelp
     CmdVersion -> showVersion
+    CmdEval _ -> throwError $ PhaseError "Eval commands cannot be handled in Build phase"
+
+-- | Handler for Eval phase commands
+handleEvalCommand :: Command -> Options -> TenM 'Eval 'Builder ()
+handleEvalCommand cmd opts = case cmd of
+    CmdEval file -> handleEval sBuilder file
+    CmdHelp -> showHelp
+    CmdVersion -> showVersion
+    _ -> throwError $ PhaseError "Command requires Build phase"
 
 -- | Show help text
 showHelp :: TenM p t ()
@@ -916,7 +924,7 @@ drvInfoHash :: DerivInfoResult -> Text
 drvInfoHash (_, hash) = hash
 
 -- | Handle build command
-handleBuild :: forall t. SingI t => SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleBuild :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
 handleBuild spt file = do
     -- Check if file exists
     exists <- liftIO $ doesFileExist file
@@ -932,7 +940,7 @@ handleBuild spt file = do
         else handleBuildTenExpression spt file
 
 -- | Handle evaluation command
-handleEval :: forall t. SingI t => SPrivilegeTier t -> FilePath -> TenM 'Eval t ()
+handleEval :: SPrivilegeTier t -> FilePath -> TenM 'Eval t ()
 handleEval spt file = do
     -- Check if file exists
     exists <- liftIO $ doesFileExist file
@@ -957,35 +965,38 @@ handleEval spt file = do
         putStrLn $ "Outputs: " ++ show (Set.size (derivOutputs result))
 
 -- | Handle GC command
-handleGC :: forall t. SingI t => SPrivilegeTier t -> Bool -> TenM 'Build t ()
-handleGC spt dryRun = case (fromSing spt) of
-    Daemon -> do
-        -- Acquire GC lock
-        env <- ask
-        let lockPath = gcLockPath (storeLocation env)
+handleGC :: SPrivilegeTier t -> Bool -> TenM 'Build t ()
+handleGC spt dryRun = case fromSing spt of
+    Daemon -> handleGCDaemon dryRun
+    Builder -> handleGCBuilder dryRun
 
-        -- Check for stale lock
-        liftIO $ breakStaleLock' lockPath
+-- | Handle GC command in Daemon context
+handleGCDaemon :: Bool -> TenM 'Build 'Daemon ()
+handleGCDaemon dryRun = do
+    -- Acquire GC lock
+    env <- ask
+    let lockPath = gcLockPath (storeLocation env)
 
-        -- Run garbage collection
-        logMsg 1 "Starting garbage collection"
-        when dryRun $
-            logMsg 1 "Dry run mode - no paths will be deleted"
+    -- Check for stale lock
+    liftIO $ breakStaleLock' lockPath
 
-        let gcFunc = if dryRun
-                     then collectGarbageDryRun
-                     else collectGarbage
+    -- Run garbage collection
+    logMsg 1 "Starting garbage collection"
+    when dryRun $
+        logMsg 1 "Dry run mode - no paths will be deleted"
 
-        (collected, live, bytes) <- withGCLock gcFunc
+    let gcFunc = if dryRun
+                  then collectGarbageDryRun
+                  else collectGarbage
 
-        -- Output results
-        liftIO $ do
-            putStrLn $ "GC completed: " ++ show collected ++ " paths collected"
-            putStrLn $ "Live paths: " ++ show live
-            when (not dryRun) $
-                putStrLn $ "Freed " ++ formatBytes bytes ++ " of disk space"
-    Builder ->
-        throwError $ PrivilegeError "Garbage collection requires daemon privileges"
+    (collected, live, bytes) <- withGCLock gcFunc
+
+    -- Output results
+    liftIO $ do
+        putStrLn $ "GC completed: " ++ show collected ++ " paths collected"
+        putStrLn $ "Live paths: " ++ show live
+        when (not dryRun) $
+            putStrLn $ "Freed " ++ formatBytes bytes ++ " of disk space"
   where
     formatBytes :: Integer -> String
     formatBytes bytes
@@ -1034,26 +1045,51 @@ handleGC spt dryRun = case (fromSing spt) of
         -- In a real implementation, this would acquire a lock file
         action
 
+-- | Handle GC command in Builder context (must go through daemon)
+handleGCBuilder :: Bool -> TenM 'Build 'Builder ()
+handleGCBuilder dryRun = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            -- Create gc request
+            let request = Request {
+                    reqId = 0,
+                    reqType = "gc",
+                    reqParams = Map.singleton "dryRun" (if dryRun then "true" else "false"),
+                    reqPayload = Nothing
+                }
+
+            -- Send request and wait for response
+            response <- liftIO $ sendRequestSync conn request 3600000000  -- 1 hour timeout
+
+            -- Process response
+            case response of
+                Left err ->
+                    throwError err
+                Right (GCResultResponse stats) -> liftIO $ do
+                    putStrLn $ "GC completed: " ++ show (gcCollected stats) ++ " paths collected"
+                    putStrLn $ "  Total paths: " ++ show (gcTotal stats)
+                    putStrLn $ "  Live paths: " ++ show (gcLive stats)
+                    when (not dryRun) $
+                        putStrLn $ "  Freed: " ++ formatBytes (gcBytes stats)
+                Right _ ->
+                    throwError $ DaemonError "Unexpected response type for GC request"
+        _ ->
+            throwError $ PrivilegeError "Garbage collection requires daemon privileges"
+  where
+    formatBytes :: Integer -> String
+    formatBytes bytes
+        | bytes < 1024 = show bytes ++ " B"
+        | bytes < 1024 * 1024 = show (bytes `div` 1024) ++ " KB"
+        | bytes < 1024 * 1024 * 1024 = show (bytes `div` (1024 * 1024)) ++ " MB"
+        | otherwise = show (bytes `div` (1024 * 1024 * 1024)) ++ " GB"
+
 -- | Handle store commands
-handleStore :: forall t. SingI t => SPrivilegeTier t -> StoreCommand -> TenM 'Build t ()
+handleStore :: SPrivilegeTier t -> StoreCommand -> TenM 'Build t ()
 handleStore spt cmd = case cmd of
-    StoreAdd file -> case (fromSing spt) of
-        Daemon -> do
-            -- Check if file exists
-            exists <- liftIO $ doesFileExist file
-            unless exists $
-                throwError $ InputNotFound file
-
-            -- Determine if it's a file or directory
-            isDir <- liftIO $ doesDirectoryExist file
-            result <- if isDir
-                        then storeDirectory file
-                        else storeFile file
-
-            -- Output the result
-            liftIO $ putStrLn $ "Added to store: " ++ T.unpack (storePathToText result)
-
-        _ -> throwError $ PrivilegeError "Storing files requires daemon privileges"
+    StoreAdd file -> case fromSing spt of
+        Daemon -> handleStoreAddDaemon file
+        Builder -> handleStoreAddBuilder file
 
     StoreVerify path -> do
         -- Try to parse as store path first
@@ -1080,9 +1116,9 @@ handleStore spt cmd = case cmd of
         let nameHint = T.pack $ takeFileName file
         storePathForContent nameHint content
 
-    StoreGC -> case (fromSing spt) of
+    StoreGC -> case fromSing spt of
         Daemon -> handleGC spt False
-        _ -> throwError $ PrivilegeError "Garbage collection requires daemon privileges"
+        Builder -> handleGCBuilder False
 
     StoreList -> do
         -- List store paths
@@ -1090,190 +1126,396 @@ handleStore spt cmd = case cmd of
         liftIO $ do
             putStrLn $ "Found " ++ show (length paths) ++ " paths in store:"
             forM_ paths $ \path -> putStrLn $ "  " ++ path
-  where
-    -- Calculate store path for content without storing it
-    storePathForContent :: Text -> BS.ByteString -> TenM 'Build t ()
-    storePathForContent nameHint content = do
-        env <- ask
 
-        -- Calculate hash of content
-        let contentHashDigest = hashByteString content
-        let contentHash = T.pack $ show contentHashDigest
+-- | Handle store add command in Daemon context
+handleStoreAddDaemon :: FilePath -> TenM 'Build 'Daemon ()
+handleStoreAddDaemon file = do
+    -- Check if file exists
+    exists <- liftIO $ doesFileExist file
+    unless exists $
+        throwError $ InputNotFound file
 
-        -- Create store path
-        let path = StorePath contentHash nameHint
+    -- Determine if it's a file or directory
+    isDir <- liftIO $ doesDirectoryExist file
+    result <- if isDir
+                then storeDirectory file
+                else storeFile file
 
-        -- Display the path
-        liftIO $ putStrLn $ T.unpack (storePathToText path)
+    -- Output the result
+    liftIO $ putStrLn $ "Added to store: " ++ T.unpack (storePathToText result)
+
+-- | Handle store add command in Builder context
+handleStoreAddBuilder :: FilePath -> TenM 'Build 'Builder ()
+handleStoreAddBuilder file = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            -- Check if file exists
+            exists <- liftIO $ doesFileExist file
+            unless exists $
+                throwError $ InputNotFound file
+
+            -- Read file content
+            content <- liftIO $ BS.readFile file
+
+            -- Create store-add request
+            let request = Request {
+                    reqId = 0,  -- Will be set by sendRequest
+                    reqType = "store-add",
+                    reqParams = Map.singleton "path" (T.pack $ takeFileName file),
+                    reqPayload = Just content
+                }
+
+            -- Send request
+            response <- liftIO $ sendRequestSync conn request 300000000
+
+            -- Handle response
+            case response of
+                Left err ->
+                    throwError err
+                Right (StoreAddResponse path) ->
+                    liftIO $ putStrLn $ "Added to store: " ++ T.unpack (storePathToText path)
+                Right _ ->
+                    throwError $ DaemonError "Unexpected response from daemon"
+        _ ->
+            throwError $ PrivilegeError "Storing files requires daemon connection"
+
+-- | Calculate store path for content without storing it
+storePathForContent :: Text -> BS.ByteString -> TenM 'Build t ()
+storePathForContent nameHint content = do
+    env <- ask
+
+    -- Calculate hash of content
+    let contentHashDigest = hashByteString content
+    let contentHash = T.pack $ show contentHashDigest
+
+    -- Create store path
+    let path = StorePath contentHash nameHint
+
+    -- Display the path
+    liftIO $ putStrLn $ T.unpack (storePathToText path)
 
 -- | Handle derivation commands
-handleDerivation :: forall t. SingI t => SPrivilegeTier t -> DerivationCommand -> TenM 'Eval t ()
+handleDerivation :: SPrivilegeTier t -> DerivationCommand -> TenM 'Build t ()
 handleDerivation spt cmd = case cmd of
-    DerivInfo path -> case textToStorePath (T.pack path) of
-        Just storePath -> do
-            -- Read the derivation
-            result <- case (fromSing spt) of
-                Daemon -> readDerivationDaemon storePath
-                _ -> readDerivationBuilder storePath
+    DerivInfo path -> handleDerivationInfo spt path
+    QueryDeriver path -> handleQueryDeriver spt path
+    StoreDerivation file -> handleStoreDerivation spt file
+    RegisterDerivation file -> handleRegisterDerivation spt file
+    ListDerivations -> handleListDerivations spt
 
-            -- Process the result
-            case result of
-                Left err -> throwError err
-                Right drv -> do
-                    -- Display derivation info
-                    liftIO $ do
-                        putStrLn $ "Derivation: " ++ T.unpack (derivName drv)
-                        putStrLn $ "Hash: " ++ T.unpack (derivHash drv)
-                        putStrLn $ "Builder: " ++ T.unpack (storePathToText (derivBuilder drv))
-                        putStrLn "Arguments:"
-                        forM_ (derivArgs drv) $ \arg -> putStrLn $ "  " ++ T.unpack arg
-                        putStrLn $ "Inputs: " ++ show (Set.size (derivInputs drv))
-                        forM_ (Set.toList (derivInputs drv)) $ \input ->
-                            putStrLn $ "  " ++ T.unpack (storePathToText (inputPath input)) ++
-                                      " as " ++ T.unpack (inputName input)
-                        putStrLn $ "Outputs: " ++ show (Set.size (derivOutputs drv))
-                        forM_ (Set.toList (derivOutputs drv)) $ \output ->
-                            putStrLn $ "  " ++ T.unpack (outputName output) ++
-                                      " -> " ++ T.unpack (storePathToText (outputPath output))
-                        putStrLn $ "System: " ++ T.unpack (derivSystem drv)
-                        putStrLn $ "Strategy: " ++ case derivStrategy drv of
-                            ApplicativeStrategy -> "applicative"
-                            MonadicStrategy -> "monadic"
+-- | Handle derivation info command
+handleDerivationInfo :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleDerivationInfo spt path = case textToStorePath (T.pack path) of
+    Just storePath -> case fromSing spt of
+        Daemon -> handleDerivationInfoDaemon storePath
+        Builder -> handleDerivationInfoBuilder storePath
+    Nothing -> throwError $ StoreError $ "Invalid store path format: " <> T.pack path
 
-        Nothing -> throwError $ StoreError $ "Invalid store path format: " <> T.pack path
+-- | Handle derivation info in Daemon context
+handleDerivationInfoDaemon :: StorePath -> TenM 'Build 'Daemon ()
+handleDerivationInfoDaemon path = do
+    -- Read the derivation
+    result <- readDerivationDaemon path
 
-    QueryDeriver path -> case textToStorePath (T.pack path) of
-        Just storePath -> do
-            -- Query for the deriver in the database
-            env <- ask
-            case (fromSing spt) of
-                Daemon -> do
-                    withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                        rows <- DB.withTenReadTransaction db $ \conn -> do
-                            -- Query using path as StorePath parameter
-                            tenQuery conn
-                                "SELECT d.path FROM Derivations d JOIN DerivationOutputs o ON d.id = o.derivation_id WHERE o.path = ?"
-                                (Only (storePathToText storePath)) :: TenM 'Eval 'Daemon [Only Text]
+    -- Process the result
+    case result of
+        Left err -> throwError err
+        Right drv -> displayDerivationInfo drv
 
-                        case rows of
-                            (Only derivPath):_ -> do
-                                -- Convert the text to StorePath
-                                case parseStorePath derivPath of
-                                    Just dPath -> liftIO $ putStrLn $ "Deriver: " ++ T.unpack derivPath
-                                    Nothing -> liftIO $ putStrLn $ "Invalid deriver path format: " ++ T.unpack derivPath
-                            [] -> liftIO $ putStrLn "No deriver found for this path"
+-- | Handle derivation info in Builder context
+handleDerivationInfoBuilder :: StorePath -> TenM 'Build 'Builder ()
+handleDerivationInfoBuilder path = do
+    -- Read the derivation
+    result <- readDerivationBuilder path
 
-                _ -> throwError $ PrivilegeError "Querying derivers requires daemon privileges"
+    -- Process the result
+    case result of
+        Left err -> throwError err
+        Right drv -> displayDerivationInfo drv
 
-        Nothing -> throwError $ StoreError $ "Invalid store path format: " <> T.pack path
+-- | Display derivation info
+displayDerivationInfo :: Derivation -> TenM 'Build t ()
+displayDerivationInfo drv = liftIO $ do
+    putStrLn $ "Derivation: " ++ T.unpack (derivName drv)
+    putStrLn $ "Hash: " ++ T.unpack (derivHash drv)
+    putStrLn $ "Builder: " ++ T.unpack (storePathToText (derivBuilder drv))
+    putStrLn "Arguments:"
+    forM_ (derivArgs drv) $ \arg -> putStrLn $ "  " ++ T.unpack arg
+    putStrLn $ "Inputs: " ++ show (Set.size (derivInputs drv))
+    forM_ (Set.toList (derivInputs drv)) $ \input ->
+        putStrLn $ "  " ++ T.unpack (storePathToText (inputPath input)) ++
+                  " as " ++ T.unpack (inputName input)
+    putStrLn $ "Outputs: " ++ show (Set.size (derivOutputs drv))
+    forM_ (Set.toList (derivOutputs drv)) $ \output ->
+        putStrLn $ "  " ++ T.unpack (outputName output) ++
+                  " -> " ++ T.unpack (storePathToText (outputPath output))
+    putStrLn $ "System: " ++ T.unpack (derivSystem drv)
+    putStrLn $ "Strategy: " ++ case derivStrategy drv of
+        ApplicativeStrategy -> "applicative"
+        MonadicStrategy -> "monadic"
 
-    StoreDerivation file -> case (fromSing spt) of
-        Daemon -> do
+-- | Handle query deriver command
+handleQueryDeriver :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleQueryDeriver spt path = case textToStorePath (T.pack path) of
+    Just storePath -> case fromSing spt of
+        Daemon -> handleQueryDeriverDaemon storePath
+        Builder -> handleQueryDeriverBuilder storePath
+    Nothing -> throwError $ StoreError $ "Invalid store path format: " <> T.pack path
+
+-- | Handle query deriver in Daemon context
+handleQueryDeriverDaemon :: StorePath -> TenM 'Build 'Daemon ()
+handleQueryDeriverDaemon path = do
+    -- Query for the deriver in the database
+    env <- ask
+    let dbPath = defaultDBPath (storeLocation env)
+
+    db <- getDatabaseConn
+    -- Using withTenReadTransaction for consistency
+    queryResults <- withTenReadTransaction db $ \conn -> do
+        -- Query using path as StorePath parameter
+        tenQuery conn
+            "SELECT d.path FROM Derivations d JOIN DerivationOutputs o ON d.id = o.derivation_id WHERE o.path = ?"
+            (Only (storePathToText path)) :: TenM 'Build 'Daemon [Only Text]
+
+    case queryResults of
+        (Only derivPath):_ -> do
+            -- Convert the text to StorePath
+            case parseStorePath derivPath of
+                Just dPath -> liftIO $ putStrLn $ "Deriver: " ++ T.unpack derivPath
+                Nothing -> liftIO $ putStrLn $ "Invalid deriver path format: " ++ T.unpack derivPath
+        [] -> liftIO $ putStrLn "No deriver found for this path"
+
+-- | Handle query deriver in Builder context
+handleQueryDeriverBuilder :: StorePath -> TenM 'Build 'Builder ()
+handleQueryDeriverBuilder path = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            -- Create request for deriver
+            let request = Request {
+                    reqId = 0,
+                    reqType = "query-deriver",
+                    reqParams = Map.singleton "path" (storePathToText path),
+                    reqPayload = Nothing
+                }
+
+            -- Send request and wait for response
+            response <- liftIO $ sendRequestSync conn request 30000000
+
+            -- Process response
+            case response of
+                Left err ->
+                    throwError err
+                Right (DerivationResponse drv) ->
+                    liftIO $ putStrLn $ "Deriver: " ++ T.unpack (derivName drv)
+                Right _ ->
+                    throwError $ DaemonError "Unexpected response type"
+        _ ->
+            throwError $ PrivilegeError "Querying derivers requires daemon connection"
+
+-- | Handle store derivation command
+handleStoreDerivation :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleStoreDerivation spt file = case fromSing spt of
+    Daemon -> handleStoreDerivationDaemon file
+    Builder -> handleStoreDerivationBuilder file
+
+-- | Handle store derivation in Daemon context
+handleStoreDerivationDaemon :: FilePath -> TenM 'Build 'Daemon ()
+handleStoreDerivationDaemon file = do
+    -- Check if file exists
+    exists <- liftIO $ doesFileExist file
+    unless exists $
+        throwError $ InputNotFound file
+
+    -- Read and deserialize the derivation
+    content <- liftIO $ BS.readFile file
+    drv <- case Derivation.deserializeDerivation content of
+        Left err -> throwError err
+        Right drv -> return drv
+
+    -- Store the derivation in build phase
+    path <- storeDerivationInBuildDaemon drv
+    liftIO $ putStrLn $ "Stored derivation at: " ++ T.unpack (storePathToText path)
+
+-- | Handle store derivation in Builder context
+handleStoreDerivationBuilder :: FilePath -> TenM 'Build 'Builder ()
+handleStoreDerivationBuilder file = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
             -- Check if file exists
             exists <- liftIO $ doesFileExist file
             unless exists $
                 throwError $ InputNotFound file
 
-            -- Read and deserialize the derivation
+            -- Read file content
             content <- liftIO $ BS.readFile file
-            drv <- case Derivation.deserializeDerivation content of
-                Left err -> throwError err
-                Right drv -> return drv
 
-            -- Store the derivation
-            path <- storeDerivationDaemon drv
-            liftIO $ putStrLn $ "Stored derivation at: " ++ T.unpack (storePathToText path)
+            -- Create store-derivation request
+            let request = Request {
+                    reqId = 0,
+                    reqType = "store-derivation",
+                    reqParams = Map.empty,
+                    reqPayload = Just content
+                }
 
-        _ -> throwError $ PrivilegeError "Storing derivations requires daemon privileges"
+            -- Send request and wait for response
+            response <- liftIO $ sendRequestSync conn request 30000000
 
-    RegisterDerivation file -> case (fromSing spt) of
-        Daemon -> do
+            -- Process response
+            case response of
+                Left err ->
+                    throwError err
+                Right (DerivationStoredResponse path) ->
+                    liftIO $ putStrLn $ "Stored derivation at: " ++ T.unpack (storePathToText path)
+                Right _ ->
+                    throwError $ DaemonError "Unexpected response type"
+        _ ->
+            throwError $ PrivilegeError "Storing derivations requires daemon connection"
+
+-- | Handle register derivation command
+handleRegisterDerivation :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleRegisterDerivation spt file = case fromSing spt of
+    Daemon -> handleRegisterDerivationDaemon file
+    Builder -> handleRegisterDerivationBuilder file
+
+-- | Handle register derivation in Daemon context
+handleRegisterDerivationDaemon :: FilePath -> TenM 'Build 'Daemon ()
+handleRegisterDerivationDaemon file = do
+    -- Check if file exists
+    exists <- liftIO $ doesFileExist file
+    unless exists $
+        throwError $ InputNotFound file
+
+    -- Read and deserialize the derivation
+    content <- liftIO $ BS.readFile file
+    drv <- case Derivation.deserializeDerivation content of
+        Left err -> throwError err
+        Right drv -> return drv
+
+    -- Store and register the derivation
+    env <- ask
+    db <- getDatabaseConn
+
+    -- Store the derivation first
+    path <- storeDerivationInBuildDaemon drv
+
+    -- Register it in the database
+    derivId <- withTenWriteTransaction db $ \conn -> do
+        -- Insert derivation and get ID
+        tenExecute conn
+            "INSERT INTO Derivations (path, name, hash, builder, system, strategy) VALUES (?, ?, ?, ?, ?, ?)"
+            (storePathToText path, derivName drv, derivHash drv,
+             storePathToText (derivBuilder drv), derivSystem drv,
+             if derivStrategy drv == ApplicativeStrategy then "applicative" else "monadic")
+
+        -- Get last inserted ID
+        rows <- tenQuery conn
+            "SELECT last_insert_rowid()"
+            () :: TenM 'Build 'Daemon [Only Int]
+
+        case rows of
+            [Only id] -> return id
+            _ -> throwError $ DBError "Failed to get derivation ID"
+
+    -- Output results
+    liftIO $ do
+        putStrLn $ "Registered derivation: " ++ T.unpack (derivName drv)
+        putStrLn $ "Storage path: " ++ T.unpack (storePathToText path)
+        putStrLn $ "Database ID: " ++ show derivId
+
+-- | Handle register derivation in Builder context
+handleRegisterDerivationBuilder :: FilePath -> TenM 'Build 'Builder ()
+handleRegisterDerivationBuilder file = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
             -- Check if file exists
             exists <- liftIO $ doesFileExist file
             unless exists $
                 throwError $ InputNotFound file
 
-            -- Read and deserialize the derivation
+            -- Read file content
             content <- liftIO $ BS.readFile file
-            drv <- case Derivation.deserializeDerivation content of
+
+            -- Create register-derivation request
+            let request = Request {
+                    reqId = 0,
+                    reqType = "register-derivation",
+                    reqParams = Map.empty,
+                    reqPayload = Just content
+                }
+
+            -- Send request and wait for response
+            response <- liftIO $ sendRequestSync conn request 30000000
+
+            -- Process response
+            case response of
+                Left err ->
+                    throwError err
+                Right (DerivationStoredResponse path) ->
+                    liftIO $ putStrLn $ "Derivation registered: " ++ T.unpack (storePathToText path)
+                Right _ ->
+                    throwError $ DaemonError "Unexpected response type"
+        _ ->
+            throwError $ PrivilegeError "Registering derivations requires daemon connection"
+
+-- | Handle list derivations command
+handleListDerivations :: SPrivilegeTier t -> TenM 'Build t ()
+handleListDerivations spt = case fromSing spt of
+    Daemon -> handleListDerivationsDaemon
+    Builder -> handleListDerivationsBuilder
+
+-- | Handle list derivations in Daemon context
+handleListDerivationsDaemon :: TenM 'Build 'Daemon ()
+handleListDerivationsDaemon = do
+    -- List all derivations in the store
+    env <- ask
+    db <- getDatabaseConn
+
+    derivs <- withTenReadTransaction db $ \conn -> do
+        -- Query derivations
+        rows <- tenQuery conn
+            "SELECT path, name FROM Derivations LIMIT 100"
+            () :: TenM 'Build 'Daemon [(Text, Text)]
+        return rows
+
+    liftIO $ do
+        putStrLn $ "Found " ++ show (length derivs) ++ " derivations:"
+        forM_ derivs $ \(path, name) ->
+            case parseStorePath path of
+                Just sp -> putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack path
+                Nothing -> putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack path ++ " (invalid format)"
+
+-- | Handle list derivations in Builder context
+handleListDerivationsBuilder :: TenM 'Build 'Builder ()
+handleListDerivationsBuilder = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            let request = Request {
+                    reqId = 0,
+                    reqType = "list-derivations",
+                    reqParams = Map.empty,
+                    reqPayload = Nothing
+                }
+
+            response <- liftIO $ sendRequestSync conn request 30000000
+            case response of
                 Left err -> throwError err
-                Right drv -> return drv
-
-            -- Store and register the derivation
-            env <- ask
-            withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                -- Store the derivation first
-                path <- storeDerivationDaemon drv
-
-                -- Register it in the database
-                derivId <- DB.withTenWriteTransaction db $ \conn -> do
-                    -- Insert derivation and get ID
-                    tenExecute conn
-                        "INSERT INTO Derivations (path, name, hash, builder, system, strategy) VALUES (?, ?, ?, ?, ?, ?)"
-                        (storePathToText path, derivName drv, derivHash drv,
-                         storePathToText (derivBuilder drv), derivSystem drv,
-                         if derivStrategy drv == ApplicativeStrategy then "applicative" else "monadic")
-
-                    -- Get last inserted ID
-                    rows <- tenQuery conn
-                        "SELECT last_insert_rowid()"
-                        () :: TenM 'Eval 'Daemon [Only Int]
-
-                    case rows of
-                        [Only id] -> return id
-                        _ -> throwError $ DBError "Failed to get derivation ID"
-
-                -- Output results
-                liftIO $ do
-                    putStrLn $ "Registered derivation: " ++ T.unpack (derivName drv)
-                    putStrLn $ "Storage path: " ++ T.unpack (storePathToText path)
-                    putStrLn $ "Database ID: " ++ show derivId
-
-        _ -> throwError $ PrivilegeError "Registering derivations requires daemon privileges"
-
-    ListDerivations -> do
-        -- List all derivations in the store
-        env <- ask
-        case (fromSing spt) of
-            Daemon -> do
-                withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                    derivs <- DB.withTenReadTransaction db $ \conn -> do
-                        -- Query derivations
-                        rows <- tenQuery conn
-                            "SELECT path, name FROM Derivations LIMIT 100"
-                            () :: TenM 'Eval 'Daemon [(Text, Text)]
-                        return rows
-
+                Right (DerivationListResponse paths) -> do
                     liftIO $ do
-                        putStrLn $ "Found " ++ show (length derivs) ++ " derivations:"
-                        forM_ derivs $ \(path, name) ->
-                            case parseStorePath path of
-                                Just sp -> putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack path
-                                Nothing -> putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack path ++ " (invalid format)"
-
-            _ -> do
-                -- In builder context, we need to go through daemon
-                conn <- getDaemonConnection
-                let request = Request {
-                        reqId = 0,
-                        reqType = "list-derivations",
-                        reqParams = Map.empty,
-                        reqPayload = Nothing
-                    }
-
-                response <- liftIO $ sendRequestSync conn request 30000000
-                case response of
-                    Left err -> throwError err
-                    Right (DerivationListResponse paths) -> do
-                        liftIO $ do
-                            putStrLn $ "Found " ++ show (length paths) ++ " derivations:"
-                            forM_ paths $ \path -> putStrLn $ "  " ++ T.unpack (storePathToText path)
-                    Right _ -> throwError $ StoreError "Unexpected response type"
+                        putStrLn $ "Found " ++ show (length paths) ++ " derivations:"
+                        forM_ paths $ \path -> putStrLn $ "  " ++ T.unpack (storePathToText path)
+                Right _ -> throwError $ StoreError "Unexpected response type"
+        _ ->
+            throwError $ PrivilegeError "Cannot list derivations without daemon connection"
 
 type DerivInfoResult = (Text, Text)  -- Simple definition for the CLI module's needs
 
 -- | Handle info command
-handleInfo :: forall t. SingI t => SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleInfo :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
 handleInfo spt path = do
     -- Check if the path is a file or a store path
     fileExists <- liftIO $ doesFileExist path
@@ -1296,38 +1538,7 @@ handleInfo spt path = do
                 putStrLn $ "Hash: " ++ hashStr
                 putStrLn $ "Permissions: " ++ showPermissions perms
         else case textToStorePath (T.pack path) of
-            Just storePath -> do
-                -- Get store path info
-                exists <- checkStorePathExists storePath
-
-                if exists
-                    then do
-                        -- Get references to and from this path
-                        env <- ask
-                        let fullPath = storePathToFilePath storePath env
-
-                        -- Get file info
-                        size <- liftIO $ fromIntegral . fileSize <$> getFileStatus fullPath
-
-                        -- Get references
-                        refsTo <- getReferencesToPath storePath
-                        refsFrom <- getReferencesFromPath storePath
-
-                        -- Check if it's a GC root
-                        isRoot <- case (fromSing spt) of
-                            Daemon -> isGCRoot storePath
-                            _ -> return False
-
-                        -- Display store path info
-                        liftIO $ do
-                            putStrLn $ "Store path: " ++ T.unpack (storePathToText storePath)
-                            putStrLn $ "Size: " ++ formatSize size
-                            putStrLn $ "Hash: " ++ T.unpack (storeHash storePath)
-                            putStrLn $ "GC root: " ++ if isRoot then "Yes" else "No"
-                            putStrLn $ "Referenced by: " ++ show (Set.size refsTo) ++ " paths"
-                            putStrLn $ "References: " ++ show (Set.size refsFrom) ++ " paths"
-                    else liftIO $ putStrLn $ "Path does not exist in store: " ++ path
-
+            Just storePath -> handleStorePathInfo spt storePath
             Nothing -> liftIO $ putStrLn $ "Not a valid store path format: " ++ path
   where
     formatSize :: Integer -> String
@@ -1344,25 +1555,68 @@ handleInfo spt path = do
         if executable perms then "x" else "-"
         ]
 
+-- | Handle info for store path
+handleStorePathInfo :: SPrivilegeTier t -> StorePath -> TenM 'Build t ()
+handleStorePathInfo spt storePath = do
+    -- Get store path info
+    exists <- checkStorePathExists storePath
+
+    if exists
+        then do
+            -- Get references to and from this path
+            env <- ask
+            let fullPath = storePathToFilePath storePath env
+
+            -- Get file info
+            size <- liftIO $ fromIntegral . fileSize <$> getFileStatus fullPath
+
+            -- Get references
+            refsTo <- getReferencesToPath storePath
+            refsFrom <- getReferencesFromPath storePath
+
+            -- Check if it's a GC root
+            isRoot <- case fromSing spt of
+                Daemon -> isGCRoot storePath
+                Builder -> return False  -- Builder can't check GC roots directly
+
+            -- Display store path info
+            liftIO $ do
+                putStrLn $ "Store path: " ++ T.unpack (storePathToText storePath)
+                putStrLn $ "Size: " ++ formatSize size
+                putStrLn $ "Hash: " ++ T.unpack (storeHash storePath)
+                putStrLn $ "GC root: " ++ if isRoot then "Yes" else "No"
+                putStrLn $ "Referenced by: " ++ show (Set.size refsTo) ++ " paths"
+                putStrLn $ "References: " ++ show (Set.size refsFrom) ++ " paths"
+        else liftIO $ putStrLn $ "Path does not exist in store: " ++ T.unpack (storePathToText storePath)
+  where
+    formatSize :: Integer -> String
+    formatSize size
+        | size < 1024 = show size ++ " B"
+        | size < 1024 * 1024 = show (size `div` 1024) ++ " KB"
+        | size < 1024 * 1024 * 1024 = show (size `div` (1024 * 1024)) ++ " MB"
+        | otherwise = show (size `div` (1024 * 1024 * 1024)) ++ " GB"
+
 -- | Handle daemon commands
-handleDaemon :: forall t. SingI t => SPrivilegeTier t -> DaemonCommand -> TenM 'Build t ()
-handleDaemon spt cmd = case (fromSing spt) of
-    Daemon -> do
-        env <- ask
+handleDaemon :: SPrivilegeTier t -> DaemonCommand -> TenM 'Build t ()
+handleDaemon spt cmd = case fromSing spt of
+    Daemon -> handleDaemonDaemon cmd
+    Builder -> handleDaemonBuilder cmd
 
-        -- Check if running as daemon
-        unless (isRunningAsDaemon env) $
-            throwError $ PrivilegeError "Daemon commands must be run in daemon mode"
+-- | Handle daemon commands in Daemon context
+handleDaemonDaemon :: DaemonCommand -> TenM 'Build 'Daemon ()
+handleDaemonDaemon cmd = do
+    env <- ask
 
-        case cmd of
-            DaemonStart -> startDaemon
-            DaemonStop -> stopDaemon
-            DaemonRestart -> restartDaemon
-            DaemonStatusCmd -> showDaemonStatus
-            DaemonConfigCmd -> showDaemonConfig
+    -- Check if running as daemon
+    unless (isRunningAsDaemon env) $
+        throwError $ PrivilegeError "Daemon commands must be run in daemon mode"
 
-    Builder ->
-        throwError $ PrivilegeError "Daemon operations require daemon privileges"
+    case cmd of
+        DaemonStart -> startDaemon
+        DaemonStop -> stopDaemon
+        DaemonRestart -> restartDaemon
+        DaemonStatusCmd -> showDaemonStatus
+        DaemonConfigCmd -> showDaemonConfig
   where
     isRunningAsDaemon :: BuildEnv -> Bool
     isRunningAsDaemon env = runMode env == DaemonMode
@@ -1494,8 +1748,39 @@ handleDaemon spt cmd = case (fromSing spt) of
                 Left _ -> return False  -- Process doesn't exist
                 Right _ -> return True  -- Process exists
 
+-- | Handle daemon commands in Builder context
+handleDaemonBuilder :: DaemonCommand -> TenM 'Build 'Builder ()
+handleDaemonBuilder cmd = do
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            let request = case cmd of
+                    DaemonStart -> Request 0 "daemon-start" Map.empty Nothing
+                    DaemonStop -> Request 0 "daemon-stop" Map.empty Nothing
+                    DaemonRestart -> Request 0 "daemon-restart" Map.empty Nothing
+                    DaemonStatusCmd -> Request 0 "daemon-status" Map.empty Nothing
+                    DaemonConfigCmd -> Request 0 "daemon-config" Map.empty Nothing
+
+            response <- liftIO $ sendRequestSync conn request 30000000
+            case response of
+                Left err ->
+                    throwError err
+                Right (StatusResponse status) -> liftIO $ do
+                    putStrLn $ "Daemon status: " ++ T.unpack (daemonStatus status)
+                    -- Display other status information
+                Right (ConfigResponse config) -> liftIO $ do
+                    putStrLn "Daemon configuration:"
+                    putStrLn $ "  Socket: " ++ daemonSocketPath config
+                    -- Display other config information
+                Right SuccessResponse ->
+                    liftIO $ putStrLn "Command executed successfully"
+                Right _ ->
+                    throwError $ DaemonError "Unexpected response type"
+        _ ->
+            throwError $ PrivilegeError "Daemon operations require daemon connection"
+
 -- | List all paths in the store
-listStorePaths :: forall t. SingI t => TenM 'Build t [FilePath]
+listStorePaths :: forall t. TenM 'Build t [FilePath]
 listStorePaths = do
     env <- ask
     let storeDir = storeLocation env
@@ -1534,35 +1819,35 @@ getDaemonStatus = do
             else return total
         ) 0 allPaths
 
+    -- Get database connection
+    db <- getDatabaseConn
+
     -- Get active builds from database
-    activeBuilds <- withDatabase (defaultDBPath storeDir) 5000 $ \db -> do
-        DB.withTenReadTransaction db $ \conn -> do
-            rows <- tenQuery conn
-                "SELECT COUNT(*) FROM ActiveBuilds WHERE status = 'running'"
-                () :: TenM 'Build 'Daemon [Only Int]
-            case rows of
-                [Only count] -> return count
-                _ -> return 0
+    activeBuilds <- withTenReadTransaction db $ \conn -> do
+        rows <- tenQuery conn
+            "SELECT COUNT(*) FROM ActiveBuilds WHERE status = 'running'"
+            () :: TenM 'Build 'Daemon [Only Int]
+        case rows of
+            [Only count] -> return count
+            _ -> return 0
 
     -- Get completed builds from database
-    completedBuilds <- withDatabase (defaultDBPath storeDir) 5000 $ \db -> do
-        DB.withTenReadTransaction db $ \conn -> do
-            rows <- tenQuery conn
-                "SELECT COUNT(*) FROM ActiveBuilds WHERE status = 'completed'"
-                () :: TenM 'Build 'Daemon [Only Int]
-            case rows of
-                [Only count] -> return count
-                _ -> return 0
+    completedBuilds <- withTenReadTransaction db $ \conn -> do
+        rows <- tenQuery conn
+            "SELECT COUNT(*) FROM ActiveBuilds WHERE status = 'completed'"
+            () :: TenM 'Build 'Daemon [Only Int]
+        case rows of
+            [Only count] -> return count
+            _ -> return 0
 
     -- Get failed builds from database
-    failedBuilds <- withDatabase (defaultDBPath storeDir) 5000 $ \db -> do
-        DB.withTenReadTransaction db $ \conn -> do
-            rows <- tenQuery conn
-                "SELECT COUNT(*) FROM ActiveBuilds WHERE status = 'failed'"
-                () :: TenM 'Build 'Daemon [Only Int]
-            case rows of
-                [Only count] -> return count
-                _ -> return 0
+    failedBuilds <- withTenReadTransaction db $ \conn -> do
+        rows <- tenQuery conn
+            "SELECT COUNT(*) FROM ActiveBuilds WHERE status = 'failed'"
+            () :: TenM 'Build 'Daemon [Only Int]
+        case rows of
+            [Only count] -> return count
+            _ -> return 0
 
     -- Calculate uptime
     -- In a real implementation, we'd get this from the daemon process start time
@@ -1590,7 +1875,7 @@ getDaemonStatus = do
     }
 
 -- | Execute daemon command via protocol
-daemonCommand :: String -> Options -> FilePath -> IO ExitCode
+daemonCommand :: String -> Options -> FilePath -> IO ()
 daemonCommand args opts socket = do
     -- Connect to daemon
     creds <- getUserCredentials socket
@@ -1598,7 +1883,7 @@ daemonCommand args opts socket = do
     case client of
         Left err -> do
             hPutStrLn stderr $ "Error connecting to daemon: " ++ show err
-            return $ ExitFailure 1
+            exitWith $ ExitFailure 1
 
         Right conn -> do
             -- Parse as command
@@ -1609,7 +1894,7 @@ daemonCommand args opts socket = do
             case command of
                 Left err -> do
                     hPutStrLn stderr $ "Error: " ++ err
-                    return $ ExitFailure 1
+                    exitWith $ ExitFailure 1
 
                 Right cmd -> do
                     -- Create a request based on the command
@@ -1622,12 +1907,11 @@ daemonCommand args opts socket = do
                     case response of
                         Left err -> do
                             hPutStrLn stderr $ "Error: " ++ show err
-                            return $ ExitFailure 1
+                            exitWith $ ExitFailure 1
 
                         Right resp -> do
                             -- Display response
                             displayDaemonResponse cmd resp
-                            return ExitSuccess
   where
     -- Parse command string and arguments
     parseCommandString :: String -> [String] -> Either String Command
@@ -1758,7 +2042,7 @@ getUserCredentials socket = do
         }
 
 -- | Evaluate a Ten expression to a derivation
-evaluateExpression :: forall t. SingI t => SPrivilegeTier t -> BS.ByteString -> TenM 'Eval t Derivation
+evaluateExpression :: SPrivilegeTier t -> BS.ByteString -> TenM 'Eval t Derivation
 evaluateExpression spt content = do
     env <- ask
 
@@ -1787,7 +2071,7 @@ evaluateExpression spt content = do
     return derivation
 
 -- | Create a basic builder for testing
-createBasicBuilder :: forall t. SingI t => SPrivilegeTier t -> TenM 'Eval t StorePath
+createBasicBuilder :: SPrivilegeTier t -> TenM 'Eval t StorePath
 createBasicBuilder spt = do
     env <- ask
 
@@ -1826,90 +2110,25 @@ requestBuildDerivation spt derivation = do
         _ -> throwError $ DaemonError "Not connected to daemon"
 
 -- | Helper function for handleBuildTenExpression
-handleBuildTenExpression :: forall t. SingI t => SPrivilegeTier t -> FilePath -> TenM 'Build t ()
-handleBuildTenExpression spt file = do
+handleBuildTenExpression :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleBuildTenExpression spt file = case fromSing spt of
+    Daemon -> handleBuildTenExpressionDaemon file
+    Builder -> handleBuildTenExpressionBuilder file
+
+-- | Handle build expression in Daemon context
+handleBuildTenExpressionDaemon :: FilePath -> TenM 'Build 'Daemon ()
+handleBuildTenExpressionDaemon file = do
     -- Read file content
     content <- liftIO $ BS.readFile file
 
-    -- Execute expression
-    case (fromSing spt) of
-        Daemon -> do
-            -- First evaluate the expression to get a derivation
-            evalResult <- runTenDaemonEval (evaluateExpression spt content)
+    -- First evaluate the expression to get a derivation
+    -- This requires running in the Eval phase
+    evalResult <- runTenDaemonEval (evaluateExpression sDaemon content)
 
-            case evalResult of
-                Left err -> throwError err
-                Right (drv, _) -> do
-                    -- Now build the derivation
-                    logMsg 1 $ "Building derivation: " <> derivName drv
-                    buildResult <- buildDerivation drv
-
-                    -- Report build result
-                    case brExitCode buildResult of
-                        ExitSuccess -> do
-                            liftIO $ putStrLn "Build succeeded!"
-                            liftIO $ putStrLn "Outputs:"
-                            forM_ (Set.toList $ brOutputPaths buildResult) $ \path ->
-                                liftIO $ putStrLn $ "  " ++ T.unpack (storePathToText path)
-
-                        ExitFailure code -> do
-                            liftIO $ hPutStrLn stderr $ "Build failed with exit code: " ++ show code
-                            liftIO $ hPutStrLn stderr $ "Build log:"
-                            liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
-                            throwError $ BuildFailed "Build failed"
-
-        Builder -> do
-            -- Go through the daemon for evaluation and building
-            -- First convert to daemon connection
-            conn <- getDaemonConnection
-
-            -- Evaluate expression
-            let evalRequest = Request {
-                    reqId = 0,
-                    reqType = "eval",
-                    reqParams = Map.singleton "file" (T.pack file),
-                    reqPayload = Just content
-                }
-
-            evalResp <- liftIO $ sendRequestSync conn evalRequest 30000000
-            case evalResp of
-                Left err -> throwError err
-                Right (EvalResponse drv) -> do
-                    -- Now build the derivation
-                    logMsg 1 $ "Building derivation: " <> derivName drv
-                    buildResult <- requestBuildDerivation spt drv
-
-                    -- Report build result
-                    case brExitCode buildResult of
-                        ExitSuccess -> do
-                            liftIO $ putStrLn "Build succeeded!"
-                            liftIO $ putStrLn "Outputs:"
-                            forM_ (Set.toList $ brOutputPaths buildResult) $ \path ->
-                                liftIO $ putStrLn $ "  " ++ T.unpack (storePathToText path)
-
-                        ExitFailure code -> do
-                            liftIO $ hPutStrLn stderr $ "Build failed with exit code: " ++ show code
-                            liftIO $ hPutStrLn stderr $ "Build log:"
-                            liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
-                            throwError $ BuildFailed "Build failed"
-
-                Right _ -> throwError $ BuildFailed "Unexpected response to eval request"
-
--- | Helper function for handleBuildDerivationFile
-handleBuildDerivationFile :: forall t. SingI t => SPrivilegeTier t -> FilePath -> TenM 'Build t ()
-handleBuildDerivationFile spt file = do
-    -- Read derivation file
-    content <- liftIO $ BS.readFile file
-
-    -- Deserialize the derivation
-    drv <- case Derivation.deserializeDerivation content of
+    case evalResult of
         Left err -> throwError err
-        Right d -> return d
-
-    -- Build the derivation
-    case (fromSing spt) of
-        Daemon -> do
-            -- Build directly
+        Right (drv, _) -> do
+            -- Now build the derivation
             logMsg 1 $ "Building derivation: " <> derivName drv
             buildResult <- buildDerivation drv
 
@@ -1927,24 +2146,114 @@ handleBuildDerivationFile spt file = do
                     liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
                     throwError $ BuildFailed "Build failed"
 
-        Builder -> do
-            -- Build through daemon connection
-            logMsg 1 $ "Building derivation: " <> derivName drv
-            buildResult <- requestBuildDerivation spt drv
+-- | Handle build expression in Builder context
+handleBuildTenExpressionBuilder :: FilePath -> TenM 'Build 'Builder ()
+handleBuildTenExpressionBuilder file = do
+    -- Read file content
+    content <- liftIO $ BS.readFile file
 
-            -- Report build result
-            case brExitCode buildResult of
-                ExitSuccess -> do
-                    liftIO $ putStrLn "Build succeeded!"
-                    liftIO $ putStrLn "Outputs:"
-                    forM_ (Set.toList $ brOutputPaths buildResult) $ \path ->
-                        liftIO $ putStrLn $ "  " ++ T.unpack (storePathToText path)
+    -- Go through the daemon for evaluation and building
+    -- First convert to daemon connection
+    env <- ask
+    case runMode env of
+        ClientMode conn -> do
+            -- Evaluate expression
+            let evalRequest = Request {
+                    reqId = 0,
+                    reqType = "eval",
+                    reqParams = Map.singleton "file" (T.pack file),
+                    reqPayload = Just content
+                }
 
-                ExitFailure code -> do
-                    liftIO $ hPutStrLn stderr $ "Build failed with exit code: " ++ show code
-                    liftIO $ hPutStrLn stderr $ "Build log:"
-                    liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
-                    throwError $ BuildFailed "Build failed"
+            evalResp <- liftIO $ sendRequestSync conn evalRequest 30000000
+            case evalResp of
+                Left err -> throwError err
+                Right (EvalResponse drv) -> do
+                    -- Now build the derivation
+                    logMsg 1 $ "Building derivation: " <> derivName drv
+                    buildResult <- requestBuildDerivation sBuilder drv
+
+                    -- Report build result
+                    case brExitCode buildResult of
+                        ExitSuccess -> do
+                            liftIO $ putStrLn "Build succeeded!"
+                            liftIO $ putStrLn "Outputs:"
+                            forM_ (Set.toList $ brOutputPaths buildResult) $ \path ->
+                                liftIO $ putStrLn $ "  " ++ T.unpack (storePathToText path)
+
+                        ExitFailure code -> do
+                            liftIO $ hPutStrLn stderr $ "Build failed with exit code: " ++ show code
+                            liftIO $ hPutStrLn stderr $ "Build log:"
+                            liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
+                            throwError $ BuildFailed "Build failed"
+
+                Right _ -> throwError $ BuildFailed "Unexpected response to eval request"
+        _ ->
+            throwError $ DaemonError "Not connected to daemon"
+
+-- | Helper function for handleBuildDerivationFile
+handleBuildDerivationFile :: SPrivilegeTier t -> FilePath -> TenM 'Build t ()
+handleBuildDerivationFile spt file = case fromSing spt of
+    Daemon -> handleBuildDerivationFileDaemon file
+    Builder -> handleBuildDerivationFileBuilder file
+
+-- | Handle build derivation file in Daemon context
+handleBuildDerivationFileDaemon :: FilePath -> TenM 'Build 'Daemon ()
+handleBuildDerivationFileDaemon file = do
+    -- Read derivation file
+    content <- liftIO $ BS.readFile file
+
+    -- Deserialize the derivation
+    drv <- case Derivation.deserializeDerivation content of
+        Left err -> throwError err
+        Right d -> return d
+
+    -- Build the derivation
+    logMsg 1 $ "Building derivation: " <> derivName drv
+    buildResult <- buildDerivation drv
+
+    -- Report build result
+    case brExitCode buildResult of
+        ExitSuccess -> do
+            liftIO $ putStrLn "Build succeeded!"
+            liftIO $ putStrLn "Outputs:"
+            forM_ (Set.toList $ brOutputPaths buildResult) $ \path ->
+                liftIO $ putStrLn $ "  " ++ T.unpack (storePathToText path)
+
+        ExitFailure code -> do
+            liftIO $ hPutStrLn stderr $ "Build failed with exit code: " ++ show code
+            liftIO $ hPutStrLn stderr $ "Build log:"
+            liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
+            throwError $ BuildFailed "Build failed"
+
+-- | Handle build derivation file in Builder context
+handleBuildDerivationFileBuilder :: FilePath -> TenM 'Build 'Builder ()
+handleBuildDerivationFileBuilder file = do
+    -- Read derivation file
+    content <- liftIO $ BS.readFile file
+
+    -- Deserialize the derivation
+    drv <- case Derivation.deserializeDerivation content of
+        Left err -> throwError err
+        Right d -> return d
+
+    -- Build through daemon connection
+    logMsg 1 $ "Building derivation: " <> derivName drv
+    buildResult <- requestBuildDerivation sBuilder drv
+
+    -- Report build result
+    case brExitCode buildResult of
+        ExitSuccess -> do
+            liftIO $ putStrLn "Build succeeded!"
+            liftIO $ putStrLn "Outputs:"
+            forM_ (Set.toList $ brOutputPaths buildResult) $ \path ->
+                liftIO $ putStrLn $ "  " ++ T.unpack (storePathToText path)
+
+        ExitFailure code -> do
+            liftIO $ hPutStrLn stderr $ "Build failed with exit code: " ++ show code
+            liftIO $ hPutStrLn stderr $ "Build log:"
+            liftIO $ hPutStrLn stderr $ T.unpack $ brLog buildResult
+            throwError $ BuildFailed "Build failed"
 
 -- | Break a stale lock
 breakStaleLock :: SPrivilegeTier 'Daemon -> FilePath -> TenM 'Build 'Daemon ()
@@ -2016,43 +2325,25 @@ breakStaleLock' lockPath = do
             Left _ -> return False  -- Process doesn't exist
             Right _ -> return True   -- Process exists
 
--- | Helper function for withDatabase that properly uses the context
-withDatabase :: FilePath -> Int -> (Database 'Daemon -> TenM 'Build 'Daemon a) -> TenM 'Build 'Daemon a
-withDatabase dbPath timeout action = do
-    -- Initialize database connection
-    conn <- liftIO $ SQL.open dbPath
-
-    -- Create Database object
-    let db = Database conn dbPath True timeout 3 sDaemon
-
-    -- Run the action with proper cleanup
-    result <- action db `catchError` \e -> do
-        -- Close database on error
-        liftIO $ SQL.close conn
-        throwError e
-
-    -- Close database connection
-    liftIO $ SQL.close conn
-
-    -- Return the result
-    return result
-
--- | Execute SQL statement with proper error handling
-tenExecute :: (SQL.ToRow q) => Connection -> Query -> q -> TenM 'Build 'Daemon ()
-tenExecute conn query params = do
-    result <- liftIO $ try $ SQL.execute conn query params
-    case result of
-        Left (e :: SomeException) ->
-            throwError $ DBError $ "Database execute error: " <> T.pack (show e)
-        Right _ -> return ()
-
--- | Get a daemon connection from the environment
-getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
-getDaemonConnection = do
+-- | Helper function to get a database connection
+getDatabaseConn :: TenM 'Build 'Daemon (Database 'Daemon)
+getDatabaseConn = do
     env <- ask
-    case runMode env of
-        ClientMode conn -> return conn
-        _ -> throwError $ DaemonError "Not connected to daemon"
+    let dbPath = defaultDBPath (storeLocation env)
+
+    -- In a real implementation, this would use a connection pool
+    -- For simplicity, we're creating a new connection each time
+    conn <- liftIO $ SQL.open dbPath
+    liftIO $ SQL.execute_ conn "PRAGMA foreign_keys = ON"
+
+    -- Return the database connection wrapped in our Database type
+    return $ Database conn dbPath True 5000 3 sDaemon
+
+-- | Execute statement against the database
+tenExecute :: (SQL.ToRow q) => Database 'Daemon -> Query -> q -> TenM 'Build 'Daemon ()
+tenExecute db query params = do
+    -- For a real implementation, this would handle retries and error cases
+    liftIO $ SQL.execute (dbConn db) query params
 
 -- | Main entry point
 main :: IO ()
