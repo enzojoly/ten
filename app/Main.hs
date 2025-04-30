@@ -1,251 +1,110 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleContexts #-}
+module Main where
 
-module Ten (
-    -- * Core Concepts & Monad
-    module Ten.Core,
+import Control.Monad (void)
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
+import System.Environment (getArgs, getProgName)
+import System.Exit (exitSuccess, exitFailure)
+import System.IO (hPutStrLn, stderr)
 
-    -- * Building Derivations
-    module Ten.Build,
+import Ten
 
-    -- * Derivation Definition & Manipulation
-    module Ten.Derivation,
+-- | Main entry point for ten executable
+main :: IO ()
+main = do
+    args <- getArgs
+    case args of
+        [] -> showHelp >> exitSuccess
+        ["help"] -> showHelp >> exitSuccess
+        ["version"] -> showVersion >> exitSuccess
+        ["daemon", "start"] -> startDaemon [] >> exitSuccess
+        ["daemon", "stop"] -> shutdownDaemon >> exitSuccess
+        ["daemon", "status"] -> checkDaemonStatus >> exitSuccess
+        ["build", path] -> buildFile path Nothing >>= handleResult
+        ["eval", path] -> evalFile path Nothing >>= handleResult
+        _ -> do
+            hPutStrLn stderr "Unknown command or invalid arguments"
+            showHelp
+            exitFailure
 
-    -- * Store Operations
-    module Ten.Store,
+-- | Show help text
+showHelp :: IO ()
+showHelp = do
+    progName <- getProgName
+    putStrLn $ "Usage: " ++ progName ++ " COMMAND [ARGS]"
+    putStrLn ""
+    putStrLn "Commands:"
+    putStrLn "  build FILE      Build the specified derivation file"
+    putStrLn "  eval FILE       Evaluate the specified file"
+    putStrLn "  daemon start    Start the Ten daemon"
+    putStrLn "  daemon stop     Stop the Ten daemon"
+    putStrLn "  daemon status   Check daemon status"
+    putStrLn "  help            Show this help"
+    putStrLn "  version         Show version information"
 
-    -- * Sandbox Configuration
-    -- | (Primarily relevant for advanced customization or direct sandbox use)
-    module Ten.Sandbox,
+-- | Show version information
+showVersion :: IO ()
+showVersion = putStrLn "Ten version 0.1.0"
 
-    -- * Hashing Utilities
-    module Ten.Hash,
+-- | Start the daemon
+startDaemon :: [String] -> IO ()
+startDaemon args = do
+    running <- isDaemonRunning =<< getDefaultSocketPath
+    if running
+        then putStrLn "Daemon is already running"
+        else do
+            result <- startDaemonIfNeeded
+            case result of
+                Left err -> do
+                    hPutStrLn stderr $ "Failed to start daemon: " ++ show err
+                    exitFailure
+                Right _ -> putStrLn "Daemon started successfully"
 
-    -- * Garbage Collection (Daemon Operations)
-    -- | (These functions typically require daemon interaction)
-    module Ten.GC,
+-- | Shutdown the daemon
+shutdownDaemon :: IO ()
+shutdownDaemon = do
+    socketPath <- getDefaultSocketPath
+    running <- isDaemonRunning socketPath
+    if not running
+        then putStrLn "Daemon is not running"
+        else do
+            result <- withDaemonConnection' socketPath $ \conn -> do
+                sendRequestSync conn (Request 0 "shutdown" Map.empty Nothing) 5000000
+            case result of
+                Left err -> do
+                    hPutStrLn stderr $ "Failed to stop daemon: " ++ show err
+                    exitFailure
+                Right _ -> putStrLn "Daemon stopped successfully"
 
-    -- * Client Operations (direct exports needed by app/Main.hs)
-    connectToDaemon,
-    disconnectFromDaemon,
-    getDefaultSocketPath,
-    isDaemonRunning,
-    sendRequest,
-    receiveResponse,
-    sendRequestSync,
-    startDaemonIfNeeded,
+-- | Check daemon status
+checkDaemonStatus :: IO ()
+checkDaemonStatus = do
+    socketPath <- getDefaultSocketPath
+    running <- isDaemonRunning socketPath
+    if not running
+        then putStrLn "Daemon is not running"
+        else do
+            result <- withDaemonConnection' socketPath $ \conn -> do
+                sendRequestSync conn (Request 0 "status" Map.empty Nothing) 5000000
+            case result of
+                Left err -> do
+                    hPutStrLn stderr $ "Failed to get daemon status: " ++ show err
+                    exitFailure
+                Right (StatusResponse status) -> do
+                    putStrLn $ "Daemon status: " ++ T.unpack (daemonStatus status)
+                    putStrLn $ "Uptime: " ++ show (daemonUptime status) ++ " seconds"
+                    putStrLn $ "Active builds: " ++ show (daemonActiveBuilds status)
+                    putStrLn $ "Store size: " ++ show (daemonStoreSize status) ++ " bytes"
+                    putStrLn $ "Store paths: " ++ show (daemonStorePaths status)
+                Right _ -> do
+                    hPutStrLn stderr "Unexpected response from daemon"
+                    exitFailure
 
-    -- High-level build operations
-    buildFile,
-    evalFile,
-    Ten.Build.buildDerivation,
-    cancelBuild,
-    getBuildStatus,
-    getBuildOutput,
-    listBuilds,
-
-    -- Store operations and requests
-    verifyStore,
-    initializeStore,
-    createStoreDirectories,
-    ensureDBDirectories,
-    requestStoreAdd,
-    requestStoreVerify,
-    requestStorePath,
-    requestStoreList,
-    requestShutdown,
-    requestPathInfo,
-    PathInfo(..),
-    DaemonResponse(..),
-
-    -- Additional store operations
-    addFileToStore,
-    verifyStorePath,
-    getStorePathForFile,
-    readStoreContent,
-    listStore,
-
-    -- Additional derivation operations
-    storeDerivation,
-    retrieveDerivation,
-    queryDerivationForOutput,
-    queryOutputsForDerivation,
-    listDerivations,
-    getDerivationInfo,
-
-    -- Additional GC operations
-    collectGarbage,
-    getGCStatus,
-    addGCRoot,
-    removeGCRoot,
-    listGCRoots,
-
-    -- Config-related
-    getDaemonConfig,
-
-    -- Authentication and Protocol Types
-    UserCredentials(..),
-    DaemonCapability(..),
-    DaemonConnection,
-
-    -- * Re-exported Database types
-    Database(..),
-    DBError(..),
-    TransactionMode(..),
-    ensureSchema,
-    initDatabaseDaemon,
-    closeDatabaseDaemon
-) where
-
--- Import core data types
-import Data.Text (Text)
-import Data.Int (Int64)
-
--- Core modules with explicit imports
-import Ten.Core (
-    BuildError(..), GCStats(..), BuildId(..),
-    StorePath(..), DaemonConnection(..),
-    Request(..), DaemonResponse(..),
-    PrivilegeTier(..), storePathToText
-    )
-
--- Build module
-import Ten.Build (
-    buildDerivation
-    )
-
--- Derivation module
-import Ten.Derivation (
-    derivationEquals, derivationOutputPaths
-    )
-
--- Store module - specific operations
-import Ten.Store (
-    verifyStore, initializeStore, createStoreDirectories
-    )
-
--- Sandbox module - limited exports
-import Ten.Sandbox (
-    SandboxConfig(..), defaultSandboxConfig
-    )
-
--- Hash module
-import Ten.Hash (
-    hashByteString, hashStorePath
-    )
-
--- GC module
-import Ten.GC (
-    GCStats(..),
-    )
-
--- Database modules
-import Ten.DB.Core (
-    Database(..),
-    DBError(..),
-    TransactionMode(..),
-    ensureDBDirectories,
-    initDatabaseDaemon,
-    closeDatabaseDaemon
-    )
-import Ten.DB.Schema (ensureSchema)
-
--- Import client functionality with specific imports
-import Ten.Daemon.Client (
-    -- Connection management
-    connectToDaemon,
-    disconnectFromDaemon,
-    getDefaultSocketPath,
-
-    -- Client communication
-    sendRequest,
-    receiveResponse,
-    sendRequestSync,
-
-    -- Status checking
-    isDaemonRunning,
-    getDaemonStatus,
-
-    -- Build operations
-    buildFile,
-    evalFile,
-    buildDerivation,
-    cancelBuild,
-    getBuildStatus,
-    getBuildOutput,
-    listBuilds,
-
-    -- Store operations
-    addFileToStore,
-    verifyStorePath,
-    getStorePathForFile,
-    readStoreContent,
-    listStore,
-
-    -- Derivation operations
-    storeDerivation,
-    retrieveDerivation,
-    queryDerivationForOutput,
-    queryOutputsForDerivation,
-    listDerivations,
-    getDerivationInfo,
-
-    -- GC operations
-    collectGarbage,
-    getGCStatus,
-    addGCRoot,
-    removeGCRoot,
-    listGCRoots,
-
-    -- Daemon management
-    startDaemonIfNeeded,
-    shutdownDaemon,
-    getDaemonConfig
-    )
-
--- Import protocol and auth types
-import Ten.Daemon.Protocol (
-    UserCredentials(..),
-    DaemonCapability(..),
-    )
-
--- | Request to add a file to the store
-requestStoreAdd :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
-requestStoreAdd = addFileToStore
-
--- | Request to verify a store path
-requestStoreVerify :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
-requestStoreVerify = verifyStorePath
-
--- | Request to calculate a store path for a file
-requestStorePath :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
-requestStorePath = getStorePathForFile
-
--- | Request to list store contents
-requestStoreList :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
-requestStoreList = listStore
-
--- | Request daemon shutdown
-requestShutdown :: DaemonConnection 'Builder -> IO (Either BuildError ())
-requestShutdown = shutdownDaemon
-
--- | Request information about a store path
-requestPathInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError PathInfo)
-requestPathInfo conn path = do
-    -- This is a stub implementation
-    return $ Left $ DaemonError "Path info request not implemented"
-
--- | Path information type
-data PathInfo = PathInfo {
-    pathPath :: StorePath,
-    pathHash :: Text,
-    pathDeriver :: Maybe StorePath,
-    pathRegistrationTime :: Int64,  -- Unix timestamp instead of UTCTime
-    pathIsValid :: Bool
-} deriving (Show, Eq)
+-- | Handle build result
+handleResult :: Either BuildError a -> IO ()
+handleResult (Left err) = do
+    hPutStrLn stderr $ "Error: " ++ show err
+    exitFailure
+handleResult (Right _) = do
+    putStrLn "Build completed successfully"
+    exitSuccess
