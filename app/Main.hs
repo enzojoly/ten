@@ -1,32 +1,163 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds #-} -- Added for privilege types if needed
 
 module Main where
 
 import Control.Exception (try, catch, SomeException, IOException)
 import Control.Monad (when, unless, void, forM_)
-import Data.Maybe (isJust, fromMaybe, isNothing)
+import Data.Maybe (isJust, fromMaybe, isNothing, listToMaybe, catMaybes)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import qualified Data.ByteString as BS -- Needed for reading file content
 import System.Directory (doesFileExist, createDirectoryIfMissing, getHomeDirectory)
-import System.Environment (getArgs, getProgName, getEnv, lookupEnv)
+import System.Environment (getArgs, getProgName, lookupEnv)
 import System.Exit (exitSuccess, exitFailure, ExitCode(..))
 import System.FilePath ((</>), takeDirectory, takeFileName)
 import System.IO (hPutStrLn, stderr, IOMode(..), withFile)
 import System.Posix.User (getUserEntryForName, getRealUserID, getLoginName)
 import qualified System.Posix.User as User
+import Data.List (partition, isPrefixOf) -- For simple arg parsing
 
-import Ten.Core
-import Ten.CLI
-import Ten.Hash (hashText, showHash)
-import Ten.Store (storePathExists, readFromStore)
-import Ten.Daemon.Config (getDefaultSocketPath, getDefaultConfig, defaultDaemonSocketPath)
-import Ten.Daemon.Client (isDaemonRunning, startDaemonIfNeeded, connectToDaemon, disconnectFromDaemon)
-import Ten.Daemon.Auth (UserCredentials(..), createAuthToken)
-import qualified Ten.Daemon.Client as DaemonClient
-import qualified Ten.Daemon.Protocol as Protocol
+-- Import from the Ten library (relies on ten.cabal exposing these)
+import Ten (
+    -- Core
+    TenM, BuildEnv(..), BuildState, BuildError(..), StorePath(..), Derivation(..),
+    BuildResult(..), RunMode(..), initBuildEnv, storePathToText, textToStorePath, parseStorePath,
+    runTen, evalTen, buildTen, InputNotFound, StoreError, -- Make sure errors are exported
+    -- Store
+    StoreAccessOps(..), StoreContentOps(..), StoreQueryOps(..),
+    -- GC
+    GCStats(..),
+    -- Protocol / Daemon Interaction related
+    UserCredentials(..), DaemonCapability(..), DaemonConnection, DaemonStatus(..), DaemonConfig(..),
+    ProtocolVersion(..),
+    -- Explicitly import client functions if needed, or rely on re-exports from Ten.hs
+    connectToDaemon, disconnectFromDaemon, isDaemonRunning, startDaemonIfNeeded,
+    -- Specific client requests
+    buildFile, evalFile, buildDerivation, requestGC, requestStoreAdd, requestStoreVerify,
+    requestStorePath, requestStoreList, requestStatus, requestShutdown, requestPathInfo,
+    -- Protocol types used in responses
+    DaemonResponse(..), PathInfo(..)
+    )
+-- Direct imports if not exposed via Ten.hs or for clarity
+import qualified Ten.Daemon.Client as DaemonClient -- Use qualified if direct access needed
+import qualified Ten.Daemon.Protocol as Protocol -- For ResponseError etc.
+
+-- CLI Parsing Logic (moved from Ten.CLI)
+
+-- | Command-line options structure
+data Options = Options {
+    optVerbosity      :: Int,
+    optStoreDir       :: Maybe FilePath,
+    optWorkDir        :: Maybe FilePath,
+    optDaemonSocket   :: Maybe FilePath,
+    optUseDaemon      :: Bool,
+    optAutoStartDaemon:: Bool,
+    optForce          :: Bool
+    -- Add other options as needed
+} deriving (Show, Eq)
+
+-- | Default options
+defaultOptions :: Options
+defaultOptions = Options {
+    optVerbosity = 1,
+    optStoreDir = Nothing,
+    optWorkDir = Nothing,
+    optDaemonSocket = Nothing,
+    optUseDaemon = True,
+    optAutoStartDaemon = True,
+    optForce = False
+    -- Initialize other options
+}
+
+-- | Main command categories
+data Command
+    = Build FilePath
+    | Eval FilePath
+    | GC
+    | Store StoreCommand
+    | Info String -- StorePath or FilePath? Assuming String for now
+    | Daemon DaemonCommand
+    | Help
+    | Version
+    deriving (Show, Eq)
+
+-- | Store sub-commands
+data StoreCommand
+    = StoreAdd FilePath
+    | StoreVerify String -- Assuming String represents StorePath text
+    | StorePath FilePath
+    | StoreGC
+    | StoreList
+    deriving (Show, Eq)
+
+-- | Daemon sub-commands
+data DaemonCommand
+    = DaemonStart
+    | DaemonStop
+    | DaemonStatus
+    | DaemonRestart
+    -- | DaemonConfig -- Removed as config module was removed
+    deriving (Show, Eq)
+
+-- | Simple argument parser (replace with GetOpt if needed)
+parseArgs :: [String] -> Either String (Command, Options)
+parseArgs [] = Left "No command specified."
+parseArgs (cmd:args) =
+    let (optsArgs, nonOptsArgs) = partition isOpt args
+        opts = parseOptions optsArgs defaultOptions -- Implement parseOptions
+    in case cmd of
+        "build"   -> case nonOptsArgs of [fp] -> Right (Build fp, opts); _ -> Left "build requires exactly one FILE argument."
+        "eval"    -> case nonOptsArgs of [fp] -> Right (Eval fp, opts); _ -> Left "eval requires exactly one FILE argument."
+        "gc"      -> case nonOptsArgs of []   -> Right (GC, opts); _ -> Left "gc takes no arguments."
+        "store"   -> parseStoreCmd nonOptsArgs opts
+        "info"    -> case nonOptsArgs of [p]  -> Right (Info p, opts); _ -> Left "info requires exactly one PATH argument."
+        "daemon"  -> parseDaemonCmd nonOptsArgs opts
+        "help"    -> Right (Help, opts)
+        "version" -> Right (Version, opts)
+        _         -> Left $ "Unknown command: " ++ cmd
+  where
+    isOpt ('-':_) = True
+    isOpt _       = False
+
+    parseStoreCmd :: [String] -> Options -> Either String (Command, Options)
+    parseStoreCmd [] _ = Left "store requires a sub-command (add, verify, path, gc, list)."
+    parseStoreCmd (sub:rest) opts = case sub of
+        "add"    -> case rest of [fp] -> Right (Store (StoreAdd fp), opts); _ -> Left "store add requires exactly one FILE argument."
+        "verify" -> case rest of [p]  -> Right (Store (StoreVerify p), opts); _ -> Left "store verify requires exactly one PATH argument."
+        "path"   -> case rest of [fp] -> Right (Store (StorePath fp), opts); _ -> Left "store path requires exactly one FILE argument."
+        "gc"     -> case rest of []   -> Right (Store StoreGC, opts); _ -> Left "store gc takes no arguments."
+        "list"   -> case rest of []   -> Right (Store StoreList, opts); _ -> Left "store list takes no arguments."
+        _        -> Left $ "Unknown store sub-command: " ++ sub
+
+    parseDaemonCmd :: [String] -> Options -> Either String (Command, Options)
+    parseDaemonCmd [] _ = Left "daemon requires a sub-command (start, stop, status, restart)." -- Removed config
+    parseDaemonCmd (sub:rest) opts = case sub of
+        "start"   -> Right (Daemon DaemonStart, opts)
+        "stop"    -> Right (Daemon DaemonStop, opts)
+        "status"  -> Right (Daemon DaemonStatus, opts)
+        "restart" -> Right (Daemon DaemonRestart, opts)
+        -- "config"  -> Right (Daemon DaemonConfig, opts) -- Removed config
+        _         -> Left $ "Unknown daemon sub-command: " ++ sub
+
+    -- Implement a function to parse Options from the args starting with '-'
+    parseOptions :: [String] -> Options -> Options
+    parseOptions args initialOpts = foldl parseOpt initialOpts args
+      where
+        parseOpt acc arg
+          | arg == "-v" || arg == "--verbose" = acc { optVerbosity = optVerbosity acc + 1 }
+          | "--socket=" `isPrefixOf` arg = acc { optDaemonSocket = Just $ drop (length "--socket=") arg }
+          | "--store=" `isPrefixOf` arg = acc { optStoreDir = Just $ drop (length "--store=") arg }
+          | "--work=" `isPrefixOf` arg = acc { optWorkDir = Just $ drop (length "--work=") arg }
+          | arg == "--no-daemon" = acc { optUseDaemon = False }
+          | arg == "--no-autostart" = acc { optAutoStartDaemon = False }
+          | arg == "-f" || arg == "--force" = acc { optForce = True }
+          | otherwise = acc -- Ignore unknown options for simplicity
+
+-- End of CLI Parsing Logic
 
 -- | Main entry point
 main :: IO ()
@@ -48,23 +179,28 @@ main = do
             exitFailure
 
         Right (cmd, opts) -> do
-            -- Determine if the command requires daemon privileges
-            let requiresDaemon = commandRequiresDaemon cmd
-            let prefersDaemon = commandPrefersDaemon cmd
+            -- Handle help and version directly
+            case cmd of
+                Help -> showUsage >> exitSuccess
+                Version -> showVersion >> exitSuccess
+                _ -> do
+                    -- Determine if the command requires daemon privileges
+                    let requiresDaemon = commandRequiresDaemon cmd
+                    let prefersDaemon = commandPrefersDaemon cmd
 
-            -- Check if daemon is explicitly disabled
-            let forceDaemonOff = not (optUseDaemon opts)
+                    -- Check if daemon is explicitly disabled
+                    let forceDaemonOff = not (optUseDaemon opts)
 
-            if requiresDaemon && forceDaemonOff then do
-                -- Error: Command requires daemon but daemon is disabled
-                hPutStrLn stderr $ "Error: Command '" ++ commandName cmd ++ "' requires the daemon, but daemon usage is disabled."
-                exitFailure
-            else if requiresDaemon || (prefersDaemon && not forceDaemonOff) then
-                -- Run with daemon for required or preferred commands (unless disabled)
-                runWithDaemon cmd opts
-            else
-                -- Run standalone for other commands
-                runStandalone cmd opts
+                    if requiresDaemon && forceDaemonOff then do
+                        -- Error: Command requires daemon but daemon is disabled
+                        hPutStrLn stderr $ "Error: Command '" ++ commandName cmd ++ "' requires the daemon, but daemon usage is disabled."
+                        exitFailure
+                    else if requiresDaemon || (prefersDaemon && not forceDaemonOff) then
+                        -- Run with daemon for required or preferred commands (unless disabled)
+                        runWithDaemon cmd opts
+                    else
+                        -- Run standalone for other commands
+                        runStandalone cmd opts
 
 -- | Show usage information
 showUsage :: IO ()
@@ -77,14 +213,30 @@ showUsage = do
     putStrLn "  eval FILE       Evaluate FILE to a derivation"
     putStrLn "  gc              Run garbage collection"
     putStrLn "  store add FILE  Add FILE to store"
-    putStrLn "  store verify PATH  Verify store PATH integrity"
-    putStrLn "  store path FILE    Calculate store path for FILE"
+    putStrLn "  store verify PATH Verify store PATH integrity"
+    putStrLn "  store path FILE   Calculate store path for FILE"
+    putStrLn "  store list      List store contents"
+    putStrLn "  info PATH       Show information about a store path"
     putStrLn "  daemon start    Start the Ten daemon"
     putStrLn "  daemon stop     Stop the Ten daemon"
     putStrLn "  daemon status   Show daemon status"
+    putStrLn "  daemon restart  Restart the Ten daemon"
+    putStrLn ""
+    putStrLn "Options:"
+    putStrLn "  -v, --verbose      Increase verbosity"
+    putStrLn "  --socket=PATH    Specify daemon socket path"
+    putStrLn "  --store=PATH     Specify store directory path"
+    putStrLn "  --work=PATH      Specify working directory path"
+    putStrLn "  --no-daemon      Force standalone mode (may fail for some commands)"
+    putStrLn "  --no-autostart   Disable automatic daemon starting"
+    putStrLn "  -f, --force        Force operation (e.g., GC)"
     putStrLn ""
     putStrLn "For detailed help, run:"
     putStrLn $ "  " ++ progName ++ " help"
+
+-- | Show version information
+showVersion :: IO ()
+showVersion = putStrLn "Ten Client version 0.1.0" -- Adjust version as needed
 
 -- | Get command name for error messages
 commandName :: Command -> String
@@ -114,762 +266,393 @@ daemonCommandName = \case
     DaemonStop -> "stop"
     DaemonStatus -> "status"
     DaemonRestart -> "restart"
-    DaemonConfig -> "config"
+    -- DaemonConfig -> "config" -- Removed
 
 -- | Determine if a command requires daemon privileges
 commandRequiresDaemon :: Command -> Bool
 commandRequiresDaemon = \case
-    -- These commands modify the store and must run with daemon privileges
     Store (StoreAdd _) -> True
     Store StoreGC -> True
-    Store StoreList -> True
+    Store StoreList -> True -- Listing might require DB access via daemon
     GC -> True
-    -- Daemon commands to control the daemon itself
     Daemon _ -> True
-    -- These commands don't strictly require the daemon
     _ -> False
 
 -- | Determine if a command benefits from daemon but can run standalone
 commandPrefersDaemon :: Command -> Bool
 commandPrefersDaemon = \case
-    -- Build and eval benefit from daemon's build management
     Build _ -> True
     Eval _ -> True
-    -- Store verification benefits from daemon's validation
     Store (StoreVerify _) -> True
-    -- Path and info operations can be local
-    Store (StorePath _) -> False
-    Info _ -> False
-    -- Help and version are always local
+    Store (StorePath _) -> False -- Can be done locally
+    Info _ -> True -- Info might require DB access via daemon
     Help -> False
     Version -> False
-    -- Already handled by commandRequiresDaemon
     _ -> False
 
 -- | Run a command with the daemon
 runWithDaemon :: Command -> Options -> IO ()
 runWithDaemon cmd opts = do
-    -- Determine socket path
-    socketPath <- case optDaemonSocket opts of
-        Just path -> return path
-        Nothing -> getDefaultSocketPath
+    socketPath <- resolveSocketPath opts
 
-    -- Check if daemon is running
     daemonRunning <- isDaemonRunning socketPath
 
-    -- Handle daemon commands specially
     case cmd of
-        Daemon daemonCmd -> do
-            -- These commands manage the daemon itself and don't need a connection
-            executeDaemonCommand daemonCmd socketPath opts
-            exitSuccess
-
+        Daemon daemonCmd -> executeDaemonCommand daemonCmd socketPath opts >> exitSuccess
         _ -> do
-            -- For other commands, we need the daemon to be running
-            unless daemonRunning $ do
-                if optAutoStartDaemon opts then do
-                    -- Try to start the daemon automatically
-                    putStrLn "Daemon not running. Starting daemon..."
-                    startResult <- try $ startDaemonIfNeeded socketPath
-                    case startResult of
-                        Left (e :: SomeException) -> do
-                            hPutStrLn stderr $ "Error starting daemon: " ++ show e
-                            if commandRequiresDaemon cmd then do
-                                -- Command requires daemon, so we fail
-                                hPutStrLn stderr $ "Command requires daemon but daemon could not be started."
-                                exitFailure
-                            else do
-                                -- Try standalone mode for commands that don't require daemon
-                                hPutStrLn stderr "Falling back to standalone mode."
-                                runStandalone cmd opts
-                                exitSuccess
-                        Right _ -> do
-                            -- Wait briefly for daemon to initialize
-                            putStrLn "Daemon started successfully."
-                else do
-                    -- Auto-start disabled
-                    hPutStrLn stderr "Daemon not running and auto-start is disabled."
-                    if commandRequiresDaemon cmd then do
-                        -- Command requires daemon, so we fail
-                        hPutStrLn stderr $ "Command requires daemon but daemon is not running."
-                        exitFailure
-                    else do
-                        -- Try standalone mode for commands that don't require daemon
-                        hPutStrLn stderr "Falling back to standalone mode."
-                        runStandalone cmd opts
-                        exitSuccess
+            unless daemonRunning $ handleDaemonNotRunning cmd opts socketPath
 
-            -- Get user credentials for authentication
             credentials <- getUserCredentials
-
-            -- Connect to daemon with authentication
             connectionResult <- try $ connectToDaemon socketPath credentials
+
             case connectionResult of
-                Left (e :: SomeException) -> do
-                    hPutStrLn stderr $ "Error connecting to daemon: " ++ show e
-                    if commandRequiresDaemon cmd then do
-                        -- Command requires daemon, so we fail
-                        hPutStrLn stderr $ "Command requires daemon but connection failed."
-                        exitFailure
-                    else do
-                        -- Try standalone mode for commands that don't require daemon
-                        hPutStrLn stderr "Falling back to standalone mode."
-                        runStandalone cmd opts
+                Left err -> handleConnectionError cmd opts err
+                Right conn -> bracket (pure conn) disconnectFromDaemon (executeDaemonCommand' cmd opts)
 
-                Right conn -> do
-                    -- Execute command using daemon connection
-                    executeDaemonCommand' cmd opts conn
+-- | Handle the case where the daemon isn't running when needed
+handleDaemonNotRunning :: Command -> Options -> FilePath -> IO ()
+handleDaemonNotRunning cmd opts socketPath = do
+    if optAutoStartDaemon opts then do
+        putStrLn "Daemon not running. Starting daemon..."
+        startResult <- try $ startDaemonIfNeeded socketPath
+        case startResult of
+            Left (e :: SomeException) -> do
+                hPutStrLn stderr $ "Error starting daemon: " ++ show e
+                if commandRequiresDaemon cmd then do
+                    hPutStrLn stderr "Command requires daemon but daemon could not be started."
+                    exitFailure
+                else fallbackToStandalone cmd opts
+            Right _ -> putStrLn "Daemon started successfully." >> TIO.putStr "" -- Continue
+    else do
+        hPutStrLn stderr "Daemon not running and auto-start is disabled."
+        if commandRequiresDaemon cmd then do
+            hPutStrLn stderr "Command requires daemon but daemon is not running."
+            exitFailure
+        else fallbackToStandalone cmd opts
 
-                    -- Disconnect from daemon
-                    disconnectFromDaemon conn
+-- | Handle errors during daemon connection
+handleConnectionError :: Command -> Options -> SomeException -> IO ()
+handleConnectionError cmd opts err = do
+    hPutStrLn stderr $ "Error connecting to daemon: " ++ show err
+    if commandRequiresDaemon cmd then do
+        hPutStrLn stderr "Command requires daemon but connection failed."
+        exitFailure
+    else fallbackToStandalone cmd opts
 
--- | Execute a command using the daemon
-executeDaemonCommand' :: Command -> Options -> DaemonClient.DaemonConnection -> IO ()
+-- | Fallback to standalone mode with a message
+fallbackToStandalone :: Command -> Options -> IO ()
+fallbackToStandalone cmd opts = do
+    hPutStrLn stderr "Falling back to standalone mode."
+    runStandalone cmd opts
+    exitSuccess
+
+-- | Execute a command using the daemon connection
+executeDaemonCommand' :: Command -> Options -> DaemonConnection 'Builder -> IO ()
 executeDaemonCommand' cmd opts conn = do
     let verbosity = optVerbosity opts
 
-    -- Execute command with daemon
-    result <- case cmd of
+    resultEither <- case cmd of
         Build filePath -> do
             when (verbosity > 0) $ putStrLn $ "Building " ++ filePath ++ " using daemon..."
-
-            -- Check if file exists
-            fileExists <- doesFileExist filePath
-            unless fileExists $ do
-                hPutStrLn stderr $ "Error: File not found: " ++ filePath
-                exitFailure
-
-            -- Read file content if it exists
-            fileContent <- readFile filePath
-
-            -- Request build from daemon
-            DaemonClient.requestBuild conn filePath (Just $ T.pack fileContent) defaultBuildOptions
+            DaemonClient.buildFile conn filePath -- Use the function from Client
 
         Eval filePath -> do
             when (verbosity > 0) $ putStrLn $ "Evaluating " ++ filePath ++ " using daemon..."
-
-            -- Check if file exists
-            fileExists <- doesFileExist filePath
-            unless fileExists $ do
-                hPutStrLn stderr $ "Error: File not found: " ++ filePath
-                exitFailure
-
-            -- Read file content if it exists
-            fileContent <- readFile filePath
-
-            -- Request evaluation from daemon
-            DaemonClient.requestEval conn filePath (Just $ T.pack fileContent) defaultBuildOptions
+            fmap DerivationResponse <$> DaemonClient.evalFile conn filePath -- Use the function from Client
 
         Store storeCmd -> executeStoreCommand storeCmd opts conn
 
         GC -> do
             when (verbosity > 0) $ putStrLn "Running garbage collection with daemon..."
-            DaemonClient.requestGC conn (optForce opts)
+            fmap GCResultResponse <$> DaemonClient.collectGarbage conn (optForce opts) -- Use the function from Client
 
         Info path -> do
             when (verbosity > 0) $ putStrLn $ "Getting info for " ++ path ++ " using daemon..."
-            DaemonClient.requestPathInfo conn path
+            -- Assuming path is StorePath text representation
+            case parseStorePath (T.pack path) of
+                 Nothing -> return $ Left $ ProtocolError $ "Invalid path format for info: " <> T.pack path
+                 Just sp -> fmap PathInfoResponse <$> DaemonClient.requestPathInfo conn sp -- Needs implementation in Client
 
-        -- These should never be called here
-        Daemon _ -> error "Daemon commands should be handled separately"
-        Help -> error "Help command should be handled separately"
-        Version -> error "Version command should be handled separately"
+        -- Should not happen due to earlier routing
+        Daemon _ -> error "Daemon command routed incorrectly"
+        Help -> error "Help command routed incorrectly"
+        Version -> error "Version command routed incorrectly"
 
     -- Handle result
-    case result of
+    case resultEither of
         Left err -> do
-            hPutStrLn stderr $ "Error: " ++ T.unpack (Protocol.errorMessage err)
+            hPutStrLn stderr $ "Error: " <> buildErrorToText err -- Use buildErrorToText
             exitFailure
-
         Right response -> do
-            -- Display response based on command type
-            case cmd of
-                Build _ ->
-                    case response of
-                        Protocol.BuildResultResponse buildResult -> displayBuildResult buildResult
-                        _ -> putStrLn "Build completed successfully."
-
-                Eval _ ->
-                    case response of
-                        Protocol.DerivationResponse deriv -> displayDerivation deriv
-                        _ -> putStrLn "Evaluation completed successfully."
-
-                Store _ ->
-                    case response of
-                        Protocol.StorePathResponse path -> putStrLn $ "Store path: " ++ T.unpack (storePathToText path)
-                        Protocol.StoreVerifyResponse valid -> putStrLn $ "Path verification: " ++ if valid then "valid" else "invalid"
-                        Protocol.StoreListResponse paths -> forM_ paths $ \p -> putStrLn $ T.unpack (storePathToText p)
-                        _ -> putStrLn "Store operation completed successfully."
-
-                GC ->
-                    case response of
-                        Protocol.GCResponse stats -> displayGCStats stats
-                        _ -> putStrLn "Garbage collection completed successfully."
-
-                Info _ ->
-                    case response of
-                        Protocol.PathInfoResponse info -> displayPathInfo info
-                        _ -> putStrLn "Info command completed successfully."
-
-                _ -> putStrLn "Command completed successfully."
-
+            displayResponse cmd response
             exitSuccess
 
+-- | Display the response from the daemon
+displayResponse :: Command -> DaemonResponse -> IO ()
+displayResponse cmd response = case (cmd, response) of
+    (Build _, BuildResultResponse res) -> displayBuildResult res
+    (Eval _, EvalResponse deriv) -> displayDerivation deriv
+    (Eval _, DerivationResponse deriv) -> displayDerivation deriv -- Handle potential alternative
+    (Store (StoreAdd _), StoreAddResponse path) -> putStrLn $ "Added: " ++ T.unpack (storePathToText path)
+    (Store (StorePath _), StorePathResponse path) -> putStrLn $ "Path: " ++ T.unpack (storePathToText path)
+    (Store (StoreVerify _), StoreVerifyResponse valid) -> putStrLn $ "Verification: " ++ if valid then "valid" else "invalid"
+    (Store StoreList, StoreListResponse paths) -> mapM_ (putStrLn . T.unpack . storePathToText) paths
+    (GC, GCResultResponse stats) -> displayGCStats stats
+    (Store StoreGC, GCResultResponse stats) -> displayGCStats stats
+    (Info _, PathInfoResponse info) -> displayPathInfo info
+    (_, ErrorResponse err) -> hPutStrLn stderr $ "Daemon Error: " <> buildErrorToText err
+    (_, SuccessResponse) -> putStrLn "Operation successful."
+    (_, _) -> putStrLn $ "Received unexpected response: " ++ show response -- Generic fallback
+
 -- | Execute a store command with daemon
-executeStoreCommand :: StoreCommand -> Options -> DaemonClient.DaemonConnection -> IO (Either Protocol.ResponseError Protocol.DaemonResponse)
-executeStoreCommand cmd opts conn =
-    case cmd of
-        StoreAdd filePath -> do
-            -- Check if file exists
-            fileExists <- doesFileExist filePath
-            unless fileExists $ do
-                hPutStrLn stderr $ "Error: File not found: " ++ filePath
-                exitFailure
+executeStoreCommand :: StoreCommand -> Options -> DaemonConnection 'Builder -> IO (Either BuildError DaemonResponse)
+executeStoreCommand cmd opts conn = case cmd of
+    StoreAdd filePath -> DaemonClient.addFileToStore conn filePath >>= handleStoreResponse StoreAddResponse
+    StoreVerify pathStr -> case parseStorePath (T.pack pathStr) of
+        Nothing -> return $ Left $ StoreError "Invalid store path format"
+        Just sp -> DaemonClient.verifyStorePath conn sp >>= handleStoreResponse StoreVerifyResponse
+    StorePath filePath -> DaemonClient.getStorePathForFile conn filePath >>= handleStoreResponse StorePathResponse
+    StoreGC -> fmap GCResultResponse <$> DaemonClient.collectGarbage conn (optForce opts)
+    StoreList -> fmap StoreListResponse <$> DaemonClient.listStore conn
 
-            -- Read file content
-            fileContent <- readFile filePath
+-- | Helper to wrap Store command results
+handleStoreResponse :: (a -> DaemonResponse) -> Either BuildError a -> IO (Either BuildError DaemonResponse)
+handleStoreResponse constructor result = return $ fmap constructor result
 
-            -- Add to store via daemon
-            DaemonClient.requestStoreAdd conn filePath (T.pack fileContent)
-
-        StoreVerify path ->
-            -- Verify path via daemon
-            DaemonClient.requestStoreVerify conn path
-
-        StorePath filePath ->
-            -- Get store path for file
-            DaemonClient.requestStorePath conn filePath
-
-        StoreGC ->
-            -- Run garbage collection
-            DaemonClient.requestGC conn (optForce opts)
-
-        StoreList ->
-            -- List store contents
-            DaemonClient.requestStoreList conn
 
 -- | Execute a daemon management command
 executeDaemonCommand :: DaemonCommand -> FilePath -> Options -> IO ()
-executeDaemonCommand cmd socketPath opts =
-    case cmd of
-        DaemonStart -> do
-            -- Check if daemon is already running
-            daemonRunning <- isDaemonRunning socketPath
-            if daemonRunning then
-                putStrLn "Daemon is already running."
-            else do
-                putStrLn "Starting Ten daemon..."
+executeDaemonCommand cmd socketPath opts = case cmd of
+    DaemonStart -> do
+        daemonRunning <- isDaemonRunning socketPath
+        if daemonRunning then
+            putStrLn "Daemon is already running."
+        else do
+            putStrLn "Starting Ten daemon..."
+            result <- try $ startDaemonProcess socketPath opts -- Changed function name
+            case result of
+                Left (e :: SomeException) -> hPutStrLn stderr $ "Error starting daemon: " ++ show e >> exitFailure
+                Right _ -> putStrLn "Daemon started successfully." >> exitSuccess -- Assuming startDaemonProcess handles exit
 
-                -- Start daemon process
-                result <- try $ do
-                    -- Get daemon executable path
-                    daemonExe <- getDaemonExecutablePath
-
-                    -- Build command line
-                    let cmdLine = buildDaemonCommandLine socketPath opts
-
-                    -- Start process
-                    (_, _, _, ph) <- createProcess $ proc daemonExe cmdLine
-
-                    -- Wait for process to initialize
-                    exitCode <- waitForProcess ph
-                    return exitCode
-
-                case result of
-                    Left (e :: SomeException) -> do
-                        hPutStrLn stderr $ "Error starting daemon: " ++ show e
-                        exitFailure
-
-                    Right ExitSuccess -> do
-                        putStrLn "Daemon started successfully."
-                        exitSuccess
-
-                    Right (ExitFailure code) -> do
-                        hPutStrLn stderr $ "Daemon failed to start (exit code " ++ show code ++ ")."
-                        exitFailure
-
-        DaemonStop -> do
-            -- Check if daemon is running
-            daemonRunning <- isDaemonRunning socketPath
-            if not daemonRunning then
-                putStrLn "Daemon is not running."
-            else do
-                putStrLn "Stopping Ten daemon..."
-
-                -- Get user credentials
-                credentials <- getUserCredentials
-
-                -- Connect to daemon
-                result <- try $ do
-                    conn <- connectToDaemon socketPath credentials
-
-                    -- Send shutdown request
-                    shutdownResult <- DaemonClient.requestShutdown conn
-
-                    -- Disconnect (may fail if daemon is shutting down)
-                    catch (disconnectFromDaemon conn) $ \(_ :: SomeException) -> return ()
-
-                    return shutdownResult
-
-                case result of
-                    Left (e :: SomeException) -> do
-                        hPutStrLn stderr $ "Error communicating with daemon: " ++ show e
-                        exitFailure
-
-                    Right (Left err) -> do
-                        hPutStrLn stderr $ "Daemon shutdown error: " ++ T.unpack (Protocol.errorMessage err)
-                        exitFailure
-
-                    Right (Right _) -> do
-                        putStrLn "Daemon shutdown requested successfully."
-                        exitSuccess
-
-        DaemonStatus -> do
-            -- Check if daemon is running
-            daemonRunning <- isDaemonRunning socketPath
-            if not daemonRunning then do
-                putStrLn "Daemon status: not running"
-                exitSuccess
-            else do
-                -- Get user credentials
-                credentials <- getUserCredentials
-
-                -- Connect to daemon
-                result <- try $ do
-                    conn <- connectToDaemon socketPath credentials
-
-                    -- Get status
-                    statusResult <- DaemonClient.requestStatus conn
-
-                    -- Disconnect
+    DaemonStop -> do
+        daemonRunning <- isDaemonRunning socketPath
+        if not daemonRunning then
+            putStrLn "Daemon is not running."
+        else do
+            putStrLn "Stopping Ten daemon..."
+            credentials <- getUserCredentials -- Needed to potentially send shutdown command
+            result <- try $ connectToDaemon socketPath credentials
+            case result of
+                Left err -> hPutStrLn stderr ("Failed to connect to daemon to stop it: " ++ show err) >> exitFailure
+                Right conn -> do
+                    stopResult <- try $ DaemonClient.shutdownDaemon conn -- Use the client function
                     disconnectFromDaemon conn
+                    case stopResult of
+                        Left (e :: SomeException) -> hPutStrLn stderr ("Error sending shutdown command: " ++ show e) >> exitFailure
+                        Right (Left err) -> hPutStrLn stderr ("Daemon shutdown error: " <> buildErrorToText err) >> exitFailure
+                        Right (Right _) -> putStrLn "Daemon stopped successfully." >> exitSuccess
 
-                    return statusResult
-
-                case result of
-                    Left (e :: SomeException) -> do
-                        hPutStrLn stderr $ "Error communicating with daemon: " ++ show e
-                        putStrLn "Daemon status: running but not responding"
-                        exitFailure
-
-                    Right (Left err) -> do
-                        hPutStrLn stderr $ "Daemon status error: " ++ T.unpack (Protocol.errorMessage err)
-                        exitFailure
-
-                    Right (Right response) ->
-                        case response of
-                            Protocol.StatusResponse status -> do
-                                displayDaemonStatus status
-                                exitSuccess
-                            _ -> do
-                                putStrLn "Daemon status: running"
-                                exitSuccess
-
-        DaemonRestart -> do
-            -- Stop and start the daemon
-            executeDaemonCommand DaemonStop socketPath opts
-            executeDaemonCommand DaemonStart socketPath opts
-
-        DaemonConfig -> do
-            -- Show daemon configuration
-            config <- getDefaultConfig
-            displayDaemonConfig config
+    DaemonStatus -> do
+        daemonRunning <- isDaemonRunning socketPath
+        if not daemonRunning then do
+            putStrLn "Daemon status: not running"
             exitSuccess
+        else do
+            credentials <- getUserCredentials
+            result <- try $ connectToDaemon socketPath credentials
+            case result of
+                Left err -> putStrLn "Daemon status: running but not responding" >> exitFailure
+                Right conn -> do
+                    statusResult <- try $ DaemonClient.getDaemonStatus conn
+                    disconnectFromDaemon conn
+                    case statusResult of
+                         Left (e :: SomeException) -> putStrLn "Daemon status: running but failed to get status" >> exitFailure
+                         Right (Left err) -> putStrLn ("Daemon status error: " <> buildErrorToText err) >> exitFailure
+                         Right (Right status) -> displayDaemonStatus status >> exitSuccess
+
+    DaemonRestart -> do
+        putStrLn "Restarting daemon..."
+        executeDaemonCommand DaemonStop socketPath opts -- Errors handled within
+        -- Add a small delay to allow the socket to be released
+        Control.Concurrent.threadDelay 500000 -- 0.5 seconds
+        executeDaemonCommand DaemonStart socketPath opts -- Errors handled within
+
+    -- DaemonConfig -> displayDaemonConfig defaultDaemonConfig >> exitSuccess -- Removed
+
+-- Placeholder: Start the daemon process (implementation likely in TenDaemon.hs or similar)
+startDaemonProcess :: FilePath -> Options -> IO ()
+startDaemonProcess socketPath opts = do
+    -- Find daemon executable
+    mDaemonExe <- System.Process.findExecutable "ten-daemon"
+    case mDaemonExe of
+        Nothing -> hPutStrLn stderr "Error: ten-daemon executable not found in PATH." >> exitFailure
+        Just daemonExe -> do
+            -- Construct command line arguments for the daemon process
+            let daemonArgs = ["start", "--socket=" ++ socketPath] ++ buildDaemonOpts opts
+            putStrLn $ "Executing: " ++ daemonExe ++ " " ++ unwords daemonArgs
+            -- Create the process (consider using System.Process.Typed for better control)
+            (_, _, _, ph) <- System.Process.createProcess (System.Process.proc daemonExe daemonArgs)
+            -- Optionally wait or check if it started correctly
+            -- For now, just assume it starts if createProcess succeeds
+            return ()
+
+buildDaemonOpts :: Options -> [String]
+buildDaemonOpts opts = catMaybes [
+    fmap (\s -> "--store=" ++ s) (optStoreDir opts),
+    fmap (\s -> "--work=" ++ s) (optWorkDir opts) -- Assuming work dir is a daemon option
+    -- Add other daemon-specific options based on TenDaemon's CLI
+    ]
+
 
 -- | Run a command in standalone mode
 runStandalone :: Command -> Options -> IO ()
 runStandalone cmd opts = do
-    -- Resolve store path
     storePath <- resolveStorePath opts
-
-    -- Create store directory if needed
-    createDirectoryIfMissing True storePath
-
-    -- Resolve work directory
     workDir <- resolveWorkDir opts
+    createDirectoryIfMissing True storePath
     createDirectoryIfMissing True workDir
 
-    -- Create build environment
-    let env = initBuildEnv workDir storePath
-                { verbosity = optVerbosity opts
-                , runMode = StandaloneMode  -- Ensure we're in standalone mode
-                }
+    let env = initBuildEnv workDir storePath -- Removed verbosity here, handle logging differently
+                { runMode = StandaloneMode }
 
-    -- Execute command
-    case cmd of
-        -- Commands that work in standalone mode
-        Help -> do
-            showHelp
-            exitSuccess
+    -- Setup minimal TenM environment for standalone execution
+    let initialState = initBuildState Core.Eval (Core.BuildIdFromInt 0) -- Use Eval phase for local ops initially
 
-        Version -> do
-            showVersion
-            exitSuccess
+    -- Execute command locally using runTen
+    result <- runTen Core.sEval Core.sBuilder (handleStandaloneCommand cmd opts) env initialState
 
-        Store (StorePath filePath) -> do
-            -- Get store path for file
-            result <- handleStorePathLocal env filePath
-            case result of
-                Left err -> do
-                    hPutStrLn stderr $ "Error: " ++ show err
-                    exitFailure
-                Right path -> do
-                    putStrLn $ "Store path: " ++ T.unpack (storePathToText path)
-                    exitSuccess
+    case result of
+        Left err -> hPutStrLn stderr ("Standalone Error: " <> buildErrorToText err) >> exitFailure
+        Right (output, _) -> TIO.putStrLn output >> exitSuccess
 
-        Info path -> do
-            -- Show path info (standalone version)
-            result <- handleInfoLocal env path
-            case result of
-                Left err -> do
-                    hPutStrLn stderr $ "Error: " ++ show err
-                    exitFailure
-                Right info -> do
-                    putStrLn $ "Path: " ++ path
-                    putStrLn $ "Valid: " ++ if isJust info then "Yes" else "No"
-                    exitSuccess
 
-        -- Commands that shouldn't be run in standalone mode
-        _ | commandRequiresDaemon cmd -> do
-            hPutStrLn stderr $ "Error: Command '" ++ commandName cmd ++ "' requires the daemon."
-            exitFailure
+-- | Handle standalone commands within TenM
+handleStandaloneCommand :: Command -> Options -> TenM 'Eval 'Builder Text
+handleStandaloneCommand cmd opts = case cmd of
+    Help -> return $ T.pack usageString -- Assuming usageString is defined
+    Version -> return $ T.pack versionString -- Assuming versionString is defined
 
-        -- Commands that can run in standalone but with limitations
-        Build filePath -> do
-            when (optVerbosity opts > 0) $
-                putStrLn "Warning: Building in standalone mode has limitations."
+    Store (StorePath filePath) -> do
+        liftIO (doesFileExist filePath) >>= \exists -> unless exists (throwError $ InputNotFound filePath)
+        contentBS <- liftIO $ BS.readFile filePath
+        let content = TE.decodeUtf8 contentBS -- Simple decode, maybe handle errors
+        let name = T.pack $ takeFileName filePath
+        let hash = showHash $ hashText content
+        let storePath = StorePath hash name
+        return $ "Store path: " <> storePathToText storePath
 
-            result <- handleBuildLocal env filePath
-            case result of
-                Left err -> do
-                    hPutStrLn stderr $ "Error: " ++ show err
-                    exitFailure
-                Right _ -> exitSuccess
+    Info pathStr -> do
+        case parseStorePath (T.pack pathStr) of
+            Nothing -> throwError $ StoreError "Invalid store path format"
+            Just sp -> do
+                exists <- checkStorePathExists sp -- Use the typeclass method
+                return $ "Path: " <> T.pack pathStr <> "\nValid: " <> (if exists then "Yes" else "No")
 
-        Eval filePath -> do
-            when (optVerbosity opts > 0) $
-                putStrLn "Warning: Evaluating in standalone mode has limitations."
+    Build filePath -> throwError $ BuildError "Build command not supported in standalone mode (yet)."
+    Eval filePath -> throwError $ BuildError "Eval command not supported in standalone mode (yet)."
+    Store (StoreVerify pathStr) -> throwError $ BuildError "Store verify not supported in standalone mode (yet)."
 
-            result <- handleEvalLocal env filePath
-            case result of
-                Left err -> do
-                    hPutStrLn stderr $ "Error: " ++ show err
-                    exitFailure
-                Right _ -> exitSuccess
+    -- Commands that require daemon
+    _ | commandRequiresDaemon cmd ->
+        throwError $ BuildError $ "Command '" <> T.pack (commandName cmd) <> "' requires the daemon."
 
-        Store (StoreVerify path) -> do
-            when (optVerbosity opts > 0) $
-                putStrLn "Warning: Verification in standalone mode has limitations."
+    _ -> throwError $ BuildError $ "Command '" <> T.pack (commandName cmd) <> "' not supported in standalone mode."
 
-            result <- handleStoreVerifyLocal env path
-            case result of
-                Left err -> do
-                    hPutStrLn stderr $ "Error: " ++ show err
-                    exitFailure
-                Right valid -> do
-                    putStrLn $ "Path: " ++ path
-                    putStrLn $ "Valid: " ++ if valid then "Yes" else "No"
-                    exitSuccess
+-- Placeholder strings for usage/version
+usageString :: String
+usageString = "Usage: ... (full help text here)"
 
-        _ -> do
-            hPutStrLn stderr "Error: Command not supported in standalone mode."
-            exitFailure
+versionString :: String
+versionString = "Ten Client version 0.1.0 (standalone)"
+
 
 -- | Get user credentials for daemon authentication
 getUserCredentials :: IO UserCredentials
 getUserCredentials = do
-    -- Get username
     username <- getEffectiveUsername
+    -- For simplicity in this example, we'll use a fixed/dummy token.
+    -- A real implementation needs secure token generation/storage/retrieval.
+    let token = "dummy-token-for-" <> username
+    return $ UserCredentials username token Builder -- Client always requests Builder tier initially
 
-    -- Get or create auth token
-    tokenPath <- getAuthTokenPath
-    createDirectoryIfMissing True (takeDirectory tokenPath)
-
-    token <- if False then do  -- Token file handling logic would go here
-        -- In a real implementation, we would read/create persistent tokens
-        -- For now, generate a temporary token
-        createAuthToken username
-    else do
-        -- Simple token for now
-        createAuthToken username
-
-    return $ UserCredentials
-        { username = username
-        , token = token
-        }
-
--- | Get effective username
+-- | Get effective username (simplified)
 getEffectiveUsername :: IO Text
-getEffectiveUsername = do
-    -- Try to get login name
-    eLoginName <- try getLoginName
-    case eLoginName of
-        Right name -> return $ T.pack name
-        Left (_ :: SomeException) -> do
-            -- Fallback to environment variables
-            mUser <- lookupEnv "USER"
-            case mUser of
-                Just user -> return $ T.pack user
-                Nothing -> do
-                    -- Try USERNAME (Windows-style)
-                    mUsername <- lookupEnv "USERNAME"
-                    case mUsername of
-                        Just username -> return $ T.pack username
-                        Nothing -> do
-                            -- Last resort: use UID
-                            uid <- getRealUserID
-                            return $ T.pack $ "user" ++ show uid
+getEffectiveUsername = T.pack <$> getLoginName `catch` \(_ :: IOException) -> return "unknown_user"
 
--- | Get path for auth token file
+-- | Get path for auth token file (dummy implementation)
 getAuthTokenPath :: IO FilePath
 getAuthTokenPath = do
     homeDir <- getHomeDirectory
-    return $ homeDir </> ".config/ten/auth_token"
+    return $ homeDir </> ".config/ten/auth_token" -- Example path
 
--- | Build daemon command line
-buildDaemonCommandLine :: FilePath -> Options -> [String]
-buildDaemonCommandLine socketPath opts =
-    ["daemon", "--socket", socketPath] ++
-    (if optVerbosity opts > 0 then ["--verbose=" ++ show (optVerbosity opts)] else []) ++
-    (case optStoreDir opts of
-        Just dir -> ["--store", dir]
-        Nothing -> [])
+-- | Create a dummy auth token
+createAuthToken :: Text -> IO Text
+createAuthToken user = return $ "temp-token-" <> user
+
+-- | Resolve socket path
+resolveSocketPath :: Options -> IO FilePath
+resolveSocketPath opts = case optDaemonSocket opts of
+    Just path -> return path
+    Nothing -> getDefaultSocketPath -- Use the function from the library
 
 -- | Resolve store directory path
 resolveStorePath :: Options -> IO FilePath
 resolveStorePath opts = case optStoreDir opts of
     Just dir -> return dir
-    Nothing -> do
-        -- Try environment variable
-        mStoreDir <- lookupEnv "TEN_STORE"
-        case mStoreDir of
-            Just dir -> return dir
-            Nothing -> do
-                -- Use default
-                homeDir <- getHomeDirectory
-                return $ homeDir </> ".ten/store"
+    Nothing -> lookupEnv "TEN_STORE" >>= \case
+        Just path -> return path
+        Nothing -> do
+            home <- getHomeDirectory
+            return $ home </> ".ten/store" -- Default path
 
 -- | Resolve work directory path
 resolveWorkDir :: Options -> IO FilePath
 resolveWorkDir opts = case optWorkDir opts of
     Just dir -> return dir
-    Nothing -> do
-        -- Try environment variable
-        mWorkDir <- lookupEnv "TEN_WORK_DIR"
-        case mWorkDir of
-            Just dir -> return dir
-            Nothing -> do
-                -- Use default
-                homeDir <- getHomeDirectory
-                return $ homeDir </> ".ten/work"
-
--- | Get daemon executable path
-getDaemonExecutablePath :: IO FilePath
-getDaemonExecutablePath = do
-    -- Try environment variable
-    mDaemonPath <- lookupEnv "TEN_DAEMON_PATH"
-    case mDaemonPath of
+    Nothing -> lookupEnv "TEN_WORK_DIR" >>= \case
         Just path -> return path
         Nothing -> do
-            -- Use default relative path
-            return "ten-daemon"  -- Assume it's in PATH
+            home <- getHomeDirectory
+            return $ home </> ".ten/work" -- Default path
+
+-- | Get daemon executable path (simplified)
+getDaemonExecutablePath :: IO FilePath
+getDaemonExecutablePath = fromMaybe "ten-daemon" <$> lookupEnv "TEN_DAEMON_PATH"
 
 -- Local handler implementations for standalone mode
 
--- | Handle build command locally
+-- | Handle build command locally (Placeholder)
 handleBuildLocal :: BuildEnv -> FilePath -> IO (Either BuildError BuildResult)
-handleBuildLocal env filePath = do
-    -- Check if file exists
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+handleBuildLocal env filePath = return $ Left $ BuildError "Standalone build not implemented"
 
-    -- In a real implementation, this would call into the build system
-    -- For now, this is a placeholder
-    putStrLn $ "Building " ++ filePath ++ " in standalone mode"
-
-    -- Create a mock build result
-    let result = BuildResult
-            { resultOutputs = mempty  -- No outputs for mock
-            , resultExitCode = ExitSuccess
-            , resultLog = "Build completed (standalone mode)"
-            , resultMetadata = mempty
-            }
-
-    return $ Right result
-
--- | Handle eval command locally
+-- | Handle eval command locally (Placeholder)
 handleEvalLocal :: BuildEnv -> FilePath -> IO (Either BuildError Derivation)
-handleEvalLocal env filePath = do
-    -- Check if file exists
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+handleEvalLocal env filePath = return $ Left $ BuildError "Standalone eval not implemented"
 
-    -- In a real implementation, this would call into the evaluation system
-    -- For now, this is a placeholder
-    putStrLn $ "Evaluating " ++ filePath ++ " in standalone mode"
+-- | Handle store verify command locally (Placeholder)
+handleStoreVerifyLocal :: BuildEnv -> String -> IO (Either BuildError Bool)
+handleStoreVerifyLocal env pathStr = return $ Left $ BuildError "Standalone verify not implemented"
 
-    -- Return a mock derivation
-    return $ Right mockDerivation
 
--- | Handle store path command locally
-handleStorePathLocal :: BuildEnv -> FilePath -> IO (Either BuildError StorePath)
-handleStorePathLocal env filePath = do
-    -- Check if file exists
-    fileExists <- doesFileExist filePath
-    unless fileExists $
-        return $ Left $ InputNotFound filePath
+-- Display functions (stubs - replace with actual implementations)
+displayBuildResult :: BuildResult -> IO ()
+displayBuildResult res = putStrLn $ "Build Result: (Exit: " ++ show (resultExitCode res) ++ ")"
 
-    -- Read file content
-    content <- readFile filePath
-    let name = T.pack $ takeFileName filePath
-    let hash = showHash $ hashText $ T.pack content
+displayDerivation :: Derivation -> IO ()
+displayDerivation deriv = putStrLn $ "Derivation: " ++ T.unpack (derivName deriv)
 
-    -- Create store path
-    return $ Right $ StorePath hash name
+displayGCStats :: GCStats -> IO ()
+displayGCStats stats = putStrLn $ "GC Stats: Collected " ++ show (gcCollected stats)
 
--- | Handle store verify command locally
-handleStoreVerifyLocal :: BuildEnv -> FilePath -> IO (Either BuildError Bool)
-handleStoreVerifyLocal env path = do
-    -- Parse store path
-    case parseStorePathFromString path of
-        Nothing -> return $ Left $ StoreError "Invalid store path format"
-        Just storePath -> do
-            -- Check if path exists in store
-            pathExists <- evalTen (storePathExists storePath) env
-            case pathExists of
-                Left err -> return $ Left err
-                Right exists -> return $ Right exists
+displayPathInfo :: PathInfo -> IO ()
+displayPathInfo info = putStrLn $ "Path Info: " ++ T.unpack (storePathToText $ pathInfoPath info)
 
--- | Handle info command locally
-handleInfoLocal :: BuildEnv -> FilePath -> IO (Either BuildError (Maybe StorePath))
-handleInfoLocal env path = do
-    -- Parse store path
-    case parseStorePathFromString path of
-        Nothing -> return $ Left $ StoreError "Invalid store path format"
-        Just storePath -> do
-            -- Check if path exists in store
-            pathExists <- evalTen (storePathExists storePath) env
-            case pathExists of
-                Left err -> return $ Left err
-                Right exists ->
-                    if exists
-                        then return $ Right $ Just storePath
-                        else return $ Right Nothing
+displayDaemonStatus :: DaemonStatus -> IO ()
+displayDaemonStatus status = putStrLn $ "Daemon Status: " ++ T.unpack (daemonStatus status)
 
--- | Parse store path from string
-parseStorePathFromString :: String -> Maybe StorePath
-parseStorePathFromString path =
-    case break (== '-') (takeFileName path) of
-        (hash, '-':name) | not (null hash) && not (null name) ->
-            Just $ StorePath (T.pack hash) (T.pack name)
-        _ -> Nothing
+displayDaemonConfig :: DaemonConfig -> IO ()
+displayDaemonConfig config = putStrLn $ "Daemon Config: Socket=" ++ daemonSocketPath config
 
--- Helper utilities
-
--- | Display build result
-displayBuildResult :: Protocol.BuildResult -> IO ()
-displayBuildResult result = do
-    putStrLn "Build completed successfully:"
-    putStrLn $ "  Outputs: " ++ show (length $ Protocol.resultOutputs result) ++ " paths"
-    putStrLn $ "  Exit code: " ++ case Protocol.resultExitCode result of
-                                      ExitSuccess -> "success"
-                                      ExitFailure code -> "failure (" ++ show code ++ ")"
-
-    -- Show build log if present
-    unless (T.null $ Protocol.resultLog result) $ do
-        putStrLn "Build log:"
-        TIO.putStrLn $ Protocol.resultLog result
-
--- | Display derivation
-displayDerivation :: Protocol.Derivation -> IO ()
-displayDerivation deriv = do
-    putStrLn "Derivation:"
-    putStrLn $ "  Name: " ++ T.unpack (Protocol.derivName deriv)
-    putStrLn $ "  Hash: " ++ T.unpack (Protocol.derivHash deriv)
-    putStrLn $ "  System: " ++ T.unpack (Protocol.derivSystem deriv)
-    putStrLn $ "  Inputs: " ++ show (length $ Protocol.derivInputs deriv)
-    putStrLn $ "  Outputs: " ++ show (length $ Protocol.derivOutputs deriv)
-
--- | Display garbage collection stats
-displayGCStats :: Protocol.GCStats -> IO ()
-displayGCStats stats = do
-    putStrLn "Garbage collection completed:"
-    putStrLn $ "  Total paths: " ++ show (Protocol.gcTotal stats)
-    putStrLn $ "  Live paths: " ++ show (Protocol.gcLive stats)
-    putStrLn $ "  Collected: " ++ show (Protocol.gcCollected stats)
-    putStrLn $ "  Space freed: " ++ formatBytes (Protocol.gcBytes stats)
-    putStrLn $ "  Elapsed time: " ++ formatElapsedTime (Protocol.gcElapsedTime stats)
-
--- | Display path info
-displayPathInfo :: Protocol.PathInfo -> IO ()
-displayPathInfo info = do
-    putStrLn $ "Path: " ++ T.unpack (storePathToText $ Protocol.pathInfoPath info)
-    putStrLn $ "Valid: " ++ if Protocol.pathInfoIsValid info then "Yes" else "No"
-    putStrLn $ "Registration time: " ++ show (Protocol.pathInfoRegistrationTime info)
-    case Protocol.pathInfoDeriver info of
-        Just deriver -> putStrLn $ "Deriver: " ++ T.unpack (storePathToText deriver)
-        Nothing -> putStrLn "Deriver: None"
-
--- | Display daemon status
-displayDaemonStatus :: Protocol.DaemonStatus -> IO ()
-displayDaemonStatus status = do
-    putStrLn $ "Daemon status: " ++ T.unpack (Protocol.daemonStatus status)
-    putStrLn $ "Uptime: " ++ formatElapsedTime (Protocol.daemonUptime status)
-    putStrLn $ "Active builds: " ++ show (Protocol.daemonActiveBuilds status)
-    putStrLn $ "Completed builds: " ++ show (Protocol.daemonCompletedBuilds status)
-    putStrLn $ "Failed builds: " ++ show (Protocol.daemonFailedBuilds status)
-    putStrLn $ "GC roots: " ++ show (Protocol.daemonGcRoots status)
-    putStrLn $ "Store size: " ++ formatBytes (Protocol.daemonStoreSize status)
-    putStrLn $ "Store paths: " ++ show (Protocol.daemonStorePaths status)
-
--- | Display daemon configuration
-displayDaemonConfig :: Protocol.DaemonConfig -> IO ()
-displayDaemonConfig config = do
-    putStrLn "Daemon configuration:"
-    putStrLn $ "  Version: " ++ T.unpack (Protocol.daemonVersion config)
-    putStrLn $ "  Socket path: " ++ Protocol.daemonSocketPath config
-    putStrLn $ "  Store path: " ++ Protocol.daemonStorePath config
-    putStrLn $ "  Max jobs: " ++ show (Protocol.daemonMaxJobs config)
-    case Protocol.daemonGcInterval config of
-        Just interval -> putStrLn $ "  GC interval: " ++ show interval ++ " seconds"
-        Nothing -> putStrLn "  GC interval: Manual only"
-    putStrLn $ "  Allowed users: " ++ show (Protocol.daemonAllowedUsers config)
-
--- | Format bytes in human-readable format
-formatBytes :: Integer -> String
-formatBytes bytes
-    | bytes < 1024 = show bytes ++ " B"
-    | bytes < 1024*1024 = show (bytes `div` 1024) ++ " KiB"
-    | bytes < 1024*1024*1024 = show (bytes `div` (1024*1024)) ++ " MiB"
-    | otherwise = show (bytes `div` (1024*1024*1024)) ++ " GiB"
-
--- | Format elapsed time in human-readable format
-formatElapsedTime :: Double -> String
-formatElapsedTime seconds
-    | seconds < 60 = show (round seconds) ++ " seconds"
-    | seconds < 3600 = show (round $ seconds / 60) ++ " minutes"
-    | otherwise = show (round $ seconds / 3600) ++ " hours"
-
--- Helpers for auto-starting daemon
-optAutoStartDaemon :: Options -> Bool
-optAutoStartDaemon _ = True  -- Default to auto-starting daemon
-
--- Convert StorePath to Text
-storePathToText :: StorePath -> Text
-storePathToText (StorePath hash name) = hash <> "-" <> name
-
--- Default build options
-defaultBuildOptions :: Protocol.BuildRequestInfo
-defaultBuildOptions = Protocol.BuildRequestInfo
-    { Protocol.buildArgs = []
-    , Protocol.buildTimeout = Nothing
-    , Protocol.buildPriority = 50  -- Normal priority
-    , Protocol.buildNotifyURL = Nothing
-    , Protocol.buildAllowRecursive = True
-    }
-
--- Mock derivation for testing
+-- Mock derivation for standalone testing
 mockDerivation :: Derivation
-mockDerivation = error "Mock derivation not implemented"  -- Would be replaced with actual implementation
+mockDerivation = Derivation "mock-standalone" "mockhash" (StorePath "builderhash" "builder") [] Set.empty Set.empty Map.empty "mock-system" ApplicativeStrategy Map.empty

@@ -1,478 +1,259 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE RankNTypes #-}
-
-module Ten
-    ( -- * Core types
-      PrivilegeTier(..)
-    , Phase(..)
-    , TenM
-    , BuildEnv
-    , BuildError(..)
-    , BuildId
-    , StorePath(..)
-    , Derivation(..)
-    , BuildResult(..)
-    , BuildStatus(..)
-    , BuildStrategy(..)
-
-    -- * Store operations
-    , addToStore
-    , storeFile
-    , storeDirectory
-    , checkStorePathExists
-    , readStoreContent
-    , scanFileForStoreReferences
-
-    -- * Derivation handling
-    , mkDerivation
-    , buildDerivation
-    , instantiateDerivation
-    , hashDerivation
-
-    -- * Build operations
-    , buildDerivationGraph
-    , buildInDependencyOrder
-    , withSandbox
-
-    -- * Sandbox configuration
-    , SandboxConfig(..)
-    , defaultSandboxConfig
-
-    -- * Graph operations
-    , createBuildGraph
-    , topologicalSort
-    , detectCycles
-
-    -- * Garbage collection
-    , collectGarbage
-    , registerGCRoot
-    , isGCRoot
-    , findGCRoots
-
-    -- * Database types
-    , Database
-    , TransactionMode(..)
-
-    -- * Database operations
-    , initializeDatabase
-    , ensureDBDirectories
-
-    -- * Derivation DB operations
-    , storeDerivationInDB
-    , readDerivationFromStore
-
-    -- * Reference management
-    , registerReference
-    , getReferences
-    , getReferrers
-
-    -- * Utilities
-    , initBuildEnv
-    , initClientEnv
-    , initDaemonEnv
-    , runTen
-    , buildTen
-    , evalTen
-    , logMsg
-    , version
-
-    -- * Daemon connection management
-    , connectToDaemon
-    , disconnectFromDaemon
-    , isDaemonRunning
-    , getDefaultSocketPath
-
-    -- * Authentication
-    , UserCredentials(..)
-    , createAuthToken
-    , validateToken
-
-    -- * Client-daemon communication
-    , sendRequest
-    , receiveResponse
-    , sendRequestSync
-
-    -- * Daemon management
-    , startDaemonIfNeeded
-    , getDaemonStatus
-    , shutdownDaemon
-    , getDaemonConfig
-
-    -- * Daemon state
-    , DaemonState(..)
-    , initDaemonState
-    , saveStateToFile
-    , loadStateFromFile
-
-    -- * Daemon capabilities
-    , DaemonCapability(..)
-    , requestCapabilities
-    , verifyCapabilities
-    , capabilityRequiresDaemon
-    , filterCapabilitiesForTier
-    ) where
-
-import Data.Int (Int64)
-import qualified Ten.Core as Core
-import qualified Ten.Build as Build
-import qualified Ten.Derivation as Derivation
-import qualified Ten.Store as Store
-import qualified Ten.Sandbox as Sandbox
-import qualified Ten.Graph as Graph
-import qualified Ten.GC as GC
-import qualified Ten.Hash as Hash
-import qualified Ten.DB.Core as DB
-import qualified Ten.DB.Derivations as DBDeriv
-import qualified Ten.DB.References as DBRef
-
--- Re-export daemon modules for client functionality
-import qualified Ten.Daemon.Client as Client
-import qualified Ten.Daemon.Protocol as Protocol
-import qualified Ten.Daemon.Auth as Auth
-import qualified Ten.Daemon.State as State
-
-import Data.Text (Text)
-import qualified Data.Text as T
-import Data.ByteString (ByteString)
-import Control.Monad.IO.Class (liftIO)
-import Control.Monad (void)
-import Data.Set (Set)
-import qualified Data.Set as Set
-import Data.Map.Strict (Map)
-import qualified Data.Map.Strict as Map
-import System.FilePath ((</>))
-
--- Re-export core types
-type TenM = Core.TenM
-type BuildEnv = Core.BuildEnv
-type BuildId = Core.BuildId
-type StorePath = Core.StorePath
-type Derivation = Core.Derivation
-type BuildResult = Core.BuildResult
-
--- Export core type constructors
-data Phase = Eval | Build
-    deriving (Show, Eq)
-
-data PrivilegeTier = Daemon | Builder
-    deriving (Show, Eq)
-
-data BuildError
-    = EvalError Text
-    | BuildFailed Text
-    | StoreError Text
-    | SandboxError Text
-    | InputNotFound FilePath
-    | HashError Text
-    | GraphError Text
-    | ResourceError Text
-    | DaemonError Text
-    | AuthError Text
-    | CyclicDependency Text
-    | SerializationError Text
-    | RecursionLimit Text
-    | NetworkError Text
-    | ParseError Text
-    | DBError Text
-    | GCError Text
-    | PhaseError Text
-    | PrivilegeError Text
-    | ProtocolError Text
-    | InternalError Text
-    | ConfigError Text
-    deriving (Show, Eq)
-
-data BuildStatus
-    = BuildPending
-    | BuildRunning Float                 -- Progress percentage (0.0-1.0)
-    | BuildRecursing BuildId             -- Switched to a new derivation
-    | BuildCompleted
-    | BuildFailed'
-    deriving (Show, Eq)
-
-data BuildStrategy
-    = ApplicativeStrategy                -- Static dependencies, can parallelize
-    | MonadicStrategy                    -- Dynamic dependencies or Return-Continuation
-    deriving (Show, Eq)
-
--- Re-export Database types
-type Database = DB.Database
-type TransactionMode = DB.TransactionMode
-
--- Re-export SandboxConfig
-type SandboxConfig = Sandbox.SandboxConfig
-
--- Re-export daemon capability types
-type DaemonCapability = Protocol.DaemonCapability
-
--- Re-export UserCredentials for auth
-type UserCredentials = Auth.UserCredentials
-
--- Re-export DaemonState
-type DaemonState = State.DaemonState
-
--- Re-export core functions
-defaultSandboxConfig :: SandboxConfig
-defaultSandboxConfig = Sandbox.defaultSandboxConfig
-
-initBuildEnv :: FilePath -> FilePath -> BuildEnv
-initBuildEnv = Core.initBuildEnv
-
-initClientEnv :: FilePath -> FilePath -> Core.DaemonConnection 'Builder -> BuildEnv
-initClientEnv = Core.initClientEnv
-
-initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
-initDaemonEnv storePath workDir userText = Core.initDaemonEnv workDir storePath userText
-
-runTen :: Core.SPhase p -> Core.SPrivilegeTier t -> TenM p t a -> BuildEnv -> Core.BuildState p -> IO (Either BuildError (a, Core.BuildState p))
-runTen sp st tm env state = do
-    result <- Core.runTen sp st tm env state
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right r -> return $ Right r
-
-evalTen :: TenM 'Core.Eval 'Core.Daemon a -> BuildEnv -> IO (Either BuildError (a, Core.BuildState 'Core.Eval))
-evalTen tm env = do
-    result <- Core.evalTen tm env
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right r -> return $ Right r
-
-buildTen :: TenM 'Core.Build 'Core.Builder a -> BuildEnv -> IO (Either BuildError (a, Core.BuildState 'Core.Build))
-buildTen tm env = do
-    result <- Core.buildTen tm env
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right r -> return $ Right r
-
--- Export store operations
-addToStore :: Store.StoreContentOps t => Text -> ByteString -> TenM p t StorePath
-addToStore = Store.addToStore
-
-storeFile :: Store.StoreContentOps t => FilePath -> TenM p t StorePath
-storeFile = Store.storeFile
-
-storeDirectory :: Store.StoreContentOps t => FilePath -> TenM p t StorePath
-storeDirectory = Store.storeDirectory
-
-checkStorePathExists :: Store.StoreAccessOps t => StorePath -> TenM p t Bool
-checkStorePathExists = Store.checkStorePathExists
-
-readStoreContent :: Store.StoreAccessOps t => StorePath -> TenM p t ByteString
-readStoreContent = Store.readStoreContent
-
-scanFileForStoreReferences :: Store.StoreScanOps t => FilePath -> TenM p t (Set StorePath)
-scanFileForStoreReferences = Store.scanFileForStoreReferences
-
--- Export derivation operations
-mkDerivation :: Text -> StorePath -> [Text] -> Set Derivation.DerivationChain
-             -> Set Text -> Map Text Text -> Text -> TenM 'Core.Eval t Derivation
-mkDerivation = Derivation.mkDerivation
-
-buildDerivation :: Build.CanBuildDerivation t => Derivation -> TenM 'Core.Build t BuildResult
-buildDerivation = Build.buildDerivation
-
-instantiateDerivation :: Derivation.CanStoreBuildDerivation t => Derivation -> TenM 'Core.Build t ()
-instantiateDerivation = Derivation.instantiateDerivation
-
-hashDerivation :: Derivation -> Text
-hashDerivation = Derivation.hashDerivation
-
--- Export build operations
-buildDerivationGraph :: Build.CanBuildDerivation t => Core.BuildGraph -> TenM 'Core.Build t (Map Text BuildResult)
-buildDerivationGraph = Build.buildDerivationGraph
-
-buildInDependencyOrder :: Build.CanBuildDerivation t => [Derivation] -> TenM 'Core.Build t [BuildResult]
-buildInDependencyOrder = Build.buildInDependencyOrder
-
-withSandbox :: Sandbox.SandboxConfig t => Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Core.Build t a) -> TenM 'Core.Build t a
-withSandbox = Sandbox.withSandbox
-
--- Export graph operations
-createBuildGraph :: Core.SingI t => Core.SPrivilegeTier t -> Set StorePath -> Set Derivation -> TenM 'Core.Eval t Core.BuildGraph
-createBuildGraph = Graph.createBuildGraph
-
-topologicalSort :: Core.SingI t => Core.SPrivilegeTier t -> Core.BuildGraph -> TenM 'Core.Eval t [Core.BuildNode]
-topologicalSort = Graph.topologicalSort
-
-detectCycles :: Core.SingI t => Core.SPrivilegeTier t -> Core.BuildGraph -> TenM 'Core.Eval t (Bool, Set Text, Set Text)
-detectCycles = Graph.detectCycles
-
--- Export garbage collection operations
-collectGarbage :: TenM 'Core.Build 'Core.Daemon (Int, Int, Integer)
-collectGarbage = GC.collectGarbage
-
-registerGCRoot :: StorePath -> Text -> Bool -> TenM 'Core.Build 'Core.Daemon Core.GCRoot
-registerGCRoot = GC.addRoot
-
-isGCRoot :: StorePath -> TenM 'Core.Build 'Core.Daemon Bool
-isGCRoot = GC.isGCRoot
-
-findGCRoots :: TenM 'Core.Build 'Core.Daemon [Core.GCRoot]
-findGCRoots = GC.listRoots
-
--- DB Core operations
-initializeDatabase :: FilePath -> Int -> IO FilePath
-initializeDatabase basePath timeout = initializeDatabase basePath timeout
-
-ensureDBDirectories :: FilePath -> TenM p 'Core.Daemon ()
-ensureDBDirectories = DB.ensureDBDirectories
-
--- DB Derivation operations
-storeDerivationInDB :: DBDeriv.CanStoreDerivation t => Derivation -> StorePath -> TenM p t Int64
-storeDerivationInDB = DBDeriv.storeDerivationInDB
-
-readDerivationFromStore :: DBDeriv.CanRetrieveDerivation p t => StorePath -> TenM p t (Maybe Derivation)
-readDerivationFromStore = DBDeriv.readDerivationFromStore
-
--- DB Reference operations
-registerReference :: DBRef.CanRegisterReferences t => Database t -> StorePath -> StorePath -> TenM p t ()
-registerReference = DBRef.registerReference
-
-getReferences :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set StorePath)
-getReferences = DBRef.getReferences
-
-getReferrers :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set StorePath)
-getReferrers = DBRef.getReferrers
-
--- Utility functions
-logMsg :: Int -> Text -> TenM p t ()
-logMsg = Core.logMsg
-
--- | Version information for the Ten build system
-version :: String
-version = "0.1.0.0"
-
--- Helper function to translate Core.BuildError to public BuildError
-translateError :: Core.BuildError -> BuildError
-translateError (Core.EvalError msg) = EvalError msg
-translateError (Core.BuildFailed msg) = BuildFailed msg
-translateError (Core.StoreError msg) = StoreError msg
-translateError (Core.SandboxError msg) = SandboxError msg
-translateError (Core.InputNotFound path) = InputNotFound path
-translateError (Core.HashError msg) = HashError msg
-translateError (Core.GraphError msg) = GraphError msg
-translateError (Core.ResourceError msg) = ResourceError msg
-translateError (Core.DaemonError msg) = DaemonError msg
-translateError (Core.AuthError msg) = AuthError msg
-translateError (Core.CyclicDependency msg) = CyclicDependency msg
-translateError (Core.SerializationError msg) = SerializationError msg
-translateError (Core.RecursionLimit msg) = RecursionLimit msg
-translateError (Core.NetworkError msg) = NetworkError msg
-translateError (Core.ParseError msg) = ParseError msg
-translateError (Core.DBError msg) = DBError msg
-translateError (Core.GCError msg) = GCError msg
-translateError (Core.PhaseError msg) = PhaseError msg
-translateError (Core.PrivilegeError msg) = PrivilegeError msg
-translateError (Core.ProtocolError msg) = ProtocolError msg
-translateError (Core.InternalError msg) = InternalError msg
-translateError (Core.ConfigError msg) = ConfigError msg
-
--- Re-export daemon client functions
-connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError (Core.DaemonConnection 'Core.Builder))
-connectToDaemon path creds = do
-    result <- Client.connectToDaemon path creds
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right conn -> return $ Right conn
-
-disconnectFromDaemon :: Core.DaemonConnection 'Core.Builder -> IO ()
-disconnectFromDaemon = Client.disconnectFromDaemon
-
-isDaemonRunning :: FilePath -> IO Bool
-isDaemonRunning = Client.isDaemonRunning
-
-getDefaultSocketPath :: IO FilePath
-getDefaultSocketPath = Client.getDefaultSocketPath
-
--- Re-export request/response functions
-sendRequest :: Core.DaemonConnection 'Core.Builder -> Core.Request -> IO (Either BuildError Int)
-sendRequest conn req = do
-    result <- Client.sendRequest conn req
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right reqId -> return $ Right reqId
-
-receiveResponse :: Core.DaemonConnection 'Core.Builder -> Int -> Int -> IO (Either BuildError Core.DaemonResponse)
-receiveResponse conn reqId timeout = do
-    result <- Client.receiveResponse conn reqId timeout
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right resp -> return $ Right resp
-
-sendRequestSync :: Core.DaemonConnection 'Core.Builder -> Core.Request -> Int -> IO (Either BuildError Core.DaemonResponse)
-sendRequestSync conn req timeout = do
-    result <- Client.sendRequestSync conn req timeout
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right resp -> return $ Right resp
-
--- Re-export daemon management functions
-startDaemonIfNeeded :: FilePath -> IO (Either BuildError ())
-startDaemonIfNeeded path = do
-    result <- Client.startDaemonIfNeeded path
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right () -> return $ Right ()
-
-getDaemonStatus :: Core.DaemonConnection 'Core.Builder -> IO (Either BuildError Core.DaemonStatus)
-getDaemonStatus conn = do
-    result <- Client.getDaemonStatus conn
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right status -> return $ Right status
-
-shutdownDaemon :: Core.DaemonConnection 'Core.Builder -> IO (Either BuildError ())
-shutdownDaemon conn = do
-    result <- Client.shutdownDaemon conn
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right () -> return $ Right ()
-
-getDaemonConfig :: Core.DaemonConnection 'Core.Builder -> IO (Either BuildError Core.DaemonConfig)
-getDaemonConfig conn = do
-    result <- Client.getDaemonConfig conn
-    case result of
-        Left err -> return $ Left $ translateError err
-        Right config -> return $ Right config
-
--- Re-export authentication functions
-createAuthToken :: Text -> IO Core.AuthToken
-createAuthToken = createAuthToken
-
-validateToken :: Core.DaemonConnection 'Core.Builder -> IO Bool
-validateToken conn = do
-    -- Simplified placeholder - actual implementation would
-    -- validate token with the daemon using Auth module
-    return True
-
--- Re-export daemon capability functions
-requestCapabilities :: Protocol.DaemonRequest -> Set Protocol.DaemonCapability
-requestCapabilities = Protocol.requestCapabilities
-
-verifyCapabilities :: Core.SPrivilegeTier t -> Set Protocol.DaemonCapability -> Either PrivilegeError ()
-verifyCapabilities = Protocol.verifyCapabilities
-
-capabilityRequiresDaemon :: Protocol.DaemonCapability -> Bool
-capabilityRequiresDaemon = Auth.capabilityRequiresDaemon
-
-filterCapabilitiesForTier :: Core.SPrivilegeTier t -> Set Protocol.DaemonCapability -> Set Protocol.DaemonCapability
-filterCapabilitiesForTier = Auth.filterCapabilitiesForTier
-
--- Re-export daemon state functions
-initDaemonState :: Core.SPrivilegeTier t -> Int -> IO (State.DaemonState t)
-initDaemonState st maxJobs = do
-    -- Create default state file path
-    stateFile <- Client.getDefaultSocketPath
-    let stateFilePath = stateFile ++ ".state"
-    State.initDaemonState st stateFilePath maxJobs 100
-
-saveStateToFile :: (Core.CanAccessStore t ~ 'True, Core.CanModifyStore t ~ 'True) => State.DaemonState t -> IO ()
-saveStateToFile = State.saveStateToFile
-
-loadStateFromFile :: Core.SPrivilegeTier t -> FilePath -> Int -> Int -> IO (State.DaemonState t)
-loadStateFromFile = State.loadStateFromFile
+
+module Ten (
+    -- * Core Concepts & Monad
+    module Ten.Core,
+
+    -- * Building Derivations
+    module Ten.Build,
+
+    -- * Derivation Definition & Manipulation
+    module Ten.Derivation,
+
+    -- * Store Operations
+    module Ten.Store,
+
+    -- * Sandbox Configuration
+    -- | (Primarily relevant for advanced customization or direct sandbox use)
+    module Ten.Sandbox,
+
+    -- * Hashing Utilities
+
+    -- * Garbage Collection (Daemon Operations)
+    -- | (These functions typically require daemon interaction)
+    module Ten.GC,
+
+    -- * Daemon Client Operations
+    -- | (Functions for interacting with a running Ten daemon)
+    module Ten.Daemon.Protocol -- Re-export necessary protocol types (e.g., UserCredentials)
+
+) where
+
+import Ten.Core (
+    -- Core Types
+    Phase(..), SPhase(..),
+    PrivilegeTier(..), SPrivilegeTier(..),
+    TenM(..),
+    BuildEnv(..), BuildState(..), BuildError(..), BuildId(..),
+    BuildStrategy(..), RunMode(..), DaemonConfig(..),
+    UserId(..), AuthToken(..), DaemonConnection(..), Request(..), Response(..),
+
+    -- Store & Derivation Types
+    StorePath(..), storePathToText, textToStorePath, parseStorePath, validateStorePath, storePathToFilePath, filePathToStorePath, makeStorePath,
+    Derivation(..), DerivationInput(..), DerivationOutput(..),
+    BuildResult(..),
+
+    -- Singletons & Permissions
+    SingI(..), sing, sDaemon, sBuilder, sEval, sBuild,
+    CanAccessStore, CanCreateSandbox, CanDropPrivileges, CanModifyStore, CanAccessDatabase, CanRunGC,
+
+    -- Running Operations
+    runTen, evalTen, buildTen,
+    runTenDaemon, runTenDaemonEval, runTenDaemonBuild,
+    runTenBuilderEval, runTenBuilderBuild,
+    runTenIO, liftTenIO,
+
+    -- Monad Operations
+    logMsg, throwError, catchError,
+    addProof, Proof(..),
+    atomicallyTen,
+
+    -- Environment/State Handling
+    initBuildEnv, initClientEnv, initDaemonEnv, initBuildState,
+
+    -- Utility Functions
+    hashByteString, buildErrorToText,
+    serializeDerivation, deserializeDerivation,
+    currentProtocolVersion, ProtocolVersion(..),
+
+    -- Daemon/Client Interaction Helpers
+    withDaemonConnection, isDaemonMode, isClientMode
+    )
+
+import Ten.Build (
+    -- Core Build Functions
+    buildDerivation,
+    buildApplicativeStrategy,
+    buildMonadicStrategy,
+
+    -- Build Result Handling
+    verifyBuildResult,
+
+    -- Build Graph Execution
+    buildDerivationGraph,
+    buildInDependencyOrder,
+
+    -- Parallel Building
+    buildDependenciesConcurrently,
+
+    -- Build Status Reporting
+    reportBuildProgress,
+    reportBuildStatus,
+
+    -- Type Classes for Privilege-Aware Operations
+    CanBuildDerivation(..),
+    CanBuildStrategy(..),
+    CanManageBuildStatus(..)
+    )
+
+import Ten.Derivation (
+    -- Derivation Creation & Inspection
+    mkDerivation,
+    instantiateDerivation,
+    derivationEquals,
+    derivationOutputPaths,
+    derivationInputPaths,
+
+    -- Return-Continuation Pattern
+    joinDerivation,
+    buildToGetInnerDerivation,
+    isReturnContinuationDerivation,
+
+    -- Hashing
+    -- hashDerivation, -- This is better handled by Ten.Hash
+
+    -- Type Classes
+    CanStoreDerivation(..),
+    CanStoreBuildDerivation(..),
+    CanRetrieveDerivation(..)
+    )
+
+import Ten.Store (
+    -- Store Path Operations
+    -- (Types re-exported from Ten.Core)
+
+    -- Content Operations (Type Class based)
+    StoreAccessOps(..),
+    StoreContentOps(..),
+    StoreModificationOps(..), -- Daemon only
+    StoreQueryOps(..),
+    StoreScanOps(..),
+    GCManagementOps(..),      -- Daemon only
+
+    -- High-level Public Functions
+    addToStore,
+    storeFile,
+    storeDirectory,
+    readStoreContent,
+    checkStorePathExists,
+    verifyStoreIntegrity,
+    listAllStorePaths,
+    findPathsWithPrefix_, -- Note the underscore to avoid clash if needed
+    scanFileForStoreReferences,
+    getReferencesTo,
+    getReferencesFrom
+    )
+
+import Ten.Sandbox (
+    -- Configuration
+    SandboxConfig(..),
+    defaultSandboxConfig,
+
+    -- Core function (mostly for internal use or advanced cases)
+    withSandbox
+    )
+
+import Ten.Hash (
+    -- Hash Type and Operations
+    Hash,
+    hashByteString,
+    hashLazyByteString,
+    hashText,
+    hashFile,
+    hashStorePath,
+
+    -- Verification
+    verifyHash,
+
+    -- Conversion
+    showHash,
+    hashFromText,
+
+    -- Higher-level Hashing
+    hashDerivation,
+    hashEnvironment,
+
+    -- Utilities
+    hashFilePath,
+    isValidHash
+    )
+
+import Ten.GC (
+    -- Core GC Operations (Daemon Only, via Client)
+    -- collectGarbage, -- Prefer client function below
+
+    -- GC Roots Management (Daemon Only, via Client)
+    -- addRoot, -- Prefer client function below
+    -- removeRoot, -- Prefer client function below
+    -- listRoots, -- Prefer client function below
+
+    -- Client-accessible GC operations are re-exported below from Ten.Daemon.Client
+    GCStats(..) -- Re-export the stats type
+    )
+
+import Ten.Daemon.Client (
+    -- Connection Management
+    connectToDaemon,
+    disconnectFromDaemon,
+    getDefaultSocketPath,
+
+    -- Client Communication Primitives (Advanced)
+    -- sendRequest, receiveResponse, sendRequestSync, -- Usually use higher-level functions
+
+    -- Status Checking
+    isDaemonRunning,
+    getDaemonStatus,
+
+    -- High-level Build Operations
+    buildFile,
+    evalFile,
+    buildDerivation, -- Note: Re-exports client version
+    cancelBuild,
+    getBuildStatus,
+    getBuildOutput,
+    listBuilds,
+
+    -- Store Operations (Client Interface)
+    addFileToStore,
+    verifyStorePath,
+    getStorePathForFile,
+    -- readStoreContent, -- Re-exported from Ten.Store as typeclass method
+    listStore,
+
+    -- Derivation Operations (Client Interface)
+    storeDerivation, -- Note: Re-exports client version
+    retrieveDerivation,
+    queryDerivationForOutput,
+    queryOutputsForDerivation,
+    listDerivations,
+    getDerivationInfo,
+
+    -- GC Operations (Client Interface)
+    collectGarbage,
+    getGCStatus,
+    addGCRoot,
+    removeGCRoot,
+    listGCRoots,
+
+    -- Daemon Management (Client Interface)
+    startDaemonIfNeeded,
+    shutdownDaemon,
+    getDaemonConfig
+    )
+
+import Ten.Daemon.Protocol (
+    -- Authentication Types
+    UserCredentials(..),
+
+    -- Capability System
+    DaemonCapability(..),
+    PrivilegeRequirement(..),
+    PrivilegeError(..)
+    )
