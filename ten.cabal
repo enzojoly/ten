@@ -25,7 +25,7 @@ library
                      , Ten.Sandbox
                      , Ten.Graph
                      , Ten.GC
-    other-modules:    Ten.Daemon.Auth
+                     , Ten.Daemon.Auth
                      , Ten.Daemon.Client
                      , Ten.Daemon.Protocol
                      , Ten.Daemon.Server
