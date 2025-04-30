@@ -21,231 +21,132 @@ module Ten (
     module Ten.Store,
 
     -- * Sandbox Configuration
-    -- | (Primarily relevant for advanced customization or direct sandbox use)
     module Ten.Sandbox,
 
     -- * Hashing Utilities
     module Ten.Hash,
 
     -- * Garbage Collection (Daemon Operations)
-    -- | (These functions typically require daemon interaction)
     module Ten.GC,
 
-    -- * Client Operations (direct exports needed by app/Main.hs)
+    -- * Database Operations
+    module Ten.DB.Core,
+    module Ten.DB.Schema,
+    module Ten.DB.Derivations,
+    module Ten.DB.References,
+
+    -- * Daemon Client Operations
+    module Ten.Daemon.Client,
+
+    -- * Daemon Server Operations (for daemon executable)
+    module Ten.Daemon.Server,
+
+    -- * Daemon State Management (for daemon executable)
+    module Ten.Daemon.State,
+
+    -- * Daemon Authentication (for daemon executable)
+    module Ten.Daemon.Auth,
+
+    -- * Daemon Protocol Types
+    module Ten.Daemon.Protocol,
+
+    -- * Re-exported types/functions for convenience
+    -- Client Operations (needed by app/Main.hs)
     connectToDaemon,
     disconnectFromDaemon,
     getDefaultSocketPath,
     isDaemonRunning,
-    sendRequest,
-    receiveResponse,
     sendRequestSync,
     startDaemonIfNeeded,
-
-    -- High-level build operations
     buildFile,
     evalFile,
-    Ten.Build.buildDerivation,
+    Ten.Daemon.Client.buildDerivation, -- Qualify to avoid ambiguity with Ten.Build
     cancelBuild,
     getBuildStatus,
     getBuildOutput,
     listBuilds,
-
-    -- Store operations and requests
-    verifyStore,
-    initializeStore,
-    createStoreDirectories,
-    ensureDBDirectories,
-    requestStoreAdd,
-    requestStoreVerify,
-    requestStorePath,
-    requestStoreList,
-    requestShutdown,
-    requestPathInfo,
-    PathInfo(..),
-    DaemonResponse(..),
-
-    -- Additional store operations
-    addFileToStore,
     verifyStorePath,
     getStorePathForFile,
     readStoreContent,
     listStore,
-
-    -- Additional derivation operations
     storeDerivation,
     retrieveDerivation,
     queryDerivationForOutput,
     queryOutputsForDerivation,
     listDerivations,
     getDerivationInfo,
-
-    -- Additional GC operations
     collectGarbage,
     getGCStatus,
     addGCRoot,
     removeGCRoot,
     listGCRoots,
-
-    -- Config-related
+    shutdownDaemon,
+    getDaemonStatus,
     getDaemonConfig,
-
-    -- Authentication and Protocol Types
     UserCredentials(..),
-    DaemonCapability(..),
     DaemonConnection,
 
-    -- * Re-exported Database types
-    Database(..),
-    DBError(..),
-    TransactionMode(..),
-    ensureSchema,
+    -- Daemon Operations (needed by app/TenDaemon.hs)
+    DaemonConfig(..), -- Re-export from Core if needed
     initDatabaseDaemon,
-    closeDatabaseDaemon
+    closeDatabaseDaemon,
+    ensureDBDirectories,
+    initializeStore,
+    verifyStore,
+    Ten.Daemon.Server.startServer,
+    Ten.Daemon.Server.createServerSocket,
+    Ten.Daemon.State.initDaemonState,
+    Ten.Daemon.State.loadStateFromFile,
+    Ten.Daemon.State.saveStateToFile,
+    Ten.Daemon.Auth.loadAuthFile,
+    Ten.Daemon.Auth.saveAuthFile,
+    SPrivilegeTier, sDaemon -- Re-export from Core
+
 ) where
 
--- Import core data types
-import Data.Text (Text)
-import Data.Int (Int64)
-
--- Core modules with explicit imports
-import Ten.Core (
-    BuildError(..), GCStats(..), BuildId(..),
-    StorePath(..), DaemonConnection(..),
-    Request(..), DaemonResponse(..),
-    PrivilegeTier(..), storePathToText
-    )
+-- Import core data types and functions
+import Ten.Core
 
 -- Build module
-import Ten.Build (
-    buildDerivation
-    )
+import Ten.Build
 
 -- Derivation module
-import Ten.Derivation (
-    derivationEquals, derivationOutputPaths
-    )
+import Ten.Derivation
 
--- Store module - specific operations
-import Ten.Store (
-    verifyStore, initializeStore, createStoreDirectories
-    )
+-- Store module
+import Ten.Store
 
--- Sandbox module - limited exports
-import Ten.Sandbox (
-    SandboxConfig(..), defaultSandboxConfig
-    )
+-- Sandbox module
+import Ten.Sandbox
 
 -- Hash module
-import Ten.Hash (
-    hashByteString, hashStorePath
-    )
+import Ten.Hash
 
 -- GC module
-import Ten.GC (
-    GCStats(..),
-    )
+import Ten.GC
 
 -- Database modules
-import Ten.DB.Core (
-    Database(..),
-    DBError(..),
-    TransactionMode(..),
-    ensureDBDirectories,
-    initDatabaseDaemon,
-    closeDatabaseDaemon
-    )
-import Ten.DB.Schema (ensureSchema)
+import Ten.DB.Core
+import Ten.DB.Schema
+import Ten.DB.Derivations
+import Ten.DB.References
 
--- Import client functionality with specific imports
-import Ten.Daemon.Client (
-    -- Connection management
-    connectToDaemon,
-    disconnectFromDaemon,
-    getDefaultSocketPath,
+-- Daemon Client module
+import Ten.Daemon.Client
 
-    -- Client communication
-    sendRequest,
-    receiveResponse,
-    sendRequestSync,
+-- Daemon Server module
+import Ten.Daemon.Server
 
-    -- Status checking
-    isDaemonRunning,
-    getDaemonStatus,
+-- Daemon State module
+import Ten.Daemon.State
 
-    -- Build operations
-    buildFile,
-    evalFile,
-    buildDerivation,
-    cancelBuild,
-    getBuildStatus,
-    getBuildOutput,
-    listBuilds,
+-- Daemon Auth module
+import Ten.Daemon.Auth
 
-    -- Store operations
-    addFileToStore,
-    verifyStorePath,
-    getStorePathForFile,
-    readStoreContent,
-    listStore,
+-- Daemon Protocol module
+import Ten.Daemon.Protocol
 
-    -- Derivation operations
-    storeDerivation,
-    retrieveDerivation,
-    queryDerivationForOutput,
-    queryOutputsForDerivation,
-    listDerivations,
-    getDerivationInfo,
-
-    -- GC operations
-    collectGarbage,
-    getGCStatus,
-    addGCRoot,
-    removeGCRoot,
-    listGCRoots,
-
-    -- Daemon management
-    startDaemonIfNeeded,
-    shutdownDaemon,
-    getDaemonConfig
-    )
-
--- Import protocol and auth types
-import Ten.Daemon.Protocol (
-    UserCredentials(..),
-    DaemonCapability(..),
-    )
-
--- | Request to add a file to the store
-requestStoreAdd :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
-requestStoreAdd = addFileToStore
-
--- | Request to verify a store path
-requestStoreVerify :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError Bool)
-requestStoreVerify = verifyStorePath
-
--- | Request to calculate a store path for a file
-requestStorePath :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
-requestStorePath = getStorePathForFile
-
--- | Request to list store contents
-requestStoreList :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
-requestStoreList = listStore
-
--- | Request daemon shutdown
-requestShutdown :: DaemonConnection 'Builder -> IO (Either BuildError ())
-requestShutdown = shutdownDaemon
-
--- | Request information about a store path
-requestPathInfo :: DaemonConnection 'Builder -> StorePath -> IO (Either BuildError PathInfo)
-requestPathInfo conn path = do
-    -- This is a stub implementation
-    return $ Left $ DaemonError "Path info request not implemented"
-
--- | Path information type
-data PathInfo = PathInfo {
-    pathPath :: StorePath,
-    pathHash :: Text,
-    pathDeriver :: Maybe StorePath,
-    pathRegistrationTime :: Int64,  -- Unix timestamp instead of UTCTime
-    pathIsValid :: Bool
-} deriving (Show, Eq)
+-- NOTE: Redundant aliases like requestStoreAdd are removed.
+--       Clients should use the functions directly exported from Client.
+-- NOTE: PathInfo definition removed, assuming it lives in Core or Store now.
+--       If needed, it should be defined there and re-exported.
