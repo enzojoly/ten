@@ -53,6 +53,23 @@ module Ten
     , isGCRoot
     , findGCRoots
 
+    -- * Database types
+    , Database
+    , TransactionMode(..)
+
+    -- * Database operations
+    , initializeDatabase
+    , ensureDBDirectories
+
+    -- * Derivation DB operations
+    , storeDerivationInDB
+    , readDerivationFromStore
+
+    -- * Reference management
+    , registerReference
+    , getReferences
+    , getReferrers
+
     -- * Utilities
     , initBuildEnv
     , initClientEnv
@@ -64,6 +81,7 @@ module Ten
     , version
     ) where
 
+import Data.Int (Int64)
 import qualified Ten.Core as Core
 import qualified Ten.Build as Build
 import qualified Ten.Derivation as Derivation
@@ -72,6 +90,9 @@ import qualified Ten.Sandbox as Sandbox
 import qualified Ten.Graph as Graph
 import qualified Ten.GC as GC
 import qualified Ten.Hash as Hash
+import qualified Ten.DB.Core as DB
+import qualified Ten.DB.Derivations as DBDeriv
+import qualified Ten.DB.References as DBRef
 
 -- Re-export core types
 type TenM = Core.TenM
@@ -125,6 +146,10 @@ data BuildStrategy
     = ApplicativeStrategy                -- Static dependencies, can parallelize
     | MonadicStrategy                    -- Dynamic dependencies or Return-Continuation
     deriving (Show, Eq)
+
+-- Re-export Database types
+type Database = DB.Database
+type TransactionMode = DB.TransactionMode
 
 -- Re-export SandboxConfig
 type SandboxConfig = Sandbox.SandboxConfig
@@ -228,6 +253,30 @@ isGCRoot = GC.isGCRoot
 
 findGCRoots :: TenM 'Core.Build 'Core.Daemon [Core.GCRoot]
 findGCRoots = GC.listRoots
+
+-- DB Core operations
+initializeDatabase :: FilePath -> Int -> IO FilePath
+initializeDatabase = DB.initializeDatabase
+
+ensureDBDirectories :: FilePath -> TenM p 'Core.Daemon ()
+ensureDBDirectories = DB.ensureDBDirectories
+
+-- DB Derivation operations
+storeDerivationInDB :: DBDeriv.CanStoreDerivation t => Derivation -> StorePath -> TenM p t Int64
+storeDerivationInDB = DBDeriv.storeDerivationInDB
+
+readDerivationFromStore :: DBDeriv.CanRetrieveDerivation p t => StorePath -> TenM p t (Maybe Derivation)
+readDerivationFromStore = DBDeriv.readDerivationFromStore
+
+-- DB Reference operations
+registerReference :: DBRef.CanRegisterReferences t => Database t -> StorePath -> StorePath -> TenM p t ()
+registerReference = DBRef.registerReference
+
+getReferences :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Core.Set StorePath)
+getReferences = DBRef.getReferences
+
+getReferrers :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Core.Set StorePath)
+getReferrers = DBRef.getReferrers
 
 -- Utility functions
 logMsg :: Int -> Core.Text -> TenM p t ()
