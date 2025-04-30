@@ -82,6 +82,7 @@ import Crypto.Hash (hash, SHA256(..), Digest)
 import qualified Crypto.Hash as Crypto
 
 import Ten.Core
+import Ten.Store
 
 -- | Create a unique ID for a store path
 pathNodeId :: StorePath -> Text
@@ -94,6 +95,25 @@ derivNodeId drv = "drv:" <> derivHash drv
 -- | Create a unique ID for an output
 outputNodeId :: StorePath -> Text
 outputNodeId path = "out:" <> storeHash path <> ":" <> storeName path
+
+computeReachablePaths :: (StoreScanOps t) => Set StorePath -> TenM p t (Set StorePath)
+computeReachablePaths rootPaths = do
+    env <- ask
+
+    -- Traverse the dependency graph using breadth-first search
+    let bfs visited [] = return visited
+        bfs visited (path:queue)
+            | path `Set.member` visited = bfs visited queue
+            | otherwise = do
+                -- Get direct references from this path
+                refs <- getReferencesFromPath path
+                -- Continue traversal with new references added to queue
+                let newVisited = Set.insert path visited
+                let newQueue = queue ++ [r | r <- Set.toList refs, not (r `Set.member` newVisited)]
+                bfs newVisited newQueue
+
+    -- Start with the root paths
+    bfs Set.empty (Set.toList rootPaths)
 
 -- | Empty build graph
 emptyGraph :: BuildGraph

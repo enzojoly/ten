@@ -17,6 +17,7 @@ module Ten.CLI (
     Command(..),
     StoreCommand(..),
     DerivationCommand(..),
+    DaemonCommand(..),  -- Export DaemonCommand
     Options(..),
     defaultOptions,
     PrivilegeRequirement(..),
@@ -79,7 +80,7 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Time (getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.List (nub, isPrefixOf, isInfixOf)
-import Data.Unique (Unique, newUnique)
+import Data.Unique (Unique, newUnique, hashUnique)
 import System.Directory
 import System.FilePath
 import qualified System.Process as Process
@@ -171,8 +172,10 @@ data DaemonCommand
     = DaemonStart                -- Start the daemon
     | DaemonStop                 -- Stop the daemon
     | DaemonRestart              -- Restart the daemon
-    | DaemonConfig               -- Get daemon configuration
+    | DaemonStatusCmd            -- Get daemon status (renamed from DaemonStatus)
+    | DaemonConfigCmd            -- Get daemon configuration (renamed from DaemonConfig)
     deriving (Show, Eq)
+
 -- | Store commands
 data StoreCommand
     = StoreAdd FilePath                -- Add a file to the store
@@ -289,9 +292,9 @@ parseArgs (cmdStr:args) = do
                     case subcmd of
                         "start" -> Right $ CmdDaemon DaemonStart
                         "stop" -> Right $ CmdDaemon DaemonStop
-                        "status" -> Right $ CmdDaemon Ten.Core.DaemonStatus
                         "restart" -> Right $ CmdDaemon DaemonRestart
-                        "config" -> Right $ CmdDaemon Ten.Core.DaemonConfig
+                        "status" -> Right $ CmdDaemon DaemonStatusCmd  -- Use new DaemonStatusCmd constructor
+                        "config" -> Right $ CmdDaemon DaemonConfigCmd  -- Use new DaemonConfigCmd constructor
                         _ -> Left $ "unknown daemon subcommand: " ++ subcmd
         "help" -> Right CmdHelp
         "version" -> Right CmdVersion
@@ -334,7 +337,7 @@ commandPhase = \case
     CmdVersion -> Build              -- Version works in any phase
 
 -- | Helper to get user name with appropriate qualification
-userName :: UserEntry -> String
+userName :: User.UserEntry -> String
 userName = User.userName
 
 -- | Main entry point to run a command
@@ -372,7 +375,7 @@ runCommand cmd opts = case commandPrivilege cmd of
         case commandPhase cmd of
             Eval -> do
                 bid <- BuildId <$> newUnique
-                result <- evalTen (handleCommand cmd opts) env' (initBuildState Eval bid)
+                result <- evalTen (handleCommand cmd opts) env'
                 case result of
                     Left err -> do
                         hPutStrLn stderr $ "Error: " ++ show err
@@ -381,7 +384,7 @@ runCommand cmd opts = case commandPrivilege cmd of
 
             Build -> do
                 bid <- BuildId <$> newUnique
-                result <- buildTen (handleCommand cmd opts) env' (initBuildState Build bid)
+                result <- buildTen (handleCommand cmd opts) env'
                 case result of
                     Left err -> do
                         hPutStrLn stderr $ "Error: " ++ show err
@@ -408,7 +411,7 @@ runCommand cmd opts = case commandPrivilege cmd of
                     case commandPhase cmd of
                         Eval -> do
                             bid <- BuildId <$> newUnique
-                            result <- evalTen (handleCommand cmd opts) env' (initBuildState Eval bid)
+                            result <- evalTen (handleCommand cmd opts) env'
                             case result of
                                 Left err -> do
                                     hPutStrLn stderr $ "Error: " ++ show err
@@ -417,7 +420,7 @@ runCommand cmd opts = case commandPrivilege cmd of
 
                         Build -> do
                             bid <- BuildId <$> newUnique
-                            result <- buildTen (handleCommand cmd opts) env' (initBuildState Build bid)
+                            result <- buildTen (handleCommand cmd opts) env'
                             case result of
                                 Left err -> do
                                     hPutStrLn stderr $ "Error: " ++ show err
@@ -493,6 +496,8 @@ commandToString = \case
         DaemonStart -> "daemon start"
         DaemonStop -> "daemon stop"
         DaemonRestart -> "daemon restart"
+        DaemonStatusCmd -> "daemon status"
+        DaemonConfigCmd -> "daemon config"
     CmdHelp -> "help"
     CmdVersion -> "version"
 
@@ -1006,7 +1011,7 @@ handleGC spt dryRun = case (fromSing spt) of
         rootPaths <- findGCRoots
 
         -- Find reachable paths
-        reachable <- computeReachablePaths rootPaths
+        reachable <- Graph.computeReachablePaths rootPaths
 
         -- Determine unreachable paths
         let unreachable = filter (\p -> not $ p `Set.member` reachable) allPaths
@@ -1148,14 +1153,19 @@ handleDerivation spt cmd = case cmd of
             case (fromSing spt) of
                 Daemon -> do
                     withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
-                        result <- DB.withTenReadTransaction db $ \conn -> do
-                            -- Use getDerivationPath instead of getDeriverForPath
-                            DBDeriv.getDerivationPath storePath
+                        rows <- DB.withTenReadTransaction db $ \conn -> do
+                            -- Query using path as StorePath parameter
+                            tenQuery conn
+                                "SELECT d.path FROM Derivations d JOIN DerivationOutputs o ON d.id = o.derivation_id WHERE o.path = ?"
+                                (Only (storePathToText storePath)) :: TenM 'Eval 'Daemon [Only Text]
 
-                        case result of
-                            Just deriverPath -> liftIO $ putStrLn $
-                                "Deriver: " ++ T.unpack (storePathToText deriverPath)
-                            Nothing -> liftIO $ putStrLn "No deriver found for this path"
+                        case rows of
+                            (Only derivPath):_ -> do
+                                -- Convert the text to StorePath
+                                case parseStorePath derivPath of
+                                    Just dPath -> liftIO $ putStrLn $ "Deriver: " ++ T.unpack derivPath
+                                    Nothing -> liftIO $ putStrLn $ "Invalid deriver path format: " ++ T.unpack derivPath
+                            [] -> liftIO $ putStrLn "No deriver found for this path"
 
                 _ -> throwError $ PrivilegeError "Querying derivers requires daemon privileges"
 
@@ -1201,7 +1211,21 @@ handleDerivation spt cmd = case cmd of
 
                 -- Register it in the database
                 derivId <- DB.withTenWriteTransaction db $ \conn -> do
-                    DBDeriv.registerDerivationFile drv path
+                    -- Insert derivation and get ID
+                    tenExecute conn
+                        "INSERT INTO Derivations (path, name, hash, builder, system, strategy) VALUES (?, ?, ?, ?, ?, ?)"
+                        (storePathToText path, derivName drv, derivHash drv,
+                         storePathToText (derivBuilder drv), derivSystem drv,
+                         if derivStrategy drv == ApplicativeStrategy then "applicative" else "monadic")
+
+                    -- Get last inserted ID
+                    rows <- tenQuery conn
+                        "SELECT last_insert_rowid()"
+                        () :: TenM 'Eval 'Daemon [Only Int]
+
+                    case rows of
+                        [Only id] -> return id
+                        _ -> throwError $ DBError "Failed to get derivation ID"
 
                 -- Output results
                 liftIO $ do
@@ -1218,13 +1242,18 @@ handleDerivation spt cmd = case cmd of
             Daemon -> do
                 withDatabase (defaultDBPath (storeLocation env)) 5000 $ \db -> do
                     derivs <- DB.withTenReadTransaction db $ \conn -> do
-                        -- Use listDerivations as an alternative
-                        DBDeriv.listDerivations 100
+                        -- Query derivations
+                        rows <- tenQuery conn
+                            "SELECT path, name FROM Derivations LIMIT 100"
+                            () :: TenM 'Eval 'Daemon [(Text, Text)]
+                        return rows
 
                     liftIO $ do
                         putStrLn $ "Found " ++ show (length derivs) ++ " derivations:"
                         forM_ derivs $ \(path, name) ->
-                            putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack (storePathToText path)
+                            case parseStorePath path of
+                                Just sp -> putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack path
+                                Nothing -> putStrLn $ "  " ++ T.unpack name ++ ": " ++ T.unpack path ++ " (invalid format)"
 
             _ -> do
                 -- In builder context, we need to go through daemon
@@ -1333,6 +1362,8 @@ handleDaemon spt cmd = case (fromSing spt) of
             DaemonStart -> startDaemon
             DaemonStop -> stopDaemon
             DaemonRestart -> restartDaemon
+            DaemonStatusCmd -> showDaemonStatus
+            DaemonConfigCmd -> showDaemonConfig
 
     Builder ->
         throwError $ PrivilegeError "Daemon operations require daemon privileges"
@@ -1551,7 +1582,7 @@ getDaemonStatus = do
             else return 0
 
     -- Construct status
-    return Ten.Core.DaemonStatus {
+    return DaemonStatus {
         daemonStatus = "running",
         daemonUptime = uptime,
         daemonActiveBuilds = activeBuilds,
@@ -1610,8 +1641,8 @@ daemonCommand args opts socket = do
     parseCommandString "store" ("verify":path:_) = Right $ CmdStore (StoreVerify path)
     parseCommandString "store" ("path":file:_) = Right $ CmdStore (CmdStorePath file)
     parseCommandString "store" ("add":file:_) = Right $ CmdStore (StoreAdd file)
-    parseCommandString "daemon" ("status":_) = Right $ CmdDaemon Ten.Core.DaemonStatus
-    parseCommandString "daemon" ("config":_) = Right $ CmdDaemon Ten.Core.DaemonConfig
+    parseCommandString "daemon" ("status":_) = Right $ CmdDaemon DaemonStatusCmd
+    parseCommandString "daemon" ("config":_) = Right $ CmdDaemon DaemonConfigCmd
     parseCommandString "daemon" ("start":_) = Right $ CmdDaemon DaemonStart
     parseCommandString "daemon" ("stop":_) = Right $ CmdDaemon DaemonStop
     parseCommandString "daemon" ("restart":_) = Right $ CmdDaemon DaemonRestart
@@ -1631,6 +1662,8 @@ daemonCommand args opts socket = do
     commandToRequest (CmdDaemon DaemonStart) = Request 0 "daemon-start" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonStop) = Request 0 "daemon-stop" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonRestart) = Request 0 "daemon-restart" Map.empty Nothing
+    commandToRequest (CmdDaemon DaemonStatusCmd) = Request 0 "daemon-status" Map.empty Nothing
+    commandToRequest (CmdDaemon DaemonConfigCmd) = Request 0 "daemon-config" Map.empty Nothing
     commandToRequest _ = Request 0 "unknown" Map.empty Nothing
 
     -- Display response
@@ -1806,9 +1839,9 @@ handleBuildTenExpression spt file = do
     case (fromSing spt) of
         Daemon -> do
             -- First evaluate the expression to get a derivation
-            result <- runTenDaemonEval (evaluateExpression spt content) =<< ask <*> get
+            evalResult <- runTenDaemonEval (evaluateExpression spt content)
 
-            case result of
+            case evalResult of
                 Left err -> throwError err
                 Right (drv, _) -> do
                     -- Now build the derivation
@@ -2007,6 +2040,24 @@ withDatabase dbPath timeout action = do
 
     -- Return the result
     return result
+
+-- | Execute SQL query with proper error handling
+tenQuery :: (SQL.ToRow q, SQL.FromRow r) => Connection -> Query -> q -> TenM 'Build 'Daemon [r]
+tenQuery conn query params = do
+    result <- liftIO $ try $ SQL.query conn query params
+    case result of
+        Left (e :: SomeException) ->
+            throwError $ DBError $ "Database query error: " <> T.pack (show e)
+        Right rows -> return rows
+
+-- | Execute SQL statement with proper error handling
+tenExecute :: (SQL.ToRow q) => Connection -> Query -> q -> TenM 'Build 'Daemon ()
+tenExecute conn query params = do
+    result <- liftIO $ try $ SQL.execute conn query params
+    case result of
+        Left (e :: SomeException) ->
+            throwError $ DBError $ "Database execute error: " <> T.pack (show e)
+        Right _ -> return ()
 
 -- | Get a daemon connection from the environment
 getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)
