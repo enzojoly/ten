@@ -288,9 +288,9 @@ parseArgs (cmdStr:args) = do
                     case subcmd of
                         "start" -> Right $ CmdDaemon DaemonStart
                         "stop" -> Right $ CmdDaemon DaemonStop
-                        "status" -> Right $ CmdDaemon Core.DaemonStatus
+                        "status" -> Right $ CmdDaemon Ten.Core.DaemonStatus
                         "restart" -> Right $ CmdDaemon DaemonRestart
-                        "config" -> Right $ CmdDaemon Core.DaemonConfig
+                        "config" -> Right $ CmdDaemon Ten.Core.DaemonConfig
                         _ -> Left $ "unknown daemon subcommand: " ++ subcmd
         "help" -> Right CmdHelp
         "version" -> Right CmdVersion
