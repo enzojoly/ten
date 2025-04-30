@@ -4,7 +4,14 @@ module Ten
     -- Env types
   , BuildEnv(..)
   , TenM
-    -- Store operations
+    -- Type classes for store operations
+  , StoreAccessOps(..)
+  , StoreContentOps(..)
+  , StoreModificationOps(..)
+  , StoreQueryOps(..)
+  , StoreScanOps(..)
+  , GCManagementOps(..)
+    -- Store operations (re-exported through type classes)
   , StorePath
   , addToStore
   , storeFile
@@ -12,6 +19,10 @@ module Ten
   , checkStorePathExists
   , readStoreContent
   , scanFileForStoreReferences
+    -- Derivation type classes
+  , CanStoreDerivation(..)
+  , CanRetrieveDerivation(..)
+  , CanStoreBuildDerivation(..)
     -- Derivation operations
   , Derivation
   , BuildResult
@@ -21,6 +32,7 @@ module Ten
   , buildDerivationGraph
     -- Sandbox operations
   , SandboxConfig
+  , SandboxCreator(..)
   , withSandbox
     -- Build graph operations
   , createBuildGraph
@@ -29,6 +41,13 @@ module Ten
   , registerGCRoot
     -- Database operations
   , Database
+  , HasDirectQueryOps(..)
+  , HasTransactionOps(..)
+  , HasStoreOps(..)
+  , HasDerivationOps(..)
+  , HasBuildOps(..)
+  , HasGCOps(..)
+  , HasSchemaOps(..)
   , initializeDatabase
   , getReferences
   , getReferrers
@@ -37,6 +56,7 @@ module Ten
     -- Auth operations
   , createAuthToken
     -- Capability operations
+  , DaemonCapability(..)
   , requestCapabilities
   , verifyCapabilities
   , capabilityRequiresDaemon
@@ -45,204 +65,103 @@ module Ten
   , initDaemonEnv
   ) where
 
--- Standard library imports for basic types
-import qualified Data.Text as T
-import qualified Data.ByteString as BS
-import qualified Data.Set as Set
-import qualified Data.Map.Strict as Map
-import qualified System.IO.Error as IOE
-import qualified System.FilePath as FP
-
--- Project-specific imports
+-- Import modules with proper type constraints
 import qualified Ten.Core as Core
 import qualified Ten.Store as Store
-import qualified Ten.Build as Build
-import qualified Ten.Sandbox as Sandbox
+import qualified Ten.Derivation as Derivation
 import qualified Ten.DB.Core as DB
 import qualified Ten.Daemon.Auth as Auth
 import qualified Ten.Daemon.Protocol as Protocol
 
--- Re-exports from Ten.Core
+-- Re-export with proper type constraints
 import Ten.Core
   ( TenM
   , StorePath
   , Derivation
   , BuildResult
   , Database
+  , TenError(..)
+  , BuildEnv(..)
   )
 
--- Main error type for the Ten system
-data TenError
-    = EvalError T.Text
-    | BuildFailed T.Text
-    | StoreError T.Text
-    | SandboxError T.Text
-    | IOError T.Text
-    | HashError T.Text
-    | GraphError T.Text
-    | ResourceError T.Text
-    | DaemonError T.Text
-    | AuthError T.Text
-    | CyclicDependency T.Text
-    | SerializationError T.Text
-    | RecursionLimit T.Text
-    | NetworkError T.Text
-    | ParseError T.Text
-    | DBError T.Text
-    | GCError T.Text
-    | PhaseError T.Text
-    | PrivilegeError T.Text
-    | ProtocolError T.Text
-    | InternalError T.Text
-    | ConfigError T.Text
-    deriving (Show, Eq)
+-- Re-export store operations with proper type constraints
+addToStore :: Store.StoreContentOps t => Text -> ByteString -> TenM p t StorePath
+addToStore = Store.addToStore
 
--- Environment for build operations
-data BuildEnv = BuildEnv
-    { storeDir      :: FilePath
-    , buildRoot     :: FilePath
-    , authToken     :: Maybe T.Text
-    , dbConnection  :: Maybe DB.DBConnection
-    }
-
--- Initialize the daemon environment with the necessary paths and auth token
-initDaemonEnv :: FilePath -> FilePath -> Maybe T.Text -> BuildEnv
-initDaemonEnv store build token = BuildEnv
-    { storeDir = store
-    , buildRoot = build
-    , authToken = token
-    , dbConnection = Nothing
-    }
-
--- Store content operations
-
--- Add content to the store with a given name and raw bytes
-addToStore :: Store.StoreContentOps t => T.Text -> BS.ByteString -> TenM p t StorePath
-addToStore name content = Store.addContent name content
-
--- Store a file in the content-addressable store
 storeFile :: Store.StoreContentOps t => FilePath -> TenM p t StorePath
-storeFile path = Store.addFile path
+storeFile = Store.storeFile
 
--- Store a directory in the content-addressable store
 storeDirectory :: Store.StoreContentOps t => FilePath -> TenM p t StorePath
-storeDirectory path = Store.addDirectory path
+storeDirectory = Store.storeDirectory
 
--- Check if a path exists in the store
 checkStorePathExists :: Store.StoreAccessOps t => StorePath -> TenM p t Bool
-checkStorePathExists path = Store.pathExists path
+checkStorePathExists = Store.checkStorePathExists
 
--- Read content from a store path
-readStoreContent :: Store.StoreAccessOps t => StorePath -> TenM p t BS.ByteString
-readStoreContent path = Store.readContent path
+readStoreContent :: Store.StoreAccessOps t => StorePath -> TenM p t ByteString
+readStoreContent = Store.readStoreContent
 
--- Scan a file for references to store paths
-scanFileForStoreReferences :: Store.StoreScanOps t => FilePath -> TenM p t (Set.Set StorePath)
-scanFileForStoreReferences path = Store.scanFile path
+scanFileForStoreReferences :: Store.StoreScanOps t => FilePath -> TenM p t (Set StorePath)
+scanFileForStoreReferences = Store.scanFileForStoreReferences
 
--- Derivation operations
+-- Re-export derivation operations with proper constraints
+mkDerivation :: Text -> StorePath -> [Text] -> Set DerivationInput -> Set Text -> Map Text Text -> Text -> TenM 'Eval t Derivation
+mkDerivation = Derivation.mkDerivation
 
--- Create a new derivation with the given parameters
-mkDerivation :: T.Text                        -- ^ Derivation name
-             -> StorePath                     -- ^ Builder path
-             -> [T.Text]                      -- ^ Arguments to the builder
-             -> Set.Set Core.DerivationInput  -- ^ Input derivations
-             -> Set.Set T.Text                -- ^ Output paths
-             -> Map.Map T.Text T.Text         -- ^ Environment variables
-             -> T.Text                        -- ^ Platform
-             -> TenM 'Core.Eval t Derivation
-mkDerivation name builder args inputs outputs env platform =
-    Core.createDerivation name builder args inputs outputs env platform
+instantiateDerivation :: Derivation.CanStoreBuildDerivation t => Derivation -> TenM 'Build t ()
+instantiateDerivation = Derivation.instantiateDerivation
 
--- Instantiate a derivation (make it concrete and ready to build)
-instantiateDerivation :: Build.CanBuildDerivation t => Derivation -> TenM 'Core.Build t ()
-instantiateDerivation deriv = Build.instantiate deriv
+hashDerivation :: Derivation -> Text
+hashDerivation = Derivation.hashDerivation
 
--- Calculate the cryptographic hash of a derivation
-hashDerivation :: Derivation -> T.Text
-hashDerivation = Build.hashDerivation
+buildDerivationGraph :: Build.CanBuildDerivation t => BuildGraph -> TenM 'Build t (Map Text BuildResult)
+buildDerivationGraph = Build.buildGraph
 
--- Build a graph of derivations
-buildDerivationGraph :: Build.CanBuildDerivation t => Core.BuildGraph -> TenM 'Core.Build t (Map.Map T.Text BuildResult)
-buildDerivationGraph graph = Build.buildGraph graph
+-- Re-export sandbox operations
+withSandbox :: Derivation.SandboxCreator t => Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Build t a) -> TenM 'Build t a
+withSandbox = Derivation.withSandbox
 
--- Sandbox operations
+-- Re-export build graph operations
+createBuildGraph :: Core.SingI t => SPrivilegeTier t -> Set StorePath -> Set Derivation -> TenM 'Eval t BuildGraph
+createBuildGraph = Core.createBuildGraph
 
--- Execute an action within a sandbox environment
-withSandbox :: Sandbox.SandboxOps t
-            => Set.Set StorePath        -- ^ Input paths to make available in the sandbox
-            -> SandboxConfig           -- ^ Sandbox configuration
-            -> (FilePath -> TenM 'Core.Build t a)  -- ^ Action to run in the sandbox
-            -> TenM 'Core.Build t a
-withSandbox inputs config action = Sandbox.withSandbox inputs config action
+detectCycles :: Core.SingI t => SPrivilegeTier t -> BuildGraph -> TenM 'Eval t (Bool, Set Text, Set Text)
+detectCycles = Core.detectCycles
 
--- Build graph operations
+-- Re-export GC operations
+registerGCRoot :: StorePath -> Text -> Bool -> TenM 'Build 'Daemon GCRoot
+registerGCRoot = Core.registerGCRoot
 
--- Create a build graph from a set of store paths and derivations
-createBuildGraph :: Core.SingI t
-                 => Core.SPrivilegeTier t
-                 -> Set.Set StorePath
-                 -> Set.Set Derivation
-                 -> TenM 'Core.Eval t Core.BuildGraph
-createBuildGraph tier paths derivs = Core.createBuildGraph tier paths derivs
+-- Re-export DB operations
+initializeDatabase :: FilePath -> TenM 'Build 'Daemon ()
+initializeDatabase = DB.initialize
 
--- Detect cycles in the build graph
-detectCycles :: Core.SingI t
-             => Core.SPrivilegeTier t
-             -> Core.BuildGraph
-             -> TenM 'Core.Eval t (Bool, Set.Set T.Text, Set.Set T.Text)
-detectCycles tier graph = Core.detectCycles tier graph
+getReferences :: DB.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set StorePath)
+getReferences = DB.getReferences
 
--- GC operations
+getReferrers :: DB.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set StorePath)
+getReferrers = DB.getReferrers
 
--- Register a store path as a GC root
-registerGCRoot :: StorePath -> T.Text -> Bool -> TenM 'Core.Build 'Core.Daemon Core.GCRoot
-registerGCRoot path name indirect = Core.registerGCRoot path name indirect
+-- Re-export logging
+logMsg :: Int -> Text -> TenM p t ()
+logMsg = Core.logMessage
 
--- Database operations
-
--- Initialize the database
-initializeDatabase :: FilePath -> TenM 'Core.Build 'Core.Daemon ()
-initializeDatabase dbPath = DB.initialize dbPath
-
--- Get references from a store path
-getReferences :: DB.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set.Set StorePath)
-getReferences db path = DB.getReferences db path
-
--- Get referrers to a store path
-getReferrers :: DB.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set.Set StorePath)
-getReferrers db path = DB.getReferrers db path
-
--- Logging
-
--- Log a message with a given level
-logMsg :: Int -> T.Text -> TenM p t ()
-logMsg level msg = Core.logMessage level msg
-
--- Auth operations
-
--- Create an authentication token
-createAuthToken :: T.Text -> IO Core.AuthToken
+-- Re-export auth operations
+createAuthToken :: Text -> IO AuthToken
 createAuthToken = Auth.create
 
--- Capability operations
-
--- Get the capabilities required by a daemon request
-requestCapabilities :: Protocol.DaemonRequest -> Set.Set Protocol.DaemonCapability
+-- Re-export capability operations
+requestCapabilities :: Protocol.DaemonRequest -> Set Protocol.DaemonCapability
 requestCapabilities = Protocol.requestCapabilities
 
--- Verify that a privilege tier has the required capabilities
-verifyCapabilities :: Core.SPrivilegeTier t
-                   -> Set.Set Protocol.DaemonCapability
-                   -> Either Core.PrivilegeError ()
-verifyCapabilities tier caps = Auth.verifyCapabilities tier caps
+verifyCapabilities :: SPrivilegeTier t -> Set Protocol.DaemonCapability -> Either Core.PrivilegeError ()
+verifyCapabilities = Protocol.verifyCapabilities
 
--- Check if a capability requires daemon privileges
 capabilityRequiresDaemon :: Protocol.DaemonCapability -> Bool
 capabilityRequiresDaemon = Auth.requiresDaemon
 
--- Filter capabilities based on privilege tier
-filterCapabilitiesForTier :: Core.SPrivilegeTier t
-                          -> Set.Set Protocol.DaemonCapability
-                          -> Set.Set Protocol.DaemonCapability
-filterCapabilitiesForTier tier caps = Auth.filterCapabilitiesForTier tier caps
+filterCapabilitiesForTier :: SPrivilegeTier t -> Set Protocol.DaemonCapability -> Set Protocol.DaemonCapability
+filterCapabilitiesForTier = Auth.filterCapabilitiesForTier
+
+-- Re-export environment setup
+initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
+initDaemonEnv = Core.initDaemonEnv
