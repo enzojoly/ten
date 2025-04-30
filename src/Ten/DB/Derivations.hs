@@ -23,6 +23,7 @@ module Ten.DB.Derivations (
     -- Helper functions (phase and context aware)
     storeDerivationInDB,
     readDerivationFromStore,
+    listDerivations,
 
     -- Information types
     OutputInfo(..),
@@ -115,6 +116,13 @@ validateAndLogDerivationInfos derivInfos = do
     forM derivInfos $ \info -> do
         _ <- validateAndLogPath (derivationStorePath info)
         return info
+
+listDerivations :: Int -> TenM p 'Daemon [DerivationInfo]
+listDerivations limit = do
+    db <- getDatabaseConn
+    tenQuery db
+        "SELECT id, hash, store_path, timestamp FROM Derivations ORDER BY timestamp DESC LIMIT ?"
+        (Only limit)
 
 -- Validate OutputInfo objects, focusing on their contained StorePath
 validateAndLogOutputInfos :: [OutputInfo] -> TenM p t [OutputInfo]

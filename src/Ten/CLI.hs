@@ -110,6 +110,7 @@ import Data.Singletons
 
 import Ten.Core
 import Ten.Store
+import Ten.Build
 import qualified Ten.Store as Store
 import Ten.Derivation
 import qualified Ten.Derivation as Derivation
@@ -164,6 +165,13 @@ data Command
     | CmdVersion                      -- Show version
     deriving (Show, Eq)
 
+-- | Daemon commands
+data DaemonCommand
+    = DaemonStart                -- Start the daemon
+    | DaemonStop                 -- Stop the daemon
+    | DaemonRestart              -- Restart the daemon
+    | DaemonConfig               -- Get daemon configuration
+    deriving (Show, Eq)
 -- | Store commands
 data StoreCommand
     = StoreAdd FilePath                -- Add a file to the store
@@ -280,9 +288,9 @@ parseArgs (cmdStr:args) = do
                     case subcmd of
                         "start" -> Right $ CmdDaemon DaemonStart
                         "stop" -> Right $ CmdDaemon DaemonStop
-                        "status" -> Right $ CmdDaemon DaemonStatus
+                        "status" -> Right $ CmdDaemon Core.DaemonStatus
                         "restart" -> Right $ CmdDaemon DaemonRestart
-                        "config" -> Right $ CmdDaemon DaemonConfig
+                        "config" -> Right $ CmdDaemon Core.DaemonConfig
                         _ -> Left $ "unknown daemon subcommand: " ++ subcmd
         "help" -> Right CmdHelp
         "version" -> Right CmdVersion
@@ -312,20 +320,20 @@ commandPrivilege = \case
     CmdVersion -> BuilderSufficient           -- Version info works in any context
 
 -- | Determine which phase a command belongs to
-commandPhase :: Command -> Core.Phase
+commandPhase :: Command -> Phase
 commandPhase = \case
-    CmdBuild _ -> Core.Build              -- Build command uses Build phase
-    CmdEval _ -> Core.Eval                -- Eval command uses Eval phase
-    CmdStore _ -> Core.Build              -- Store commands use Build phase
-    CmdGC -> Core.Build                   -- GC uses Build phase
-    CmdDeriv _ -> Core.Eval               -- Derivation commands use Eval phase
-    CmdInfo _ -> Core.Build               -- Info works in Build phase
-    CmdDaemon _ -> Core.Build             -- Daemon commands use Build phase
-    CmdHelp -> Core.Build                 -- Help works in any phase
+    CmdBuild _ -> Build              -- Build command uses Build phase
+    CmdEval _ -> Eval                -- Eval command uses Eval phase
+    CmdStore _ -> Build              -- Store commands use Build phase
+    CmdGC -> Build                   -- GC uses Build phase
+    CmdDeriv _ -> Eval               -- Derivation commands use Eval phase
+    CmdInfo _ -> Build               -- Info works in Build phase
+    CmdDaemon _ -> Build             -- Daemon commands use Build phase
+    CmdHelp -> Build                 -- Help works in any phase
     CmdVersion -> Core.Build              -- Version works in any phase
 
 -- | Helper to get user name with appropriate qualification
-userName :: User.UserEntry -> String
+userName :: UserEntry -> String
 userName = User.userName
 
 -- | Main entry point to run a command
@@ -361,18 +369,18 @@ runCommand cmd opts = case commandPrivilege cmd of
 
         -- Run the command based on its phase
         case commandPhase cmd of
-            Core.Eval -> do
+            Eval -> do
                 bid <- BuildId <$> newUnique
-                result <- evalTen (handleCommand cmd opts) env' (initBuildState Core.Eval bid)
+                result <- evalTen (handleCommand cmd opts) env' (initBuildState Eval bid)
                 case result of
                     Left err -> do
                         hPutStrLn stderr $ "Error: " ++ show err
                         exitWith (ExitFailure 1)
                     Right _ -> return ()
 
-            Core.Build -> do
+            Build -> do
                 bid <- BuildId <$> newUnique
-                result <- buildTen (handleCommand cmd opts) env' (initBuildState Core.Build bid)
+                result <- buildTen (handleCommand cmd opts) env' (initBuildState Build bid)
                 case result of
                     Left err -> do
                         hPutStrLn stderr $ "Error: " ++ show err
@@ -397,18 +405,18 @@ runCommand cmd opts = case commandPrivilege cmd of
 
                     -- Run the command based on its phase
                     case commandPhase cmd of
-                        Core.Eval -> do
+                        Eval -> do
                             bid <- BuildId <$> newUnique
-                            result <- evalTen (handleCommand cmd opts) env' (initBuildState Core.Eval bid)
+                            result <- evalTen (handleCommand cmd opts) env' (initBuildState Eval bid)
                             case result of
                                 Left err -> do
                                     hPutStrLn stderr $ "Error: " ++ show err
                                     exitWith (ExitFailure 1)
                                 Right _ -> return ()
 
-                        Core.Build -> do
+                        Build -> do
                             bid <- BuildId <$> newUnique
-                            result <- buildTen (handleCommand cmd opts) env' (initBuildState Core.Build bid)
+                            result <- buildTen (handleCommand cmd opts) env' (initBuildState Build bid)
                             case result of
                                 Left err -> do
                                     hPutStrLn stderr $ "Error: " ++ show err
@@ -483,9 +491,7 @@ commandToString = \case
     CmdDaemon subcmd -> case subcmd of
         DaemonStart -> "daemon start"
         DaemonStop -> "daemon stop"
-        DaemonStatus -> "daemon status"
         DaemonRestart -> "daemon restart"
-        DaemonConfig -> "daemon config"
     CmdHelp -> "help"
     CmdVersion -> "version"
 
@@ -534,10 +540,6 @@ executeDaemonCommand spt cmd opts conn = do
             Request 0 "derivation-info" (Map.singleton "path" (T.pack path)) Nothing
         CmdDeriv ListDerivations ->
             Request 0 "list-derivations" Map.empty Nothing
-        CmdDaemon DaemonStatus ->
-            Request 0 "status" Map.empty Nothing
-        CmdDaemon DaemonConfig ->
-            Request 0 "config" Map.empty Nothing
         _ -> error $ "Command not supported via daemon protocol: " ++ show cmd
 
     -- Display response from daemon based on command type
@@ -1329,9 +1331,7 @@ handleDaemon spt cmd = case (fromSing spt) of
         case cmd of
             DaemonStart -> startDaemon
             DaemonStop -> stopDaemon
-            DaemonStatus -> showDaemonStatus
             DaemonRestart -> restartDaemon
-            DaemonConfig -> showDaemonConfig
 
     Builder ->
         throwError $ PrivilegeError "Daemon operations require daemon privileges"
@@ -1550,7 +1550,7 @@ getDaemonStatus = do
             else return 0
 
     -- Construct status
-    return DaemonStatus {
+    return Ten.Core.DaemonStatus {
         daemonStatus = "running",
         daemonUptime = uptime,
         daemonActiveBuilds = activeBuilds,
@@ -1609,8 +1609,8 @@ daemonCommand args opts socket = do
     parseCommandString "store" ("verify":path:_) = Right $ CmdStore (StoreVerify path)
     parseCommandString "store" ("path":file:_) = Right $ CmdStore (CmdStorePath file)
     parseCommandString "store" ("add":file:_) = Right $ CmdStore (StoreAdd file)
-    parseCommandString "daemon" ("status":_) = Right $ CmdDaemon DaemonStatus
-    parseCommandString "daemon" ("config":_) = Right $ CmdDaemon DaemonConfig
+    parseCommandString "daemon" ("status":_) = Right $ CmdDaemon Ten.Core.DaemonStatus
+    parseCommandString "daemon" ("config":_) = Right $ CmdDaemon Ten.Core.DaemonConfig
     parseCommandString "daemon" ("start":_) = Right $ CmdDaemon DaemonStart
     parseCommandString "daemon" ("stop":_) = Right $ CmdDaemon DaemonStop
     parseCommandString "daemon" ("restart":_) = Right $ CmdDaemon DaemonRestart
@@ -1627,8 +1627,6 @@ daemonCommand args opts socket = do
         Request 0 "store-path" (Map.singleton "path" (T.pack path)) Nothing
     commandToRequest (CmdStore (StoreAdd path)) =
         Request 0 "store-add" (Map.singleton "path" (T.pack path)) Nothing
-    commandToRequest (CmdDaemon DaemonStatus) = Request 0 "status" Map.empty Nothing
-    commandToRequest (CmdDaemon DaemonConfig) = Request 0 "config" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonStart) = Request 0 "daemon-start" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonStop) = Request 0 "daemon-stop" Map.empty Nothing
     commandToRequest (CmdDaemon DaemonRestart) = Request 0 "daemon-restart" Map.empty Nothing
@@ -2008,10 +2006,6 @@ withDatabase dbPath timeout action = do
 
     -- Return the result
     return result
-
--- Helper to execute SQL queries
-tenQuery :: SQL.FromRow r => Connection -> Query -> SQL.QueryParams -> TenM 'Build 'Daemon [r]
-tenQuery conn q params = liftIO $ SQL.query conn q params
 
 -- | Get a daemon connection from the environment
 getDaemonConnection :: TenM p 'Builder (DaemonConnection 'Builder)

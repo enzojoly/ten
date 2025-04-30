@@ -71,6 +71,7 @@ module Ten.Store
     , getReferencesFromPath
     , findPathsWithPrefix
     , getStorePaths
+    , tenQuery
     ) where
 
 import Control.Concurrent.STM
