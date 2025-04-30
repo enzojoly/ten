@@ -18,8 +18,6 @@ ten
 │   │   ├────── Daemon
 │   │   │   ├── Auth.hs
 │   │   │   ├── Client.hs
-│   │   │   ├── Config.hs
-│   │   │   ├── Core.hs
 │   │   │   ├── Protocol.hs
 │   │   │   ├── Server.hs
 │   │   │   └── State.hs
