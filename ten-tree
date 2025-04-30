@@ -8,9 +8,14 @@ ten
 ├── src
 │   ├── Ten
 │   │   ├── Build.hs
-│   │   ├── CLI.hs
 │   │   ├── Core.hs
-│   │   ├── Daemon
+│   │   ├── Derivation.hs
+│   │   ├── GC.hs
+│   │   ├── Graph.hs
+│   │   ├── Hash.hs
+│   │   ├── Sandbox.hs
+│   │   ├── Store.hs
+│   │   ├────── Daemon
 │   │   │   ├── Auth.hs
 │   │   │   ├── Client.hs
 │   │   │   ├── Config.hs
@@ -18,20 +23,15 @@ ten
 │   │   │   ├── Protocol.hs
 │   │   │   ├── Server.hs
 │   │   │   └── State.hs
-│   │   ├── DB
+│   │   ├─────── DB
 │   │   │   ├── Core.hs
 │   │   │   ├── Derivations.hs
 │   │   │   ├── References.hs
 │   │   │   └── Schema.hs
-│   │   ├── Derivation.hs
-│   │   ├── GC.hs
-│   │   ├── Graph.hs
-│   │   ├── Hash.hs
-│   │   ├── Sandbox.hs
-│   │   └── Store.hs
-│   └── Ten.hs
+│   │   └─ Derivation.hs
+│   └── Ten.hs [CURRENTLY MISSING]
 ├── ten.cabal
-├── test
+├─────── test
 │   ├── hello.c
 │   └── Spec.hs
 ├── 典
