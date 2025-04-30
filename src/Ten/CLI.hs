@@ -336,10 +336,6 @@ commandPhase = \case
     CmdHelp -> Build                 -- Help works in any phase
     CmdVersion -> Build              -- Version works in any phase
 
--- | Helper to get user name with appropriate qualification
-userName :: User.UserEntry -> String
-userName = User.userName
-
 -- | Main entry point to run a command
 runCommand :: Command -> Options -> IO ()
 runCommand cmd opts = case commandPrivilege cmd of
@@ -2040,15 +2036,6 @@ withDatabase dbPath timeout action = do
 
     -- Return the result
     return result
-
--- | Execute SQL query with proper error handling
-tenQuery :: (SQL.ToRow q, SQL.FromRow r) => Connection -> Query -> q -> TenM 'Build 'Daemon [r]
-tenQuery conn query params = do
-    result <- liftIO $ try $ SQL.query conn query params
-    case result of
-        Left (e :: SomeException) ->
-            throwError $ DBError $ "Database query error: " <> T.pack (show e)
-        Right rows -> return rows
 
 -- | Execute SQL statement with proper error handling
 tenExecute :: (SQL.ToRow q) => Connection -> Query -> q -> TenM 'Build 'Daemon ()

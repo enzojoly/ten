@@ -22,6 +22,7 @@ module Ten.Graph (
     validateGraph,
     detectCycles,
     detectCyclesFrom,
+    computeReachablePaths,
 
     -- Dependency tracking
     getDependencies,
