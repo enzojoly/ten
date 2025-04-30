@@ -120,7 +120,7 @@ executable ten-daemon
                      , random
     hs-source-dirs:   app
     default-language: GHC2021
-    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N -package time -package containers
 
 test-suite ten-test
     import:           warnings

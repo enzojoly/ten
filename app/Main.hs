@@ -115,6 +115,10 @@ import Ten.Sandbox
 import Ten.Hash
 import Ten.GC
 
+-- Required for PathInfo definition
+import Data.Text (Text)
+import Data.Int (Int64)
+
 -- Database modules (with selective re-exports)
 import Ten.DB.Core (
     Database(..),
@@ -231,6 +235,6 @@ data PathInfo = PathInfo {
     pathPath :: StorePath,
     pathHash :: Text,
     pathDeriver :: Maybe StorePath,
-    pathRegistrationTime :: UTCTime,
+    pathRegistrationTime :: Int64,  -- Unix timestamp instead of UTCTime
     pathIsValid :: Bool
 } deriving (Show, Eq)
