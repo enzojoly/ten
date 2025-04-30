@@ -21,13 +21,12 @@ import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
 import System.Exit (exitSuccess, exitFailure)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..))
-import System.Posix.Daemon (daemonize)
 import System.Posix.Files (fileExist, setFileMode)
 import System.Posix.Process (getProcessID, exitImmediately)
 import System.Posix.Signals hiding (SignalSet, Handler) -- Avoid conflict with Control.Exception
 import qualified System.Posix.Signals as PosixSignals
 import System.Posix.Types (UserID, GroupID) -- Import necessary types
-import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName, UserEntry(..), GroupEntry(..),
+import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName, UserEntry, GroupEntry,
                          getRealUserID, setUserID, setGroupID, getUserEntryForName, getGroupEntryForName,
                          userID, groupID)
 import qualified Network.Socket as Net -- For socket operations
@@ -188,7 +187,7 @@ main = do
         _ -> error $ "Invalid command for ten-daemon executable: " ++ show cmd -- Should not happen
 
     -- Extract options using the corrected getOpt'
-    let getOpt' constructor = foldr (\opt acc -> case opt of constructor x -> Just x; _ -> acc) Nothing opts
+    let getOpt' constructor = foldr (\opt acc -> case opt of x -> Just x; _ -> acc) Nothing opts
     let hasOpt constructor = any (\case { x | x == constructor -> True; _ -> False }) opts -- Simplified check
 
     let configFile = getOpt' OptConfig

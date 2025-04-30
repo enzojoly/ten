@@ -26,16 +26,14 @@ import Ten (
     -- Core
     TenM, BuildEnv(..), BuildState, BuildError(..), StorePath(..), Derivation(..),
     BuildResult(..), RunMode(..), initBuildEnv, storePathToText, textToStorePath, parseStorePath,
-    runTen, evalTen, buildTen, InputNotFound, StoreError, -- Make sure errors are exported
+    runTen, evalTen, buildTen, -- Make sure errors are exported
     -- Store
     StoreAccessOps(..), StoreContentOps(..), StoreQueryOps(..),
     -- GC
     GCStats(..),
     -- Protocol / Daemon Interaction related
-    UserCredentials(..), DaemonCapability(..), DaemonConnection, DaemonStatus(..), DaemonConfig(..),
+    UserCredentials(..), DaemonCapability(..), DaemonConnection, DaemonConfig(..),
     ProtocolVersion(..),
-    -- Explicitly import client functions if needed, or rely on re-exports from Ten.hs
-    connectToDaemon, disconnectFromDaemon, isDaemonRunning, startDaemonIfNeeded,
     -- Specific client requests
     buildFile, evalFile, buildDerivation, requestGC, requestStoreAdd, requestStoreVerify,
     requestStorePath, requestStoreList, requestStatus, requestShutdown, requestPathInfo,
@@ -45,8 +43,6 @@ import Ten (
 -- Direct imports if not exposed via Ten.hs or for clarity
 import qualified Ten.Daemon.Client as DaemonClient -- Use qualified if direct access needed
 import qualified Ten.Daemon.Protocol as Protocol -- For ResponseError etc.
-
--- CLI Parsing Logic (moved from Ten.CLI)
 
 -- | Command-line options structure
 data Options = Options {
