@@ -330,7 +330,7 @@ commandPhase = \case
     CmdInfo _ -> Build               -- Info works in Build phase
     CmdDaemon _ -> Build             -- Daemon commands use Build phase
     CmdHelp -> Build                 -- Help works in any phase
-    CmdVersion -> Core.Build              -- Version works in any phase
+    CmdVersion -> Build              -- Version works in any phase
 
 -- | Helper to get user name with appropriate qualification
 userName :: UserEntry -> String
