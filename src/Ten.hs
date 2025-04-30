@@ -79,6 +79,41 @@ module Ten
     , evalTen
     , logMsg
     , version
+
+    -- * Daemon connection management
+    , connectToDaemon
+    , disconnectFromDaemon
+    , isDaemonRunning
+    , getDefaultSocketPath
+
+    -- * Authentication
+    , UserCredentials(..)
+    , createAuthToken
+    , validateToken
+
+    -- * Client-daemon communication
+    , sendRequest
+    , receiveResponse
+    , sendRequestSync
+
+    -- * Daemon management
+    , startDaemonIfNeeded
+    , getDaemonStatus
+    , shutdownDaemon
+    , getDaemonConfig
+
+    -- * Daemon state
+    , DaemonState(..)
+    , initDaemonState
+    , saveStateToFile
+    , loadStateFromFile
+
+    -- * Daemon capabilities
+    , DaemonCapability(..)
+    , requestCapabilities
+    , verifyCapabilities
+    , capabilityRequiresDaemon
+    , filterCapabilitiesForTier
     ) where
 
 import Data.Int (Int64)
@@ -93,6 +128,12 @@ import qualified Ten.Hash as Hash
 import qualified Ten.DB.Core as DB
 import qualified Ten.DB.Derivations as DBDeriv
 import qualified Ten.DB.References as DBRef
+
+-- Re-export daemon modules for client functionality
+import qualified Ten.Daemon.Client as Client
+import qualified Ten.Daemon.Protocol as Protocol
+import qualified Ten.Daemon.Auth as Auth
+import qualified Ten.Daemon.State as State
 
 -- Re-export core types
 type TenM = Core.TenM
@@ -153,6 +194,15 @@ type TransactionMode = DB.TransactionMode
 
 -- Re-export SandboxConfig
 type SandboxConfig = Sandbox.SandboxConfig
+
+-- Re-export daemon capability types
+type DaemonCapability = Protocol.DaemonCapability
+
+-- Re-export UserCredentials for auth
+type UserCredentials = Auth.UserCredentials
+
+-- Re-export DaemonState
+type DaemonState = State.DaemonState
 
 -- Re-export core functions
 defaultSandboxConfig :: SandboxConfig
@@ -310,3 +360,108 @@ translateError (Core.PrivilegeError msg) = PrivilegeError msg
 translateError (Core.ProtocolError msg) = ProtocolError msg
 translateError (Core.InternalError msg) = InternalError msg
 translateError (Core.ConfigError msg) = ConfigError msg
+
+-- Re-export daemon client functions
+connectToDaemon :: FilePath -> UserCredentials -> IO (Either BuildError (Core.DaemonConnection 'Core.Builder))
+connectToDaemon path creds = do
+    result <- Client.connectToDaemon path creds
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right conn -> return $ Right conn
+
+disconnectFromDaemon :: Core.DaemonConnection 'Core.Builder -> IO ()
+disconnectFromDaemon = Client.disconnectFromDaemon
+
+isDaemonRunning :: FilePath -> IO Bool
+isDaemonRunning = Client.isDaemonRunning
+
+getDefaultSocketPath :: IO FilePath
+getDefaultSocketPath = Client.getDefaultSocketPath
+
+-- Re-export request/response functions
+sendRequest :: Core.DaemonConnection 'Core.Builder -> Core.Request -> IO (Either BuildError Int)
+sendRequest conn req = do
+    result <- Client.sendRequest conn req
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right reqId -> return $ Right reqId
+
+receiveResponse :: Core.DaemonConnection 'Core.Builder -> Int -> Int -> IO (Either BuildError Core.DaemonResponse)
+receiveResponse conn reqId timeout = do
+    result <- Client.receiveResponse conn reqId timeout
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right resp -> return $ Right resp
+
+sendRequestSync :: Core.DaemonConnection 'Core.Builder -> Core.Request -> Int -> IO (Either BuildError Core.DaemonResponse)
+sendRequestSync conn req timeout = do
+    result <- Client.sendRequestSync conn req timeout
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right resp -> return $ Right resp
+
+-- Re-export daemon management functions
+startDaemonIfNeeded :: FilePath -> IO (Either BuildError ())
+startDaemonIfNeeded path = do
+    result <- Client.startDaemonIfNeeded path
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right () -> return $ Right ()
+
+getDaemonStatus :: Core.DaemonConnection 'Core.Builder -> IO (Either BuildError Core.DaemonStatus)
+getDaemonStatus conn = do
+    result <- Client.getDaemonStatus conn
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right status -> return $ Right status
+
+shutdownDaemon :: Core.DaemonConnection 'Core.Builder -> IO (Either BuildError ())
+shutdownDaemon conn = do
+    result <- Client.shutdownDaemon conn
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right () -> return $ Right ()
+
+getDaemonConfig :: Core.DaemonConnection 'Core.Builder -> IO (Either BuildError Core.DaemonConfig)
+getDaemonConfig conn = do
+    result <- Client.getDaemonConfig conn
+    case result of
+        Left err -> return $ Left $ translateError err
+        Right config -> return $ Right config
+
+-- Re-export authentication functions
+createAuthToken :: Core.Text -> IO Core.AuthToken
+createAuthToken = Auth.createAuthToken
+
+validateToken :: Core.DaemonConnection 'Core.Builder -> IO Bool
+validateToken conn = do
+    -- Simplified placeholder - actual implementation would
+    -- validate token with the daemon using Auth module
+    return True
+
+-- Re-export daemon capability functions
+requestCapabilities :: Protocol.DaemonRequest -> Core.Set Protocol.DaemonCapability
+requestCapabilities = Protocol.requestCapabilities
+
+verifyCapabilities :: Core.SPrivilegeTier t -> Core.Set Protocol.DaemonCapability -> Either Auth.PrivilegeError ()
+verifyCapabilities = Protocol.verifyCapabilities
+
+capabilityRequiresDaemon :: Protocol.DaemonCapability -> Bool
+capabilityRequiresDaemon = Protocol.capabilityRequiresDaemon
+
+filterCapabilitiesForTier :: Core.SPrivilegeTier t -> Core.Set Protocol.DaemonCapability -> Core.Set Protocol.DaemonCapability
+filterCapabilitiesForTier = Auth.filterCapabilitiesForTier
+
+-- Re-export daemon state functions
+initDaemonState :: Core.SPrivilegeTier t -> Int -> IO (State.DaemonState t)
+initDaemonState st maxJobs = do
+    -- Create default state file path
+    stateFile <- Client.getDefaultSocketPath
+    let stateFilePath = stateFile ++ ".state"
+    State.initDaemonState st stateFilePath maxJobs 100
+
+saveStateToFile :: (Core.CanAccessStore t ~ 'True, Core.CanModifyStore t ~ 'True) => State.DaemonState t -> IO ()
+saveStateToFile = State.saveStateToFile
+
+loadStateFromFile :: Core.SPrivilegeTier t -> FilePath -> Int -> Int -> IO (State.DaemonState t)
+loadStateFromFile = State.loadStateFromFile
