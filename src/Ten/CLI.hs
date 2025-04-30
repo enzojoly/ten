@@ -59,7 +59,7 @@ module Ten.CLI (
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM
 import Control.Exception (try, catch, finally, mask, bracket, throwIO, onException, evaluate, ErrorCall(..), handle, SomeException)
-import Control.Monad (forM, forM_, when, unless, void)
+import Control.Monad (forM, forM_, when, unless, void, foldM)
 import Control.Monad.Reader (ask, asks, runReaderT)
 import Control.Monad.State (get, modify, gets)
 import Control.Monad.Except (throwError, catchError)
@@ -79,6 +79,7 @@ import qualified Data.ByteString.Lazy as LBS
 import Data.Time (getCurrentTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.List (nub, isPrefixOf, isInfixOf)
+import Data.Unique (Unique, newUnique)
 import System.Directory
 import System.FilePath
 import qualified System.Process as Process
@@ -86,7 +87,7 @@ import System.Exit
 import System.Environment (getArgs)
 import System.Console.GetOpt
 import System.IO (hPutStrLn, stderr, stdin, IOMode(..), withFile, hClose, hGetContents, hSetBuffering, BufferMode(..))
-import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup, modificationTime)
+import System.Posix.Files (setFileMode, getFileStatus, fileMode, fileOwner, fileGroup, setOwnerAndGroup, modificationTime, fileSize)
 import qualified System.Posix.User as User
 import qualified System.Posix.Process as Process
 import System.Posix.Process (getProcessStatus, forkProcess, executeFile, getProcessID)
