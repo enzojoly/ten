@@ -21,7 +21,7 @@ import System.Directory (doesFileExist, createDirectoryIfMissing, removeFile, do
 import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
 import System.Exit (exitSuccess, exitFailure)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..), Handle, openFile, hClose, hFlush)
+import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..), Handle, openFile, hClose, hFlush, stdin)
 import System.Posix.Files (fileExist, setFileMode, fileMode, setOwnerAndGroup)
 import System.Posix.Process (getProcessID, exitImmediately, forkProcess, createSession)
 import System.Posix.Signals hiding (SignalSet, Handler)
@@ -203,10 +203,20 @@ main = do
             { daemonSocketPath = fromMaybe (daemonSocketPath config) socketPath
             , daemonStorePath = fromMaybe (daemonStorePath config) storePath
             , daemonStateFile = fromMaybe (daemonStateFile config) stateFile
-            , daemonUser = T.pack <$> userOverride `orElse` daemonUser config
-            , daemonGroup = T.pack <$> groupOverride `orElse` daemonGroup config
-            , daemonLogFile = (\f -> if f == "stdout" || f == "stderr" then Nothing else Just f) <$> logFile `orElse` daemonLogFile config
-            , daemonLogLevel = fromLogLevel <$> logLevel `orElse` Just (daemonLogLevel config)
+            , daemonUser = case userOverride of
+                             Just u -> Just (T.pack u)
+                             Nothing -> daemonUser config
+            , daemonGroup = case groupOverride of
+                              Just g -> Just (T.pack g)
+                              Nothing -> daemonGroup config
+            , daemonLogFile = case logFile of
+                                Just f -> if f == "stdout" || f == "stderr"
+                                           then Nothing
+                                           else Just f
+                                Nothing -> daemonLogFile config
+            , daemonLogLevel = case logLevel of
+                                 Just l -> fromLogLevel l
+                                 Nothing -> daemonLogLevel config
             , daemonForeground = foreground || daemonForeground config
             , daemonMaxJobs = fromMaybe (daemonMaxJobs config) maxJobs
             }
@@ -348,11 +358,13 @@ acquireGlobalLockSafe config = do
     let lockPath = daemonStorePath config </> "var/ten/daemon.lock"
     createDirectoryIfMissing True (takeDirectory lockPath)
     -- Attempt to create and lock the file
-    catch (acquireGlobalLock lockPath) $ \(e :: SomeException) -> do
-        hPutStrLn stderr $ "Error: Could not acquire global daemon lock at " ++ lockPath
-        hPutStrLn stderr $ "Ensure no other daemon instance is running and you have permissions."
-        hPutStrLn stderr $ "Details: " ++ show e
-        exitFailure
+    catch
+        (acquireGlobalLock lockPath)
+        (\(e :: SomeException) -> do
+            hPutStrLn stderr $ "Error: Could not acquire global daemon lock at " ++ lockPath
+            hPutStrLn stderr $ "Ensure no other daemon instance is running and you have permissions."
+            hPutStrLn stderr $ "Details: " ++ show e
+            exitFailure)
 
 -- Proper file locking implementation
 acquireGlobalLock :: FilePath -> IO LockHandle
@@ -430,7 +442,9 @@ daemonDbPath config = daemonStorePath config </> "var/ten/db/ten.db"
 
 -- Close database connection
 closeDatabase :: DBCore.Database t -> IO ()
-closeDatabase = DBCore.closeDatabaseDaemon
+closeDatabase db = case DBCore.dbPrivEvidence db of
+    SDaemon -> DBCore.closeDatabaseDaemon db
+    _ -> hPutStrLn stderr "Warning: Cannot close non-daemon database"
 
 -- Set up logging based on configuration
 setupLogging :: DaemonConfig -> IO (Handle, Handle) -- Returns (accessLog, securityLog)
@@ -588,7 +602,6 @@ defaultDaemonConfig = DaemonConfig
     , daemonGcInterval = Just 3600  -- 1 hour
     , daemonUser = Nothing  -- Run as current user by default
     , daemonGroup = Nothing
-    , daemonAllowedUsers = Set.fromList ["root"]
     , daemonMaxJobs = 4
     , daemonForeground = False
     , daemonTmpDir = "/tmp/ten"
@@ -643,7 +656,7 @@ runInitAction action = do
     -- Create minimal environment/state needed for the action
     let env = initDaemonEnv "/tmp/ten-init-work" "/tmp/ten-init-store" Nothing -- Example paths
     state <- DaemonState.initDaemonState sDaemon "/tmp/ten-init-state" 1 100 -- Example state
-    initialState <- initBuildState Eval (BuildIdFromInt 0) -- Example BuildState
+    let initialState = initBuildState Eval (BuildIdFromInt 0) :: BuildState 'Eval
     runTen sEval sDaemon action env initialState >>= \case
          Left err -> return $ Left err
          Right (res, _) -> return $ Right res

@@ -44,7 +44,7 @@ module Ten (
     -- High-level build operations
     buildFile,
     evalFile,
-    buildDerivation,
+    Ten.Build.buildDerivation,
     cancelBuild,
     getBuildStatus,
     getBuildOutput,
@@ -55,12 +55,10 @@ module Ten (
     initializeStore,
     createStoreDirectories,
     ensureDBDirectories,
-    requestGC,
     requestStoreAdd,
     requestStoreVerify,
     requestStorePath,
     requestStoreList,
-    requestStatus,
     requestShutdown,
     requestPathInfo,
     PathInfo(..),
@@ -95,7 +93,6 @@ module Ten (
     UserCredentials(..),
     DaemonCapability(..),
     DaemonConnection,
-    ProtocolVersion(..),
 
     -- * Re-exported Database types
     Database(..),
@@ -106,20 +103,49 @@ module Ten (
     closeDatabaseDaemon
 ) where
 
--- Core modules
-import Ten.Core
-import Ten.Build
-import Ten.Derivation
-import Ten.Store
-import Ten.Sandbox
-import Ten.Hash
-import Ten.GC
-
--- Required for PathInfo definition
+-- Import core data types
 import Data.Text (Text)
 import Data.Int (Int64)
 
--- Database modules (with selective re-exports)
+-- Core modules with explicit imports
+import Ten.Core (
+    BuildError(..), GCStats(..), BuildId(..),
+    StorePath(..), DaemonConnection(..),
+    Request(..), DaemonResponse(..),
+    PrivilegeTier(..), storePathToText
+    )
+
+-- Build module
+import Ten.Build (
+    buildDerivation
+    )
+
+-- Derivation module
+import Ten.Derivation (
+    derivationEquals, derivationOutputPaths
+    )
+
+-- Store module - specific operations
+import Ten.Store (
+    verifyStore, initializeStore, createStoreDirectories
+    )
+
+-- Sandbox module - limited exports
+import Ten.Sandbox (
+    SandboxConfig(..), defaultSandboxConfig
+    )
+
+-- Hash module
+import Ten.Hash (
+    hashByteString, hashStorePath
+    )
+
+-- GC module
+import Ten.GC (
+    GCStats(..),
+    )
+
+-- Database modules
 import Ten.DB.Core (
     Database(..),
     DBError(..),
@@ -130,7 +156,7 @@ import Ten.DB.Core (
     )
 import Ten.DB.Schema (ensureSchema)
 
--- Import client functionality with re-exports
+-- Import client functionality with specific imports
 import Ten.Daemon.Client (
     -- Connection management
     connectToDaemon,
@@ -183,22 +209,11 @@ import Ten.Daemon.Client (
     getDaemonConfig
     )
 
--- Import store operations
-import Ten.Store (
-    verifyStore,
-    initializeStore,
-    createStoreDirectories
-    )
-
 -- Import protocol and auth types
 import Ten.Daemon.Protocol (
     UserCredentials(..),
     DaemonCapability(..),
     )
-
--- | Request garbage collection from the daemon
-requestGC :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
-requestGC = Ten.Store.collectGarbage
 
 -- | Request to add a file to the store
 requestStoreAdd :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)
@@ -215,10 +230,6 @@ requestStorePath = getStorePathForFile
 -- | Request to list store contents
 requestStoreList :: DaemonConnection 'Builder -> IO (Either BuildError [StorePath])
 requestStoreList = listStore
-
--- | Request daemon status
-requestStatus :: DaemonConnection 'Builder -> IO (Either BuildError DaemonStatus)
-requestStatus = getDaemonStatus
 
 -- | Request daemon shutdown
 requestShutdown :: DaemonConnection 'Builder -> IO (Either BuildError ())
