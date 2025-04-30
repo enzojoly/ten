@@ -135,6 +135,17 @@ import qualified Ten.Daemon.Protocol as Protocol
 import qualified Ten.Daemon.Auth as Auth
 import qualified Ten.Daemon.State as State
 
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.ByteString (ByteString)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad (void)
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import System.FilePath ((</>))
+
 -- Re-export core types
 type TenM = Core.TenM
 type BuildEnv = Core.BuildEnv
@@ -151,28 +162,28 @@ data PrivilegeTier = Daemon | Builder
     deriving (Show, Eq)
 
 data BuildError
-    = EvalError Core.Text
-    | BuildFailed Core.Text
-    | StoreError Core.Text
-    | SandboxError Core.Text
+    = EvalError Text
+    | BuildFailed Text
+    | StoreError Text
+    | SandboxError Text
     | InputNotFound FilePath
-    | HashError Core.Text
-    | GraphError Core.Text
-    | ResourceError Core.Text
-    | DaemonError Core.Text
-    | AuthError Core.Text
-    | CyclicDependency Core.Text
-    | SerializationError Core.Text
-    | RecursionLimit Core.Text
-    | NetworkError Core.Text
-    | ParseError Core.Text
-    | DBError Core.Text
-    | GCError Core.Text
-    | PhaseError Core.Text
-    | PrivilegeError Core.Text
-    | ProtocolError Core.Text
-    | InternalError Core.Text
-    | ConfigError Core.Text
+    | HashError Text
+    | GraphError Text
+    | ResourceError Text
+    | DaemonError Text
+    | AuthError Text
+    | CyclicDependency Text
+    | SerializationError Text
+    | RecursionLimit Text
+    | NetworkError Text
+    | ParseError Text
+    | DBError Text
+    | GCError Text
+    | PhaseError Text
+    | PrivilegeError Text
+    | ProtocolError Text
+    | InternalError Text
+    | ConfigError Text
     deriving (Show, Eq)
 
 data BuildStatus
@@ -214,8 +225,8 @@ initBuildEnv = Core.initBuildEnv
 initClientEnv :: FilePath -> FilePath -> Core.DaemonConnection 'Builder -> BuildEnv
 initClientEnv = Core.initClientEnv
 
-initDaemonEnv :: FilePath -> FilePath -> Maybe Core.Text -> BuildEnv
-initDaemonEnv = Core.initDaemonEnv
+initDaemonEnv :: FilePath -> FilePath -> Maybe Text -> BuildEnv
+initDaemonEnv storePath workDir userText = Core.initDaemonEnv workDir storePath userText
 
 runTen :: Core.SPhase p -> Core.SPrivilegeTier t -> TenM p t a -> BuildEnv -> Core.BuildState p -> IO (Either BuildError (a, Core.BuildState p))
 runTen sp st tm env state = do
@@ -239,63 +250,63 @@ buildTen tm env = do
         Right r -> return $ Right r
 
 -- Export store operations
-addToStore :: Core.StoreContentOps t => Core.Text -> Core.ByteString -> TenM p t StorePath
+addToStore :: Store.StoreContentOps t => Text -> ByteString -> TenM p t StorePath
 addToStore = Store.addToStore
 
-storeFile :: Core.StoreContentOps t => FilePath -> TenM p t StorePath
+storeFile :: Store.StoreContentOps t => FilePath -> TenM p t StorePath
 storeFile = Store.storeFile
 
-storeDirectory :: Core.StoreContentOps t => FilePath -> TenM p t StorePath
+storeDirectory :: Store.StoreContentOps t => FilePath -> TenM p t StorePath
 storeDirectory = Store.storeDirectory
 
-checkStorePathExists :: Core.StoreAccessOps t => StorePath -> TenM p t Bool
+checkStorePathExists :: Store.StoreAccessOps t => StorePath -> TenM p t Bool
 checkStorePathExists = Store.checkStorePathExists
 
-readStoreContent :: Core.StoreAccessOps t => StorePath -> TenM p t Core.ByteString
+readStoreContent :: Store.StoreAccessOps t => StorePath -> TenM p t ByteString
 readStoreContent = Store.readStoreContent
 
-scanFileForStoreReferences :: Core.StoreScanOps t => FilePath -> TenM p t (Core.Set StorePath)
+scanFileForStoreReferences :: Store.StoreScanOps t => FilePath -> TenM p t (Set StorePath)
 scanFileForStoreReferences = Store.scanFileForStoreReferences
 
 -- Export derivation operations
-mkDerivation :: Core.Text -> StorePath -> [Core.Text] -> Core.Set Core.DerivationInput
-             -> Core.Set Core.Text -> Core.Map Core.Text Core.Text -> Core.Text -> TenM 'Core.Eval t Derivation
+mkDerivation :: Text -> StorePath -> [Text] -> Set Derivation.DerivationChain
+             -> Set Text -> Map Text Text -> Text -> TenM 'Core.Eval t Derivation
 mkDerivation = Derivation.mkDerivation
 
 buildDerivation :: Build.CanBuildDerivation t => Derivation -> TenM 'Core.Build t BuildResult
 buildDerivation = Build.buildDerivation
 
-instantiateDerivation :: Build.CanStoreBuildDerivation t => Derivation -> TenM 'Core.Build t ()
+instantiateDerivation :: Derivation.CanStoreBuildDerivation t => Derivation -> TenM 'Core.Build t ()
 instantiateDerivation = Derivation.instantiateDerivation
 
-hashDerivation :: Derivation -> Core.Text
+hashDerivation :: Derivation -> Text
 hashDerivation = Derivation.hashDerivation
 
 -- Export build operations
-buildDerivationGraph :: Build.CanBuildDerivation t => Core.BuildGraph -> TenM 'Core.Build t (Core.Map Core.Text BuildResult)
+buildDerivationGraph :: Build.CanBuildDerivation t => Core.BuildGraph -> TenM 'Core.Build t (Map Text BuildResult)
 buildDerivationGraph = Build.buildDerivationGraph
 
 buildInDependencyOrder :: Build.CanBuildDerivation t => [Derivation] -> TenM 'Core.Build t [BuildResult]
 buildInDependencyOrder = Build.buildInDependencyOrder
 
-withSandbox :: Sandbox.SandboxCreator t => Core.Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Core.Build t a) -> TenM 'Core.Build t a
+withSandbox :: Sandbox.SandboxConfig t => Set StorePath -> SandboxConfig -> (FilePath -> TenM 'Core.Build t a) -> TenM 'Core.Build t a
 withSandbox = Sandbox.withSandbox
 
 -- Export graph operations
-createBuildGraph :: Core.SingI t => Core.SPrivilegeTier t -> Core.Set StorePath -> Core.Set Derivation -> TenM 'Core.Eval t Core.BuildGraph
+createBuildGraph :: Core.SingI t => Core.SPrivilegeTier t -> Set StorePath -> Set Derivation -> TenM 'Core.Eval t Core.BuildGraph
 createBuildGraph = Graph.createBuildGraph
 
 topologicalSort :: Core.SingI t => Core.SPrivilegeTier t -> Core.BuildGraph -> TenM 'Core.Eval t [Core.BuildNode]
 topologicalSort = Graph.topologicalSort
 
-detectCycles :: Core.SingI t => Core.SPrivilegeTier t -> Core.BuildGraph -> TenM 'Core.Eval t (Bool, Core.Set Core.Text, Core.Set Core.Text)
+detectCycles :: Core.SingI t => Core.SPrivilegeTier t -> Core.BuildGraph -> TenM 'Core.Eval t (Bool, Set Text, Set Text)
 detectCycles = Graph.detectCycles
 
 -- Export garbage collection operations
 collectGarbage :: TenM 'Core.Build 'Core.Daemon (Int, Int, Integer)
 collectGarbage = GC.collectGarbage
 
-registerGCRoot :: StorePath -> Core.Text -> Bool -> TenM 'Core.Build 'Core.Daemon Core.GCRoot
+registerGCRoot :: StorePath -> Text -> Bool -> TenM 'Core.Build 'Core.Daemon Core.GCRoot
 registerGCRoot = GC.addRoot
 
 isGCRoot :: StorePath -> TenM 'Core.Build 'Core.Daemon Bool
@@ -306,7 +317,7 @@ findGCRoots = GC.listRoots
 
 -- DB Core operations
 initializeDatabase :: FilePath -> Int -> IO FilePath
-initializeDatabase = DB.initializeDatabase
+initializeDatabase basePath timeout = initializeDatabase basePath timeout
 
 ensureDBDirectories :: FilePath -> TenM p 'Core.Daemon ()
 ensureDBDirectories = DB.ensureDBDirectories
@@ -322,14 +333,14 @@ readDerivationFromStore = DBDeriv.readDerivationFromStore
 registerReference :: DBRef.CanRegisterReferences t => Database t -> StorePath -> StorePath -> TenM p t ()
 registerReference = DBRef.registerReference
 
-getReferences :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Core.Set StorePath)
+getReferences :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set StorePath)
 getReferences = DBRef.getReferences
 
-getReferrers :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Core.Set StorePath)
+getReferrers :: DBRef.CanQueryReferences t => Database t -> StorePath -> TenM p t (Set StorePath)
 getReferrers = DBRef.getReferrers
 
 -- Utility functions
-logMsg :: Int -> Core.Text -> TenM p t ()
+logMsg :: Int -> Text -> TenM p t ()
 logMsg = Core.logMsg
 
 -- | Version information for the Ten build system
@@ -430,8 +441,8 @@ getDaemonConfig conn = do
         Right config -> return $ Right config
 
 -- Re-export authentication functions
-createAuthToken :: Core.Text -> IO Core.AuthToken
-createAuthToken = Auth.createAuthToken
+createAuthToken :: Text -> IO Core.AuthToken
+createAuthToken = createAuthToken
 
 validateToken :: Core.DaemonConnection 'Core.Builder -> IO Bool
 validateToken conn = do
@@ -440,16 +451,16 @@ validateToken conn = do
     return True
 
 -- Re-export daemon capability functions
-requestCapabilities :: Protocol.DaemonRequest -> Core.Set Protocol.DaemonCapability
+requestCapabilities :: Protocol.DaemonRequest -> Set Protocol.DaemonCapability
 requestCapabilities = Protocol.requestCapabilities
 
-verifyCapabilities :: Core.SPrivilegeTier t -> Core.Set Protocol.DaemonCapability -> Either Auth.PrivilegeError ()
+verifyCapabilities :: Core.SPrivilegeTier t -> Set Protocol.DaemonCapability -> Either PrivilegeError ()
 verifyCapabilities = Protocol.verifyCapabilities
 
 capabilityRequiresDaemon :: Protocol.DaemonCapability -> Bool
-capabilityRequiresDaemon = Protocol.capabilityRequiresDaemon
+capabilityRequiresDaemon = Auth.capabilityRequiresDaemon
 
-filterCapabilitiesForTier :: Core.SPrivilegeTier t -> Core.Set Protocol.DaemonCapability -> Core.Set Protocol.DaemonCapability
+filterCapabilitiesForTier :: Core.SPrivilegeTier t -> Set Protocol.DaemonCapability -> Set Protocol.DaemonCapability
 filterCapabilitiesForTier = Auth.filterCapabilitiesForTier
 
 -- Re-export daemon state functions
