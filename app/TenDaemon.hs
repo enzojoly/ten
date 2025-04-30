@@ -8,7 +8,7 @@
 module Main where
 
 import Control.Concurrent (threadDelay, myThreadId)
-import Control.Exception (bracket, try, catch, SomeException, IOException, finally)
+import Control.Exception (bracket, try, catch, SomeException, IOException, finally, displayException)
 import Control.Monad (when, unless, forever, void, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Maybe (isJust, fromMaybe, listToMaybe)
@@ -16,34 +16,25 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import System.Console.GetOpt -- Needed for CLI parsing
-import System.Directory (doesFileExist, createDirectoryIfMissing, removeFile)
+import System.Directory (doesFileExist, createDirectoryIfMissing, removeFile, doesDirectoryExist, listDirectory)
 import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
 import System.Exit (exitSuccess, exitFailure)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..))
-import System.Posix.Files (fileExist, setFileMode)
+import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..), Handle, openFile, hClose)
+import System.Posix.Files (fileExist, setFileMode, setOwnerAndGroup)
 import System.Posix.Process (getProcessID, exitImmediately)
 import System.Posix.Signals hiding (SignalSet, Handler) -- Avoid conflict with Control.Exception
 import qualified System.Posix.Signals as PosixSignals
 import System.Posix.Types (UserID, GroupID) -- Import necessary types
-import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName, UserEntry, GroupEntry,
+import System.Posix.User (getEffectiveUserID, getUserEntryForID, userName,
                          getRealUserID, setUserID, setGroupID, getUserEntryForName, getGroupEntryForName,
                          userID, groupID)
 import qualified Network.Socket as Net -- For socket operations
 
+import Ten.Core (UserEntry(..), GroupEntry(..))
+
 -- Import Ten modules (ensure exposed by ten.cabal library)
-import Ten (
-    -- Core
-    TenM, BuildEnv(..), BuildState(..), BuildError(..), DaemonConfig(..), RunMode(..),
-    PrivilegeTier(..), SPrivilegeTier(..), sDaemon, sBuild,
-    runTen, runTenDaemon, initDaemonEnv, initBuildState, BuildId(..),
-    -- Store
-    initializeStore, createStoreDirectories, verifyStore,
-    -- DB
-    ensureDBDirectories,
-    -- Protocol/Client (for status/shutdown checks)
-    isDaemonRunning -- Needs to be exposed or reimplemented locally
-    )
+import Ten
 -- Direct imports if needed and exposed
 import qualified Ten.Daemon.State as DaemonState
 import qualified Ten.Daemon.Server as DaemonServer
@@ -310,7 +301,7 @@ setupStoreStructure config = do
     -- Set base store permissions (may be overridden later if dropping privs)
     catch (setFileMode storeDir 0o755) (\(_ :: IOException) -> hPutStrLn stderr $ "Warning: could not set permissions on " ++ storeDir)
     -- Create DB directories (permissions set inside ensureDBDirectories)
-    handleDBErrorAsWarning $ ensureDBDirectories storeDir
+    handleDBErrorAsWarning $ Main.ensureDBDirectories storeDir
 
 -- | Acquire global lock safely
 type LockHandle = Handle -- Or a custom type wrapping the handle/FD
@@ -352,11 +343,11 @@ initializeSecureStore :: DaemonConfig -> IO ()
 initializeSecureStore config = do
     let storeDir = daemonStorePath config
     -- Initialize store (might create files/dirs)
-    handleDBErrorAsWarning $ initializeStore storeDir
+    handleDBErrorAsWarning $ Main.initializeStore storeDir
     -- Ensure DB directories exist again after potential store init
-    handleDBErrorAsWarning $ ensureDBDirectories storeDir
+    handleDBErrorAsWarning $ Main.ensureDBDirectories storeDir
     -- Verify store structure and permissions
-    handleDBErrorAsWarning $ verifyStore storeDir
+    handleDBErrorAsWarning $ Main.verifyStore storeDir
 
 handleDBErrorAsWarning :: IO () -> IO ()
 handleDBErrorAsWarning action = catch action $ \(e :: SomeException) ->
@@ -385,7 +376,7 @@ runDaemonWithConfig config = do
     setupLogging config
 
     -- Initialize database connection pool (or single connection)
-    dbConn <- catch (DBCore.initializeDatabase (daemonDbPath config) 5000) $
+    dbConn <- catch (initializeDatabase (daemonDbPath config) 5000) $
         \(e :: SomeException) -> logToFile (daemonLogFile config) ("[CRITICAL] Database init failed: " ++ show e) >> exitFailure
 
     -- Load or initialize daemon state
@@ -403,7 +394,7 @@ runDaemonWithConfig config = do
     -- Run the main server loop (needs DaemonState, Socket, Config)
     -- Assuming runDaemonServer is the main loop accepting connections
     DaemonServer.startServer serverSocket daemonState config
-        `finally` (logToFile (daemonLogFile config) "[INFO] Server loop terminated." >> DBCore.closeDatabase dbConn)
+        `finally` (logToFile (daemonLogFile config) "[INFO] Server loop terminated." >> closeDatabase dbConn)
 
 
 -- | Set up logging based on configuration
@@ -507,9 +498,9 @@ dropPrivilegesIfNeeded config = do
     dropPrivs :: UserID -> String -> Maybe String -> IO ()
     dropPrivs currentUid user mGroup = do
         targetUserEntry <- getUserEntryForName user `catch` userNotFound user
-        let targetUid = userID targetUserEntry
+        let targetUid = Ten.Core.userID targetUserEntry
         targetGid <- case mGroup of
-            Just groupName -> groupID <$> (getGroupEntryForName groupName `catch` groupNotFound groupName)
+            Just groupName -> Ten.Core.groupID <$> (getGroupEntryForName groupName `catch` groupNotFound groupName)
             Nothing        -> return $ userGroupID targetUserEntry -- Use user's primary group
 
         -- Ensure store ownership *before* dropping privileges
@@ -630,24 +621,13 @@ ensureDBDirectories storeDir = runInitAction (DBCore.ensureDBDirectories storeDi
     where printError e = hPutStrLn stderr $ "Failed ensureDBDirectories: " ++ show e
 
 initializeStore :: FilePath -> IO ()
-initializeStore storeDir = runInitAction (Store.initializeStore storeDir) >>= either printError return
+initializeStore storeDir = runInitAction (Ten.initializeStore storeDir) >>= either printError return
     where printError e = hPutStrLn stderr $ "Failed initializeStore: " ++ show e
 
 createStoreDirectories :: FilePath -> IO ()
-createStoreDirectories storeDir = runInitAction (Store.createStoreDirectories storeDir) >>= either printError return
+createStoreDirectories storeDir = runInitAction (Ten.createStoreDirectories storeDir) >>= either printError return
     where printError e = hPutStrLn stderr $ "Failed createStoreDirectories: " ++ show e
 
 verifyStore :: FilePath -> IO ()
-verifyStore storeDir = runInitAction (Store.verifyStore storeDir) >>= either printError return
+verifyStore storeDir = runInitAction (Ten.verifyStore storeDir) >>= either printError return
     where printError e = hPutStrLn stderr $ "Failed verifyStore: " ++ show e
-
--- We need the `isDaemonRunning` function
-isDaemonRunning :: FilePath -> IO Bool
-isDaemonRunning socketPath = do
-    exists <- doesFileExist socketPath
-    if not exists then return False else do
-        result <- try $ bracket (Net.socket Net.AF_UNIX Net.Stream 0) Net.close $ \sock ->
-             Net.connect sock (Net.SockAddrUnix socketPath)
-        case result of
-            Left (_ :: IOException) -> return False
-            Right ()                -> return True

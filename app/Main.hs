@@ -188,15 +188,13 @@ import Ten.Store (
 
 -- Import protocol and auth types
 import Ten.Daemon.Protocol (
-    DaemonResponse(..),
     UserCredentials(..),
     DaemonCapability(..),
-    ProtocolVersion(..)
     )
 
 -- | Request garbage collection from the daemon
 requestGC :: DaemonConnection 'Builder -> Bool -> IO (Either BuildError GCStats)
-requestGC = collectGarbage
+requestGC = Ten.Store.collectGarbage
 
 -- | Request to add a file to the store
 requestStoreAdd :: DaemonConnection 'Builder -> FilePath -> IO (Either BuildError StorePath)

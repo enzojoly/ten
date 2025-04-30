@@ -34,8 +34,17 @@ module Ten (
     -- | (Functions for interacting with a running Ten daemon)
     module Ten.Daemon.Protocol -- Re-export necessary protocol types (e.g., UserCredentials)
 
+    , initializeStore
+    , createStoreDirectories
+    , verifyStore
+    , ensureDBDirectories
+    , isDaemonRunning
+
 ) where
 
+import Ten.Store (initializeStore, createStoreDirectories, verifyStore)
+import Ten.DB.Core (ensureDBDirectories)
+import Ten.Daemon.Client (isDaemonRunning)
 import Ten.Core (
     -- Core Types
     Phase(..), SPhase(..),
