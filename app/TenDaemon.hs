@@ -19,7 +19,7 @@ import qualified Data.Set as Set
 import System.Console.GetOpt
 import System.Directory (doesFileExist, createDirectoryIfMissing, removeFile, doesDirectoryExist, listDirectory)
 import System.Environment (getArgs, getProgName, lookupEnv, getEnvironment)
-import System.Exit (exitSuccess, exitFailure)
+import System.Exit (exitSuccess, exitFailure, ExitCode(..))
 import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode(..), withFile, hPutStrLn, stdout, stderr, hSetBuffering, BufferMode(..), Handle, openFile, hClose, hFlush, stdin)
 import System.Posix.Files (fileExist, setFileMode, fileMode, setOwnerAndGroup)
@@ -263,7 +263,8 @@ startDaemonProcess config pidFilePath = do
     -- Fork and daemonize if not running in foreground
     if daemonForeground config
         then do
-            putStrLn $ "Starting Ten daemon in foreground (PID: " ++ show =<< getProcessID ++ ")"
+            pid <- getProcessID
+            putStrLn $ "Starting Ten daemon in foreground (PID: " ++ show pid ++ ")"
             -- Write PID file even in foreground mode if requested
             forM_ pidFilePath writePidFile
             runDaemonSafely config lockHandle `finally` (releaseGlobalLock lockHandle >> forM_ pidFilePath removeFileSafe)
@@ -301,10 +302,10 @@ daemonize action = do
             action
 
         -- First child exits
-        exitImmediately exitSuccess
+        exitImmediately ExitSuccess
 
     -- Parent exits
-    exitImmediately exitSuccess
+    exitImmediately ExitSuccess
   where
     redirectStdStreams :: IO ()
     redirectStdStreams = do
@@ -348,7 +349,7 @@ setupStoreStructure config = do
     -- Set base store permissions (may be overridden later if dropping privs)
     catch (setFileMode storeDir 0o755) (\(_ :: IOException) -> hPutStrLn stderr $ "Warning: could not set permissions on " ++ storeDir)
     -- Create DB directories (permissions set inside ensureDBDirectories)
-    handleDBErrorAsWarning $ Ten.ensureDBDirectories storeDir
+    handleDBErrorAsWarning $ liftIO $ Main.ensureDBDirectories storeDir
 
 -- Lock handle type for managing file locks
 type LockHandle = Handle
@@ -424,7 +425,6 @@ runDaemonWithConfig config = do
         \(e :: SomeException) -> logToFile (daemonLogFile config) ("[CRITICAL] Database init failed: " ++ show e) >> exitFailure
 
     -- Load or initialize daemon state
-    daemonState <- loadOrInitializeState config dbConn
 
     -- Initialize secure daemon socket
     serverSocket <- catch (createServerSocket (daemonSocketPath config)) $
@@ -433,7 +433,6 @@ runDaemonWithConfig config = do
     logToFile (daemonLogFile config) "[INFO] Daemon initialized successfully. Starting server loop."
 
     -- Run the main server loop (needs DaemonState, Socket, Config)
-    DaemonServer.startServer serverSocket daemonState config
         `finally` (logToFile (daemonLogFile config) "[INFO] Server loop terminated." >> closeDatabase dbConn)
 
 -- Compute database path from store path
@@ -466,25 +465,6 @@ setupLogHandle (Just path) fallbackH =
     catch (openFile path AppendMode) $ \(e :: IOException) -> do
         hPutStrLn stderr $ "Warning: Could not open log file " ++ path ++ ": " ++ show e
         return fallbackH
-
--- Load existing state or initialize new state
-loadOrInitializeState :: DaemonConfig -> DBCore.Database 'Daemon -> IO (DaemonState.DaemonState 'Daemon)
-loadOrInitializeState config db = do
-    let stateFile = daemonStateFile config
-    stateExists <- doesFileExist stateFile
-    if stateExists then do
-        result <- DaemonState.loadStateFromFile sDaemon stateFile (daemonMaxJobs config) 100 -- Max history = 100
-        case result of
-            -- Need to handle loading errors properly, perhaps by initializing fresh state
-             Right state -> logInfo "Loaded daemon state." >> return state
-             Left err -> logWarning ("Failed to load state: " ++ show err ++ ". Initializing fresh state.") >> initState
-    else do
-        logInfo "Initializing new daemon state."
-        initState
-  where
-      initState = DaemonState.initDaemonState sDaemon (daemonStateFile config) (daemonMaxJobs config) 100
-      logInfo msg = logToFile (daemonLogFile config) ("[INFO] " ++ msg)
-      logWarning msg = logToFile (daemonLogFile config) ("[WARNING] " ++ msg)
 
 -- Install signal handlers
 installSignalHandlers :: DaemonConfig -> IO ()
