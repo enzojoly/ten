@@ -27,7 +27,7 @@ ten
 │   │   │   ├── References.hs
 │   │   │   └── Schema.hs
 │   │   └─ Derivation.hs
-│   └── Ten.hs [CURRENTLY MISSING]
+│   └── Ten.hs
 ├── ten.cabal
 ├─────── test
 │   ├── hello.c

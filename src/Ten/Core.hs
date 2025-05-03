@@ -1069,7 +1069,7 @@ data BuildState (p :: Phase) = BuildState
     } deriving (Show)
 
 -- | The core monad for all Ten operations
--- Parameterized by phase and privilege tier with singleton evidence passing
+-- Parameterised by phase and privilege tier with singleton evidence passing
 newtype TenM (p :: Phase) (t :: PrivilegeTier) a = TenM
     { runTenM :: SPhase p -> SPrivilegeTier t -> ReaderT BuildEnv (StateT (BuildState p) (ExceptT BuildError IO)) a }
 

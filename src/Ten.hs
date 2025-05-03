@@ -2,151 +2,100 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
 
-module Ten (
-    -- * Core Concepts & Monad
-    module Ten.Core,
+-- | Ten: A content-addressed build system and store manager
+--
+-- This module serves as the main entry point for the Ten library,
+-- re-exporting the core functionality while providing a simplified API.
+module Ten
+  ( -- * Core types
+    module Ten.Core
 
-    -- * Building Derivations
-    module Ten.Build,
+    -- * Database operations
+  , module Ten.DB.Core
 
-    -- * Derivation Definition & Manipulation
-    module Ten.Derivation,
+    -- * Client functionality
+  , connectToTenDaemon
+  , disconnectFromDaemon
+  , runClientCommand
 
-    -- * Store Operations
-    module Ten.Store,
+    -- * Server functionality
+  , startTenDaemon
+  , stopTenDaemon
 
-    -- * Sandbox Configuration
-    module Ten.Sandbox,
+    -- * Version information
+  , version
+  , versionString
+  ) where
 
-    -- * Hashing Utilities
-    module Ten.Hash,
-
-    -- * Garbage Collection (Daemon Operations)
-    module Ten.GC,
-
-    -- * Database Operations
-    module Ten.DB.Core,
-    module Ten.DB.Schema,
-    module Ten.DB.Derivations,
-    module Ten.DB.References,
-
-    -- * Daemon Client Operations
-    module Ten.Daemon.Client,
-
-    -- * Daemon Server Operations (for daemon executable)
-    module Ten.Daemon.Server,
-
-    -- * Daemon State Management (for daemon executable)
-    module Ten.Daemon.State,
-
-    -- * Daemon Authentication (for daemon executable)
-    module Ten.Daemon.Auth,
-
-    -- * Daemon Protocol Types
-    module Ten.Daemon.Protocol,
-
-    -- * Re-exported types/functions for convenience
-    -- Client Operations (needed by app/Main.hs)
-    connectToDaemon,
-    disconnectFromDaemon,
-    getDefaultSocketPath,
-    isDaemonRunning,
-    sendRequestSync,
-    startDaemonIfNeeded,
-    buildFile,
-    evalFile,
-    Ten.Daemon.Client.buildDerivation, -- Qualify to avoid ambiguity with Ten.Build
-    cancelBuild,
-    getBuildStatus,
-    getBuildOutput,
-    listBuilds,
-    verifyStorePath,
-    getStorePathForFile,
-    readStoreContent,
-    listStore,
-    storeDerivation,
-    retrieveDerivation,
-    queryDerivationForOutput,
-    queryOutputsForDerivation,
-    listDerivations,
-    getDerivationInfo,
-    collectGarbage,
-    getGCStatus,
-    addGCRoot,
-    removeGCRoot,
-    listGCRoots,
-    shutdownDaemon,
-    getDaemonStatus,
-    getDaemonConfig,
-    UserCredentials(..),
-    DaemonConnection,
-
-    -- Daemon Operations (needed by app/TenDaemon.hs)
-    DaemonConfig(..), -- Re-export from Core if needed
-    initDatabaseDaemon,
-    closeDatabaseDaemon,
-    ensureDBDirectories,
-    initializeStore,
-    verifyStore,
-    Ten.Daemon.Server.startServer,
-    Ten.Daemon.Server.createServerSocket,
-    Ten.Daemon.State.initDaemonState,
-    Ten.Daemon.State.loadStateFromFile,
-    Ten.Daemon.State.saveStateToFile,
-    Ten.Daemon.Auth.loadAuthFile,
-    Ten.Daemon.Auth.saveAuthFile,
-    SPrivilegeTier, sDaemon -- Re-export from Core
-
-) where
-
--- Import core data types and functions
+-- Import core modules
 import Ten.Core
-
--- Build module
-import Ten.Build
-
--- Derivation module
-import Ten.Derivation
-
--- Store module
-import Ten.Store
-
--- Sandbox module
-import Ten.Sandbox
-
--- Hash module
-import Ten.Hash
-
--- GC module
-import Ten.GC
-
--- Database modules
 import Ten.DB.Core
-import Ten.DB.Schema
-import Ten.DB.Derivations
-import Ten.DB.References
 
--- Daemon Client module
-import Ten.Daemon.Client
+-- Import daemon modules with qualifiers to avoid name clashes
+import qualified Ten.Daemon.Auth as Auth
+import qualified Ten.Daemon.Client as Client
+import qualified Ten.Daemon.Protocol as Protocol
+import qualified Ten.Daemon.Server as Server
+import qualified Ten.Daemon.State as State
 
--- Daemon Server module
-import Ten.Daemon.Server
+-- | Version information based on protocol version
+version :: (Int, Int, Int)
+version = case Protocol.currentProtocolVersion of
+    Protocol.ProtocolVersion major minor patch -> (major, minor, patch)
 
--- Daemon State module
-import Ten.Daemon.State
+-- | Version string for display purposes
+versionString :: String
+versionString = case Protocol.currentProtocolVersion of
+    Protocol.ProtocolVersion major minor patch ->
+        "Ten " ++ show major ++ "." ++ show minor ++ "." ++ show patch
 
--- Daemon Auth module
-import Ten.Daemon.Auth
+-- | Connect to a Ten daemon
+connectToTenDaemon :: FilePath -> Protocol.UserCredentials -> IO (Either BuildError (DaemonConnection 'Builder))
+connectToTenDaemon = Client.connectToDaemon
 
--- Daemon Protocol module
-import Ten.Daemon.Protocol
+-- | Disconnect from a Ten daemon
+disconnectFromDaemon :: DaemonConnection 'Builder -> IO ()
+disconnectFromDaemon = Client.disconnectFromDaemon
 
--- NOTE: Redundant aliases like requestStoreAdd are removed.
---       Clients should use the functions directly exported from Client.
--- NOTE: PathInfo definition removed, assuming it lives in Core or Store now.
---       If needed, it should be defined there and re-exported.
+-- | Run a client command against a daemon
+runClientCommand :: DaemonConnection 'Builder
+                 -> (DaemonConnection 'Builder -> IO (Either BuildError a))
+                 -> IO (Either BuildError a)
+runClientCommand conn cmd = cmd conn
+
+-- | Start a Ten daemon process
+startTenDaemon :: DaemonConfig -> IO ()
+startTenDaemon config = do
+    -- Get the socket path
+    socketPath <- case daemonSocketPath config of
+        "" -> Protocol.getDefaultSocketPath
+        path -> return path
+
+    -- Create the socket
+    socket <- Server.createServerSocket socketPath
+
+    -- Initialize daemon state
+    now <- getCurrentTime
+    state <- State.initDaemonState sDaemon (daemonStateFile config) (daemonMaxJobs config) 500
+
+    -- Start the server
+    serverControl <- Server.startServer socket state config
+
+    -- Log startup
+    putStrLn $ "Ten daemon " ++ versionString ++ " started on socket " ++ socketPath
+
+    -- Block until the server is stopped
+    waitForever
+  where
+    waitForever = forever $ threadDelay 1000000
+
+-- | Stop a running Ten daemon
+stopTenDaemon :: ServerControl -> IO ()
+stopTenDaemon = Server.stopServer
+
+-- Reexport ServerControl type
+type ServerControl = Server.ServerControl
