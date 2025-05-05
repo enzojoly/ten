@@ -22,10 +22,6 @@ module Ten
   , disconnectFromDaemon
   , runClientCommand
 
-    -- * Server functionality
-  , startTenDaemon
-  , stopTenDaemon
-
     -- * Version information
   , version
   , versionString
@@ -44,13 +40,13 @@ import qualified Ten.Daemon.State as State
 
 -- | Version information based on protocol version
 version :: (Int, Int, Int)
-version = case Protocol.currentProtocolVersion of
-    Protocol.ProtocolVersion major minor patch -> (major, minor, patch)
+version = case Ten.Core.currentProtocolVersion of
+    Ten.Core.ProtocolVersion major minor patch -> (major, minor, patch)
 
 -- | Version string for display purposes
 versionString :: String
-versionString = case Protocol.currentProtocolVersion of
-    Protocol.ProtocolVersion major minor patch ->
+versionString = case Ten.Core.currentProtocolVersion of
+    Ten.Core.ProtocolVersion major minor patch ->
         "Ten " ++ show major ++ "." ++ show minor ++ "." ++ show patch
 
 -- | Connect to a Ten daemon
@@ -66,36 +62,6 @@ runClientCommand :: DaemonConnection 'Builder
                  -> (DaemonConnection 'Builder -> IO (Either BuildError a))
                  -> IO (Either BuildError a)
 runClientCommand conn cmd = cmd conn
-
--- | Start a Ten daemon process
-startTenDaemon :: DaemonConfig -> IO ()
-startTenDaemon config = do
-    -- Get the socket path
-    socketPath <- case daemonSocketPath config of
-        "" -> Protocol.getDefaultSocketPath
-        path -> return path
-
-    -- Create the socket
-    socket <- Server.createServerSocket socketPath
-
-    -- Initialize daemon state
-    now <- getCurrentTime
-    state <- State.initDaemonState sDaemon (daemonStateFile config) (daemonMaxJobs config) 500
-
-    -- Start the server
-    serverControl <- Server.startServer socket state config
-
-    -- Log startup
-    putStrLn $ "Ten daemon " ++ versionString ++ " started on socket " ++ socketPath
-
-    -- Block until the server is stopped
-    waitForever
-  where
-    waitForever = forever $ threadDelay 1000000
-
--- | Stop a running Ten daemon
-stopTenDaemon :: ServerControl -> IO ()
-stopTenDaemon = Server.stopServer
 
 -- Reexport ServerControl type
 type ServerControl = Server.ServerControl
