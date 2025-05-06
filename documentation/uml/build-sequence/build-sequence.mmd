@@ -1,0 +1,658 @@
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'noteBkgColor': '#fffdf7',
+    'noteTextColor': '#333333',
+    'noteBorderColor': '#e8e8e8',
+    'messageBorderColor': '#999999',
+    'messageTextColor': '#666666',
+    'actorBorder': '#6b6b6b',
+    'actorBkg': '#f8f9fa',
+    'actorTextColor': '#333333',
+    'activationBorderColor': '#6b6b6b',
+    'activationBkgColor': '#f8f9fa'
+  }
+}}%%
+sequenceDiagram
+    %% Core participants
+    participant USER as User
+    participant CLI as Ten CLI
+    participant CLIENT as Daemon Client
+    participant DAEMON as Ten Daemon (Privileged)
+    participant AUTH as Auth Manager
+    participant STATE as Daemon State (STM)
+    participant RESL as Resource Limiter
+    participant PARSER as Expression Parser
+    participant EVAL as Evaluation Phase
+    participant FETCH as Fetchers (builtins)
+    participant GRAPH as Dependency Graph
+    participant BUILD as Build Phase
+    participant SANDBOX as Build Sandbox
+    participant BUILDER as Builder Process (Unprivileged)
+    participant STORE as Content Store
+    participant VERIFY as Hash Verifier
+    participant LOCK as Lock Manager
+    participant GC as Garbage Collector
+    participant FAIL as Failure Handler
+
+    %% System Initialisation and Recovery
+    rect rgb(240, 250, 240)
+        Note over USER,FAIL: System Startup & Recovery
+    end
+
+    Note over DAEMON: Running as root (privileged daemon)
+    DAEMON->>DAEMON: checkStorePermissions()
+    DAEMON->>DAEMON: setupSignalHandlers()
+    DAEMON->>LOCK: acquireGlobalLock("/run/ten/daemon.lock")
+
+    alt Lock acquisition fails
+        LOCK-->>DAEMON: LockError("Another daemon is running")
+        DAEMON->>FAIL: handleFatalError("Daemon already running")
+        FAIL->>USER: exitWithError(1, "Another daemon instance is running")
+    else Lock acquired successfully
+        LOCK-->>DAEMON: LockAcquired
+
+        %% State recovery
+        DAEMON->>STATE: initialiseDaemonState()
+        STATE->>STATE: loadStateFile("/var/lib/ten/daemon-state.json")
+
+        alt State file corrupted or missing
+            STATE->>STATE: handleCorruptState()
+            STATE->>DAEMON: initialiseEmptyState()
+        else State file valid
+            STATE->>DAEMON: stateRecovered(lastRunTimestamp)
+        end
+
+        %% Store recovery
+        DAEMON->>STORE: verifyStoreIntegrity()
+        STORE->>STORE: checkStoreConsistency()
+
+        alt Store inconsistencies detected
+            STORE->>STORE: repairStoreDatabase()
+            STORE->>DAEMON: storeRepairReport(fixedPathCount)
+        else Store consistent
+            STORE-->>DAEMON: storeConsistencyVerified
+        end
+
+        %% Build graph recovery
+        STATE->>GRAPH: recoverBuildGraph()
+        GRAPH->>GRAPH: validateRecoveredGraph()
+        GRAPH-->>STATE: globalBuildGraph
+
+        %% Drop privileges for regular operation
+        DAEMON->>DAEMON: dropPrivilegesForNonStoreOps()
+        Note over DAEMON: Keeps CAP_DAC_OVERRIDE for store access
+    end
+
+    %% Client connection with authentication and error handling
+    rect rgb(220, 230, 250)
+        Note over USER,FAIL: Client Connection Phase (with Authentication)
+    end
+
+    USER->>CLI: ten build example.ten
+    CLI->>CLI: loadUserConfig("~/.config/ten/config.toml")
+    CLI->>CLI: validateInputFile("example.ten")
+
+    alt Input file missing or inaccessible
+        CLI->>USER: exitWithError(1, "Input file not found or not readable")
+    else Input file exists
+        CLI->>CLIENT: connectToDaemon("/run/ten/daemon.sock")
+
+        alt Connection fails
+            CLIENT->>CLIENT: attemptDaemonAutostart()
+            CLIENT->>CLIENT: retryConnection(maxRetries=3)
+
+            alt Connection still fails
+                CLIENT->>CLI: connectionFailed("Could not connect to daemon")
+                CLI->>USER: "Error: Could not connect to Ten daemon. Is it running?"
+            else Connection succeeds after retry
+                CLIENT-->>CLI: connectionEstablished
+            end
+        else Connection succeeds
+            CLIENT-->>CLI: connectionEstablished
+        end
+
+        %% Protocol version negotiation
+        CLIENT->>DAEMON: protocolHandshake(clientVersion=1.0)
+        DAEMON->>DAEMON: checkCompatibility(clientVersion)
+
+        alt Incompatible protocol version
+            DAEMON-->>CLIENT: protocolError("Unsupported protocol version")
+            CLIENT->>CLI: protocolError("Daemon requires upgrade")
+            CLI->>USER: "Error: Protocol version mismatch - please upgrade Ten"
+        else Compatible protocol
+            DAEMON-->>CLIENT: protocolAccepted(serverVersion=1.0)
+
+            %% Authentication
+            CLIENT->>AUTH: authenticate(UserCredentials)
+            AUTH->>AUTH: validateCredentials()
+            AUTH->>STATE: checkUserPermissions(userId)
+
+            alt Authentication fails
+                AUTH-->>CLIENT: authFailed("Invalid credentials")
+                CLIENT->>CLI: authenticationError("Invalid user or token")
+                CLI->>USER: "Error: Authentication failed. Check your credentials"
+            else Authentication succeeds
+                STATE-->>AUTH: userPermissions(store_read=true, store_write=true)
+                AUTH-->>CLIENT: authToken(validUntil=expiry)
+                CLIENT->>CLIENT: storeAuthToken(token)
+            end
+        end
+    end
+
+    %% Evaluation Phase with detailed error handling
+    rect rgb(231, 242, 255)
+        Note over USER,FAIL: Phase 1: Evaluation ('Eval) with Error Handling
+    end
+
+    CLIENT->>CLIENT: readInputFile("example.ten")
+    CLIENT->>DAEMON: evaluateDerivation(fileContent, authToken)
+    DAEMON->>AUTH: validateToken(authToken, "evaluate")
+
+    alt Token invalid or expired
+        AUTH-->>DAEMON: tokenInvalid("Expired or insufficient permissions")
+        DAEMON-->>CLIENT: authError("Please re-authenticate")
+        CLIENT->>CLI: sessionExpired()
+        CLI->>USER: "Error: Session expired, please login again"
+    else Token valid
+        AUTH-->>DAEMON: tokenValid(userId, permissions)
+
+        %% Register evaluation
+        DAEMON->>STATE: atomically(registerEvaluation(userId, "example.ten"))
+        STATE-->>DAEMON: evaluationId
+
+        %% Parse the derivation file
+        DAEMON->>PARSER: parseDerivationFile(fileContent)
+
+        alt Parse error
+            PARSER-->>DAEMON: parseError(line, column, errorMsg)
+            DAEMON->>STATE: atomically(recordEvaluationFailure(evaluationId))
+            DAEMON-->>CLIENT: evaluationFailed(parseErrorDetails)
+            CLIENT->>CLI: formatParseError(errorDetails)
+            CLI->>USER: "Parse error at line 12: unexpected token 'let'"
+        else Parse successful
+            PARSER->>PARSER: parseAttributes(name, system, builder, args, etc.)
+            PARSER-->>DAEMON: parsedDerivation
+
+            %% Evaluate the derivation
+            DAEMON->>EVAL: evalDerivation(parsedDerivation)
+
+            %% Handle builtin functions with proper resource limiting
+            alt Derivation has fetchTarball or other fetch operations
+                EVAL->>FETCH: builtins.fetchTarball({ url, sha256 })
+                FETCH->>RESL: checkResourceLimits(network=true, maxSize=1GB)
+
+                alt Resource limits exceeded
+                    RESL-->>FETCH: resourceLimitExceeded("Network transfers exceeded")
+                    FETCH-->>EVAL: fetchError("Resource limits exceeded")
+                    EVAL-->>DAEMON: evaluationFailed("Resource limits exceeded")
+                else Resources available
+                    RESL-->>FETCH: resourcesAvailable
+                    FETCH->>STORE: checkStorePath(sha256)
+
+                    alt Source already in store
+                        STORE-->>FETCH: StorePath
+                    else Store miss - need to fetch
+                        FETCH->>FETCH: downloadFile(url, maxRetries=3)
+
+                        alt Network error during fetch
+                            FETCH-->>EVAL: networkError("Failed to download from url")
+                            EVAL-->>DAEMON: evaluationFailed("Network error")
+                        else Download succeeded
+                            FETCH->>VERIFY: verifyHash(content, sha256)
+
+                            alt Hash verification failed
+                                VERIFY-->>FETCH: hashMismatch(expected, actual)
+                                FETCH-->>EVAL: securityError("Hash verification failed")
+                                EVAL-->>DAEMON: evaluationFailed("Security error: hash mismatch")
+                            else Hash verified
+                                VERIFY-->>FETCH: hashVerified
+                                FETCH->>STORE: addToStore(name, content)
+
+                                alt Store write error
+                                    STORE-->>FETCH: storeError("Permission denied")
+                                    FETCH-->>EVAL: storeError("Failed to write to store")
+                                else Successfully added to store
+                                    STORE-->>FETCH: StorePath
+                                end
+                            end
+                        end
+                    end
+
+                    FETCH-->>EVAL: StorePath
+                end
+            end
+
+            %% Process dependencies and validate graph
+            EVAL->>EVAL: processDependencies(derivation)
+            EVAL->>GRAPH: createBuildGraph(derivation)
+            GRAPH->>GRAPH: validateGraph(graph)
+            GRAPH->>GRAPH: detectCycles(graph)
+
+            alt Cyclic dependency detected
+                GRAPH-->>EVAL: cyclicDependencyError(path)
+                EVAL-->>DAEMON: evaluationFailed("Cyclic dependency detected")
+                DAEMON-->>CLIENT: evalError("Cyclic dependency in build graph")
+                CLIENT->>CLI: formatEvalError(errorDetails)
+                CLI->>USER: "Error: Cyclic dependency detected: a -> b -> c -> a"
+            else Graph acyclic and valid
+                GRAPH-->>EVAL: GraphProof(Acyclic/Complete)
+
+                %% Determine build strategy with security considerations
+                EVAL->>EVAL: analyseDerivationStrategy(derivation)
+                Note right of EVAL: Determine if derivation can use applicative build
+
+                %% Instantiate the derivation
+                EVAL->>EVAL: instantiateDerivation(derivation)
+                EVAL-->>DAEMON: InstantiatedDerivation(strategy=Applicative|Monadic)
+
+                %% Store the derivation securely
+                DAEMON->>STORE: atomically(storeDerivation(derivation))
+                STORE->>VERIFY: verifyDerivationHash(derivation)
+                VERIFY-->>STORE: hashVerified
+                STORE->>LOCK: acquireWriteLock(derivationPath)
+
+                alt Store lock contention
+                    LOCK-->>STORE: lockTimeout("Could not acquire lock")
+                    STORE-->>DAEMON: storeLockError("Timed out waiting for store lock")
+                else Lock acquired
+                    LOCK-->>STORE: lockAcquired
+                    STORE->>STORE: writeDerivationToStore(path, content)
+                    STORE->>LOCK: releaseLock(derivationPath)
+                    STORE-->>DAEMON: derivationStored(storePath)
+                end
+
+                DAEMON->>STATE: atomically(recordDerivation(evaluationId, derivation))
+                DAEMON-->>CLIENT: evaluationComplete(derivationId)
+                CLIENT-->>CLI: "Derivation evaluated successfully"
+                CLI-->>USER: "Evaluated example.ten -> /ten/store/hash-example.drv"
+            end
+        end
+    end
+
+    %% Build Phase with resource management and complete error handling
+    rect rgb(255, 242, 240)
+        Note over USER,FAIL: Phase 2: Build with Resource Management and Error Handling
+    end
+
+    CLIENT->>DAEMON: buildDerivation(derivationPath, authToken)
+    DAEMON->>AUTH: validateToken(authToken, "build")
+
+    alt Token lacks build permission
+        AUTH-->>DAEMON: permissionDenied("build")
+        DAEMON-->>CLIENT: accessDenied("User lacks build permission")
+        CLIENT->>CLI: permissionError("You don't have permission to build")
+        CLI->>USER: "Error: You don't have permission to build derivations"
+    else Token has build permission
+        AUTH-->>DAEMON: permissionGranted("build")
+        DAEMON->>STATE: atomically(checkBuildInProgress(derivationPath))
+
+        alt Build already in progress
+            STATE-->>DAEMON: BuildInProgress(buildId, progress, pid)
+            DAEMON-->>CLIENT: BuildInProgress(progress)
+            CLIENT->>CLI: showBuildProgress(progress)
+            CLI-->>USER: "Build already running (45% complete)"
+        else New build required
+            STATE-->>DAEMON: NotInProgress
+            DAEMON->>STATE: atomically(registerBuild(derivationPath, userId))
+            STATE-->>DAEMON: newBuildId
+
+            %% Allocate resources for build
+            DAEMON->>RESL: allocateResources(cpuCores=4, memoryMB=2048, diskMB=5000)
+
+            alt Resource allocation failed
+                RESL-->>DAEMON: resourcesUnavailable("Not enough system resources")
+                DAEMON->>STATE: atomically(markBuildFailed(buildId))
+                DAEMON-->>CLIENT: buildFailed("Not enough system resources")
+                CLIENT->>CLI: resourceError("Build failed - insufficient resources")
+                CLI-->>USER: "Error: Not enough system resources to perform build"
+            else Resources allocated
+                RESL-->>DAEMON: resourcesAllocated(resourceHandle)
+
+                %% Select build strategy
+                DAEMON->>BUILD: buildDerivation(instantiatedDerivation, resourceHandle)
+                BUILD->>BUILD: determineOptimalBuildStrategy(derivation)
+
+                alt Can use applicative strategy (static dependencies)
+                    %% Applicative build path - parallel builds possible
+                    BUILD->>GRAPH: getStaticDependencies(derivation)
+                    GRAPH-->>BUILD: Set<Derivation>
+                    BUILD->>STATE: atomically(checkDependencyBuildStatus)
+
+                    alt All dependencies already built
+                        STATE-->>BUILD: AllDependenciesReady
+                        BUILD->>STORE: atomically(lockRequiredPaths)
+                        BUILD->>SANDBOX: createSandbox(inputs, config)
+                    else Some dependencies need building
+                        STATE-->>BUILD: DependenciesToBuild(Set<Derivation>)
+
+                        %% Parallel build of dependencies
+                        BUILD->>BUILD: buildDependenciesConcurrently(dependencies)
+                        Note right of BUILD: Applicative context allows parallel builds
+
+                        alt Dependency build failed
+                            BUILD->>STATE: atomically(markBuildFailed(buildId))
+                            BUILD-->>DAEMON: BuildFailure("Dependency build failed")
+                            DAEMON-->>CLIENT: buildFailed("Dependency build failed")
+                            CLIENT->>CLI: formatBuildError(details)
+                            CLI-->>USER: "Error: Failed to build dependency 'openssl-1.1.1'"
+                        else Dependencies built successfully
+                            %% Wait for all dependencies
+                            BUILD->>BUILD: waitForAllDependencies()
+                            BUILD->>STORE: atomically(lockRequiredPaths)
+
+                            alt Failed to lock required paths
+                                STORE-->>BUILD: lockError("Could not lock path")
+                                BUILD->>STATE: atomically(markBuildFailed(buildId))
+                                BUILD-->>DAEMON: BuildFailure("Failed to lock required paths")
+                            else Paths locked successfully
+                                STORE-->>BUILD: pathsLocked
+                                BUILD->>SANDBOX: createSandbox(inputs, config)
+                            end
+                        end
+                    end
+
+                    %% Sandbox setup with security hardening
+                    SANDBOX->>SANDBOX: createIsolatedDirectory()
+                    SANDBOX->>SANDBOX: setupMountNamespace()
+                    SANDBOX->>SANDBOX: setupNetworkNamespace(allowNetwork=false)
+                    SANDBOX->>SANDBOX: setupUserNamespace(user="nobody", group="nogroup")
+                    SANDBOX->>SANDBOX: setupSeccompFilters(syscallAllowlist)
+                    SANDBOX->>SANDBOX: dropCapabilities(keepOnly=[])
+                    SANDBOX->>SANDBOX: setResourceLimits(cpu=1h, mem=2GB, disk=5GB)
+
+                    alt Sandbox setup failed
+                        SANDBOX-->>BUILD: sandboxError("Failed to setup isolation")
+                        BUILD->>STATE: atomically(markBuildFailed(buildId))
+                        BUILD-->>DAEMON: BuildFailure("Sandbox creation failed")
+                    else Sandbox created successfully
+                        SANDBOX-->>BUILD: sandboxReady(sandboxPath)
+
+                        %% Builder process for applicative build
+                        Note right of SANDBOX: Isolated environment with all inputs available
+                        SANDBOX->>STORE: readFromStore(builderPath)
+
+                        alt Failed to read builder from store
+                            STORE-->>SANDBOX: storeError("Path not found or permission denied")
+                            SANDBOX-->>BUILD: sandboxError("Failed to read builder")
+                            BUILD->>STATE: atomically(markBuildFailed(buildId))
+                            BUILD-->>DAEMON: BuildFailure("Builder not available")
+                        else Builder available
+                            STORE-->>SANDBOX: BuilderContent
+                            SANDBOX->>VERIFY: verifyExecutableHash(builderContent, expectedHash)
+
+                            alt Hash verification failed
+                                VERIFY-->>SANDBOX: hashError("Builder hash mismatch")
+                                SANDBOX-->>BUILD: securityError("Builder has been tampered with")
+                                BUILD->>STATE: atomically(markBuildFailed(buildId))
+                                BUILD-->>DAEMON: BuildFailure("Security error: builder hash mismatch")
+                            else Hash verification passed
+                                VERIFY-->>SANDBOX: hashVerified
+                                SANDBOX->>SANDBOX: setupEnvironment(derivation.env)
+                                SANDBOX->>SANDBOX: makeInputsAvailable(derivation.inputs)
+
+                                %% Execute builder with privilege drop and resource limits
+                                SANDBOX->>SANDBOX: dropToUnprivilegedUser("nobody")
+                                SANDBOX->>BUILDER: spawnProcess(derivation.builder, derivation.args)
+
+                                %% Monitor builder process with timeout
+                                SANDBOX->>BUILDER: monitorResourceUsage(timeout=3600)
+                                DAEMON->>STATE: periodicBuildStatusUpdate(buildId, progress)
+                                STATE-->>CLIENT: BuildProgressUpdate(progress)
+                                CLIENT-->>CLI: updateProgressBar(progress)
+
+                                alt Builder times out or exceeds resources
+                                    BUILDER-->>SANDBOX: resourceLimitExceeded("Memory limit")
+                                    SANDBOX->>BUILDER: terminateProcess(SIGKILL)
+                                    SANDBOX-->>BUILD: buildError("Resource limits exceeded")
+                                    BUILD->>STATE: atomically(markBuildFailed(buildId))
+                                    BUILD-->>DAEMON: BuildFailure("Build exceeded resource limits")
+                                else Builder process completes
+                                    BUILDER->>SANDBOX: writeOutputs(buildDir + "/out/")
+                                    BUILDER-->>SANDBOX: ExitSuccess
+
+                                    %% Verify outputs match expected format
+                                    SANDBOX->>SANDBOX: validateOutputs(expectedOutputs)
+
+                                    alt Output validation failed
+                                        SANDBOX-->>BUILD: outputError("Expected output missing")
+                                        BUILD->>STATE: atomically(markBuildFailed(buildId))
+                                        BUILD-->>DAEMON: BuildFailure("Output validation failed")
+                                    else Outputs validated
+                                        %% Collect results from applicative build
+                                        SANDBOX->>BUILD: collectBuildResult(derivation, buildDir)
+
+                                        %% Add outputs to store with secure hashing
+                                        BUILD->>STORE: preparePathsToAdd(outputs)
+                                        BUILD->>VERIFY: computeOutputHashes(outputs)
+                                        VERIFY-->>BUILD: verifiedHashes
+
+                                        BUILD->>STORE: atomically(addMultipleToStore)
+
+                                        alt Store addition failed
+                                            STORE-->>BUILD: storeError("Disk full or permission denied")
+                                            BUILD->>STATE: atomically(markBuildFailed(buildId))
+                                            BUILD-->>DAEMON: BuildFailure("Failed to add outputs to store")
+                                        else Store addition succeeded
+                                            STORE-->>BUILD: Set<StorePath>
+                                            BUILD->>BUILD: verifyBuildResult(derivation, result)
+                                            BUILD-->>DAEMON: BuildResult(outputs, exitCode, log)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                else Requires monadic strategy (dynamic dependencies or Return-Continuation)
+                    %% Monadic build path - sequential execution
+                    Note right of BUILD: Required for Return-Continuation
+                    BUILD->>STORE: atomically(lockRequiredPaths)
+                    BUILD->>SANDBOX: createSandbox(inputs, config)
+
+                    %% Similar sandbox setup and security as in applicative path
+                    SANDBOX->>SANDBOX: setupSecureEnvironment()
+
+                    %% Builder process for monadic build
+                    Note right of SANDBOX: Isolated environment based on derivation spec
+                    SANDBOX->>STORE: secureReadFromStore(builderPath)
+                    STORE-->>SANDBOX: BuilderContent
+                    SANDBOX->>SANDBOX: setupEnvironment(derivation.env)
+                    SANDBOX->>SANDBOX: makeInputsAvailable(derivation.inputs)
+                    SANDBOX->>BUILDER: spawnProcess(derivation.builder, derivation.args)
+
+                    %% Return-Continuation Pattern with proper security checking
+                    alt Builder returns new derivation
+                        BUILDER->>SANDBOX: writeFile("return.drv", innerDerivation)
+                        BUILDER-->>SANDBOX: ExitSuccess
+                        SANDBOX->>BUILD: checkForReturnedDerivation(buildDir)
+                        BUILD->>VERIFY: validateReturnFile(returnPath)
+                        VERIFY-->>BUILD: returnFileValid
+                        BUILD->>BUILD: deserializeDerivation("return.drv")
+
+                        alt Deserialization failed
+                            BUILD->>STATE: atomically(markBuildFailed(buildId))
+                            BUILD-->>DAEMON: BuildFailure("Invalid return derivation")
+                        else Deserialization succeeded
+                            %% Build State Tracking for Recursion
+                            BUILD->>STATE: atomically(recordReturnedDerivation)
+                            STATE->>GRAPH: detectRecursionCycle(derivationChain)
+
+                            alt Cycle detected
+                                GRAPH-->>STATE: CycleDetected
+                                STATE-->>BUILD: BuildError("Recursion cycle detected")
+                                BUILD-->>DAEMON: BuildFailure("Recursion cycle detected")
+                                DAEMON-->>CLIENT: buildFailed("Recursion cycle detected in return-continuation")
+                                CLIENT->>CLI: formatBuildError(details)
+                                CLI-->>USER: "Error: Recursion cycle detected in return-continuation"
+                            else No cycle
+                                GRAPH-->>STATE: NoCycle
+
+                                %% Notify client about recursive continuation
+                                DAEMON-->>CLIENT: BuildRecursing(derivation, innerDerivation)
+                                CLIENT-->>CLI: showRecursiveBuild(innerDerivation)
+                                CLI-->>USER: "Build continuing with next derivation..."
+
+                                %% Security check for returned derivation
+                                BUILD->>AUTH: checkReturnDerivationPermission(userId, innerDerivation)
+
+                                alt Permission denied for return derivation
+                                    AUTH-->>BUILD: permissionDenied("Cannot build returned derivation")
+                                    BUILD->>STATE: atomically(markBuildFailed(buildId))
+                                    BUILD-->>DAEMON: BuildFailure("Permission denied for returned derivation")
+                                else Permission granted
+                                    AUTH-->>BUILD: permissionGranted
+
+                                    %% Recursive build of inner derivation (must use monadic strategy)
+                                    Note over BUILD: Recursively build the returned derivation
+                                    BUILD->>BUILD: buildDerivation(innerDerivation, strategy=Monadic)
+
+                                    %% Recursive build would follow same pattern
+                                    %% (simplified for diagram clarity)
+                                    BUILD-->>DAEMON: BuildResult
+                                end
+                            end
+                        end
+
+                    else Normal build with outputs
+                        BUILDER->>SANDBOX: writeOutputs(buildDir + "/out/")
+                        BUILDER-->>SANDBOX: ExitSuccess
+                        SANDBOX->>BUILD: collectBuildResult(derivation, buildDir)
+
+                        %% Store outputs atomically with validation
+                        BUILD->>VERIFY: validateOutputIntegrity(outputs)
+                        VERIFY-->>BUILD: outputsValid
+                        BUILD->>STORE: atomically(addMultipleToStore)
+                        STORE-->>BUILD: Set<StorePath>
+                        BUILD->>BUILD: verifyBuildResult(derivation, result)
+                        BUILD-->>DAEMON: BuildResult(outputs, exitCode, log)
+                    end
+                end
+
+                %% Clean up and notify client
+                BUILD->>STORE: atomically(unlockPaths)
+                BUILD->>RESL: releaseResources(resourceHandle)
+                DAEMON->>STATE: atomically(markBuildComplete)
+
+                %% Register references for garbage collection
+                DAEMON->>STORE: registerPathReferences(outputs, inputs)
+
+                DAEMON-->>CLIENT: BuildSuccess(BuildResult)
+                CLIENT->>CLI: DisplayResults(BuildResult)
+                CLI-->>USER: "Build successful: /ten/store/hash-name"
+            end
+        end
+    end
+
+    %% Garbage Collection with safety checks
+    rect rgb(245, 245, 255)
+        Note over USER,FAIL: Periodic Garbage Collection with Safety Checks
+    end
+
+    DAEMON->>STATE: shouldRunGarbageCollection()
+    STATE-->>DAEMON: true
+
+    %% Get exclusive GC lock
+    DAEMON->>LOCK: acquireGCLock("gc.lock")
+
+    alt GC lock acquisition failed
+        LOCK-->>DAEMON: lockFailed("Another GC in progress")
+        DAEMON->>STATE: scheduleGCRetry(interval=15min)
+    else GC lock acquired
+        LOCK-->>DAEMON: lockAcquired
+        DAEMON->>GC: collectGarbage(dryRun=true)
+
+        %% Find all store paths
+        GC->>STORE: findAllStorePaths()
+        STORE-->>GC: Set<StorePath>
+
+        %% Get roots to determine what's reachable
+        GC->>STATE: atomically(getRootPaths)
+        STATE-->>GC: Set<StorePath>
+
+        %% Build reachability graph
+        GC->>GRAPH: computeReachableSet(rootPaths)
+        GRAPH-->>GC: Set<StorePath>
+
+        %% Only delete paths not being built currently
+        GC->>STATE: atomically(checkActiveBuildPaths)
+        STATE-->>GC: Set<StorePath>
+
+        %% Compute deletable paths
+        GC->>GC: deletablePaths = allPaths - (reachablePaths + activePaths)
+
+        %% Verify deletion is safe
+        GC->>GC: validateDeletionSafety(deletablePaths)
+
+        alt Unsafe deletion detected
+            GC->>DAEMON: gcWarning("Unsafe deletion detected")
+            DAEMON->>STATE: recordGCSafetyViolation(details)
+            DAEMON->>GC: abortGarbageCollection()
+        else Deletion safe
+            %% Perform actual deletion (without dry run)
+            GC->>GC: logPathsToDelete(deletablePaths)
+            GC->>STORE: deleteUnreachablePaths(deletablePaths)
+
+            alt Deletion error occurred
+                STORE-->>GC: deletionError("Failed to delete some paths")
+                GC->>STATE: recordGCPartialFailure(details)
+            else Deletion successful
+                STORE-->>GC: deletionSuccessful
+
+                %% Update database to reflect deleted paths
+                GC->>STORE: updateStoreDatabase(deletedPaths)
+
+                %% Record GC stats
+                GC->>STATE: recordGCStats(pathsDeleted, bytesFreed)
+            end
+        end
+
+        %% Release GC lock
+        GC->>LOCK: releaseGCLock("gc.lock")
+        GC-->>DAEMON: GCStats
+
+        %% Notify any interested clients
+        DAEMON-->>CLIENT: optionalGCNotification(stats)
+    end
+
+    %% System Maintenance with error recovery
+    rect rgb(250, 245, 240)
+        Note over USER,FAIL: Background Maintenance and Error Recovery
+    end
+
+    DAEMON->>STATE: pruneCompletedBuilds(olderThan=7days)
+
+    %% Persist state with backup
+    DAEMON->>STATE: backupStateFile("/var/lib/ten/state.backup")
+    DAEMON->>STATE: persistStateToFile("/var/lib/ten/state.json")
+
+    alt State persistence failed
+        STATE-->>DAEMON: persistenceError("Failed to write state file")
+        DAEMON->>FAIL: handleStatePersistenceFailure()
+        FAIL->>DAEMON: scheduleFallbackPersistence(interval=5min)
+    else State persisted successfully
+        STATE-->>DAEMON: statePersisted
+    end
+
+    %% Check client connections for dead clients
+    DAEMON->>STATE: checkClientConnections()
+    STATE->>STATE: removeExpiredClients(timeout=30min)
+
+    %% Regular store maintenance
+    DAEMON->>STORE: performStoreMaintenance()
+    STORE->>STORE: optimizeStoreDB()
+    STORE->>STORE: validateCriticalPaths()
+
+    %% Check daemon health
+    DAEMON->>DAEMON: performHealthCheck()
+    DAEMON->>RESL: monitorResourceUsage()
+
+    alt Resource usage critical
+        RESL-->>DAEMON: resourceAlert("Memory usage above 90%")
+        DAEMON->>FAIL: handleResourceAlert()
+        FAIL->>DAEMON: runEmergencyCleanup()
+    else Resources healthy
+        RESL-->>DAEMON: resourcesHealthy
+    end
+
+    Note over USER,FAIL: Ten provides secure isolation between privileged daemon<br>and unprivileged builder processes with comprehensive error handling
