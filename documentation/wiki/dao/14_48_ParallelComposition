@@ -1,0 +1,8 @@
+Parallel Composition
+
+Ten's build system needs to efficiently build packages in parallel while respecting dependencies.
+The BuildGraph module in Ten implements dependency graph management through types like BuildNode and BuildGraph, with functions like topologicalSort determining build order.
+Parallel composition from applicative functors provides the theoretical foundation for how Ten can safely execute independent build tasks simultaneously.
+
+The current Ten implementation has scaffolding for parallel builds, but doesn't yet fully implement parallel composition patterns.
+The executeBuild function in Ten.Build would be an ideal place to leverage applicative parallel composition patterns when processing derivations without dependencies between them.

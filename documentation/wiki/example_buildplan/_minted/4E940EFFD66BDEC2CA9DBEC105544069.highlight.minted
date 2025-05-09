@@ -1,0 +1,68 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeFamilies \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE FlexibleContexts \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Derivation}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Singletons}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.State}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Store}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Core derivation creation \PYGZhy{} works in Eval phase}
+\PYG{n+nf}{mkDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{DerivationAttrs}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}
+\PYG{n+nf}{mkDerivation}\PYG{+w}{ }\PYG{n}{attrs}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sEval}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation details}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} ...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Instantiate a derivation for building}
+\PYG{n+nf}{instantiateDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPhase}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{instantiateDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Store a derivation with proper privilege checking}
+\PYG{n+nf}{storeDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o}{\PYGZti{}}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{StorePath}
+\PYG{n+nf}{storeDerivation}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{drv}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{withStore}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{st\PYGZsq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Retrieve a derivation \PYGZhy{} available in any context}
+\PYG{n+nf}{retrieveDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{p}{)}
+\PYG{n+nf}{retrieveDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return\PYGZhy{}continuation pattern (monadic join)}
+\PYG{n+nf}{joinDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPhase}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}
+\PYG{n+nf}{joinDerivation}\PYG{+w}{ }\PYG{n}{sBuild}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation with runtime checks based on singleton evidence}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} ...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Helper for safely transitioning to build phase}
+\PYG{n+nf}{evaluateThenBuild}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{BuildResult}
+\PYG{n+nf}{evaluateThenBuild}\PYG{+w}{ }\PYG{n}{eval}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sBuild}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation with safe phase transition}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} ...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Universal do\PYGZhy{}notation entry point}
+\PYG{n+nf}{derivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{DerivationAttrs}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}
+\PYG{n+nf}{derivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{mkDerivation}
+\end{MintedVerbatim}

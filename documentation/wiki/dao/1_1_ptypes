@@ -1,0 +1,12 @@
+They create compile-time errors rather than runtime failures
+They make illegal states unrepresentable in the type system
+They enable the compiler to prevent phase confusion entirely, not just detect it
+
+However, you're right that Ten could use them more holistically by:
+
+Adding phase-specific operations through typeclasses with phase constraints
+Implementing phase transitions explicitly as type-changing operations
+Using more sophisticated phantom type machinery like type families to encode invariants
+Creating proof-carrying code that validates phase transitions
+
+A more advanced implementation would use phantom types to track not just phases but derived properties and effects, moving beyond simple labeling to encode complex guarantees in the type signature itself.

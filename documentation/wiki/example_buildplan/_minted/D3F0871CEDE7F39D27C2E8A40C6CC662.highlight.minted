@@ -1,0 +1,470 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE OverloadedStrings \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Config}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Exception}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{try}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{when}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{unless}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Aeson}\PYG{+w}{ }\PYG{p}{(}\PYG{p}{(}\PYG{o}{.:}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{p}{(}\PYG{o}{.=}\PYG{p}{)}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Aeson}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Aeson}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteString}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{BS}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteString.Lazy}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{LBS}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Maybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{fromMaybe}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{isNothing}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Set}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Text}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{T}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text.Encoding}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{TE}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Console.GetOpt}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{OptDescr}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{ArgDescr}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{ArgOrder}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getOpt}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Directory}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{doesFileExist}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getHomeDirectory}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{createDirectoryIfMissing}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Environment}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{getEnv}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{lookupEnv}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.FilePath}\PYG{+w}{ }\PYG{p}{(}\PYG{p}{(}\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{takeDirectory}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Posix.User}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{getEffectiveUserID}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getUserEntryForID}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{userName}\PYG{p}{)}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Daemon configuration with privilege\PYGZhy{}aware settings}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Network settings}
+\PYG{+w}{    }\PYG{n}{daemonSocketPath}\PYG{+w}{    }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to the daemon socket}
+\PYG{+w}{    }\PYG{n}{daemonPort}\PYG{+w}{          }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{,}\PYG{+w}{     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Optional TCP port for remote connections}
+\PYG{+w}{    }\PYG{n}{daemonBindAddress}\PYG{+w}{   }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Optional bind address for TCP connections}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Storage settings}
+\PYG{+w}{    }\PYG{n}{daemonStorePath}\PYG{+w}{     }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to the content\PYGZhy{}addressable store}
+\PYG{+w}{    }\PYG{n}{daemonStateFile}\PYG{+w}{     }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to the daemon state file}
+\PYG{+w}{    }\PYG{n}{daemonTmpDir}\PYG{+w}{        }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path for temporary files}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build settings}
+\PYG{+w}{    }\PYG{n}{daemonMaxJobs}\PYG{+w}{       }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{,}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Maximum concurrent build jobs}
+\PYG{+w}{    }\PYG{n}{daemonBuildTimeout}\PYG{+w}{  }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{,}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Build timeout in seconds (0 = no timeout)}
+\PYG{+w}{    }\PYG{n}{daemonKeepFailed}\PYG{+w}{    }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{,}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Keep failed build outputs for inspection}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Privilege and security settings}
+\PYG{+w}{    }\PYG{n}{daemonUser}\PYG{+w}{          }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} User to run daemon as (if running as root)}
+\PYG{+w}{    }\PYG{n}{daemonGroup}\PYG{+w}{         }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Group to run daemon as (if running as root)}
+\PYG{+w}{    }\PYG{n}{daemonAllowedUsers}\PYG{+w}{  }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Users allowed to connect to daemon}
+\PYG{+w}{    }\PYG{n}{daemonRequireAuth}\PYG{+w}{   }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{,}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Whether authentication is required}
+\PYG{+w}{    }\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{,}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Whether to allow privilege escalation}
+\PYG{+w}{    }\PYG{n}{daemonPrivilegeModel}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeModel}\PYG{p}{,}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} How to handle privileges}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Logging settings}
+\PYG{+w}{    }\PYG{n}{daemonLogFile}\PYG{+w}{       }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to log file (Nothing = stdout)}
+\PYG{+w}{    }\PYG{n}{daemonLogLevel}\PYG{+w}{      }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{LogLevel}\PYG{p}{,}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Logging verbosity}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Daemon behavior settings}
+\PYG{+w}{    }\PYG{n}{daemonForeground}\PYG{+w}{    }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{,}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Run in foreground (don\PYGZsq{}t daemonize)}
+\PYG{+w}{    }\PYG{n}{daemonAutoStart}\PYG{+w}{     }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{,}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Auto\PYGZhy{}start daemon when client connects if not running}
+\PYG{+w}{    }\PYG{n}{daemonRestrictive}\PYG{+w}{   }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Use more restrictive sandbox settings}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Log levels}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{LogLevel}
+\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{LogQuiet}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Minimal logging}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{LogNormal}\PYG{+w}{     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Standard logging}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{LogVerbose}\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Verbose logging}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{LogDebug}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Debug level logging}
+\PYG{+w}{    }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Ord}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Enum}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Bounded}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Privilege handling model}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{PrivilegeModel}
+\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{PrivilegeAlwaysDrop}\PYG{+w}{     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Always drop privileges (safest)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PrivilegeDropSelective}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Drop privileges selectively}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PrivilegeNoDrop}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Never drop privileges (only for special cases)}
+\PYG{+w}{    }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Load daemon configuration from a file}
+\PYG{n+nf}{loadDaemonConfig}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Config file path}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{p}{)}
+\PYG{n+nf}{loadDaemonConfig}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the file exists}
+\PYG{+w}{    }\PYG{n}{exists}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{doesFileExist}\PYG{+w}{ }\PYG{n}{path}
+
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{exists}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Configuration file not found: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Read and parse the file}
+\PYG{+w}{            }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{try}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{readFile}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{result}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{ex}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Error reading configuration file: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{show}\PYG{+w}{ }\PYG{n}{ex}
+
+\PYG{+w}{                }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Aeson}\PYG{o}{.}\PYG{n}{eitherDecodeStrict}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Error parsing configuration: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{err}
+
+\PYG{+w}{                        }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate the loaded configuration}
+\PYG{+w}{                            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{validateConfig}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                                }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}
+\PYG{+w}{                                }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{validConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{validConfig}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Get default configuration considering user permissions}
+\PYG{n+nf}{getDefaultConfig}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}
+\PYG{n+nf}{getDefaultConfig}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get current user information}
+\PYG{+w}{    }\PYG{n}{uid}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getEffectiveUserID}
+\PYG{+w}{    }\PYG{n}{userEntry}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getUserEntryForID}\PYG{+w}{ }\PYG{n}{uid}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{currentUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{userName}\PYG{+w}{ }\PYG{n}{userEntry}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Determine if we\PYGZsq{}re running as root}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{isRoot}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{uid}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{l+m+mi}{0}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get home directory for non\PYGZhy{}root paths}
+\PYG{+w}{    }\PYG{n}{homeDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getHomeDirectory}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get XDG directories}
+\PYG{+w}{    }\PYG{n}{xdgConfigHome}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{XDG\PYGZus{}CONFIG\PYGZus{}HOME}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{xdgConfigDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{homeDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{.config}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{xdgConfigHome}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{tenConfigDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{xdgConfigDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ten}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{n}{xdgDataHome}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{XDG\PYGZus{}DATA\PYGZus{}HOME}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{xdgDataDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{homeDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{.local/share}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{xdgDataHome}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{tenDataDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{xdgDataDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ten}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{n}{xdgStateHome}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{XDG\PYGZus{}STATE\PYGZus{}HOME}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{xdgStateDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{homeDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{.local/state}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{xdgStateHome}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{tenStateDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{xdgStateDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ten}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create directories if they don\PYGZsq{}t exist}
+\PYG{+w}{    }\PYG{n}{mapM\PYGZus{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{p}{)}
+\PYG{+w}{          }\PYG{p}{[}\PYG{n}{tenConfigDir}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{tenDataDir}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{tenStateDir}\PYG{p}{]}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Modify default config based on whether we\PYGZsq{}re root or not}
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{isRoot}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{defaultDaemonConfig}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{defaultDaemonConfig}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Non\PYGZhy{}root appropriate paths}
+\PYG{+w}{            }\PYG{n}{daemonSocketPath}\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{tenStateDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{daemon.sock}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonStorePath}\PYG{+w}{     }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{tenDataDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{store}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonStateFile}\PYG{+w}{     }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{tenStateDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{daemon\PYGZhy{}state.json}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonTmpDir}\PYG{+w}{        }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{tenStateDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{tmp}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonLogFile}\PYG{+w}{       }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{tenStateDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{daemon.log}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{p}{,}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Always run in foreground when not root}
+\PYG{+w}{            }\PYG{n}{daemonForeground}\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{p}{,}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Set current user as default allowed user}
+\PYG{+w}{            }\PYG{n}{daemonAllowedUsers}\PYG{+w}{  }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{singleton}\PYG{+w}{ }\PYG{n}{currentUser}\PYG{p}{,}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Non\PYGZhy{}root users can\PYGZsq{}t allow privilege escalation}
+\PYG{+w}{            }\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Default daemon configuration}
+\PYG{n+nf}{defaultDaemonConfig}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}
+\PYG{n+nf}{defaultDaemonConfig}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Network defaults}
+\PYG{+w}{    }\PYG{n}{daemonSocketPath}\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{/var/run/ten/daemon.sock}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonPort}\PYG{+w}{          }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Nothing}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonBindAddress}\PYG{+w}{   }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Nothing}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Storage defaults}
+\PYG{+w}{    }\PYG{n}{daemonStorePath}\PYG{+w}{     }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{/var/lib/ten/store}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonStateFile}\PYG{+w}{     }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{/var/lib/ten/daemon\PYGZhy{}state.json}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonTmpDir}\PYG{+w}{        }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{/var/lib/ten/tmp}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build defaults}
+\PYG{+w}{    }\PYG{n}{daemonMaxJobs}\PYG{+w}{       }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+m+mi}{4}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonBuildTimeout}\PYG{+w}{  }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+m+mi}{3600}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1 hour}
+\PYG{+w}{    }\PYG{n}{daemonKeepFailed}\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Privilege and security defaults}
+\PYG{+w}{    }\PYG{n}{daemonUser}\PYG{+w}{          }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Nothing}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonGroup}\PYG{+w}{         }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Nothing}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonAllowedUsers}\PYG{+w}{  }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{empty}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Empty means all users allowed}
+\PYG{+w}{    }\PYG{n}{daemonRequireAuth}\PYG{+w}{   }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} By default, don\PYGZsq{}t allow privilege escalation}
+\PYG{+w}{    }\PYG{n}{daemonPrivilegeModel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{PrivilegeAlwaysDrop}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Most secure default}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Logging defaults}
+\PYG{+w}{    }\PYG{n}{daemonLogFile}\PYG{+w}{       }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{/var/log/ten/daemon.log}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonLogLevel}\PYG{+w}{      }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{LogNormal}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Behavior defaults}
+\PYG{+w}{    }\PYG{n}{daemonForeground}\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonAutoStart}\PYG{+w}{     }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{daemonRestrictive}\PYG{+w}{   }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Save configuration to a file}
+\PYG{n+nf}{saveConfigToFile}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Config file path}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration to save}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{p}{)}
+\PYG{n+nf}{saveConfigToFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create directory if needed}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{dir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{takeDirectory}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{    }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{try}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{n}{dir}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{result}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{ex}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Error creating directory: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{show}\PYG{+w}{ }\PYG{n}{ex}
+
+\PYG{+w}{        }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Write the config}
+\PYG{+w}{            }\PYG{n}{writeResult}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{try}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{LBS}\PYG{o}{.}\PYG{n}{writeFile}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Aeson}\PYG{o}{.}\PYG{n}{encode}\PYG{+w}{ }\PYG{n}{config}\PYG{p}{)}
+
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{writeResult}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{ex}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Error writing configuration: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{show}\PYG{+w}{ }\PYG{n}{ex}
+
+\PYG{+w}{                }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n+nb}{()}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Load configuration from environment variables}
+\PYG{n+nf}{loadConfigFromEnv}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}
+\PYG{n+nf}{loadConfigFromEnv}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Start with default config}
+\PYG{+w}{    }\PYG{n}{defaultConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getDefaultConfig}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Override with environment variables}
+\PYG{+w}{    }\PYG{n}{mSocketPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}SOCKET}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mPort}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvInt}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}PORT}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mBindAddr}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}BIND\PYGZus{}ADDRESS}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mStorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}STORE\PYGZus{}PATH}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mStateFile}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}STATE\PYGZus{}FILE}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mTmpDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}TMP\PYGZus{}DIR}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mMaxJobs}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvInt}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}MAX\PYGZus{}JOBS}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mTimeout}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvInt}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}BUILD\PYGZus{}TIMEOUT}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mKeepFailed}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvBool}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}KEEP\PYGZus{}FAILED}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mUser}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvText}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}USER}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mGroup}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvText}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}GROUP}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mAllowedUsers}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvTextList}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}ALLOWED\PYGZus{}USERS}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mRequireAuth}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvBool}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}REQUIRE\PYGZus{}AUTH}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mAllowPrivEsc}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvBool}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}ALLOW\PYGZus{}PRIVILEGE\PYGZus{}ESCALATION}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mPrivModel}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvPrivModel}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}PRIVILEGE\PYGZus{}MODEL}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mLogFile}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}LOG\PYGZus{}FILE}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mLogLevel}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvLogLevel}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}LOG\PYGZus{}LEVEL}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mForeground}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvBool}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}FOREGROUND}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mAutoStart}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvBool}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}AUTO\PYGZus{}START}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{mRestrictive}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnvBool}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TEN\PYGZus{}DAEMON\PYGZus{}RESTRICTIVE}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Apply all overrides}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{daemonSocketPath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonSocketPath}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mSocketPath}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonPort}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{mPort}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{n}{daemonPort}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonBindAddress}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{mBindAddr}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{n}{daemonBindAddress}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonStorePath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonStorePath}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mStorePath}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonStateFile}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonStateFile}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mStateFile}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonTmpDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonTmpDir}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mTmpDir}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonMaxJobs}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonMaxJobs}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mMaxJobs}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonBuildTimeout}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonBuildTimeout}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mTimeout}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonKeepFailed}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonKeepFailed}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mKeepFailed}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{mUser}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{n}{daemonUser}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonGroup}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{mGroup}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{n}{daemonGroup}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonAllowedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{maybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonAllowedUsers}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{fromList}\PYG{+w}{ }\PYG{n}{mAllowedUsers}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonRequireAuth}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonRequireAuth}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mRequireAuth}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mAllowPrivEsc}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonPrivilegeModel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonPrivilegeModel}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mPrivModel}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonLogFile}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{                }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{mLogFile}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{stdout}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{                }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{                }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{mLogFile}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{n}{daemonLogFile}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonLogLevel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonLogLevel}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mLogLevel}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonForeground}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonForeground}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mForeground}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonAutoStart}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonAutoStart}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mAutoStart}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{daemonRestrictive}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromMaybe}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonRestrictive}\PYG{+w}{ }\PYG{n}{defaultConfig}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{mRestrictive}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate the final config}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{validateConfig}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n+ne}{error}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid configuration from environment: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{err}
+\PYG{+w}{        }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{validConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{validConfig}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Command\PYGZhy{}line option descriptions for daemon configuration}
+\PYG{n+nf}{configOptionDescriptions}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{OptDescr}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{p}{)}\PYG{p}{]}
+\PYG{n+nf}{configOptionDescriptions}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{p}{[}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}s\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{socket}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{s}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonSocketPath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{PATH}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Path to daemon socket}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}p\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{port}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{p}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonPort}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{read}\PYG{+w}{ }\PYG{n}{p}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{PORT}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{TCP port for remote connections}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}b\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{bind}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{b}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonBindAddress}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{b}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ADDRESS}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Bind address for TCP connections}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{store}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{s}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonStorePath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{PATH}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Path to store directory}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{state\PYGZhy{}file}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{s}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonStateFile}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{PATH}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Path to daemon state file}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{tmp\PYGZhy{}dir}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{t}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonTmpDir}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{PATH}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Path for temporary files}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}j\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{jobs}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{j}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonMaxJobs}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{read}\PYG{+w}{ }\PYG{n}{j}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{N}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Maximum concurrent build jobs}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{timeout}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{t}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonBuildTimeout}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{read}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{SECONDS}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Build timeout in seconds (0 = no timeout)}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}k\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{keep\PYGZhy{}failed}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonKeepFailed}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Keep failed build outputs}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}u\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{user}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{u}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{n}{u}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{USER}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User to run daemon as}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}g\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{group}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{g}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonGroup}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{n}{g}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{GROUP}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Group to run daemon as}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{allowed\PYGZhy{}users}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{us}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{daemonAllowedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{fromList}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{map}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{strip}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{map}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{splitOn}\PYG{+w}{ }\PYG{l+s+sc}{\PYGZsq{},\PYGZsq{}}\PYG{+w}{ }\PYG{n}{us}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{USER1,USER2,...}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Users allowed to connect to daemon}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{no\PYGZhy{}auth}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonRequireAuth}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Disable authentication requirement}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{allow\PYGZhy{}privilege\PYGZhy{}escalation}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Allow users to escalate privileges (dangerous)}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{privilege\PYGZhy{}model}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{m}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{daemonPrivilegeModel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{parsePrivilegeModel}\PYG{+w}{ }\PYG{n}{m}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{always\PYGZhy{}drop|selective|no\PYGZhy{}drop}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Privilege model (how to handle privilege dropping)}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{log\PYGZhy{}file}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ReqArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{f}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{daemonLogFile}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{stdout}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{f}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{PATH}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Path to log file (stdout = log to standard output)}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}q\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{quiet}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonLogLevel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{LogQuiet}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Minimal logging}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}v\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{verbose}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonLogLevel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{LogVerbose}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Verbose logging}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}d\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{debug}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonLogLevel}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{LogDebug}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Debug logging}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}f\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{foreground}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonForeground}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Run in foreground (don\PYGZsq{}t daemonize)}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{no\PYGZhy{}auto\PYGZhy{}start}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonAutoStart}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Don\PYGZsq{}t auto\PYGZhy{}start daemon when client connects}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Option}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s+sc}{\PYGZsq{}r\PYGZsq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{[}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{restrictive}\PYG{l+s}{\PYGZdq{}}\PYG{p}{]}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{NoArg}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{cfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{cfg}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{daemonRestrictive}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Use more restrictive sandbox settings}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{p}{]}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Parse daemon configuration from command\PYGZhy{}line arguments}
+\PYG{n+nf}{parseConfigFromArgs}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{p}{[}\PYG{k+kt}{String}\PYG{p}{]}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Command\PYGZhy{}line arguments}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{p}{)}
+\PYG{n+nf}{parseConfigFromArgs}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{args}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get default configuration}
+\PYG{+w}{    }\PYG{n}{defaultCfg}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getDefaultConfig}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Parse command\PYGZhy{}line arguments}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{getOpt}\PYG{+w}{ }\PYG{k+kt}{Permute}\PYG{+w}{ }\PYG{n}{configOptionDescriptions}\PYG{+w}{ }\PYG{n}{args}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n}{options}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Apply options to default configuration}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{foldl}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{flip}\PYG{+w}{ }\PYG{n}{id}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{defaultCfg}\PYG{+w}{ }\PYG{n}{options}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate the resulting configuration}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{validateConfig}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kr}{\PYGZus{}}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{errors}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{concat}\PYG{+w}{ }\PYG{n}{errors}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Validate a daemon configuration}
+\PYG{n+nf}{validateConfig}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}
+\PYG{n+nf}{validateConfig}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check for required fields}
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{null}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{daemonSocketPath}\PYG{+w}{ }\PYG{n}{config}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Socket path cannot be empty}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{null}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{daemonStorePath}\PYG{+w}{ }\PYG{n}{config}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Store path cannot be empty}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonMaxJobs}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o}{\PYGZlt{}=}\PYG{+w}{ }\PYG{l+m+mi}{0}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Maximum jobs must be positive}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonBuildTimeout}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o}{\PYGZlt{}}\PYG{+w}{ }\PYG{l+m+mi}{0}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Build timeout cannot be negative}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if privilege escalation is configured safely}
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonRequireAuth}\PYG{+w}{ }\PYG{n}{config}\PYG{p}{)}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Cannot allow privilege escalation without authentication}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check port range if specified}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{daemonPort}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{port}\PYG{+w}{ }\PYG{o}{|}\PYG{+w}{ }\PYG{n}{port}\PYG{+w}{ }\PYG{o}{\PYGZlt{}=}\PYG{+w}{ }\PYG{l+m+mi}{0}\PYG{+w}{ }\PYG{o}{||}\PYG{+w}{ }\PYG{n}{port}\PYG{+w}{ }\PYG{o}{\PYGZgt{}}\PYG{+w}{ }\PYG{l+m+mi}{65535}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Port number must be between 1 and 65535}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{        }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n+nb}{()}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return the validated config}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to lookup environment variable as Int}
+\PYG{n+nf}{lookupEnvInt}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{)}
+\PYG{n+nf}{lookupEnvInt}\PYG{+w}{ }\PYG{n}{name}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{mValue}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{n}{name}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mValue}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{reads}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{            }\PYG{p}{[}\PYG{p}{(}\PYG{n}{num}\PYG{p}{,}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{p}{]}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{num}
+\PYG{+w}{            }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to lookup environment variable as Bool}
+\PYG{n+nf}{lookupEnvBool}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{)}
+\PYG{n+nf}{lookupEnvBool}\PYG{+w}{ }\PYG{n}{name}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{mValue}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{n}{name}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mValue}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{toLower}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{true}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{yes}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{1}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{false}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{False}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{no}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{False}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{0}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{False}
+\PYG{+w}{            }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to lookup environment variable as Text}
+\PYG{n+nf}{lookupEnvText}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{)}
+\PYG{n+nf}{lookupEnvText}\PYG{+w}{ }\PYG{n}{name}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{mValue}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{n}{name}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{mValue}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to lookup environment variable as Text list}
+\PYG{n+nf}{lookupEnvTextList}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{Text}\PYG{p}{]}\PYG{p}{)}
+\PYG{n+nf}{lookupEnvTextList}\PYG{+w}{ }\PYG{n}{name}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{mValue}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{n}{name}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mValue}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{map}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{strip}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{map}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{splitOn}\PYG{+w}{ }\PYG{l+s+sc}{\PYGZsq{},\PYGZsq{}}\PYG{+w}{ }\PYG{n}{value}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to lookup environment variable as LogLevel}
+\PYG{n+nf}{lookupEnvLogLevel}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{LogLevel}\PYG{p}{)}
+\PYG{n+nf}{lookupEnvLogLevel}\PYG{+w}{ }\PYG{n}{name}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{mValue}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{n}{name}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mValue}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{toLower}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{quiet}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{LogQuiet}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{normal}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{LogNormal}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{verbose}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{LogVerbose}
+\PYG{+w}{            }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{debug}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{k+kt}{LogDebug}
+\PYG{+w}{            }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{reads}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{p}{[}\PYG{p}{(}\PYG{n}{num}\PYG{p}{,}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{p}{]}\PYG{+w}{ }\PYG{o}{|}\PYG{+w}{ }\PYG{n}{num}\PYG{+w}{ }\PYG{o}{\PYGZgt{}=}\PYG{+w}{ }\PYG{l+m+mi}{0}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{num}\PYG{+w}{ }\PYG{o}{\PYGZlt{}=}\PYG{+w}{ }\PYG{l+m+mi}{3}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{toEnum}\PYG{+w}{ }\PYG{n}{num}
+\PYG{+w}{                }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to lookup environment variable as PrivilegeModel}
+\PYG{n+nf}{lookupEnvPrivModel}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{PrivilegeModel}\PYG{p}{)}
+\PYG{n+nf}{lookupEnvPrivModel}\PYG{+w}{ }\PYG{n}{name}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{mValue}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{n}{name}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mValue}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{value}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{parsePrivilegeModel}\PYG{+w}{ }\PYG{n}{value}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Parse privilege model from string}
+\PYG{n+nf}{parsePrivilegeModel}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeModel}
+\PYG{n+nf}{parsePrivilegeModel}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{toLower}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{    }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{always\PYGZhy{}drop}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeAlwaysDrop}
+\PYG{+w}{    }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{selective}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeDropSelective}
+\PYG{+w}{    }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{no\PYGZhy{}drop}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeNoDrop}
+\PYG{+w}{    }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeAlwaysDrop}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Default to safest option}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | String utilities}
+\PYG{n+nf}{splitOn}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Char}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{String}\PYG{p}{]}
+\PYG{n+nf}{splitOn}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{break}\PYG{+w}{ }\PYG{p}{(}\PYG{o}{==}\PYG{+w}{ }\PYG{n}{c}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{s}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{    }\PYG{p}{(}\PYG{n}{chunk}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{[]}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{p}{[}\PYG{n}{chunk}\PYG{p}{]}
+\PYG{+w}{    }\PYG{p}{(}\PYG{n}{chunk}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{k+kt}{:}\PYG{n}{rest}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{chunk}\PYG{+w}{ }\PYG{k+kt}{:}\PYG{+w}{ }\PYG{n}{splitOn}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{n}{rest}
+
+\PYG{n+nf}{toLower}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{String}
+\PYG{n+nf}{toLower}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{map}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{c}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{o}{\PYGZgt{}=}\PYG{+w}{ }\PYG{l+s+sc}{\PYGZsq{}A\PYGZsq{}}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{o}{\PYGZlt{}=}\PYG{+w}{ }\PYG{l+s+sc}{\PYGZsq{}Z\PYGZsq{}}\PYG{+w}{ }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{toEnum}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{fromEnum}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{o}{+}\PYG{+w}{ }\PYG{l+m+mi}{32}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{c}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper for optional values}
+\PYG{p}{(}\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{n}{a}
+\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{n}{x}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{x}
+\PYG{n+nf}{x}\PYG{+w}{ }\PYG{o}{\PYGZlt{}|\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{x}
+\end{MintedVerbatim}

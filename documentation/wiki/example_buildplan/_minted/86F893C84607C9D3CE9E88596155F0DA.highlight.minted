@@ -1,0 +1,139 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TemplateHaskell \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeFamilies \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE KindSignatures \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE PolyKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE StandaloneDeriving \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE UndecidableInstances \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeOperators \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE RankNTypes \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Singletons.TH}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Kind}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Type}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.State}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Define the core kinds}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Eval}\PYG{+w}{ }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Build}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Builder}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate singletons using Template Haskell}
+\PYG{o}{\PYGZdl{}}\PYG{p}{(}\PYG{n}{genSingletons}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{\PYGZsq{}\PYGZsq{}Phase}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}\PYGZsq{}PrivilegeTier}\PYG{p}{]}\PYG{p}{)}
+\PYG{o}{\PYGZdl{}}\PYG{p}{(}\PYG{n}{singDecideInstances}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{\PYGZsq{}\PYGZsq{}Phase}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}\PYGZsq{}PrivilegeTier}\PYG{p}{]}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Type families for permissions and capabilities}
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{  }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{  }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanCreateSandbox}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{  }\PYG{k+kt}{CanCreateSandbox}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{  }\PYG{k+kt}{CanCreateSandbox}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanEvaluate}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{  }\PYG{k+kt}{CanEvaluate}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{  }\PYG{k+kt}{CanEvaluate}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanBuild}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{  }\PYG{k+kt}{CanBuild}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{  }\PYG{k+kt}{CanBuild}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Error types}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{    }\PYG{k+kt}{EvalError}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{  }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{BuildFailed}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{  }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{StoreError}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{  }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{SandboxError}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{  }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{  }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PhaseError}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Other error types}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Environment and state types}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{workDir}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{storeLocation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{verbosity}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{,}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Runtime representation for privilege checking}
+\PYG{+w}{    }\PYG{n}{currentPrivilege}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomePrivilegeTier}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{currentPhaseRep}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomePhase}\PYG{p}{,}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Other fields}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{BuildState}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{BuildState}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} State fields}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Core monad definition with singleton evidence}
+\PYG{k+kr}{newtype}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{runTenM}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SPhase}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{              }\PYG{k+kt}{ReaderT}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{StateT}\PYG{+w}{ }\PYG{k+kt}{BuildState}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ExceptT}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{p}{)}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Instances}
+\PYG{k+kr}{instance}\PYG{+w}{ }\PYG{k+kt}{Functor}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{n}{fmap}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{g}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{fmap}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{g}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+
+\PYG{k+kr}{instance}\PYG{+w}{ }\PYG{k+kt}{Applicative}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{n}{pure}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{pure}\PYG{+w}{ }\PYG{n}{a}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{f}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZlt{}*\PYGZgt{}}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{g}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o}{\PYGZlt{}*\PYGZgt{}}\PYG{+w}{ }\PYG{n}{g}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{k+kr}{instance}\PYG{+w}{ }\PYG{k+kt}{Monad}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZgt{}\PYGZgt{}=}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{        }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m\PYGZsq{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{n}{a}
+\PYG{+w}{        }\PYG{n}{m\PYGZsq{}}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Helper for singleton creation}
+\PYG{n+nf}{phase}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{o}{.}\PYG{+w}{ }\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{SPhase}\PYG{+w}{ }\PYG{n}{p}
+\PYG{n+nf}{phase}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{sing}
+
+\PYG{n+nf}{privilege}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}\PYG{+w}{ }\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}
+\PYG{n+nf}{privilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{sing}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Phase transition with singleton evidence}
+\PYG{n+nf}{transitionPhase}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{q}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{p}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{q}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{q}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}
+\PYG{n+nf}{transitionPhase}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{n}{m}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{phase}\PYG{+w}{ }\PYG{o}{@}\PYG{n}{p}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Privilege transition with singleton evidence}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can only drop privileges, never gain them}
+\PYG{n+nf}{transitionPrivilege}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t\PYGZsq{}}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t\PYGZsq{}}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o}{\PYGZti{}}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{n}{t\PYGZsq{}}\PYG{+w}{ }\PYG{o}{\PYGZti{}}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t\PYGZsq{}}\PYG{+w}{ }\PYG{n}{a}
+\PYG{n+nf}{transitionPrivilege}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{privilege}\PYG{+w}{ }\PYG{o}{@}\PYG{n}{t}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Runtime wrappers for operations with compile\PYGZhy{}time and runtime checks}
+\PYG{n+nf}{withStore}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o}{\PYGZti{}}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}
+\PYG{n+nf}{withStore}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{    }\PYG{k+kr}{in}\PYG{+w}{ }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{n+nf}{withBuild}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{p}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{CanBuild}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{o}{\PYGZti{}}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SPhase}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}
+\PYG{n+nf}{withBuild}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{n}{sp}
+\PYG{+w}{    }\PYG{k+kr}{in}\PYG{+w}{ }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Execution functions}
+\PYG{n+nf}{runTen}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{p}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{a}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{p}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuildState}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{a}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{BuildState}\PYG{p}{)}\PYG{p}{)}
+\PYG{n+nf}{runTen}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{env}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{    }\PYG{n}{runExceptT}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{runStateT}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{runReaderT}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{m}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{phase}\PYG{+w}{ }\PYG{o}{@}\PYG{n}{p}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{privilege}\PYG{+w}{ }\PYG{o}{@}\PYG{n}{t}\PYG{p}{)}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{env}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Other core functions and instances}
+\end{MintedVerbatim}

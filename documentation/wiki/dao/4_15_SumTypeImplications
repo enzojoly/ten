@@ -1,0 +1,15 @@
+Sum Types
+Sum types (also called tagged unions or discriminated unions) represent values that could be one of several different types.
+Each constructor in a sum type contains a value of a specific type, creating a "sum" of possible value spaces.
+
+
+Implications for Ten's Goals
+These functional programming concepts are essential to Ten's goals as an architectural prototype for Nix-like systems:
+
+Type-Level Guarantees: The sum types enable Ten to provide stronger static guarantees than existing build systems.
+
+
+Formal Verification: The categorical structure allows Ten to formally verify build properties through its proof system.
+Prototyping Foundation: By using these foundational concepts, Ten provides a clean mathematical base for experimenting with build system design.
+DSL Design: The algebraic structure informs Ten's DSL design, making it more composable and easier to reason about.
+Research Platform: The explicit use of category theory concepts makes Ten valuable as a research platform for exploring build system semantics.

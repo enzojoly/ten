@@ -1,0 +1,305 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE OverloadedStrings \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE LambdaCase \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE FlexibleContexts \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.CLI}\PYG{+w}{ }\PYG{p}{(}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Command types}
+\PYG{+w}{    }\PYG{k+kt}{Command}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{Options}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{defaultOptions}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Command parsing}
+\PYG{+w}{    }\PYG{n+nf}{parseArgs}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Context\PYGZhy{}aware command execution}
+\PYG{+w}{    }\PYG{n+nf}{runCommand}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{executeInContext}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Privilege\PYGZhy{}aware dispatch}
+\PYG{+w}{    }\PYG{n+nf}{dispatchCommand}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{elevatePrivileges}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Context handlers}
+\PYG{+w}{    }\PYG{n+nf}{handleBuild}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{handleEval}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{handleStore}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{handleGC}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Daemon communication}
+\PYG{+w}{    }\PYG{n+nf}{withDaemonConnection}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{requestFromDaemon}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Utility functions}
+\PYG{+w}{    }\PYG{n+nf}{isPrivilegedOperation}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{ensureDirectory}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Error reporting}
+\PYG{+w}{    }\PYG{n+nf}{reportError}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n+nf}{reportPrivilegeError}
+\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{ask}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{asks}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.State}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{get}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{modify}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{throwError}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{catchError}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.IO.Class}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{liftIO}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Text}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{T}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Environment}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{getArgs}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getProgName}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Exit}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{exitSuccess}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{exitFailure}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Directory}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{doesFileExist}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{createDirectoryIfMissing}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.FilePath}\PYG{+w}{ }\PYG{p}{(}\PYG{p}{(}\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Posix.User}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{getEffectiveUserID}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{System.Process}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Process}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Store}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Build}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Derivation}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Graph}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Protocol}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Client}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Run a command with context\PYGZhy{}aware privilege handling}
+\PYG{n+nf}{runCommand}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Options}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{runCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Determine required privilege tier for this command}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{requiredPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{commandPrivilege}\PYG{+w}{ }\PYG{n}{cmd}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check current privileges}
+\PYG{+w}{    }\PYG{n}{currentUID}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getEffectiveUserID}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hasPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{currentUID}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{l+m+mi}{0}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Set up environment based on privilege context}
+\PYG{+w}{    }\PYG{n}{env}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{hasPrivilege}
+\PYG{+w}{           }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{setupDaemonEnv}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{           }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{setupBuilderEnv}\PYG{+w}{ }\PYG{n}{options}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Execute command based on privilege context}
+\PYG{+w}{    }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{requiredPrivilege}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{hasPrivilege}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{DaemonRequired}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Execute directly with daemon privileges}
+\PYG{+w}{            }\PYG{n}{runTenDaemon}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{executeCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{env}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{initBuildState}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{commandPhase}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{p}{)}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{DaemonRequired}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Need to use daemon protocol}
+\PYG{+w}{            }\PYG{n}{withDaemonConnection}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{conn}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                }\PYG{n}{runTenBuilder}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{requestCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{+w}{ }\PYG{n}{conn}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{env}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{initBuildState}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{commandPhase}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{p}{)}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{BuilderSufficient}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can run in either context}
+\PYG{+w}{            }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{hasPrivilege}
+\PYG{+w}{                }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{runTenDaemon}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{executeCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{env}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{initBuildState}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{commandPhase}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{                }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{runTenBuilder}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{executeCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{env}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{initBuildState}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{commandPhase}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Handle result}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{result}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{reportError}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o}{\PYGZgt{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{exitFailure}
+\PYG{+w}{        }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{exitSuccess}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Determine which privilege tier is needed for a command}
+\PYG{n+nf}{commandPrivilege}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeRequirement}
+\PYG{n+nf}{commandPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{case}
+\PYG{+w}{    }\PYG{k+kt}{Build}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build can use either context}
+\PYG{+w}{    }\PYG{k+kt}{Eval}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Eval can use either context}
+\PYG{+w}{    }\PYG{k+kt}{Store}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{StoreAdd}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonRequired}\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Adding to store needs daemon privileges}
+\PYG{+w}{    }\PYG{k+kt}{Store}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{StoreList}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Listing can use either}
+\PYG{+w}{    }\PYG{k+kt}{Store}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{StoreGC}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonRequired}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} GC needs daemon privileges}
+\PYG{+w}{    }\PYG{k+kt}{GC}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonRequired}\PYG{+w}{                  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} GC needs daemon privileges}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{RegisterDerivation}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonRequired}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Registration needs daemon}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{QueryDerivation}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Query works in either context}
+\PYG{+w}{    }\PYG{k+kt}{Help}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Help works in any context}
+\PYG{+w}{    }\PYG{k+kt}{Version}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Version info works in any context}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Determine which phase a command operates in}
+\PYG{n+nf}{commandPhase}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Phase}
+\PYG{n+nf}{commandPhase}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{case}
+\PYG{+w}{    }\PYG{k+kt}{Build}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Build}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build command uses Build phase}
+\PYG{+w}{    }\PYG{k+kt}{Eval}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Eval}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Eval command uses Eval phase}
+\PYG{+w}{    }\PYG{k+kt}{Store}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Build}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Store commands use Build phase}
+\PYG{+w}{    }\PYG{k+kt}{GC}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Build}\PYG{+w}{                 }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} GC uses Build phase}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Eval}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Derivation commands use Eval phase}
+\PYG{+w}{    }\PYG{k+kt}{Help}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Build}\PYG{+w}{                 }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Help works in any phase}
+\PYG{+w}{    }\PYG{k+kt}{Version}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Build}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Version works in any phase}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Set up the daemon environment (privileged)}
+\PYG{n+nf}{setupDaemonEnv}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Options}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}
+\PYG{n+nf}{setupDaemonEnv}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create store and work directories}
+\PYG{+w}{    }\PYG{n}{storePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{resolveStorePath}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{    }\PYG{n}{workDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{resolveWorkDir}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{    }\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{n}{storePath}
+\PYG{+w}{    }\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{n}{workDir}
+
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{initDaemonEnv}\PYG{+w}{ }\PYG{n}{workDir}\PYG{+w}{ }\PYG{n}{storePath}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{root}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Set up the builder environment (unprivileged)}
+\PYG{n+nf}{setupBuilderEnv}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Options}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}
+\PYG{n+nf}{setupBuilderEnv}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create store and work directories}
+\PYG{+w}{    }\PYG{n}{storePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{resolveStorePath}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{    }\PYG{n}{workDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{resolveWorkDir}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{    }\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{n}{workDir}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Establish daemon connection if needed and available}
+\PYG{+w}{    }\PYG{n}{mConn}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{optUseDaemon}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{             }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{tryConnectDaemon}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{             }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mConn}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{conn}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{initClientEnv}\PYG{+w}{ }\PYG{n}{workDir}\PYG{+w}{ }\PYG{n}{storePath}\PYG{+w}{ }\PYG{n}{conn}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{initBuildEnv}\PYG{+w}{ }\PYG{n}{workDir}\PYG{+w}{ }\PYG{n}{storePath}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Try to connect to the daemon}
+\PYG{n+nf}{tryConnectDaemon}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Options}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{DaemonConnection}\PYG{p}{)}
+\PYG{n+nf}{tryConnectDaemon}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get socket path from options or default}
+\PYG{+w}{    }\PYG{n}{socketPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{optDaemonSocket}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{getDefaultSocketPath}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Try to connect}
+\PYG{+w}{    }\PYG{n}{runExceptT}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{credentials}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getUserCredentials}
+\PYG{+w}{        }\PYG{n}{connectToDaemon}\PYG{+w}{ }\PYG{n}{socketPath}\PYG{+w}{ }\PYG{n}{credentials}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Execute commands in the appropriate phase and privilege context}
+\PYG{n+nf}{executeCommand}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{PhaseOf}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ContextOf}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{executeCommand}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{case}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Eval phase commands}
+\PYG{+w}{    }\PYG{k+kt}{Eval}\PYG{+w}{ }\PYG{n}{file}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{evalFile}\PYG{+w}{ }\PYG{n}{file}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build phase commands}
+\PYG{+w}{    }\PYG{k+kt}{Build}\PYG{+w}{ }\PYG{n}{file}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{buildFile}\PYG{+w}{ }\PYG{n}{file}
+
+\PYG{+w}{    }\PYG{k+kt}{Store}\PYG{+w}{ }\PYG{n}{cmd}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{executeStoreCommand}\PYG{+w}{ }\PYG{n}{cmd}
+
+\PYG{+w}{    }\PYG{k+kt}{GC}\PYG{+w}{ }\PYG{n}{force}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{executeGCCommand}\PYG{+w}{ }\PYG{n}{force}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Help and version work in any phase/context}
+\PYG{+w}{    }\PYG{k+kt}{Help}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{showHelp}
+
+\PYG{+w}{    }\PYG{k+kt}{Version}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{showVersion}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Execute a request via the daemon}
+\PYG{n+nf}{requestCommand}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonConnection}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{PhaseOf}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{requestCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{+w}{ }\PYG{n}{conn}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create appropriate request based on command}
+\PYG{+w}{    }\PYG{n}{request}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{createRequestForCommand}\PYG{+w}{ }\PYG{n}{cmd}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Send request to daemon}
+\PYG{+w}{    }\PYG{n}{response}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{sendToDaemon}\PYG{+w}{ }\PYG{n}{conn}\PYG{+w}{ }\PYG{n}{request}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Handle response}
+\PYG{+w}{    }\PYG{n}{handleDaemonResponse}\PYG{+w}{ }\PYG{n}{response}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Create a daemon request for a command}
+\PYG{n+nf}{createRequestForCommand}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{k+kt}{DaemonRequest}
+\PYG{n+nf}{createRequestForCommand}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{case}
+\PYG{+w}{    }\PYG{k+kt}{Build}\PYG{+w}{ }\PYG{n}{file}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check file existence first}
+\PYG{+w}{        }\PYG{n}{exists}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{doesFileExist}\PYG{+w}{ }\PYG{n}{file}
+\PYG{+w}{        }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{exists}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{InputNotFound}\PYG{+w}{ }\PYG{n}{file}
+
+\PYG{+w}{        }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BuildFileRequest}\PYG{+w}{ }\PYG{n}{file}
+
+\PYG{+w}{    }\PYG{k+kt}{Store}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{StoreAdd}\PYG{+w}{ }\PYG{n}{file}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Read file content first}
+\PYG{+w}{        }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{readFile}\PYG{+w}{ }\PYG{n}{file}
+\PYG{+w}{        }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{StoreContentRequest}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{takeFileName}\PYG{+w}{ }\PYG{n}{file}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{content}
+
+\PYG{+w}{    }\PYG{k+kt}{GC}\PYG{+w}{ }\PYG{n}{force}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{GCRequest}\PYG{+w}{ }\PYG{n}{force}
+
+\PYG{+w}{    }\PYG{n}{cmd}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ProtocolError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Command not supported via protocol: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{show}\PYG{+w}{ }\PYG{n}{cmd}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Handle a daemon response}
+\PYG{n+nf}{handleDaemonResponse}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{DaemonResponse}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{handleDaemonResponse}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{case}
+\PYG{+w}{    }\PYG{k+kt}{BuildComplete}\PYG{+w}{ }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{showBuildResult}\PYG{+w}{ }\PYG{n}{result}
+
+\PYG{+w}{    }\PYG{k+kt}{StorePathResponse}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{putStrLn}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Stored at: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{unpack}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{storePathToText}\PYG{+w}{ }\PYG{n}{path}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{k+kt}{GCComplete}\PYG{+w}{ }\PYG{n}{stats}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{showGCStats}\PYG{+w}{ }\PYG{n}{stats}
+
+\PYG{+w}{    }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{n}{err}
+
+\PYG{+w}{    }\PYG{n}{resp}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ProtocolError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Unexpected daemon response: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{show}\PYG{+w}{ }\PYG{n}{resp}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Helper to execute store commands with appropriate context dispatching}
+\PYG{n+nf}{executeStoreCommand}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{StoreCommand}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{ctx}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{executeStoreCommand}\PYG{+w}{ }\PYG{n}{cmd}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{ctx}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{asks}\PYG{+w}{ }\PYG{n}{privilegeContext}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{cmd}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{ctx}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Commands that require daemon privileges}
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{StoreAdd}\PYG{+w}{ }\PYG{n}{file}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{addFileToStore}\PYG{+w}{ }\PYG{n}{file}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{StoreAdd}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Adding to store requires daemon privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{StoreGC}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{void}\PYG{+w}{ }\PYG{n}{collectGarbage}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{StoreGC}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Garbage collection requires daemon privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Commands that work in either context}
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{StoreList}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{listStoreContents}
+
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{StoreVerify}\PYG{+w}{ }\PYG{n}{path}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{verifyAndShowStorePath}\PYG{+w}{ }\PYG{n}{path}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Execute GC with privilege checking}
+\PYG{n+nf}{executeGCCommand}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{ctx}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{executeGCCommand}\PYG{+w}{ }\PYG{n}{force}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{ctx}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{asks}\PYG{+w}{ }\PYG{n}{privilegeContext}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{ctx}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can run directly in daemon context}
+\PYG{+w}{            }\PYG{n}{stats}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{withGCLock}\PYG{+w}{ }\PYG{n}{collectGarbage}
+\PYG{+w}{            }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{showGCStats}\PYG{+w}{ }\PYG{n}{stats}
+
+\PYG{+w}{        }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Need daemon in builder context}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Garbage collection requires daemon privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Display help text}
+\PYG{n+nf}{showHelp}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{ctx}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{showHelp}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{putStrLn}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Ten \PYGZhy{} A pure functional build system}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{putStrLn}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Usage: ten COMMAND [OPTIONS]}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Help text continues...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Display version information}
+\PYG{n+nf}{showVersion}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{n}{ctx}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{showVersion}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{putStrLn}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Ten version 0.1.0}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{n}{putStrLn}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Copyright (C) 2025}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Privilege requirement for commands}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{PrivilegeRequirement}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{DaemonRequired}\PYG{+w}{ }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{BuilderSufficient}
+\PYG{+w}{    }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Type families for mapping commands to appropriate phase and context}
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{PhaseOf}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{cmd}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Phase}
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{ContextOf}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{cmd}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}
+\end{MintedVerbatim}

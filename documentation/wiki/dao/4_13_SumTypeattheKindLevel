@@ -1,0 +1,2 @@
+data Phase = Eval | Build
+This sum type at the kind level (used as a phantom type parameter) ensures that evaluation-time and build-time operations cannot mix, providing stronger guarantees than Nix's original implementation

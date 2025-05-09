@@ -1,0 +1,30 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} In src/Ten/Daemon/Protocol.hs}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate all external inputs before processing}
+\PYG{n+nf}{validateExternalInput}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{ExternalInput}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{ValidatedInput}
+\PYG{n+nf}{validateExternalInput}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{input}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1. Validate file paths to prevent path traversal}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{inputType}\PYG{+w}{ }\PYG{n}{input}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{n}{validPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{isValidFilePath}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{            }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{validPath}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{SecurityError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid file path: potential traversal}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 2. Check for malicious content}
+\PYG{+w}{        }\PYG{k+kt}{Content}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{n}{isSafe}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{scanForMaliciousContent}\PYG{+w}{ }\PYG{n}{content}
+\PYG{+w}{            }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{isSafe}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{SecurityError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Potentially malicious content detected}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 3. Validate URLs/URIs}
+\PYG{+w}{        }\PYG{k+kt}{URL}\PYG{+w}{ }\PYG{n}{url}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{n}{validURL}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{isValidURL}\PYG{+w}{ }\PYG{n}{url}
+\PYG{+w}{            }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{validURL}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{SecurityError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid or disallowed URL}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return sanitized input}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{sanitizeInput}\PYG{+w}{ }\PYG{n}{input}
+\end{MintedVerbatim}

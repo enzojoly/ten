@@ -1,0 +1,19 @@
+Optimal Strategy for Ten
+The most effective strategy for Ten would be:
+
+Basic phase separation: Simple phantom types (TenM ('Phase p) a)
+Dependency existence: Singletons or Liquid Haskell (singletons for tighter GHC integration)
+Build graph structure: Free categories
+Phase transitions: Adjunctions between categories
+Resource constraints: Liquid Haskell
+Property composition: Constraint manipulation for complex properties
+
+
+#2
+Alternative
+Yes, we would still need our phantom types approach, but they serve a different purpose:
+
+Phantom types: Control what operations are allowed in which phase
+Singletons: Verify dependency existence
+Free categories: Model the structure of the build graph
+Adjunctions: Formalize the relationship between phases

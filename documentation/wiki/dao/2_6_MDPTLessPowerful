@@ -1,0 +1,17 @@
+Multi-dimensional Phantom Types: Power vs. Simplicity
+Multi-dimensional phantom types are less powerful in several ways:
+
+No Runtime Connection: Phantom types have no value-level representation, making it harder to make runtime decisions based on types
+Limited Expressivity: Can't easily encode complex predicates or properties
+Manual Constraint Manipulation: No automatic derivation of constraints from values
+
+However, they excel at:
+
+Phase tracking: Perfect for Ten's Eval/Build separation
+Simple state transitions: Good for tracking basic state changes
+Low boilerplate: Much simpler implementation
+
+For Ten, a hybrid approach is sensible:
+
+Use phantom types for phase separation (simpler, sufficient)
+Use singletons for complex properties like dependency existence (more powerful when needed)

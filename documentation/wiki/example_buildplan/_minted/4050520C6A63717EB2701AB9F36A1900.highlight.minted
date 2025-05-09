@@ -1,0 +1,26 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} In src/Ten/Daemon/Server.hs}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate client request with proper authentication}
+\PYG{n+nf}{handleClientRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{Request}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{p}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{handleClientRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1. Validate authentication token}
+\PYG{+w}{    }\PYG{n}{validToken}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{validateAuthToken}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{requestToken}\PYG{+w}{ }\PYG{n}{request}\PYG{p}{)}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{validToken}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{AuthError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid or expired token}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 2. Check operation permissions}
+\PYG{+w}{    }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{checkOperationPermission}
+\PYG{+w}{                        }\PYG{p}{(}\PYG{n}{requestUserId}\PYG{+w}{ }\PYG{n}{request}\PYG{p}{)}
+\PYG{+w}{                        }\PYG{p}{(}\PYG{n}{requestOperation}\PYG{+w}{ }\PYG{n}{request}\PYG{p}{)}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Operation not permitted for this user}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 3. Sanitize all inputs}
+\PYG{+w}{    }\PYG{n}{sanitizedRequest}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{sanitizeRequestInputs}\PYG{+w}{ }\PYG{n}{request}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 4. Process the request}
+\PYG{+w}{    }\PYG{n}{processRequest}\PYG{+w}{ }\PYG{n}{sanitizedRequest}
+\end{MintedVerbatim}

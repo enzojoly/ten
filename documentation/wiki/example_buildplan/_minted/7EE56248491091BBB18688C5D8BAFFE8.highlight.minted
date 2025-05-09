@@ -1,0 +1,569 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeFamilies \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE FlexibleContexts \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE RankNTypes \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE LambdaCase \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Server}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Concurrent}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{forkIO}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{ThreadId}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Concurrent.STM}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Exception}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{bracket}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{finally}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{try}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{unless}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{when}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{void}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Map.Strict}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Map.Strict}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Map}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Set}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Text}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{T}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Singletons}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Network.Socket}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Protocol}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.State}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Auth}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Config}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Server control information with proper privilege tier tagging}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{ServerControl}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{ServerControl}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{scThread}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{ThreadId}\PYG{p}{,}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Main server thread}
+\PYG{+w}{    }\PYG{n}{scClients}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{ClientId}\PYG{+w}{ }\PYG{k+kt}{ClientInfo}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Connected clients}
+\PYG{+w}{    }\PYG{n}{scShutdown}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{p}{,}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Shutdown flag}
+\PYG{+w}{    }\PYG{n}{scState}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{,}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state with privilege evidence}
+\PYG{+w}{    }\PYG{n}{scConfig}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon configuration}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Client information with privilege tier information}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{ClientInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{ClientInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{ciSocket}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Socket}\PYG{p}{,}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client socket}
+\PYG{+w}{    }\PYG{n}{ciUserId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UserId}\PYG{p}{,}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Authenticated user ID}
+\PYG{+w}{    }\PYG{n}{ciPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege level granted}
+\PYG{+w}{    }\PYG{n}{ciAuthToken}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{AuthToken}\PYG{p}{,}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Authentication token}
+\PYG{+w}{    }\PYG{n}{ciPermissions}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Granted permissions}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Start the daemon server with proper privilege evidence}
+\PYG{n+nf}{startServer}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Singleton evidence for daemon privilege}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Listening socket}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state (privileged)}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ServerControl}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{p}{)}
+\PYG{n+nf}{startServer}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{sock}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Initialize client tracking with privilege checks}
+\PYG{+w}{    }\PYG{n}{clients}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}
+\PYG{+w}{    }\PYG{n}{shutdownFlag}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{False}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Start listener thread in privileged context}
+\PYG{+w}{    }\PYG{n}{serverThread}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{forkIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{runServer}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{acceptClients}\PYG{+w}{ }\PYG{n}{sock}\PYG{+w}{ }\PYG{n}{clients}\PYG{+w}{ }\PYG{n}{shutdownFlag}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Run with daemon privileges}
+\PYG{+w}{        }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{runTen}\PYG{+w}{ }\PYG{n}{runServer}
+\PYG{+w}{                  }\PYG{p}{(}\PYG{n}{initDaemonEnv}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonTmpDir}\PYG{+w}{ }\PYG{n}{config}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{daemonStorePath}\PYG{+w}{ }\PYG{n}{config}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{daemon}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{p}{)}
+\PYG{+w}{                  }\PYG{p}{(}\PYG{n}{initBuildState}\PYG{+w}{ }\PYG{k+kt}{Build}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{BuildIdFromInt}\PYG{+w}{ }\PYG{l+m+mi}{0}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{p}{)}
+
+\PYG{+w}{        }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{result}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{            }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{putStrLn}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Server error: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{n}{show}\PYG{+w}{ }\PYG{n}{err}
+\PYG{+w}{            }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n+nb}{()}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return the server control with privilege evidence}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ServerControl}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{        }\PYG{n}{scThread}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{serverThread}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{scClients}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{clients}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{scShutdown}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{shutdownFlag}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{scState}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{scConfig}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{config}
+\PYG{+w}{    }\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Stop the server with proper privilege validation}
+\PYG{n+nf}{stopServer}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{ServerControl}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Server control}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{stopServer}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{control}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Set shutdown flag}
+\PYG{+w}{    }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{writeTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{scShutdown}\PYG{+w}{ }\PYG{n}{control}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kt}{True}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get client info for cleanup}
+\PYG{+w}{    }\PYG{n}{clientMap}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{scClients}\PYG{+w}{ }\PYG{n}{control}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Close all client connections}
+\PYG{+w}{    }\PYG{n}{forM\PYGZus{}}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{elems}\PYG{+w}{ }\PYG{n}{clientMap}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{ci}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Send shutdown notification with privilege check}
+\PYG{+w}{        }\PYG{n}{sendShutdownNotice}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{ciSocket}\PYG{+w}{ }\PYG{n}{ci}\PYG{p}{)}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Close the socket}
+\PYG{+w}{        }\PYG{n}{close}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{ciSocket}\PYG{+w}{ }\PYG{n}{ci}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Log shutdown}
+\PYG{+w}{    }\PYG{n}{logMessage}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Daemon server shutting down}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Accept client connections with proper privilege validation}
+\PYG{n+nf}{acceptClients}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Listening socket}
+\PYG{+w}{    }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{ClientId}\PYG{+w}{ }\PYG{k+kt}{ClientInfo}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client tracking}
+\PYG{+w}{    }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Shutdown flag}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{acceptClients}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{sock}\PYG{+w}{ }\PYG{n}{clients}\PYG{+w}{ }\PYG{n}{shutdownFlag}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{acceptLoop}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check shutdown flag}
+\PYG{+w}{            }\PYG{n}{shouldShutdown}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{readTVarIO}\PYG{+w}{ }\PYG{n}{shutdownFlag}
+\PYG{+w}{            }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{shouldShutdown}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Accept client connection (with privilege check)}
+\PYG{+w}{                }\PYG{p}{(}\PYG{n}{clientSock}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{clientAddr}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{accept}\PYG{+w}{ }\PYG{n}{sock}
+
+\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Set socket options with privilege}
+\PYG{+w}{                }\PYG{n}{setSocketOption}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{k+kt}{ReuseAddr}\PYG{+w}{ }\PYG{l+m+mi}{1}
+
+\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate connection rate limits}
+\PYG{+w}{                }\PYG{n}{allowed}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{checkConnectionRateLimit}\PYG{+w}{ }\PYG{n}{clientAddr}
+
+\PYG{+w}{                }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{allowed}
+\PYG{+w}{                    }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Rate limit exceeded, close connection}
+\PYG{+w}{                        }\PYG{n}{close}\PYG{+w}{ }\PYG{n}{clientSock}
+\PYG{+w}{                        }\PYG{n}{acceptLoop}
+\PYG{+w}{                    }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Fork client handler thread with proper privilege}
+\PYG{+w}{                        }\PYG{n}{clientThread}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{forkIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{n}{handleClient}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{clientAddr}\PYG{+w}{ }\PYG{n}{clients}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Continue accepting}
+\PYG{+w}{                        }\PYG{n}{acceptLoop}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Start accept loop}
+\PYG{+w}{    }\PYG{n}{acceptLoop}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Handle a client connection with proper privilege validation}
+\PYG{n+nf}{handleClient}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client socket}
+\PYG{+w}{    }\PYG{k+kt}{SockAddr}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client address}
+\PYG{+w}{    }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{ClientId}\PYG{+w}{ }\PYG{k+kt}{ClientInfo}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client tracking}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{handleClient}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{clientAddr}\PYG{+w}{ }\PYG{n}{clients}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Perform authentication protocol (with privilege boundary check)}
+\PYG{+w}{    }\PYG{n}{authResult}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{authenticateClient}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{authResult}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Authentication failed, send error and close}
+\PYG{+w}{            }\PYG{n}{sendAuthFailure}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{err}
+\PYG{+w}{            }\PYG{n}{close}\PYG{+w}{ }\PYG{n}{clientSock}
+
+\PYG{+w}{        }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{userId}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{authToken}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{clientPerm}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{privTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Successfully authenticated}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create client info record}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{clientInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{ClientInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                    }\PYG{n}{ciSocket}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{ciUserId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{userId}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{ciPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{privTier}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{ciAuthToken}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{authToken}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{ciPermissions}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{clientPerm}
+\PYG{+w}{                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate client ID}
+\PYG{+w}{            }\PYG{n}{clientId}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{randomClientId}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register client}
+\PYG{+w}{            }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{n}{clients}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{clientId}\PYG{+w}{ }\PYG{n}{clientInfo}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process client requests based on privilege level}
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{privTier}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Handle daemon\PYGZhy{}privileged requests}
+\PYG{+w}{                    }\PYG{n}{processClientRequests}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{userId}\PYG{+w}{ }\PYG{n}{clientPerm}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{+w}{                }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Handle builder\PYGZhy{}privileged requests}
+\PYG{+w}{                    }\PYG{n}{processClientRequestsBuilder}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{userId}\PYG{+w}{ }\PYG{n}{clientPerm}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Remove client when done}
+\PYG{+w}{            }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{n}{clients}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{delete}\PYG{+w}{ }\PYG{n}{clientId}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Process requests from a daemon\PYGZhy{}privileged client}
+\PYG{n+nf}{processClientRequests}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client socket}
+\PYG{+w}{    }\PYG{k+kt}{UserId}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} User ID}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                 }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Permissions}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{processClientRequests}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{userId}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{processLoop}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Read request with timeout}
+\PYG{+w}{            }\PYG{n}{mRequest}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{readRequestWithTimeout}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{l+m+mi}{30000000}
+
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mRequest}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Timeout or error, exit loop}
+
+\PYG{+w}{                }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{request}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{reqId}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate request against permissions with privilege evidence}
+\PYG{+w}{                    }\PYG{n}{allowed}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{withDaemonPermission}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{permissions}
+
+\PYG{+w}{                    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{allowed}
+\PYG{+w}{                        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Permission denied}
+\PYG{+w}{                            }\PYG{n}{sendResponse}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{reqId}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                                }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Permission denied}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{                            }\PYG{n}{processLoop}
+\PYG{+w}{                        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process the request in daemon context}
+\PYG{+w}{                            }\PYG{n}{response}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{runDaemonRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Send the response}
+\PYG{+w}{                            }\PYG{n}{sendResponse}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{reqId}\PYG{+w}{ }\PYG{n}{response}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Continue processing}
+\PYG{+w}{                            }\PYG{n}{processLoop}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Run the request processing loop}
+\PYG{+w}{    }\PYG{n}{processLoop}\PYG{+w}{ }\PYG{p}{`}\PYG{n}{catch}\PYG{p}{`}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{p}{(}\PYG{n}{e}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Log error and terminate gracefully}
+\PYG{+w}{        }\PYG{n}{logError}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Error handling client: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{show}\PYG{+w}{ }\PYG{n}{e}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Process requests from a builder\PYGZhy{}privileged client}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Similar to processClientRequests but with Builder privilege context}
+\PYG{n+nf}{processClientRequestsBuilder}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client socket}
+\PYG{+w}{    }\PYG{k+kt}{UserId}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} User ID}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                 }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Permissions}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{processClientRequestsBuilder}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{userId}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create builder privilege singleton}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{builderSt}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{SBuilder}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} This is where we drop privileges for the client}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Similar to processClientRequests but using builder privilege context}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{processLoop}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Read request}
+\PYG{+w}{            }\PYG{n}{mRequest}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{readRequestWithTimeout}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{l+m+mi}{30000000}
+
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mRequest}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Timeout or error, exit loop}
+
+\PYG{+w}{                }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{request}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{reqId}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate request against permissions with builder evidence}
+\PYG{+w}{                    }\PYG{n}{allowed}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{withBuilderPermission}\PYG{+w}{ }\PYG{n}{builderSt}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{permissions}
+
+\PYG{+w}{                    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{allowed}
+\PYG{+w}{                        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Permission denied}
+\PYG{+w}{                            }\PYG{n}{sendResponse}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{reqId}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                                }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Permission denied}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{                            }\PYG{n}{processLoop}
+\PYG{+w}{                        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process the request in builder context}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Note how we drop privilege here by using transitionPrivilege}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{builderAction}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{runBuilderRequest}\PYG{+w}{ }\PYG{n}{builderSt}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{state}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{daemonAction}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{transitionPrivilege}\PYG{+w}{ }\PYG{n}{builderAction}
+
+\PYG{+w}{                            }\PYG{n}{response}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{daemonAction}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Send the response}
+\PYG{+w}{                            }\PYG{n}{sendResponse}\PYG{+w}{ }\PYG{n}{clientSock}\PYG{+w}{ }\PYG{n}{reqId}\PYG{+w}{ }\PYG{n}{response}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Continue processing}
+\PYG{+w}{                            }\PYG{n}{processLoop}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Run the builder request processing loop}
+\PYG{+w}{    }\PYG{n}{processLoop}\PYG{+w}{ }\PYG{p}{`}\PYG{n}{catch}\PYG{p}{`}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{p}{(}\PYG{n}{e}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{logError}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Error handling builder client: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{show}\PYG{+w}{ }\PYG{n}{e}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Validate if a request can be processed with daemon privileges}
+\PYG{n+nf}{withDaemonPermission}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Request}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Request to validate}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Granted permissions}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{withDaemonPermission}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Determine the required permission and privilege level for this request}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{requiredPermission}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{getRequiredPermission}\PYG{+w}{ }\PYG{n}{request}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{requiredPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{getRequiredPrivilege}\PYG{+w}{ }\PYG{n}{request}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the client has the required permission}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{requiredPermission}\PYG{+w}{ }\PYG{p}{`}\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{member}\PYG{p}{`}\PYG{+w}{ }\PYG{n}{permissions}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the privilege level is sufficient (already \PYGZsq{}Daemon here)}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hasPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{requiredPrivilege}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{k+kt}{Daemon}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} All checks must pass}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{hasPrivilege}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Validate if a request can be processed with builder privileges}
+\PYG{n+nf}{withBuilderPermission}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Request}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Request to validate}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Granted permissions}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{withBuilderPermission}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Determine the required permission and privilege level for this request}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{requiredPermission}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{getRequiredPermission}\PYG{+w}{ }\PYG{n}{request}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{requiredPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{getRequiredPrivilege}\PYG{+w}{ }\PYG{n}{request}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the client has the required permission}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{requiredPermission}\PYG{+w}{ }\PYG{p}{`}\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{member}\PYG{p}{`}\PYG{+w}{ }\PYG{n}{permissions}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the permission can be used in Builder context}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Some permissions require Daemon privileges}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{validForBuilder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{requiresDaemonPrivilege}\PYG{+w}{ }\PYG{n}{requiredPermission}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} For Builder tier, also verify if the requested operation is allowed in Builder context}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{sufficientPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{requiredPrivilege}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{            }\PYG{k+kt}{Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Builder privilege is sufficient}
+\PYG{+w}{            }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Daemon privilege required, can\PYGZsq{}t proceed}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} All checks must pass}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{validForBuilder}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{sufficientPrivilege}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Check if a permission requires Daemon privileges}
+\PYG{n+nf}{requiresDaemonPrivilege}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{requiresDaemonPrivilege}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{case}
+\PYG{+w}{    }\PYG{k+kt}{PermModifyStore}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Store modifications require Daemon}
+\PYG{+w}{    }\PYG{k+kt}{PermRunGC}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} GC operations require Daemon}
+\PYG{+w}{    }\PYG{k+kt}{PermShutdown}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Shutdown requires Daemon}
+\PYG{+w}{    }\PYG{k+kt}{PermManageUsers}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} User management requires Daemon}
+\PYG{+w}{    }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{+w}{                     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Other permissions can work with Builder}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Process a request in daemon privilege context}
+\PYG{n+nf}{runDaemonRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Request}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Request to process}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{               }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{runDaemonRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Dispatch to appropriate handler based on request type with privilege evidence}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{BuildRequest}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{handleBuildRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{        }\PYG{k+kt}{QueryStoreRequest}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{handleStoreQueryRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{        }\PYG{k+kt}{ModifyStoreRequest}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{handleStoreModifyRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{        }\PYG{k+kt}{GCRequest}\PYG{+w}{ }\PYG{n}{force}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{handleGCRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{force}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Other request handlers with proper privilege handling}
+\PYG{+w}{        }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Default case \PYGZhy{} unknown request}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Unknown request type}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Process a request in builder privilege context}
+\PYG{n+nf}{runBuilderRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Request}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Request to process}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{runBuilderRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Dispatch to appropriate handler based on request type}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Note that these are builder\PYGZhy{}safe operations only}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{BuildRequest}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{handleBuilderBuildRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{        }\PYG{k+kt}{QueryStoreRequest}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{handleBuilderStoreQueryRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Explicitly reject operations requiring Daemon privilege}
+\PYG{+w}{        }\PYG{k+kt}{ModifyStoreRequest}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Store modification requires daemon privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{k+kt}{GCRequest}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{GC operations require daemon privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Other request handlers}
+\PYG{+w}{        }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Unknown or prohibited request type}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Handle a build request with daemon privileges}
+\PYG{n+nf}{handleBuildRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                               }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to build}
+\PYG{+w}{    }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{BuildContent}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                 }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Optional build content}
+\PYG{+w}{    }\PYG{k+kt}{BuildOptions}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Build options}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{               }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{handleBuildRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process the build with full daemon privileges}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate input}
+\PYG{+w}{    }\PYG{n}{validPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{validatePath}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{validPath}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid build path}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get content}
+\PYG{+w}{    }\PYG{n}{buildContent}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{c}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{readBuildFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Parse build file}
+\PYG{+w}{    }\PYG{n}{derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{parseBuildFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{buildContent}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register the build}
+\PYG{+w}{    }\PYG{n}{buildId}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{registerBuild}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{n}{options}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} If async, start build in background}
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{asyncBuild}\PYG{+w}{ }\PYG{n}{options}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Fork with proper privilege tracking}
+\PYG{+w}{            }\PYG{n}{void}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{forkIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                }\PYG{n}{processBuild}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{buildId}\PYG{+w}{ }\PYG{n}{derivation}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return immediate response}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BuildStartedResponse}\PYG{+w}{ }\PYG{n}{buildId}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process build synchronously}
+\PYG{+w}{            }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{processBuild}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{buildId}\PYG{+w}{ }\PYG{n}{derivation}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return complete result}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BuildResultResponse}\PYG{+w}{ }\PYG{n}{result}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Handle a store modification request (requires daemon privileges)}
+\PYG{n+nf}{handleStoreModifyRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path}
+\PYG{+w}{    }\PYG{k+kt}{BuildContent}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Content}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{handleStoreModifyRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} This is a privileged operation requiring Daemon context}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Add content to store}
+\PYG{+w}{    }\PYG{n}{storePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{withStore}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{st\PYGZsq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{        }\PYG{n}{addToStore}\PYG{+w}{ }\PYG{n}{st\PYGZsq{}}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{unpack}\PYG{+w}{ }\PYG{n}{path}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{content}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register in reachable paths}
+\PYG{+w}{    }\PYG{n}{markPathAsReachable}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{storePath}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return the store path}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{StorePathResponse}\PYG{+w}{ }\PYG{n}{storePath}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Handle a GC request (requires daemon privileges)}
+\PYG{n+nf}{handleGCRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Force flag}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{handleGCRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{force}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Acquire GC lock}
+\PYG{+w}{    }\PYG{n}{acquired}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{tryAcquireGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{acquired}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{force}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{GC already in progress}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Run GC with proper privilege}
+\PYG{+w}{            }\PYG{n}{gcStats}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{withGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{st\PYGZsq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                }\PYG{n}{collectGarbage}\PYG{+w}{ }\PYG{n}{st\PYGZsq{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return results}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{GCResultResponse}\PYG{+w}{ }\PYG{n}{gcStats}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Handle a build request in builder context}
+\PYG{n+nf}{handleBuilderBuildRequest}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to build}
+\PYG{+w}{    }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{BuildContent}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Optional build content}
+\PYG{+w}{    }\PYG{k+kt}{BuildOptions}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Build options}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{k+kt}{Response}
+\PYG{n+nf}{handleBuilderBuildRequest}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{n}{options}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process the build with limited builder privileges}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Note: will use daemon service for privileged operations}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Validate input}
+\PYG{+w}{    }\PYG{n}{validPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{validatePath}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{validPath}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid build path}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get content}
+\PYG{+w}{    }\PYG{n}{buildContent}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{c}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{c}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{readBuildFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{path}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Parse build file (this is allowed in Builder context)}
+\PYG{+w}{    }\PYG{n}{derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{parseBuildFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{buildContent}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register the build via daemon protocol (RPC)}
+\PYG{+w}{    }\PYG{n}{buildId}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{registerBuildViaProtocol}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{n}{options}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return immediate response (async only in builder context)}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BuildStartedResponse}\PYG{+w}{ }\PYG{n}{buildId}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Authenticate client with proper privilege accounting}
+\PYG{n+nf}{authenticateClient}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client socket}
+\PYG{+w}{    }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Configuration}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UserId}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{AuthToken}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{p}{)}
+\PYG{n+nf}{authenticateClient}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{sock}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Read authentication request}
+\PYG{+w}{    }\PYG{n}{mAuthReq}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{readAuthRequest}\PYG{+w}{ }\PYG{n}{sock}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mAuthReq}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid authentication request}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{username}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{password}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process authentication with privilege validation}
+\PYG{+w}{            }\PYG{n}{authResult}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{authenticateUser}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{password}
+
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{authResult}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}
+
+\PYG{+w}{                }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{userId}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{token}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{permissions}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Determine privilege tier to grant based on requested tier,}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} permissions, and daemon configuration}
+\PYG{+w}{                    }\PYG{n}{grantedTier}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{canGrantDaemonTier}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{n}{config}
+\PYG{+w}{                                   }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Daemon}
+\PYG{+w}{                                   }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{Builder}
+
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return auth result with granted privilege tier}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{userId}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{token}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{permissions}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{grantedTier}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Check if a user can be granted Daemon privileges}
+\PYG{n+nf}{canGrantDaemonTier}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{DaemonConfig}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{canGrantDaemonTier}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{n}{config}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Daemon privilege can be granted if:}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1. User has admin permission}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 2. Daemon allows privilege escalation in config}
+\PYG{+w}{    }\PYG{k+kt}{PermAdmin}\PYG{+w}{ }\PYG{p}{`}\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{member}\PYG{p}{`}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{o}{\PYGZam{}\PYGZam{}}\PYG{+w}{ }\PYG{n}{daemonAllowPrivilegeEscalation}\PYG{+w}{ }\PYG{n}{config}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Random ID generation for clients}
+\PYG{n+nf}{randomClientId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{k+kt}{ClientId}
+\PYG{n+nf}{randomClientId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate a random client ID}
+\PYG{+w}{    }\PYG{n}{uuid}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{genRandomUUID}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{ClientId}\PYG{+w}{ }\PYG{n}{uuid}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Utility to send shutdown notice to client}
+\PYG{n+nf}{sendShutdownNotice}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Socket}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Client socket}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{sendShutdownNotice}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{sock}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create shutdown message}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{msg}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{createShutdownMessage}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Send to client}
+\PYG{+w}{    }\PYG{n}{sendAll}\PYG{+w}{ }\PYG{n}{sock}\PYG{+w}{ }\PYG{n}{msg}
+\end{MintedVerbatim}

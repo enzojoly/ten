@@ -1,0 +1,24 @@
+Development time:
+
+Liquid Haskell verifies complex properties statically
+GHC's type checker verifies basic type safety and phase separation
+
+
+Build system initialization:
+
+Singleton values provide runtime witnesses of dependencies
+Additional Liquid Haskell properties are documented but not accessible at runtime
+
+
+Build execution:
+
+The type system guarantees dependency existence
+Runtime checks leverage singleton values for detailed error reporting
+Build paths follow categorical laws ensured by types
+Phase transitions follow adjunction laws
+
+
+Error handling:
+
+When dependencies are missing, the runtime representation lets Ten report exactly which ones
+Advanced Liquid Haskell properties have already been verified, preventing other classes of errors

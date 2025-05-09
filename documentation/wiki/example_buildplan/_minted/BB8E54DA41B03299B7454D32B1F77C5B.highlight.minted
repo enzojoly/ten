@@ -1,0 +1,23 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} In Nix, users must manually choose between different patterns:}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Nix APPLICATIVE pattern (callPackage)}
+\PYG{n+nf}{app}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{callPackage}\PYG{+w}{ }\PYG{o}{./}\PYG{n}{app}\PYG{o}{.}\PYG{n}{nix}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{inherit}\PYG{+w}{ }\PYG{n}{lib}\PYG{p}{;}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Nix MONADIC pattern (import)}
+\PYG{n+nf}{app}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{.}\PYG{o}{/}\PYG{n}{app}\PYG{o}{.}\PYG{n}{nix}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{inherit}\PYG{+w}{ }\PYG{n}{lib}\PYG{p}{;}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Nix RETURN\PYGZhy{}CONTINUATION pattern (override)}
+\PYG{n+nf}{compiler}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{.}\PYG{o}{/}\PYG{n}{bootstrap}\PYG{o}{.}\PYG{n}{nix}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{p}{\PYGZcb{}}\PYG{p}{)}\PYG{o}{.}\PYG{n}{overrideAttrs}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{old}\PYG{k+kt}{:}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{o}{...}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} In Ten, ALL patterns use the same do\PYGZhy{}notation syntax:}
+\PYG{n+nf}{anyBuild}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{  }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{o}{...}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+\PYG{+w}{  }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{result}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} The system automatically determines the optimal build strategy:}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1. Analyzes data dependencies between derivations}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 2. Selects parallel building when possible}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 3. Detects return\PYGZhy{}continuation pattern automatically}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 4. Optimises using content\PYGZhy{}addressed storage}
+\end{MintedVerbatim}

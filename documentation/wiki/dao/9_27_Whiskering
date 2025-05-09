@@ -1,0 +1,13 @@
+Whiskering is a special case of horizontal composition where one of the natural transformations is an identity
+
+Whiskering is a specialized form of composition in category theory that extends natural transformations across functor compositions. There are two forms:
+
+Left Whiskering (α ◦ F):
+Given categories C, D, E, functors F: C→D and G,H: D→E, and a natural transformation α: G⇒H, the left whiskering (α ◦ F) creates a natural transformation G∘F ⇒ H∘F.
+For each object c in C, the component is defined as (α ◦ F)c = α{F(c)}.
+
+Right Whiskering (H ◦ β):
+Given functors F,G: C→D and H: D→E and a natural transformation β: F⇒G, the right whiskering (H ◦ β) creates a natural transformation H∘F ⇒ H∘G.
+For each object c in C, the component is defined as (H ◦ β)_c = H(β_c).
+
+Whiskering essentially "extends" a transformation through functor composition, either by applying a functor before the transformation (left) or after it (right).

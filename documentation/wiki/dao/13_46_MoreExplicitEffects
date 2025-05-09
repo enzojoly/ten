@@ -1,0 +1,1 @@
+Ten could benefit from adopting a more explicit effects system, potentially using libraries like polysemy or fused-effects to formalize the handling of these computational effects while maintaining the strong phase separation that makes it unique.

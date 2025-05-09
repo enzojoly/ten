@@ -1,0 +1,2 @@
+Tannakian reconstruction is a technique from category theory that allows recovering an original algebraic structure from its representations.
+Applied to programming, it provides ways to reconstruct data types based on how they can be manipulated, essentially "defining objects by their behaviors."

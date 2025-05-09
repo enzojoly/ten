@@ -1,0 +1,7 @@
+Interchange Law
+The interchange law governs the interaction between vertical and horizontal composition of natural transformations.
+
+For natural transformations α: F → G, β: G → H, γ: I → J, and δ: J → K, it states that:
+(δ ∘ γ) ∘ₕ (β ∘ α) = (δ ∘ₕ β) ∘ (γ ∘ₕ α)
+
+This ensures that different ways of composing natural transformations yield the same result.

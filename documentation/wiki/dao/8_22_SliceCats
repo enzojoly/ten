@@ -1,0 +1,2 @@
+8.3 Slice categories
+What IS it: For a category C and an object c in C, the slice category C/c has as objects all morphisms in C with codomain c. Morphisms in C/c are commutative triangles formed by morphisms in C.

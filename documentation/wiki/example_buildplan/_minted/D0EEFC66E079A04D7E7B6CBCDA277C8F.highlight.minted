@@ -1,0 +1,35 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} The CLI must respect privilege boundaries at the type level}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} while providing a seamless experience to users}
+
+\PYG{+w}{                            }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{+w}{                            }\PYG{o}{|}\PYG{+w}{   }\PYG{k+kt}{User}\PYG{+w}{ }\PYG{k+kt}{Input}\PYG{+w}{   }\PYG{o}{|}
+\PYG{+w}{                            }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{+w}{                                    }\PYG{o}{|}
+\PYG{+w}{                                    }\PYG{n}{v}
+\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}\PYG{+w}{            }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{o}{|}\PYG{+w}{             }\PYG{o}{|}\PYG{+w}{            }\PYG{o}{|}\PYG{+w}{   }\PYG{k+kt}{Argument}\PYG{+w}{     }\PYG{o}{|}
+\PYG{o}{|}\PYG{+w}{  }\PYG{k+kt}{Privilege}\PYG{+w}{  }\PYG{o}{|\PYGZlt{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZgt{}|}\PYG{+w}{   }\PYG{k+kt}{Parsing}\PYG{+w}{      }\PYG{o}{|}
+\PYG{o}{|}\PYG{+w}{  }\PYG{k+kt}{Detection}\PYG{+w}{  }\PYG{o}{|}\PYG{+w}{            }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{o}{|}\PYG{+w}{             }\PYG{o}{|}\PYG{+w}{                    }\PYG{o}{|}
+\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}\PYG{+w}{                    }\PYG{n}{v}
+\PYG{+w}{       }\PYG{o}{|}\PYG{+w}{              }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{+w}{       }\PYG{o}{|}\PYG{+w}{              }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Command}\PYG{+w}{ }\PYG{k+kt}{Categorization}\PYG{+w}{ }\PYG{o}{|}
+\PYG{+w}{       }\PYG{o}{|}\PYG{+w}{              }\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Privileged}\PYG{+w}{ }\PYG{k+kt}{Operations}\PYG{o}{|}
+\PYG{+w}{       }\PYG{o}{|}\PYG{+w}{              }\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Regular}\PYG{+w}{ }\PYG{k+kt}{Operations}\PYG{+w}{   }\PYG{o}{|}
+\PYG{+w}{       }\PYG{n}{v}\PYG{+w}{              }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}\PYG{+w}{                   }\PYG{o}{|}
+\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Context}\PYG{+w}{      }\PYG{o}{|}\PYG{+w}{                   }\PYG{n}{v}
+\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Building}\PYG{+w}{     }\PYG{o}{|}\PYG{+w}{     }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{BuildEnv}\PYG{+w}{   }\PYG{o}{|}\PYG{+w}{     }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Dispatch}\PYG{+w}{ }\PYG{n}{with}\PYG{+w}{ }\PYG{k+kt}{Context}\PYG{+w}{      }\PYG{o}{|}
+\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{BuildState}\PYG{+w}{ }\PYG{o}{|\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZgt{}|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{n}{vs}\PYG{+w}{ }\PYG{k+kt}{Builder}\PYG{+w}{        }\PYG{o}{|}
+\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{+w}{      }\PYG{o}{|}\PYG{+w}{     }\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Privilege}\PYG{+w}{ }\PYG{k+kt}{Reqs}\PYG{+w}{ }\PYG{k+kt}{Applied}\PYG{+w}{   }\PYG{o}{|}
+\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}\PYG{+w}{     }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{+w}{                                  }\PYG{o}{|}
+\PYG{+w}{                                  }\PYG{n}{v}
+\PYG{+w}{                     }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\PYG{+w}{                     }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{Execute}\PYG{+w}{ }\PYG{n}{with}\PYG{+w}{ }\PYG{k+kt}{Run}\PYG{o}{*}\PYG{+w}{ }\PYG{k+kt}{Functions}\PYG{o}{|}
+\PYG{+w}{                     }\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Type}\PYG{o}{\PYGZhy{}}\PYG{k+kt}{Safe}\PYG{+w}{ }\PYG{k+kt}{Execution}\PYG{+w}{      }\PYG{o}{|}
+\PYG{+w}{                     }\PYG{o}{|}\PYG{+w}{ }\PYG{o}{\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{Phase}\PYG{o}{\PYGZhy{}}\PYG{k+kt}{Aware}\PYG{+w}{ }\PYG{k+kt}{Operations}\PYG{+w}{   }\PYG{o}{|}
+\PYG{+w}{                     }\PYG{o}{+\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}\PYGZhy{}+}
+\end{MintedVerbatim}

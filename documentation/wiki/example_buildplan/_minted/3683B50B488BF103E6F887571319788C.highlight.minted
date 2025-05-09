@@ -1,0 +1,99 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeFamilies \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Build}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Singletons}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.State}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Set}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Store}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Sandbox}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Derivation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build result type}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Result fields}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Universal entry point with privilege dispatching}
+\PYG{n+nf}{buildDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{BuildResult}
+\PYG{n+nf}{buildDerivation}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Dispatch based on privilege context}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{fromSing}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{buildDerivationDaemon}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}
+\PYG{+w}{            }\PYG{k+kr}{in}\PYG{+w}{ }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{+w}{        }\PYG{k+kt}{Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{buildDerivationBuilder}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}
+\PYG{+w}{            }\PYG{k+kr}{in}\PYG{+w}{ }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Daemon\PYGZhy{}specific implementation}
+\PYG{n+nf}{buildDerivationDaemon}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{BuildResult}
+\PYG{n+nf}{buildDerivationDaemon}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation with full privileges}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} ...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Builder\PYGZhy{}specific implementation}
+\PYG{n+nf}{buildDerivationBuilder}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{k+kt}{BuildResult}
+\PYG{n+nf}{buildDerivationBuilder}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation with limited privileges}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} ...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build strategy selection}
+\PYG{n+nf}{buildApplicativeStrategy}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{BuildResult}
+\PYG{n+nf}{buildApplicativeStrategy}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{n+nf}{buildMonadicStrategy}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{BuildResult}
+\PYG{n+nf}{buildMonadicStrategy}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build result handling}
+\PYG{n+nf}{collectBuildResult}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{CanAccessStore}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o}{\PYGZti{}}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{StorePath}\PYG{p}{)}
+\PYG{n+nf}{collectBuildResult}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{n+nf}{verifyBuildResult}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{verifyBuildResult}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return\PYGZhy{}continuation handling}
+\PYG{n+nf}{checkForReturnedDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{p}{)}
+\PYG{n+nf}{checkForReturnedDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{n+nf}{handleReturnedDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}
+\PYG{n+nf}{handleReturnedDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Dependency handling for parallel builds}
+\PYG{n+nf}{buildDependenciesConcurrently}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{Derivation}\PYG{p}{]}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{p}{)}\PYG{p}{)}
+\PYG{n+nf}{buildDependenciesConcurrently}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Resource management}
+\PYG{n+nf}{runBuilder}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{BuilderEnv}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ExitCode}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{String}\PYG{p}{)}\PYG{p}{)}
+\PYG{n+nf}{runBuilder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Implementation}
+\end{MintedVerbatim}

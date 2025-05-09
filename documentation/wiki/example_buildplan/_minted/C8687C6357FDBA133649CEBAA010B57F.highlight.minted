@@ -1,0 +1,536 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeFamilies \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE OverloadedStrings \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE RankNTypes \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.Auth}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Concurrent.MVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{MVar}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{newMVar}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{withMVar}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Exception}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{catch}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{throwIO}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Exception}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{unless}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{when}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Crypto.Hash}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Crypto}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Crypto.KDF.PBKDF2}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{PBKDF2}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteString}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{BS}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteString.Base64}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Base64}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteArray}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{BA}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Map.Strict}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Map.Strict}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Map}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Set}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Text}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{T}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text.Encoding}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{TE}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Singletons}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Time.Clock}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UTCTime}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getCurrentTime}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{diffUTCTime}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Directory}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{doesFileExist}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{createDirectoryIfMissing}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{renameFile}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.FilePath}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{takeDirectory}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Handle}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{withFile}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{IOMode}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{hClose}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Posix.User}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UserEntry}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getUserEntryForName}\PYG{p}{)}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Authentication error with privilege information}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{AuthError}
+\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{InvalidCredentials}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{UserNotFound}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{TokenExpired}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{InsufficientPrivileges}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{AuthFileError}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{+w}{    }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{k+kr}{instance}\PYG{+w}{ }\PYG{k+kt}{Exception}\PYG{+w}{ }\PYG{k+kt}{AuthError}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | User credentials for authentication}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{UserCredentials}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{UserCredentials}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{ucUsername}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{ucPassword}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{ucRequestedTier}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Requested privilege tier}
+\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Token information with privilege tier}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{TokenInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TokenInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{tiToken}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{tiUserId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UserId}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{tiExpires}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{UTCTime}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{tiPermissions}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{tiPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{,}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Granted privilege tier}
+\PYG{+w}{    }\PYG{n}{tiLastUsed}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UTCTime}
+\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Password hash}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{PasswordHash}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{PasswordHash}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{phAlgorithm}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{phSalt}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{k+kt}{ByteString}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{phHash}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{k+kt}{ByteString}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{phIterations}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}
+\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | User information with permissions and privilege tiers}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{UserInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{UserInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{uiUserId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UserId}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{uiUsername}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{uiPasswordHash}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PasswordHash}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{uiPermissions}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{uiAllowedPrivilegeTiers}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{,}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Which privilege tiers are allowed}
+\PYG{+w}{    }\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{k+kt}{TokenInfo}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{uiLastLogin}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{UTCTime}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{uiSystemUser}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Associated system user, if any}
+\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Authentication database}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{AuthDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{AuthDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{k+kt}{UserInfo}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{adTokens}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Token to username mapping}
+\PYG{+w}{    }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UTCTime}
+\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Permission types with associated privilege requirements}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{Permission}
+\PYG{+w}{    }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{PermBuild}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can build derivations (Builder)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermCancelBuild}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can cancel builds (Builder)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermQueryBuild}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can query build status (Builder)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermQueryStore}\PYG{+w}{         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can query store contents (Builder)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermModifyStore}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can add to store (Daemon)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermRunGC}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can run garbage collection (Daemon)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermShutdown}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can shut down daemon (Daemon)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermManageUsers}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Can manage users (Daemon)}
+\PYG{+w}{    }\PYG{o}{|}\PYG{+w}{ }\PYG{k+kt}{PermAdmin}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Administrative access (Daemon)}
+\PYG{+w}{    }\PYG{k+kr}{deriving}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Show}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Eq}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Ord}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Enum}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Bounded}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Check if a permission requires daemon privilege}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{k+kt}{PermModifyStore}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{k+kt}{PermRunGC}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{k+kt}{PermShutdown}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{k+kt}{PermManageUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{k+kt}{PermAdmin}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{True}
+\PYG{n+nf}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{False}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Type families for permission capabilities}
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanModifyStore}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{k+kt}{CanModifyStore}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{    }\PYG{k+kt}{CanModifyStore}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanRunGC}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{k+kt}{CanRunGC}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{    }\PYG{k+kt}{CanRunGC}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{k+kr}{type}\PYG{+w}{ }\PYG{k+kr}{family}\PYG{+w}{ }\PYG{k+kt}{CanManageUsers}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Bool}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{k+kt}{CanManageUsers}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}True}
+\PYG{+w}{    }\PYG{k+kt}{CanManageUsers}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}False}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Default permissions for privilege tiers}
+\PYG{n+nf}{defaultPermissions}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}
+\PYG{n+nf}{defaultPermissions}\PYG{+w}{ }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{fromList}\PYG{+w}{ }\PYG{p}{[}
+\PYG{+w}{    }\PYG{k+kt}{PermBuild}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermCancelBuild}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermQueryBuild}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermQueryStore}\PYG{p}{,}
+\PYG{+w}{    }\PYG{k+kt}{PermModifyStore}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermRunGC}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermShutdown}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermManageUsers}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermAdmin}
+\PYG{+w}{    }\PYG{p}{]}
+\PYG{n+nf}{defaultPermissions}\PYG{+w}{ }\PYG{k+kt}{Builder}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{fromList}\PYG{+w}{ }\PYG{p}{[}
+\PYG{+w}{    }\PYG{k+kt}{PermBuild}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermCancelBuild}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermQueryBuild}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{PermQueryStore}
+\PYG{+w}{    }\PYG{p}{]}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Authenticate a user and return proper privilege evidence}
+\PYG{n+nf}{authenticateUser}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Username}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Password}
+\PYG{+w}{    }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Requested privilege tier}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UserId}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{AuthToken}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{p}{)}
+\PYG{n+nf}{authenticateUser}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{password}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Load auth database}
+\PYG{+w}{    }\PYG{n}{authDb}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{loadAuthDb}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Find user}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User not found}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Verify password}
+\PYG{+w}{            }\PYG{n}{passwordValid}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{verifyPassword}\PYG{+w}{ }\PYG{n}{password}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiPasswordHash}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{)}
+
+\PYG{+w}{            }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{passwordValid}
+\PYG{+w}{                }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid credentials}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{                }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the requested privilege tier is allowed for this user}
+\PYG{+w}{                    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{allowedTiers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{uiAllowedPrivilegeTiers}\PYG{+w}{ }\PYG{n}{userInfo}
+
+\PYG{+w}{                    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{+w}{ }\PYG{p}{`}\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{member}\PYG{p}{`}\PYG{+w}{ }\PYG{n}{allowedTiers}
+\PYG{+w}{                        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate token}
+\PYG{+w}{                            }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+\PYG{+w}{                            }\PYG{n}{token}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{generateToken}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Grant appropriate permissions based on tier}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{grantedPermissions}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{                                    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{k+kt}{Daemon}
+\PYG{+w}{                                    }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{uiPermissions}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} All permissions for Daemon}
+\PYG{+w}{                                    }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{filter}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{not}\PYG{+w}{ }\PYG{o}{.}\PYG{+w}{ }\PYG{n}{permissionRequiresDaemon}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiPermissions}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{)}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create token info}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TokenInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                                    }\PYG{n}{tiToken}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{token}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{tiUserId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{uiUserId}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{tiExpires}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{addUTCTime}\PYG{+w}{ }\PYG{p}{(}\PYG{l+m+mi}{60}\PYG{o}{*}\PYG{l+m+mi}{60}\PYG{o}{*}\PYG{l+m+mi}{24}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{now}\PYG{p}{,}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 24h expiry}
+\PYG{+w}{                                    }\PYG{n}{tiPermissions}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{grantedPermissions}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{tiPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{tiLastUsed}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{                                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update auth database}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{token}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{)}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                                    }\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedTokens}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{uiLastLogin}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{                                }\PYG{p}{\PYGZcb{}}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{updatedUser}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedTokenMap}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{token}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adTokens}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}
+\PYG{+w}{                            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{authDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                                    }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{adTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedTokenMap}\PYG{p}{,}
+\PYG{+w}{                                    }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{                                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Save updated auth database}
+\PYG{+w}{                            }\PYG{n}{saveAuthDb}\PYG{+w}{ }\PYG{n}{updatedDb}
+
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return appropriate privilege evidence}
+\PYG{+w}{                            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                                }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return daemon privilege evidence}
+\PYG{+w}{                                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiUserId}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{AuthToken}\PYG{+w}{ }\PYG{n}{token}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{grantedPermissions}\PYG{p}{,}
+\PYG{+w}{                                                  }\PYG{k+kt}{SDaemon}\PYG{p}{)}
+
+\PYG{+w}{                                }\PYG{k+kt}{Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return builder privilege evidence}
+\PYG{+w}{                                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiUserId}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{AuthToken}\PYG{+w}{ }\PYG{n}{token}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{grantedPermissions}\PYG{p}{,}
+\PYG{+w}{                                                  }\PYG{k+kt}{SBuilder}\PYG{p}{)}
+\PYG{+w}{                        }\PYG{k+kr}{else}
+\PYG{+w}{                            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User not authorized for }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{show}\PYG{+w}{ }\PYG{n}{requestedTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Validate a token with proper privilege evidence}
+\PYG{n+nf}{validateToken}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{AuthToken}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Authentication token}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UserId}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{p}{)}
+\PYG{n+nf}{validateToken}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{AuthToken}\PYG{+w}{ }\PYG{n}{token}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Load auth database}
+\PYG{+w}{    }\PYG{n}{authDb}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{loadAuthDb}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Find the token}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{token}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adTokens}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid or expired token}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Find the user}
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User not found}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{                }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Find token info}
+\PYG{+w}{                    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{token}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Token not found}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{                        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check expiration}
+\PYG{+w}{                            }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+\PYG{+w}{                            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{tiExpires}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                                }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{expiry}\PYG{+w}{ }\PYG{o}{|}\PYG{+w}{ }\PYG{n}{now}\PYG{+w}{ }\PYG{o}{\PYGZgt{}}\PYG{+w}{ }\PYG{n}{expiry}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                                    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Token expired}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{                                }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update last used time}
+\PYG{+w}{                                    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedTokenInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{tiLastUsed}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+\PYG{+w}{                                    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{token}\PYG{+w}{ }\PYG{n}{updatedTokenInfo}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{)}
+\PYG{+w}{                                    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedTokens}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+\PYG{+w}{                                    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{updatedUser}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}
+\PYG{+w}{                                    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{authDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                                            }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{p}{,}
+\PYG{+w}{                                            }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{                                        }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{                                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Save updated auth database}
+\PYG{+w}{                                    }\PYG{n}{saveAuthDb}\PYG{+w}{ }\PYG{n}{updatedDb}
+
+\PYG{+w}{                                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return appropriate singleton evidence based on token\PYGZsq{}s tier}
+\PYG{+w}{                                    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{tiPrivilegeTier}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                                        }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                                            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{tiUserId}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{tiPermissions}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SDaemon}\PYG{p}{)}
+
+\PYG{+w}{                                        }\PYG{k+kt}{Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                                            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{tiUserId}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{tiPermissions}\PYG{+w}{ }\PYG{n}{tokenInfo}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SBuilder}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Verify if a password matches a hash}
+\PYG{n+nf}{verifyPassword}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Password to check}
+\PYG{+w}{    }\PYG{k+kt}{PasswordHash}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{          }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Password hash}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{verifyPassword}\PYG{+w}{ }\PYG{n}{password}\PYG{+w}{ }\PYG{k+kt}{PasswordHash}\PYG{p}{\PYGZob{}}\PYG{o}{..}\PYG{p}{\PYGZcb{}}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{phAlgorithm}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{pbkdf2\PYGZhy{}sha512}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{calculatedHash}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{pbkdf2Hash}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TE}\PYG{o}{.}\PYG{n}{encodeUtf8}\PYG{+w}{ }\PYG{n}{password}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{phSalt}\PYG{+w}{ }\PYG{n}{phIterations}\PYG{+w}{ }\PYG{l+m+mi}{64}
+\PYG{+w}{            }\PYG{k+kr}{in}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{calculatedHash}\PYG{+w}{ }\PYG{o}{==}\PYG{+w}{ }\PYG{n}{phHash}
+\PYG{+w}{        }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Unknown algorithm}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Generate PBKDF2 hash}
+\PYG{n+nf}{pbkdf2Hash}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{k+kt}{ByteString}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{k+kt}{ByteString}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{k+kt}{ByteString}
+\PYG{n+nf}{pbkdf2Hash}\PYG{+w}{ }\PYG{n}{password}\PYG{+w}{ }\PYG{n}{salt}\PYG{+w}{ }\PYG{n}{iterations}\PYG{+w}{ }\PYG{n}{keyLen}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{    }\PYG{k+kt}{PBKDF2}\PYG{o}{.}\PYG{n}{fastPBKDF2\PYGZus{}SHA512}
+\PYG{+w}{        }\PYG{p}{(}\PYG{k+kt}{PBKDF2}\PYG{o}{.}\PYG{k+kt}{Parameters}\PYG{+w}{ }\PYG{n}{iterations}\PYG{+w}{ }\PYG{n}{keyLen}\PYG{p}{)}
+\PYG{+w}{        }\PYG{n}{password}
+\PYG{+w}{        }\PYG{n}{salt}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Hash a password}
+\PYG{n+nf}{hashPassword}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Password to hash}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{k+kt}{PasswordHash}
+\PYG{n+nf}{hashPassword}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{password}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate a random salt (16 bytes)}
+\PYG{+w}{    }\PYG{n}{salt}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{generateRandomBytes}\PYG{+w}{ }\PYG{l+m+mi}{16}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Use 100,000 iterations (adjust based on security requirements)}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{iterations}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+m+mi}{100000}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hash}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{pbkdf2Hash}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TE}\PYG{o}{.}\PYG{n}{encodeUtf8}\PYG{+w}{ }\PYG{n}{password}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{salt}\PYG{+w}{ }\PYG{n}{iterations}\PYG{+w}{ }\PYG{l+m+mi}{64}
+
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{PasswordHash}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{        }\PYG{n}{phAlgorithm}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{pbkdf2\PYGZhy{}sha512}\PYG{l+s}{\PYGZdq{}}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{phSalt}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{salt}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{phHash}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{hash}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{phIterations}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{iterations}
+\PYG{+w}{    }\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Generate a random authentication token}
+\PYG{n+nf}{generateToken}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{n+nf}{generateToken}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate random bytes (32 bytes = 256 bits of entropy)}
+\PYG{+w}{    }\PYG{n}{randomBytes}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{generateRandomBytes}\PYG{+w}{ }\PYG{l+m+mi}{32}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Use Base64 for text representation}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{token}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ten\PYGZus{}}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TE}\PYG{o}{.}\PYG{n}{decodeUtf8}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Base64}\PYG{o}{.}\PYG{n}{encode}\PYG{+w}{ }\PYG{n}{randomBytes}\PYG{p}{)}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{token}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Add a new user with proper privilege checks}
+\PYG{n+nf}{addUser}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Username}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Password}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{               }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Permissions}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Allowed privilege tiers}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{addUser}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{password}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{n}{allowedTiers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Verify we have admin privileges (already checked by type system)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Load auth database}
+\PYG{+w}{    }\PYG{n}{authDb}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{loadAuthDb}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if user already exists}
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{member}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{AuthError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User already exists: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{username}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Hash the password}
+\PYG{+w}{    }\PYG{n}{passwordHash}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{hashPassword}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{password}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate user ID}
+\PYG{+w}{    }\PYG{n}{userId}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{UserId}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{p}{(}\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{user\PYGZus{}}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{uniqueId}
+
+\PYG{+w}{    }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create user info}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{UserInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{uiUserId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{userId}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiUsername}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{username}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiPasswordHash}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{passwordHash}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiPermissions}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{permissions}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiAllowedPrivilegeTiers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{allowedTiers}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiLastLogin}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Nothing}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{uiSystemUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update auth database}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{authDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Save auth database}
+\PYG{+w}{    }\PYG{n}{saveAuthDb}\PYG{+w}{ }\PYG{n}{updatedDb}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Remove a user with proper privilege checks}
+\PYG{n+nf}{removeUser}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Username}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{removeUser}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Load auth database}
+\PYG{+w}{    }\PYG{n}{authDb}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{loadAuthDb}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if user exists}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{AuthError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User not found: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{username}
+
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Remove all tokens for this user}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{userTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{keys}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{uiTokens}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{p}{)}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedTokenMap}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{foldl}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{n}{m}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{delete}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adTokens}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{userTokens}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update auth database}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{delete}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{authDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                    }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{adTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedTokenMap}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Save auth database}
+\PYG{+w}{            }\PYG{n}{saveAuthDb}\PYG{+w}{ }\PYG{n}{updatedDb}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Change a user\PYGZsq{}s allowed privilege tiers}
+\PYG{n+nf}{changeUserPrivilegeTiers}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Username}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} New allowed tiers}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{changeUserPrivilegeTiers}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{newTiers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Load auth database}
+\PYG{+w}{    }\PYG{n}{authDb}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{loadAuthDb}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if user exists}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{AuthError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{User not found: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{username}
+
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update user info}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUser}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{userInfo}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{uiAllowedPrivilegeTiers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{newTiers}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update auth database}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{username}\PYG{+w}{ }\PYG{n}{updatedUser}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{adUsers}\PYG{+w}{ }\PYG{n}{authDb}\PYG{p}{)}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{updatedDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{authDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                    }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updatedUsers}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Save auth database}
+\PYG{+w}{            }\PYG{n}{saveAuthDb}\PYG{+w}{ }\PYG{n}{updatedDb}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Check if a user can use a specific permission in the current context}
+\PYG{n+nf}{checkPermission}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{               }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} User permissions}
+\PYG{+w}{    }\PYG{k+kt}{Permission}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Permission to check}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{checkPermission}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{permissions}\PYG{+w}{ }\PYG{n}{perm}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} First check if the permission is in the set}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hasPermission}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{perm}\PYG{+w}{ }\PYG{p}{`}\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{member}\PYG{p}{`}\PYG{+w}{ }\PYG{n}{permissions}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} If not in the set, fail immediately}
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{hasPermission}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{False}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} If permission requires daemon privileges, check the privilege tier}
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{permissionRequiresDaemon}\PYG{+w}{ }\PYG{n}{perm}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} For daemon privileges, check singleton type}
+\PYG{+w}{                    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{fromSing}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                        }\PYG{k+kt}{Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Has daemon privileges}
+\PYG{+w}{                        }\PYG{k+kt}{Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{False}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Doesn\PYGZsq{}t have daemon privileges}
+\PYG{+w}{                }\PYG{k+kt}{False}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Permission doesn\PYGZsq{}t require daemon privileges}
+\PYG{+w}{                    }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{True}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Load the authentication database}
+\PYG{n+nf}{loadAuthDb}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{AuthDb}
+\PYG{n+nf}{loadAuthDb}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get auth database path}
+\PYG{+w}{    }\PYG{n}{dbPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getAuthDbPath}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if file exists}
+\PYG{+w}{    }\PYG{n}{exists}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{doesFileExist}\PYG{+w}{ }\PYG{n}{dbPath}
+
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{exists}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create new empty database}
+\PYG{+w}{            }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{AuthDb}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                }\PYG{n}{adUsers}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}\PYG{p}{,}
+\PYG{+w}{                }\PYG{n}{adTokens}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}\PYG{p}{,}
+\PYG{+w}{                }\PYG{n}{adLastModified}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{            }\PYG{p}{\PYGZcb{}}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Read the file}
+\PYG{+w}{            }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{readFile}\PYG{+w}{ }\PYG{n}{dbPath}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Parse the database}
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Aeson}\PYG{o}{.}\PYG{n}{eitherDecodeStrict}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{n}{throwIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{AuthError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{AuthFileError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Failed to parse auth database: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{n}{err}
+
+\PYG{+w}{                }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{db}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{db}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Save the authentication database}
+\PYG{n+nf}{saveAuthDb}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{AuthDb}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{saveAuthDb}\PYG{+w}{ }\PYG{n}{db}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get auth database path}
+\PYG{+w}{    }\PYG{n}{dbPath}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getAuthDbPath}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create directory if needed}
+\PYG{+w}{    }\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{takeDirectory}\PYG{+w}{ }\PYG{n}{dbPath}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Write to a temporary file first}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{tempPath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{dbPath}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{.tmp}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{writeFile}\PYG{+w}{ }\PYG{n}{tempPath}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{LBS}\PYG{o}{.}\PYG{n}{toStrict}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Aeson}\PYG{o}{.}\PYG{n}{encode}\PYG{+w}{ }\PYG{n}{db}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Rename to final path}
+\PYG{+w}{    }\PYG{n}{renameFile}\PYG{+w}{ }\PYG{n}{tempPath}\PYG{+w}{ }\PYG{n}{dbPath}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Get auth database path}
+\PYG{n+nf}{getAuthDbPath}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{k+kt}{FilePath}
+\PYG{n+nf}{getAuthDbPath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get home directory}
+\PYG{+w}{    }\PYG{n}{homeDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getHomeDirectory}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Use XDG directories if available}
+\PYG{+w}{    }\PYG{n}{mXdgConfigDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{lookupEnv}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{XDG\PYGZus{}CONFIG\PYGZus{}HOME}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mXdgConfigDir}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{configDir}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{configDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{ten/auth.db}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{homeDir}\PYG{+w}{ }\PYG{o}{\PYGZlt{}/\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{.config/ten/auth.db}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Generate random bytes}
+\PYG{n+nf}{generateRandomBytes}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{k+kt}{ByteString}
+\PYG{n+nf}{generateRandomBytes}\PYG{+w}{ }\PYG{n}{n}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} In a real implementation, use a CSPRNG}
+\PYG{+w}{    }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{replicateM}\PYG{+w}{ }\PYG{n}{n}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{randomRIO}\PYG{+w}{ }\PYG{p}{(}\PYG{l+m+mi}{0}\PYG{p}{,}\PYG{+w}{ }\PYG{l+m+mi}{255}\PYG{p}{)}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Generate a unique ID string}
+\PYG{n+nf}{uniqueId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{IO}\PYG{+w}{ }\PYG{k+kt}{Text}
+\PYG{n+nf}{uniqueId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get current time}
+\PYG{+w}{    }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Convert to microseconds since epoch}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{micros}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{floor}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+m+mi}{1000000}\PYG{+w}{ }\PYG{o}{*}\PYG{+w}{ }\PYG{n}{realToFrac}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{diffUTCTime}\PYG{+w}{ }\PYG{n}{now}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{read}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{1970\PYGZhy{}01\PYGZhy{}01 00:00:00 UTC}\PYG{l+s}{\PYGZdq{}}\PYG{p}{)}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Add some randomness}
+\PYG{+w}{    }\PYG{n}{r}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{randomIO}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Combine time and random number}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{show}\PYG{+w}{ }\PYG{n}{micros}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{\PYGZus{}}\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{show}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{r}\PYG{+w}{ }\PYG{p}{`}\PYG{n}{mod}\PYG{p}{`}\PYG{+w}{ }\PYG{l+m+mi}{1000}\PYG{p}{)}
+\end{MintedVerbatim}

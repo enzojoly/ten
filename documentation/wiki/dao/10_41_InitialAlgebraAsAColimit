@@ -1,0 +1,2 @@
+Ten's build system can be viewed as computing a colimit of the dependency graph, where the final build result represents the "integration" of all dependencies.
+While not explicitly mentioned in the code, this conceptual framework underlies the dependency resolution system.

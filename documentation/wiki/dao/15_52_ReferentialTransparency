@@ -1,0 +1,40 @@
+REFERENTIAL TRANSPARENCY
+Relationship to Pure Functions
+-----------------------------------------------------------------------
+A function f is referentially transparent if and only if:
+
+For all inputs x, f(x) always produces the same output
+f(x) has no side effects
+f(x) can be replaced with its result value throughout the program
+-----------------------------------------------------------------------
+EXAMPLES
+
+Referentially Transparent:
+
+Mathematical expressions: 2 + 3
+Pure function applications: length([1,2,3])
+Constant values: "hello"
+Pure data transformations: map(double, [1,2,3])
+
+NOT Referentially Transparent:
+
+Reading user input: readLine()
+Current time: getCurrentTime()
+Random values: random()
+Database queries: queryDatabase(sql)
+Mutable variable access: counter++
+Logging: log("operation completed")
+-----------------------------------------------------------------------
+Referential Transparency with Monads
+
+The genius of monads is that they enable working with effects while maintaining referential transparency:
+
+Value vs. Action Separation
+Monads distinguish between:
+
+- The description of an effectful computation (which is referentially transparent)
+- The execution of that computation (which may have side effects)
+
+Monadic Values as First-Class: A value of type IO String is itself referentially transparent — it's a data structure representing an action, not the action's execution.
+Delayed Execution: Effects described by monads are only executed when the runtime system processes them (in Haskell, ultimately by the main function).
+Pure Composition: Monadic operations can be composed using pure functions like >>= (bind), preserving referential transparency even when describing complex effectful sequences.

@@ -1,0 +1,6 @@
+Continuation Passing Style
+CPS could improve Ten's build execution engine by making it more efficient and enabling advanced control flow:
+
+Tail-recursive build execution would avoid stack overflows for large build graphs
+Named continuations could simplify complex recovery mechanisms
+Defunctionalization could provide optimization opportunities

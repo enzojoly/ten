@@ -1,0 +1,2 @@
+Indexed Monads can encode pre and post-conditions, they are excellent for tracking how operations change state
+Less expressive than dependent types for arbitrary invariants

@@ -1,0 +1,39 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} In src/Ten/Build.hs}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Verify derivation when transitioning between build phases}
+\PYG{n+nf}{verifyReturnedDerivation}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}
+\PYG{n+nf}{verifyReturnedDerivation}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{n}{returnPath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1. Verify file exists and is readable}
+\PYG{+w}{    }\PYG{n}{fileExists}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{doesFileExist}\PYG{+w}{ }\PYG{n}{returnPath}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{fileExists}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BuildFailed}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Return derivation file does not exist}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 2. Check file permissions}
+\PYG{+w}{    }\PYG{n}{permissions}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{getPermissions}\PYG{+w}{ }\PYG{n}{returnPath}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{readable}\PYG{+w}{ }\PYG{n}{permissions}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BuildFailed}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Return derivation file is not readable}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 3. Read and parse the derivation}
+\PYG{+w}{    }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{liftIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{readFile}\PYG{+w}{ }\PYG{n}{returnPath}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{deserializeDerivation}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{SerializationError}\PYG{+w}{ }\PYG{n}{err}
+
+\PYG{+w}{        }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{innerDrv}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 4. Verify derivation hash/signature}
+\PYG{+w}{            }\PYG{n}{validHash}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{verifyDerivationHash}\PYG{+w}{ }\PYG{n}{innerDrv}
+\PYG{+w}{            }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{validHash}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{SecurityError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Return derivation hash verification failed}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 5. Check for cycles in build chain}
+\PYG{+w}{            }\PYG{n}{chain}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{gets}\PYG{+w}{ }\PYG{n}{buildChain}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{hasCycle}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{detectCycle}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{innerDrv}\PYG{+w}{ }\PYG{k+kt}{:}\PYG{+w}{ }\PYG{n}{chain}\PYG{p}{)}
+\PYG{+w}{            }\PYG{n}{when}\PYG{+w}{ }\PYG{n}{hasCycle}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{CyclicDependency}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Recursion cycle detected in build chain}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return the verified derivation}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{innerDrv}
+\end{MintedVerbatim}

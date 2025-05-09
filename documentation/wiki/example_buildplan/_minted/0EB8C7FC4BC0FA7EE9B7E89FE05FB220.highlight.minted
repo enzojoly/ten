@@ -1,0 +1,454 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE DataKinds \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE GADTs \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE TypeFamilies \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE ScopedTypeVariables \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE FlexibleContexts \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+\PYG{c+cm}{\PYGZob{}\PYGZhy{}}\PYG{c+cm}{\PYGZsh{} LANGUAGE RankNTypes \PYGZsh{}}\PYG{c+cm}{\PYGZhy{}\PYGZcb{}}
+
+\PYG{k+kr}{module}\PYG{+w}{ }\PYG{n+nn}{Ten.Daemon.State}\PYG{+w}{ }\PYG{k+kr}{where}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Concurrent}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{MVar}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{newMVar}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{takeMVar}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{putMVar}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{withMVar}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Concurrent.STM}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Exception}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{bracket}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{finally}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{try}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{unless}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{when}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{void}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Reader}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Control.Monad.Except}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Aeson}\PYG{+w}{ }\PYG{p}{(}\PYG{p}{(}\PYG{o}{.:}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{p}{(}\PYG{o}{.=}\PYG{p}{)}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Aeson}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Aeson}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteString}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{BS}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.ByteString.Lazy}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{LBS}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Map.Strict}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Map.Strict}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Map}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Set}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{Set}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Text}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{k}{qualified}\PYG{+w}{ }\PYG{n+nn}{Data.Text}\PYG{+w}{ }\PYG{k}{as}\PYG{+w}{ }\PYG{n}{T}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Data.Singletons}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.Directory}\PYG{+w}{ }\PYG{p}{(}\PYG{n+nf}{doesFileExist}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{createDirectoryIfMissing}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{getModificationTime}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{System.IO}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Handle}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{withFile}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{IOMode}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{,}\PYG{+w}{ }\PYG{n+nf}{hClose}\PYG{p}{)}
+
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Core}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Build}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{BuildResult}\PYG{p}{(}\PYG{o}{..}\PYG{p}{)}\PYG{p}{)}
+\PYG{k+kr}{import}\PYG{+w}{ }\PYG{n+nn}{Ten.Derivation}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Derivation}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Active build information with privilege awareness}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{ActiveBuild}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{ActiveBuild}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{abBuildId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{BuildId}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abOwner}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UserId}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abStatus}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{k+kt}{BuildStatus}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abStartTime}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UTCTime}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abUpdateTime}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{k+kt}{UTCTime}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abLogBuffer}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abResult}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TMVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abProcessId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{ProcessID}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{abPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Record which privilege tier initiated this build}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Build queue entry}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{BuildQueueEntry}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{BuildQueueEntry}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{n}{bqBuildId}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{BuildId}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{bqDerivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{bqOwner}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{UserId}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{bqPriority}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{bqPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Record which privilege tier requested this build}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Daemon state with privilege tier phantom}
+\PYG{k+kr}{data}\PYG{+w}{ }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Build tracking (with phantom type for privilege control)}
+\PYG{+w}{    }\PYG{n}{dsActiveBuilds}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{BuildId}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{ActiveBuild}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{dsBuildQueue}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{[}\PYG{k+kt}{BuildQueueEntry}\PYG{p}{]}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{dsCompletedBuilds}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{BuildId}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UTCTime}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Either}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{+w}{ }\PYG{k+kt}{BuildResult}\PYG{p}{)}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{dsFailedBuilds}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{BuildId}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{UTCTime}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{BuildError}\PYG{p}{)}\PYG{p}{)}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Store path tracking}
+\PYG{+w}{    }\PYG{n}{dsPathLocks}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TMVar}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{p}{)}\PYG{p}{)}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{dsReachablePaths}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{StorePath}\PYG{p}{)}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Derivation tracking}
+\PYG{+w}{    }\PYG{n}{dsKnownDerivations}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Map}\PYG{+w}{ }\PYG{k+kt}{Text}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{p}{)}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} GC coordination}
+\PYG{+w}{    }\PYG{n}{dsGCLock}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TMVar}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{dsGCLockOwner}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TVar}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Maybe}\PYG{+w}{ }\PYG{k+kt}{ProcessID}\PYG{p}{)}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Configuration}
+\PYG{+w}{    }\PYG{n}{dsStateFilePath}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{FilePath}\PYG{p}{,}
+\PYG{+w}{    }\PYG{n}{dsMaxConcurrentBuilds}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Int}\PYG{p}{,}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Privilege tracking}
+\PYG{+w}{    }\PYG{n}{dsPrivilegeEvidence}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Runtime evidence of privilege tier}
+\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Initialize daemon state with appropriate privilege tier}
+\PYG{n+nf}{initDaemonState}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} State file path}
+\PYG{+w}{    }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Max concurrent builds}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}
+\PYG{n+nf}{initDaemonState}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{stateFile}\PYG{+w}{ }\PYG{n}{maxJobs}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create TVars for state components}
+\PYG{+w}{    }\PYG{n}{activeBuildsVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}
+\PYG{+w}{    }\PYG{n}{buildQueueVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{[]}
+\PYG{+w}{    }\PYG{n}{completedBuildsVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}
+\PYG{+w}{    }\PYG{n}{failedBuildsVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}
+
+\PYG{+w}{    }\PYG{n}{pathLocksVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}
+\PYG{+w}{    }\PYG{n}{reachablePathsVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{empty}
+
+\PYG{+w}{    }\PYG{n}{knownDerivationsVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{empty}
+
+\PYG{+w}{    }\PYG{n}{gcLockVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTMVarIO}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{+w}{    }\PYG{n}{gcLockOwnerVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return the state with privilege evidence}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{        }\PYG{n}{dsActiveBuilds}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{activeBuildsVar}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{dsBuildQueue}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{buildQueueVar}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{dsCompletedBuilds}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{completedBuildsVar}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{dsFailedBuilds}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{failedBuildsVar}\PYG{p}{,}
+
+\PYG{+w}{        }\PYG{n}{dsPathLocks}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{pathLocksVar}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{dsReachablePaths}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{reachablePathsVar}\PYG{p}{,}
+
+\PYG{+w}{        }\PYG{n}{dsKnownDerivations}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{knownDerivationsVar}\PYG{p}{,}
+
+\PYG{+w}{        }\PYG{n}{dsGCLock}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{gcLockVar}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{dsGCLockOwner}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{gcLockOwnerVar}\PYG{p}{,}
+
+\PYG{+w}{        }\PYG{n}{dsStateFilePath}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{stateFile}\PYG{p}{,}
+\PYG{+w}{        }\PYG{n}{dsMaxConcurrentBuilds}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{maxJobs}\PYG{p}{,}
+
+\PYG{+w}{        }\PYG{n}{dsPrivilegeEvidence}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{    }\PYG{p}{\PYGZcb{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Load daemon state from a file with privilege checking}
+\PYG{n+nf}{loadStateFromFile}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{FilePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} State file path}
+\PYG{+w}{    }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Max concurrent builds}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}
+\PYG{n+nf}{loadStateFromFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{stateFile}\PYG{+w}{ }\PYG{n}{maxJobs}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if file exists}
+\PYG{+w}{    }\PYG{n}{exists}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{doesFileExist}\PYG{+w}{ }\PYG{n}{stateFile}
+
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{not}\PYG{+w}{ }\PYG{n}{exists}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create a new state if file doesn\PYGZsq{}t exist}
+\PYG{+w}{            }\PYG{n}{initDaemonState}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{stateFile}\PYG{+w}{ }\PYG{n}{maxJobs}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Try to load from file}
+\PYG{+w}{            }\PYG{n}{result}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{try}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                }\PYG{n}{content}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{readFile}\PYG{+w}{ }\PYG{n}{stateFile}
+\PYG{+w}{                }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Aeson}\PYG{o}{.}\PYG{n}{eitherDecodeStrict}\PYG{+w}{ }\PYG{n}{content}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                    }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{throwIO}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{StateError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{T}\PYG{o}{.}\PYG{n}{pack}\PYG{+w}{ }\PYG{n}{err}
+\PYG{+w}{                    }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{stateData}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Initialize empty state}
+\PYG{+w}{                        }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{initDaemonState}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{stateFile}\PYG{+w}{ }\PYG{n}{maxJobs}
+
+\PYG{+w}{                        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Populate with data from file}
+\PYG{+w}{                        }\PYG{n}{populateState}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{stateData}
+
+\PYG{+w}{                        }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{result}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{k+kt}{Left}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{SomeException}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} If loading fails, create a fresh state}
+\PYG{+w}{                    }\PYG{n}{initDaemonState}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{stateFile}\PYG{+w}{ }\PYG{n}{maxJobs}
+\PYG{+w}{                }\PYG{k+kt}{Right}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Save daemon state to a file}
+\PYG{n+nf}{saveStateToFile}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{       }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{saveStateToFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create directory if needed}
+\PYG{+w}{    }\PYG{n}{createDirectoryIfMissing}\PYG{+w}{ }\PYG{k+kt}{True}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{takeDirectory}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsStateFilePath}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Capture state data}
+\PYG{+w}{    }\PYG{n}{stateData}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{captureStateData}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Write to a temporary file first}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{tempFile}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{dsStateFilePath}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o}{++}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{.tmp}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{    }\PYG{k+kt}{BS}\PYG{o}{.}\PYG{n}{writeFile}\PYG{+w}{ }\PYG{n}{tempFile}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{LBS}\PYG{o}{.}\PYG{n}{toStrict}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Aeson}\PYG{o}{.}\PYG{n}{encode}\PYG{+w}{ }\PYG{n}{stateData}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Rename to final location}
+\PYG{+w}{    }\PYG{n}{renameFile}\PYG{+w}{ }\PYG{n}{tempFile}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsStateFilePath}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Register a build with proper privilege tier tracking}
+\PYG{n+nf}{registerBuild}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{              }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Derivation to build}
+\PYG{+w}{    }\PYG{k+kt}{UserId}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Owner}
+\PYG{+w}{    }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Priority}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{BuildId}
+\PYG{n+nf}{registerBuild}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{n}{owner}\PYG{+w}{ }\PYG{n}{priority}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Generate a new build ID}
+\PYG{+w}{    }\PYG{n}{buildId}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{genBuildId}
+
+\PYG{+w}{    }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if we\PYGZsq{}re at capacity for concurrent builds}
+\PYG{+w}{    }\PYG{n}{activeBuildCount}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{size}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsActiveBuilds}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{activeBuildCount}\PYG{+w}{ }\PYG{o}{\PYGZgt{}=}\PYG{+w}{ }\PYG{n}{dsMaxConcurrentBuilds}\PYG{+w}{ }\PYG{n}{state}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Queue the build}
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{queueEntry}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{BuildQueueEntry}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                    }\PYG{n}{bqBuildId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{buildId}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{bqDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{derivation}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{bqOwner}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{owner}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{bqPriority}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{priority}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{bqPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromSing}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Record which tier initiated this build}
+\PYG{+w}{                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{            }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsBuildQueue}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{entries}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                }\PYG{n}{sortQueueEntries}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{queueEntry}\PYG{+w}{ }\PYG{k+kt}{:}\PYG{+w}{ }\PYG{n}{entries}\PYG{p}{)}
+
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{buildId}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create a new active build}
+\PYG{+w}{            }\PYG{n}{statusVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{BuildPending}
+\PYG{+w}{            }\PYG{n}{updateTimeVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{n}{now}
+\PYG{+w}{            }\PYG{n}{logBufferVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{            }\PYG{n}{resultVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newEmptyTMVarIO}
+\PYG{+w}{            }\PYG{n}{processIdVar}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTVarIO}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{+w}{            }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{activeBuild}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{ActiveBuild}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{                    }\PYG{n}{abBuildId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{buildId}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{derivation}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abOwner}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{owner}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abStatus}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{statusVar}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abStartTime}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{now}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abUpdateTime}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{updateTimeVar}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abLogBuffer}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{logBufferVar}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abResult}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{resultVar}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abProcessId}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{processIdVar}\PYG{p}{,}
+\PYG{+w}{                    }\PYG{n}{abPrivilegeTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromSing}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Record which tier initiated this build}
+\PYG{+w}{                }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register the build}
+\PYG{+w}{            }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsActiveBuilds}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{buildId}\PYG{+w}{ }\PYG{n}{activeBuild}
+
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register the derivation}
+\PYG{+w}{            }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsKnownDerivations}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{                }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{derivHash}\PYG{+w}{ }\PYG{n}{derivation}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{derivation}
+
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{buildId}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Register a build via protocol (for Builder tier to communicate with Daemon)}
+\PYG{n+nf}{registerBuildViaProtocol}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Builder privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Builder state}
+\PYG{+w}{    }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Derivation to build}
+\PYG{+w}{    }\PYG{k+kt}{UserId}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Owner}
+\PYG{+w}{    }\PYG{k+kt}{Int}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                         }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Priority}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{k+kt}{BuildId}
+\PYG{n+nf}{registerBuildViaProtocol}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{derivation}\PYG{+w}{ }\PYG{n}{owner}\PYG{+w}{ }\PYG{n}{priority}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} For Builder tier, we need to use the protocol to talk to the daemon}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Create a registration request}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{request}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{RegisterBuildRequest}\PYG{+w}{ }\PYG{p}{\PYGZob{}}
+\PYG{+w}{            }\PYG{n}{regDerivation}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{derivation}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{regOwner}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{owner}\PYG{p}{,}
+\PYG{+w}{            }\PYG{n}{regPriority}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{priority}
+\PYG{+w}{        }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Send via protocol}
+\PYG{+w}{    }\PYG{n}{response}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{sendToDaemon}\PYG{+w}{ }\PYG{n}{request}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Process response}
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{response}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{BuildRegisteredResponse}\PYG{+w}{ }\PYG{n}{buildId}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{buildId}
+\PYG{+w}{        }\PYG{k+kt}{ErrorResponse}\PYG{+w}{ }\PYG{n}{err}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{DaemonError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Failed to register build: }\PYG{l+s}{\PYGZdq{}}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{err}
+\PYG{+w}{        }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{DaemonError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Invalid response from daemon for build registration}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Update a build\PYGZsq{}s status with proper privilege checking}
+\PYG{n+nf}{updateBuildStatus}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{BuildId}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Build ID}
+\PYG{+w}{    }\PYG{k+kt}{BuildStatus}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                 }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} New status}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{updateBuildStatus}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{buildId}\PYG{+w}{ }\PYG{n}{status}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if the build exists}
+\PYG{+w}{    }\PYG{n}{mBuild}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{buildId}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsActiveBuilds}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mBuild}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{            }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{StateBuildNotFound}\PYG{+w}{ }\PYG{n}{buildId}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{build}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Verify privileges}
+\PYG{+w}{            }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{fromSing}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{,}\PYG{+w}{ }\PYG{n}{abPrivilegeTier}\PYG{+w}{ }\PYG{n}{build}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{                }\PYG{p}{(}\PYG{k+kt}{Builder}\PYG{p}{,}\PYG{+w}{ }\PYG{k+kt}{Daemon}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Builder tier can\PYGZsq{}t update Daemon\PYGZhy{}initiated builds}
+\PYG{+w}{                    }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Cannot update daemon\PYGZhy{}initiated build with builder privileges}\PYG{l+s}{\PYGZdq{}}
+\PYG{+w}{                }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Update status}
+\PYG{+w}{                    }\PYG{n}{now}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getCurrentTime}
+\PYG{+w}{                    }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                        }\PYG{n}{writeTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{abStatus}\PYG{+w}{ }\PYG{n}{build}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{status}
+\PYG{+w}{                        }\PYG{n}{writeTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{abUpdateTime}\PYG{+w}{ }\PYG{n}{build}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{now}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Acquire a store path lock with privilege checking}
+\PYG{n+nf}{acquirePathLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to lock}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{acquirePathLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get or create lock for this path}
+\PYG{+w}{    }\PYG{n}{lock}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{locks}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsPathLocks}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+\PYG{+w}{        }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{locks}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{            }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{existingLock}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{existingLock}
+\PYG{+w}{            }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                }\PYG{n}{newLock}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{newTMVar}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{+w}{                }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsPathLocks}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{newLock}
+\PYG{+w}{                }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{newLock}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Try to acquire the lock}
+\PYG{+w}{    }\PYG{n}{taken}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{isEmptyTMVar}\PYG{+w}{ }\PYG{n}{lock}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{taken}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{takeTMVar}\PYG{+w}{ }\PYG{n}{lock}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Release a store path lock}
+\PYG{n+nf}{releasePathLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to unlock}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{releasePathLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Get the lock}
+\PYG{+w}{    }\PYG{n}{mLock}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Map}\PYG{o}{.}\PYG{n}{lookup}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsPathLocks}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{k+kr}{case}\PYG{+w}{ }\PYG{n}{mLock}\PYG{+w}{ }\PYG{k+kr}{of}
+\PYG{+w}{        }\PYG{k+kt}{Nothing}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{n+nb}{()}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} No lock to release}
+\PYG{+w}{        }\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{lock}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if lock is taken}
+\PYG{+w}{            }\PYG{n}{empty}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{isEmptyTMVar}\PYG{+w}{ }\PYG{n}{lock}
+
+\PYG{+w}{            }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{empty}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{                }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Release the lock}
+\PYG{+w}{                }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{putTMVar}\PYG{+w}{ }\PYG{n}{lock}\PYG{+w}{ }\PYG{n+nb}{()}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Execute an action with a locked store path}
+\PYG{n+nf}{withPathLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to lock}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{            }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Action to run with lock}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}
+\PYG{n+nf}{withPathLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{n}{action}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{bracket}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n}{runTenM}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{acquirePathLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{runTenM}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{releasePathLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{runTenM}\PYG{+w}{ }\PYG{n}{action}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Acquire the GC lock with proper privilege verification}
+\PYG{n+nf}{acquireGCLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{acquireGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Verify we\PYGZsq{}re in daemon context (this is enforced by type system too)}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{privilegeTier}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{fromSing}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{privilegeTier}\PYG{+w}{ }\PYG{o}{/=}\PYG{+w}{ }\PYG{k+kt}{Daemon}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}
+\PYG{+w}{        }\PYG{n}{throwError}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{PrivilegeError}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{GC operations require daemon privileges}\PYG{l+s}{\PYGZdq{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Try to take the TMVar lock}
+\PYG{+w}{    }\PYG{n}{empty}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{isEmptyTMVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLock}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+\PYG{+w}{    }\PYG{n}{unless}\PYG{+w}{ }\PYG{n}{empty}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{takeTMVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLock}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Record our process as the owner}
+\PYG{+w}{    }\PYG{n}{pid}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{getProcessID}
+\PYG{+w}{    }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{writeTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLockOwner}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{Just}\PYG{+w}{ }\PYG{n}{pid}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Release the GC lock}
+\PYG{n+nf}{releaseGCLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{releaseGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Clear the owner}
+\PYG{+w}{    }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{writeTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLockOwner}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kt}{Nothing}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Release the lock}
+\PYG{+w}{    }\PYG{n}{empty}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{isEmptyTMVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLock}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+\PYG{+w}{    }\PYG{n}{when}\PYG{+w}{ }\PYG{n}{empty}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{putTMVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLock}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{n+nb}{()}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Execute an action with the GC lock}
+\PYG{n+nf}{withGCLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n}{a}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Action to run with lock}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n}{a}
+\PYG{n+nf}{withGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{action}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{bracket}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n}{runTenM}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{acquireGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{runTenM}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{releaseGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+\PYG{+w}{        }\PYG{p}{(}\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{runTenM}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{action}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Check if GC lock is available}
+\PYG{n+nf}{checkGCLock}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{checkGCLock}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if we have a recorded owner}
+\PYG{+w}{    }\PYG{n}{mOwner}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsGCLockOwner}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{isNothing}\PYG{+w}{ }\PYG{n}{mOwner}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Mark a path as reachable}
+\PYG{n+nf}{markPathAsReachable}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to mark}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{markPathAsReachable}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n}{modifyTVar\PYGZsq{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsReachablePaths}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{insert}\PYG{+w}{ }\PYG{n}{path}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Check if a path is reachable}
+\PYG{n+nf}{isPathReachable}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{             }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{StorePath}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{                   }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Path to check}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{isPathReachable}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{atomically}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{o}{.}\PYG{n}{member}\PYG{+w}{ }\PYG{n}{path}\PYG{+w}{ }\PYG{o}{\PYGZlt{}\PYGZdl{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{readTVar}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{dsReachablePaths}\PYG{+w}{ }\PYG{n}{state}\PYG{p}{)}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | Run background maintenance tasks}
+\PYG{n+nf}{scheduledMaintenance}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{      }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state}
+\PYG{+w}{    }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Build}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{n+nb}{()}
+\PYG{n+nf}{scheduledMaintenance}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Prune old completed builds}
+\PYG{+w}{    }\PYG{n}{pruneCompletedBuilds}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Clean up stale builds}
+\PYG{+w}{    }\PYG{n}{cleanupStaleBuilds}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Save state to file}
+\PYG{+w}{    }\PYG{n}{saveStateToFile}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{state}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} | The Builder\PYGZhy{}safe view of the daemon state for RPC}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} This allows builder\PYGZhy{}privileged code to view/modify only authorized parts}
+\PYG{n+nf}{builderViewOfState}\PYG{+w}{ }\PYG{o+ow}{::}
+\PYG{+w}{    }\PYG{k+kt}{SPrivilegeTier}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{     }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Builder privilege evidence}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Daemon}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Daemon state (still has Daemon phantom type)}
+\PYG{+w}{    }\PYG{k+kt}{DaemonState}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Builder}\PYG{+w}{           }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} \PYGZca{} Builder view (has Builder phantom type)}
+\PYG{n+nf}{builderViewOfState}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{n}{daemonState}\PYG{+w}{ }\PYG{o+ow}{=}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} This would be implemented with a proper restricted view}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} of the daemon state that only exposes builder\PYGZhy{}safe operations}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Without the full state, privileged operations will fail to compile}
+\PYG{+w}{    }\PYG{n+ne}{error}\PYG{+w}{ }\PYG{l+s}{\PYGZdq{}}\PYG{l+s}{Not implemented: converting daemon state to builder view}\PYG{l+s}{\PYGZdq{}}
+\end{MintedVerbatim}

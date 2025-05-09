@@ -1,0 +1,70 @@
+\begin{MintedVerbatim}[commandchars=\\\{\}]
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} The universal derivation entry point (public API)}
+\PYG{n+nf}{derivation}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{n}{forall}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{t}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{PrivilegeTier}\PYG{p}{)}\PYG{o}{.}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{SingI}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=\PYGZgt{}}
+\PYG{+w}{    }\PYG{k+kt}{DerivationAttrs}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Derivation}
+\PYG{n+nf}{derivation}\PYG{+w}{ }\PYG{n}{attrs}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sEval}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{n}{env}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{ask}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 1. Create the derivation instance}
+\PYG{+w}{    }\PYG{n}{drv}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{createDerivationObject}\PYG{+w}{ }\PYG{n}{attrs}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 2. Analyze dependencies to determine build strategy}
+\PYG{+w}{    }\PYG{n}{deps}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{analyzeDependencies}\PYG{+w}{ }\PYG{n}{drv}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 3. Automatically determine optimal build strategy}
+\PYG{+w}{    }\PYG{n}{buildStrategy}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{hasReturnContinuationMarkers}\PYG{+w}{ }\PYG{n}{drv}
+\PYG{+w}{        }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{MonadicStrategy}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} For return\PYGZhy{}continuation pattern}
+\PYG{+w}{        }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{k+kr}{if}\PYG{+w}{ }\PYG{n}{hasDynamicDependencies}\PYG{+w}{ }\PYG{n}{drv}\PYG{+w}{ }\PYG{n}{deps}
+\PYG{+w}{            }\PYG{k+kr}{then}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{MonadicStrategy}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} For true monadic dependencies}
+\PYG{+w}{            }\PYG{k+kr}{else}\PYG{+w}{ }\PYG{n}{return}\PYG{+w}{ }\PYG{k+kt}{ApplicativeStrategy}\PYG{+w}{  }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} For independent builds}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 4. Record the strategy in the derivation}
+\PYG{+w}{    }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{n}{drv\PYGZsq{}}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{drv}\PYG{+w}{ }\PYG{p}{\PYGZob{}}\PYG{+w}{ }\PYG{n}{derivStrategy}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{buildStrategy}\PYG{+w}{ }\PYG{p}{\PYGZcb{}}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} 5. Register the derivation in the evaluation graph}
+\PYG{+w}{    }\PYG{n}{registerDerivation}\PYG{+w}{ }\PYG{n}{drv\PYGZsq{}}
+
+\PYG{+w}{    }\PYG{n}{return}\PYG{+w}{ }\PYG{n}{drv\PYGZsq{}}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Detect if a derivation contains dynamic dependencies on other derivations}
+\PYG{n+nf}{hasDynamicDependencies}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{Set}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{hasDynamicDependencies}\PYG{+w}{ }\PYG{n}{drv}\PYG{+w}{ }\PYG{n}{deps}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Inspect environment variables and arguments for references to other derivations}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Detect if builder output is needed by another derivation (sequential dependency)}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Return True if dependencies necessitate sequential building}
+\PYG{+w}{    }\PYG{o}{...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Detect if a derivation uses return\PYGZhy{}continuation pattern}
+\PYG{n+nf}{hasReturnContinuationMarkers}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{Derivation}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{k+kt}{Bool}
+\PYG{n+nf}{hasReturnContinuationMarkers}\PYG{+w}{ }\PYG{n}{drv}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Check if builder might produce a continuation derivation:}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{}   \PYGZhy{} Contains bootstrapping or stage indicators}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{}   \PYGZhy{} Uses special return environment variables}
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{}   \PYGZhy{} Has builder that\PYGZsq{}s known to produce new derivations}
+\PYG{+w}{    }\PYG{o}{...}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} The internal TenM instance implements Monad, Applicative, and Alternative}
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} to automatically optimise build graph based on dependency structure}
+\PYG{k+kr}{instance}\PYG{+w}{ }\PYG{k+kt}{Monad}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{p}{(}\PYG{o}{\PYGZgt{}\PYGZgt{}=}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{b}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{b}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZgt{}\PYGZgt{}=}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{m}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{        }\PYG{k+kr}{let}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{m\PYGZsq{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{n}{f}\PYG{+w}{ }\PYG{n}{a}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Register monadic dependency in graph for proper sequencing}
+\PYG{+w}{        }\PYG{n}{recordDependency}\PYG{+w}{ }\PYG{n}{a}
+\PYG{+w}{        }\PYG{n}{m\PYGZsq{}}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+
+\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Supporting applicative optimisation even in do\PYGZhy{}notation}
+\PYG{k+kr}{instance}\PYG{+w}{ }\PYG{k+kt}{Applicative}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{p}{)}\PYG{+w}{ }\PYG{k+kr}{where}
+\PYG{+w}{    }\PYG{n}{pure}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{k+kr}{\PYGZus{}}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{pure}\PYG{+w}{ }\PYG{n}{a}
+
+\PYG{+w}{    }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Parallel application when dependencies aren\PYGZsq{}t related}
+\PYG{+w}{    }\PYG{p}{(}\PYG{o}{\PYGZlt{}*\PYGZgt{}}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{::}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{n}{b}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{k+kt}{\PYGZsq{}Eval}\PYG{+w}{ }\PYG{n}{t}\PYG{+w}{ }\PYG{n}{b}
+\PYG{+w}{    }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{mf}\PYG{p}{)}\PYG{+w}{ }\PYG{o}{\PYGZlt{}*\PYGZgt{}}\PYG{+w}{ }\PYG{p}{(}\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{n}{ma}\PYG{p}{)}\PYG{+w}{ }\PYG{o+ow}{=}\PYG{+w}{ }\PYG{k+kt}{TenM}\PYG{+w}{ }\PYG{o}{\PYGZdl{}}\PYG{+w}{ }\PYG{n+nf}{\PYGZbs{}}\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}\PYG{+w}{ }\PYG{o+ow}{\PYGZhy{}\PYGZgt{}}\PYG{+w}{ }\PYG{k+kr}{do}
+\PYG{+w}{        }\PYG{c+c1}{\PYGZhy{}\PYGZhy{} Record that these operations can happen in parallel}
+\PYG{+w}{        }\PYG{n}{recordParallelOperations}
+\PYG{+w}{        }\PYG{n}{f}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{mf}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{        }\PYG{n}{a}\PYG{+w}{ }\PYG{o+ow}{\PYGZlt{}\PYGZhy{}}\PYG{+w}{ }\PYG{n}{ma}\PYG{+w}{ }\PYG{n}{sp}\PYG{+w}{ }\PYG{n}{st}
+\PYG{+w}{        }\PYG{n}{return}\PYG{+w}{ }\PYG{p}{(}\PYG{n}{f}\PYG{+w}{ }\PYG{n}{a}\PYG{p}{)}
+\end{MintedVerbatim}

@@ -1,0 +1,7 @@
+Liquid Haskell becomes essential when verifying more sophisticated dependency properties:
+
+Consistency checking: Verifying that dependencies don't have conflicting requirements
+Transitive closure properties: Ensuring all indirect dependencies satisfy constraints
+Version constraint satisfaction: Validating that version requirements are met
+Resource bounds: Ensuring dependencies don't exceed system limitations
+Dependency graph properties: Verifying acyclicity, reachability, etc.

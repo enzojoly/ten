@@ -1,0 +1,2 @@
+Endofunctors are functors from a category to itself.
+In Ten, the most prominent endofunctor is the TenM monad itself, which maps from the category of types to itself while adding the context of build operations. Additionally, the phase transitions in Ten.Core can be seen as endofunctors on the category of Ten operations.
