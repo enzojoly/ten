@@ -1,5 +1,7 @@
 # Ten Build System
 
+AI GENERATED DOCUMENTATION - READ AT YOUR OWN PERIL. COULD BE DEPRECATED OR OTHERWISE WRONG
+
 Ten is a pure functional build system with robust guarantees for reproducible and reliable builds. It ensures correctness through type-level phase separation between evaluation and execution, content-addressed storage, and isolated build environments.
 
 ## Core Features
@@ -12,12 +14,13 @@ Ten's most distinctive feature is its strict compile-time separation between eva
 * **Build Phase**: Executes derivations in isolated environments to produce outputs
 * **Type Safety**: The compiler prevents evaluation-only operations during build and vice versa
 * **Phase Transitions**: Enables safe transitions between phases with formal guarantees
+* **Privilege Tiers**: Daemon spawns unprivileged Builder processes, client requests privileged actions from the Daemon
 
 ### Content-Addressed Storage
 
-All artifacts in Ten are immutable and addressed by content hash:
+All artefacts in Ten are immutable and addressed by content hash:
 
-* **Immutable Storage**: Once created, build artifacts cannot be modified
+* **Immutable Storage**: Once created, build artefacts cannot be modified
 * **Hash-Based Addressing**: Files are referenced by cryptographic hash of content
 * **Automatic Deduplication**: Identical files share storage automatically
 * **Integrity Verification**: Hashes validate file integrity
