@@ -206,10 +206,10 @@ main = hspec $ do
                     let graph = BuildGraph nodes edges (Set.singleton "a") Nothing
 
                     -- Create a test action that gets cycle detection result
-                    let testAction = Graph.detectCycles sDaemon graph >>= \(hasCycle, _, _) -> return hasCycle
+                    let testAction = Graph.detectCycles sBuilder graph >>= \(hasCycle, _, _) -> return hasCycle
 
                     -- Run the test action in the Ten monad
-                    result <- runTenTest @'Eval @'Daemon testAction env state
+                    result <- runTenTest @'Eval @'Builder testAction env state
                     result `shouldBe` Right True
 
                 it "topologically sorts a directed acyclic graph" $ do
@@ -235,10 +235,10 @@ main = hspec $ do
                     let graph = BuildGraph nodes edges (Set.singleton "c") (Just ValidProof)
 
                     -- Create a test action that gets the sorted nodes
-                    let testAction = Graph.topologicalSort sDaemon graph
+                    let testAction = Graph.topologicalSort sBuilder graph
 
                     -- Run the test action in the Ten monad
-                    result <- runTenTest @'Eval @'Daemon testAction env state
+                    result <- runTenTest @'Eval @'Builder testAction env state
                     case result of
                         Right sortedNodes -> length sortedNodes `shouldBe` 3
                         Left err -> error $ "Test failed: " ++ show err
@@ -327,8 +327,8 @@ main = hspec $ do
                         state <- createTestState
 
                         -- Run cycle detection
-                        let testAction = Graph.detectCycles sDaemon graph >>= \(hasCycle, _, _) -> return hasCycle
-                        result <- runTenTest @'Eval @'Daemon testAction env state
+                        let testAction = Graph.detectCycles sBuilder graph >>= \(hasCycle, _, _) -> return hasCycle
+                        result <- runTenTest @'Eval @'Builder testAction env state
 
                         -- Handle error or success appropriately
                         case result of
@@ -347,11 +347,11 @@ main = hspec $ do
                         state <- createTestState
 
                         -- Create a test action
-                        let testAction = Graph.topologicalSort sDaemon graph >>= \nodes ->
+                        let testAction = Graph.topologicalSort sBuilder graph >>= \nodes ->
                                            return (length nodes == nodeCount)
 
                         -- Run the test and check the result
-                        result <- runTenTest @'Eval @'Daemon testAction env state
+                        result <- runTenTest @'Eval @'Builder testAction env state
                         case result of
                             Right isCorrectLength -> return isCorrectLength
                             Left err -> do
